@@ -233,9 +233,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
 /* One row's proposals for the step issued ahead. A refusal is fatal: that step was planned with
  * the count expect_draft announced, and the scheduler cannot withdraw a draft for a step it
  * already planned (set_draft only takes the count that step expects), so carrying on would
- * verify the previous cycle's proposals. NOTFOUND is the one harmless answer: reap() only drops
- * a request that is in no step and holds no block (scheduler.cpp), so every step still to run is
- * unaffected by the missing publication. */
+ * verify the previous cycle's proposals. NOTFOUND is not a refusal, because every caller still
+ * holds its snapshot across the call: block_holds() is true for each row, so reap() and cancel()
+ * defer the release instead of dropping it (scheduler.cpp), and the request is still in by_id_.
+ * The one way left is a concurrent Scheduler::shutdown, which clears the snapshot first; by then
+ * no step is left that could verify the old proposals. The host block driver has no step issued
+ * ahead at all (pipelining is off there), so it never has one to lose either. */
 int Engine::publish_draft(uint64_t seq, const int32_t* tok, int n) {
     const int st = sched_.set_draft(seq, tok, n);
     if (st == RAD_E_NOTFOUND) return RAD_OK;
@@ -245,6 +248,31 @@ int Engine::publish_draft(uint64_t seq, const int32_t* tok, int n) {
     return st;
 }
 
+namespace {
+/* Ends the serial snapshot on every exit of the finish below, in the destructor, so that it runs
+ * after the last set_draft: the hold is what keeps reap() from dropping a row between the cycle
+ * and its publication. A refused cycle ends it here instead of leaving that to
+ * Scheduler::step()/shutdown, and does so with 0 rounds: serial_end would otherwise move the
+ * watermark over verified positions of a cycle the engine refused, i.e. record a filled history
+ * for work it threw away. */
+struct SerialHold {
+    Scheduler& sched;
+    bool held = true;
+    explicit SerialHold(Scheduler& s) : sched(s) {}
+    ~SerialHold() { if (held) sched.serial_end(0); }
+    void release(int rounds) { held = false; sched.serial_end(rounds); }
+};
+
+/* The block host driver's snapshot, armed once the context pass has run: block_end() moves the
+ * filled range over that pass, so ending the snapshot before it -- or after it failed -- would
+ * claim a range nobody wrote. Those exits stay with Scheduler::step()'s own clear. */
+struct BlockHold {
+    Scheduler& sched;
+    explicit BlockHold(Scheduler& s) : sched(s) {}
+    ~BlockHold() { sched.block_end(); }
+};
+}  /* namespace */
+
 /* After commit: check the host's acceptance against the card's, publish the proposals through
  * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
  * so a disagreement is a defect and the step is refused. Each row publishes StepSlot::gen rounds,
@@ -252,6 +280,7 @@ int Engine::publish_draft(uint64_t seq, const int32_t* tok, int n) {
  * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    SerialHold hold(sched_);
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
@@ -267,10 +296,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
-    if (serial_done_ <= 0 || serial_rows_ <= 0) {
-        sched_.serial_end(serial_done_);
-        return RAD_OK;
-    }
+    if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;   /* only the history pass ran */
 
     Rank& r0 = *ranks_[0];
     const int rounds = serial_rounds_;
@@ -314,11 +340,12 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         st = publish_draft(serial_row_[(size_t)i].seq,
                            &draft_out_[(size_t)i * (size_t)rounds], serial_k_[(size_t)i]);
     }
-    /* The snapshot ends here, after the publish: serial_end releases the hold that defers the
-     * release of a request cancelled or reaped while the rounds ran. Dropped earlier, the
-     * server's reap could take a request out of the scheduler between the end and its set_draft
-     * above and that publication would be lost. */
-    sched_.serial_end(serial_done_);
+    /* The snapshot ends with hold's scope, after the publish: serial_end releases the hold that
+     * defers the release of a request cancelled or reaped while the rounds ran. Dropped earlier,
+     * the server's reap could take a request out of the scheduler between the end and its
+     * set_draft above and that publication would be lost. A failed publication releases with 0
+     * rounds: the cycle is refused, so its verified positions are redone, not recorded. */
+    hold.release(st < 0 ? 0 : serial_done_);
     return st;
 }
 
@@ -375,10 +402,8 @@ int Engine::run_block_drafter(int step) {
     const int steps = drafter_.depth;
     /* The row count is the drafter's (defaulted and checked by declare_drafter). */
     const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
-    std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
-    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
-                                  rows.data(), (int)rows.size());
-
+    /* Before block_begin: the proposal buffer is the rank's, not the block plan's, so a missing
+     * one returns before the snapshot exists. */
     Rank& r0 = *ranks_[0];
     void* prop = r0.ctx.buf_ptr(drafter_.proposal);
     if (!prop) {
@@ -386,10 +411,19 @@ int Engine::run_block_drafter(int step) {
                 drafter_.name, r0.program.buffers[drafter_.proposal].name.c_str());
         return RAD_E_STATE;
     }
+    std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
+    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
+                                  rows.data(), (int)rows.size());
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
-     * drafter will need, and skipping would leave a permanent hole in its cache. */
+     * drafter will need, and skipping would leave a permanent hole in its cache. A failure here
+     * still has to clear the snapshot, but block_end would then claim the range this pass did not
+     * write; Scheduler::step() clears it instead. */
     if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+
+    /* The context pass ran: every exit below -- a failed query pass, a readback that could not be
+     * reserved or copied, the publish -- ends the snapshot in hold's scope. */
+    BlockHold hold(sched_);
 
     /* Cleared so a query batch that could not be built does not republish the previous step's
      * proposals. */
@@ -405,10 +439,7 @@ int Engine::run_block_drafter(int step) {
             draft_out_.assign(raw, raw + n_raw);
         }
     }
-    if (n <= 0 || draft_out_.empty()) {
-        sched_.block_end();
-        return RAD_OK;
-    }
+    if (n <= 0 || draft_out_.empty()) return RAD_OK;
 
     int st = RAD_OK;
     for (int i = 0; i < n && st >= 0; ++i) {
@@ -416,9 +447,8 @@ int Engine::run_block_drafter(int step) {
         if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
         st = publish_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
     }
-    /* After the publish, as serial_end in finish_serial_drafter: the hold keeps reap() from
-     * dropping a row between the end and its set_draft. */
-    sched_.block_end();
+    /* As serial_end in finish_serial_drafter: the snapshot ends after the publish, so the hold
+     * keeps reap() from dropping a row between the end and its set_draft. */
     return st;
 }
 
