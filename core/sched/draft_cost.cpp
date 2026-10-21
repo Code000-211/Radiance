@@ -527,7 +527,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
-    if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
+        if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (std::abs(b.shape.ctx_class - s.ctx_class) != 1) continue;
         if (!near || b.shape.ctx_class > near->shape.ctx_class) near = &b;
     }
@@ -644,9 +644,10 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
         record(sample, (uint16_t)(sample.flags & kDraftSampleAhead));
         return RAD_OK;
     }
-    if (sample.flags & kDisturbing) {
+    if ((sample.flags & kDisturbing) && draft_sample_storable(sample)) {
         /* Stored apart with its flags: a recording, audit, warmup, admission or placement bracket
-         * is not a price of normal operation, but it is not an outlier to be discarded either. */
+         * is not a price of normal operation, but it is not an outlier to be discarded either. A
+         * flagged bracket that did not time the shape (not valid) is not storable at all. */
         record(sample, (uint16_t)(sample.flags & (kDisturbing | kDraftSampleAhead)));
         return RAD_OK;
     }
