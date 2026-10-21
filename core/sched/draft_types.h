@@ -252,6 +252,15 @@ struct DraftPlan {
     DraftPlanSource source = DraftPlanSource::Legacy;
     DraftFallback   fallback = DraftFallback::None;  /* set when source is Fallback */
     DraftProbe      probe = DraftProbe::None;
+    DraftReplay     replay = DraftReplay::None;      /* the cycle's replay state, part of its shape */
+    bool            timing_valid = false;            /* total_ms is a real bracket for this plan */
+    int32_t         prefill_tokens = 0;              /* prefill sharing the step; 0 decode-only */
+
+    /* The shape the plan was priced on, per request where it varies: a historical plan read under
+     * issue_ahead() must still say it, and a K0 plan with history_tokens > 0 is "policy K0 with
+     * history", not "no work". */
+    int32_t*        ctx_class = nullptr;      /* [cap] draft_ctx_class of the request's context */
+    int32_t*        history_tokens = nullptr; /* [cap] MTP history/QSA rows the request carried */
 
     /* Caller-provided. Request arrays are sized at cap; `rows` at RAD_SCHED_MAX_SPEC + 1. */
     uint64_t*       req_id = nullptr;   /* [cap] */
@@ -381,7 +390,8 @@ inline int draft_plan_valid(const DraftPlan& p) {
         return RAD_E_INVAL;
     }
     if (p.verify_k < 0 || p.verify_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
-    if (!p.k || !p.rows || !p.fill) return RAD_E_INVAL;
+    if (!p.k || !p.rows || !p.fill || !p.ctx_class || !p.history_tokens) return RAD_E_INVAL;
+    if (p.prefill_tokens < 0) return RAD_E_INVAL;
     if (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen)) return RAD_E_INVAL;
     int32_t count[RAD_SCHED_MAX_SPEC + 1] = {};
     for (int32_t i = 0; i < p.n_seq; ++i) {
@@ -393,6 +403,12 @@ inline int draft_plan_valid(const DraftPlan& p) {
         if ((p.k[i] == 0) != (p.fill[i] == DraftDrafter::None)) {
             RAD_ERR("draft plan: request %d has k %d and fill %d", (int)i, (int)p.k[i],
                     (int)p.fill[i]);
+            return RAD_E_INVAL;
+        }
+        if (p.ctx_class[i] < 0 || p.ctx_class[i] >= RAD_DRAFT_CTX_CLASSES ||
+            p.history_tokens[i] < 0) {
+            RAD_ERR("draft plan: request %d has ctx class %d and %d history rows", (int)i,
+                    (int)p.ctx_class[i], (int)p.history_tokens[i]);
             return RAD_E_INVAL;
         }
         for (int j = 1; j <= p.k[i]; ++j) ++count[j];

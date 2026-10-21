@@ -132,6 +132,33 @@ TEST(a_k0_plan_bars_every_drafter_including_the_ngram_fallback) {
     CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
 }
 
+TEST(a_k0_plan_says_which_shape_it_was_priced_on) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 0;
+    policy.history_tokens = 8;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    /* "Policy K0 with history", not "no work": the head is loaded and its history still runs. */
+    CHECK_EQ(f.plan.history_tokens[0], 8);
+    CHECK_EQ(f.plan.ctx_class[0], 0);
+    CHECK_EQ(f.plan.prefill_tokens, 0);
+    CHECK(f.plan.timing_valid);
+    CHECK(f.plan.replay == DraftReplay::None);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+
+    /* The fields are part of the checked plan, not decoration. */
+    f.plan.history_tokens[0] = -1;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+    f.plan.history_tokens[0] = 0;
+    f.plan.ctx_class[0] = RAD_DRAFT_CTX_CLASSES;   /* a class the profile never carries */
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+    f.plan.ctx_class[0] = 0;
+    f.plan.prefill_tokens = -1;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+}
+
 TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     DraftSeqObservation o;
     o.accepted = 1;

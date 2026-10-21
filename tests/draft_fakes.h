@@ -87,6 +87,7 @@ struct Policy {
     enum class Mode { Legacy, Cost };
     Mode mode = Mode::Legacy;
     int  legacy_k = 3;
+    int  history_tokens = 8;   /* MTP history/QSA rows every request carries */
     int  calls = 0;
 };
 
@@ -111,6 +112,9 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     plan->source = s->mode == Policy::Mode::Cost ? DraftPlanSource::Cost : DraftPlanSource::Legacy;
     plan->fallback = DraftFallback::None;
     plan->probe = DraftProbe::None;
+    plan->replay = DraftReplay::None;   /* the fake does not run a replay pass */
+    plan->timing_valid = true;          /* a sample's bracket is taken as a real duration */
+    plan->prefill_tokens = view.prefill_tokens;
 
     int32_t eligible = 0;
     int32_t top = 0;
@@ -120,6 +124,8 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         plan->slot[i] = v.slot;
         plan->slot_gen[i] = v.slot_gen;
         plan->why[i] = DraftFallback::None;
+        plan->ctx_class[i] = v.ctx_class;
+        plan->history_tokens[i] = s->history_tokens;
         int k = 0;
         if (v.eligibility == DraftEligibility::Eligible) {
             ++eligible;
@@ -198,6 +204,8 @@ struct Fixture {
     uint32_t         slot_gen[kMaxSeq];
     int32_t          k[kMaxSeq];
     DraftDrafter     fill[kMaxSeq];
+    int32_t          ctx_class[kMaxSeq];
+    int32_t          history_tokens[kMaxSeq];
     DraftFallback    why[kMaxSeq];
     int32_t          rows[RAD_SCHED_MAX_SPEC + 1];
     DraftPlan        plan;
@@ -220,6 +228,8 @@ struct Fixture {
         plan.slot_gen = slot_gen;
         plan.k = k;
         plan.fill = fill;
+        plan.ctx_class = ctx_class;
+        plan.history_tokens = history_tokens;
         plan.why = why;
         plan.rows = rows;
     }

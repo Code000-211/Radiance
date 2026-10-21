@@ -45,6 +45,10 @@ prediction and sample.
   request the plan puts at K 0 stays empty; the scheduler's n-gram fallback is a drafter too and
   may not fill it (`draft_plan_bars_fill`). The view's batch-wide `ngram_allowed` is the gate the
   plan is chosen under, not a licence to override the plan.
+- **The plan carries the shape it was priced on.** Per request `ctx_class` and `history_tokens`,
+  cycle-wide `prefill_tokens`, `replay` and `timing_valid`. A historical plan kept alive by
+  `issue_ahead()` can then still say what it priced, and a K0 plan with `history_tokens > 0` is
+  "policy K0 with history", not "no work".
 - **Verify shape and draft extent are separate.** `DraftVerifyShape` keys the cost model on verify
   tokens, context class, history tokens and `N_j` (requests reaching round j), not just
   `(rows, max K)`. `DraftCostSample` carries the rounds and rows actually executed beside it.
