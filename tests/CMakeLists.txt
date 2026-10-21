@@ -250,7 +250,8 @@ endif()
 # RUN_SERIAL: it holds device memory for its whole run, and a test beside it would fail to allocate.
 if(RAD_HIP_FOUND AND TARGET bole_gdn_gpu_test)
   target_link_libraries(bole_gdn_gpu_test PRIVATE ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
-  target_include_directories(bole_gdn_gpu_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  target_include_directories(bole_gdn_gpu_test PRIVATE ${CMAKE_SOURCE_DIR}/abi
+                             ${CMAKE_SOURCE_DIR}/libbolegdn)
   add_dependencies(bole_gdn_gpu_test libbolegdn libr4d)
   # The loop above registered `bole_gdn_gpu_test` as a host unit entry; this one is the real check.
   add_test(NAME bole_gdn_gpu_card COMMAND bole_gdn_gpu_test)

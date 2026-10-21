@@ -153,6 +153,12 @@ static int bole_prepare(const RadArgs* a, bool commit, BoleArgs* out) {
     /* The serial row derives the conv depth from the state tensors; here it is stated, so it is
      * checked against them instead. */
     if (cst->rank != 3 || cst->shape[2] != cdepth) return RAD_E_SHAPE;
+    /* The window must fit the cache: `mql = shape[2] - (conv_width - 2)` is libr4d's own bound
+     * (r4d_gdn_recurrent_update..., before ru_conv_recurrent_launch), and it is a hard bound here
+     * too, not a preference. A node at depth d reads history entries up to
+     * off + d - 1 + (conv_width - 1), so a window deeper than shape[2] - (conv_width - 2) walks past
+     * the cache's extent -- a device memory fault, not a wrong number. */
+    if (q_len > cdepth - (BOLE_CONV_W - 2)) return RAD_E_UNSUPPORTED;
     if (cu->rank != 1 || cu->shape[0] < 2) return RAD_E_SHAPE;
     const int nseq = (int)(cu->shape[0] - 1);
     if (si->shape[0] != nseq || ci->shape[0] != nseq || cx->shape[0] != nseq ||

@@ -26,6 +26,8 @@
  *
  * The test needs one card. Without a visible device it reports SKIP (exit 77) rather than passing.
  */
+#include "bole_layout.h"
+
 #include "rad_abi.h"
 #include "rad_plugin.h"
 
@@ -254,7 +256,9 @@ int main() {
         const bool cancel = variant == 2;
         Host h;
         h.T = variant == 1 ? 1 : 5;
-        h.depth = h.T + 2;
+        /* The window must fit the cache: libr4d's bound is mql = depth - (conv_width - 2), so a
+         * T-token window needs depth >= T + 2. The two extra rows hold the oldest history taps. */
+        h.depth = h.T + BOLE_CONV_W;
         h.N = 1;
         build(h, cancel);
         const int cd = h.conv_dim();
@@ -534,6 +538,9 @@ int main() {
         refuse("a conv_depth that disagrees with the cache", h.T, "1e-6", "verify", RAD_F32,
                h.depth + 1, false);
         refuse("an unknown stage", h.T, "1e-6", "sideways", RAD_F32, h.depth, false);
+        /* A window deeper than the cache can back: the bound libr4d enforces before its launcher,
+         * and without which the conv read walks past the cache's extent. */
+        refuse("a window deeper than the conv cache", h.T, "1e-6", "verify", RAD_F32, h.T, false);
 
         /* A malformed parent array: node 1 claims node 3 as its parent. The row walks parents, so
          * this must be refused rather than followed. */
