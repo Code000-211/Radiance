@@ -55,17 +55,6 @@ RadMtpCoupleState make_state(const std::vector<int32_t>& ids, const std::vector<
     return s;
 }
 
-/* A parameter row bound to the state, as the sampler stages it. */
-RadSampleParams make_params(uint64_t seed, uint64_t pos) {
-    RadSampleParams p{};
-    p.seed = seed;
-    p.pos = pos;
-    p.temp = 1.0f;
-    p.top_k = 0;
-    p.mask_row = -1;
-    return p;
-}
-
 /* The target's candidate plane: ids in [0, n), softmax scores. */
 void target_plane(int n, std::vector<int32_t>* ids, std::vector<float>* val) {
     ids->clear();
