@@ -392,6 +392,28 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     CHECK_EQ(observer.calls, 1);
 }
 
+TEST(the_verify_shape_names_the_loaded_drafter_so_the_two_k0_arms_differ) {
+    draft_fake::Fixture f;
+    f.view.k_ceiling = 6;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.mode = draft_fake::Policy::Mode::Cost;
+    policy.legacy_k = 0;
+    draft_fake::CostModel model;
+    model.measured = true;
+    model.ms[0] = 4.0;
+
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    CHECK(model.last.drafter == DraftDrafter::Serial);   /* K0 with the head loaded */
+
+    f.view.k_ceiling = 0;   /* a process with no drafter at all */
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    CHECK(model.last.drafter == DraftDrafter::None);
+}
+
 TEST(a_cost_plan_without_a_cost_model_is_unsupported) {
     draft_fake::Fixture f;
     f.add(0, 1);

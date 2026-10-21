@@ -153,7 +153,8 @@ refused by name, not reinterpreted.
         "prefill_tokens": 0,
         "rows": [0, 8, 8, 8],
         "sampling": "greedy",
-        "replay": "play"
+        "replay": "play",
+        "drafter": "serial"
       },
       "extent": { "rounds": 3, "draft_rows": 24 },
       "time_ms": { "mean": 43.0, "unc": 0.6, "n": 5 },
@@ -172,7 +173,8 @@ refused by name, not reinterpreted.
   execution invalidates the old file rather than rescaling it.
 - **`shape` is the lookup key.** It is the verify token count and length distribution
   (`n_rows`, `verify_k`, `verify_tokens`), context class, history tokens, prefill tokens, `N_j`,
-  sampling class and replay state. `T(B, maxK)` alone is not a key.
+  sampling class, replay state and the loaded drafter. `T(B, maxK)` alone is not a key, and K0
+  with the head loaded is not the same bucket as K0 with no drafter process.
 - **`ctx_class`.** 0 = below 4K, 1 = 4K–32K, 2 = 32K–128K, 3 = 128K and above
   (`draft_ctx_class`). Profiles only carry the classes the configured capacity can reach.
 - **Coverage and uncertainty.** Each bucket carries its sample count and uncertainty. A missing

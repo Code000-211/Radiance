@@ -177,6 +177,9 @@ struct DraftVerifyShape {
     int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
     DraftSampling sampling = DraftSampling::Greedy;
     DraftReplay   replay = DraftReplay::None;
+    /* The drafter loaded for the pass, not who filled k[]: K0 with the head loaded (its history
+     * and KV still maintained) and K0 with no drafter process are different buckets. */
+    DraftDrafter  drafter = DraftDrafter::None;
 };
 
 /* One completed cycle's timing, tied to the plan that shaped it. Verify shape and draft extent

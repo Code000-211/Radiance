@@ -56,11 +56,13 @@ struct CostModel {
     double ms[RAD_SCHED_MAX_SPEC + 1] = {};
     bool   measured = false;
     int    calls = 0;
+    DraftVerifyShape last;   /* what the policy last asked to price */
 };
 
 inline int estimate(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* out) {
     auto* s = static_cast<CostModel*>(ctx);
     ++s->calls;
+    s->last = shape;
     if (!out) return RAD_E_INVAL;
     *out = DraftCostEstimate{};
     const int k = shape.verify_k;
@@ -146,6 +148,11 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         shape.n_rows = eligible;
         shape.verify_k = top;
         shape.ctx_class = 0;
+        /* The loaded drafter, which is not who fills k[]: at K0 with the head loaded this stays
+         * Serial, so the two K0 arms are distinct keys. */
+        shape.drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+        shape.history_tokens = s->history_tokens;
+        shape.prefill_tokens = view.prefill_tokens;
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int k = plan->k[i];
             shape.verify_tokens += 1 + k;
