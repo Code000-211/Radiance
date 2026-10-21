@@ -4,9 +4,11 @@
  * instead of guessing: the format id, the full fingerprint, the execution, and each bucket's
  * shape, extent and timing. Nothing here runs on the step path.
  *
- * The table's lookup is a linear scan over the reserved buckets. A shape key is compared cheap
- * fields first (depths, counts, classes), then N_j; the scan is over a few hundred buckets, not
- * thousands, and it runs once per priced candidate plan, not per draft token.
+ * The table's lookup is a linear scan over the reserved buckets. A key is the verify shape plus the
+ * executed draft extent: the same window at another pipeline depth is another bucket, because
+ * total_ms is an amortised batch time at one depth. A shape key is compared cheap fields first
+ * (depths, counts, classes), then N_j; the scan is over a few hundred buckets, not thousands, and
+ * it runs once per priced candidate plan, not per draft token.
  */
 #include "draft_cost.h"
 
@@ -74,20 +76,56 @@ bool shape_head_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
            a.sampling == b.sampling && a.replay == b.replay;
 }
 
-bool shape_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
-    if (!shape_head_same(a, b)) return false;
+bool rows_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     for (int j = 0; j <= a.verify_k; ++j)
         if (a.rows[j] != b.rows[j]) return false;
     return true;
 }
 
-/* Everything the shape has except the context class: the one documented interpolation step. */
+bool shape_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
+    return shape_head_same(a, b) && rows_same(a, b);
+}
+
+/* Everything the shape has except the context class: the one documented interpolation step. The
+ * N_j must match too -- the same depth with a different length distribution is another kernel. */
 bool shape_same_except_ctx(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     if (a.ctx_class == b.ctx_class) return false;
     return a.n_rows == b.n_rows && a.verify_k == b.verify_k &&
            a.verify_tokens == b.verify_tokens && a.history_tokens == b.history_tokens &&
            a.prefill_tokens == b.prefill_tokens && a.sampling == b.sampling &&
-           a.replay == b.replay;
+           a.replay == b.replay && rows_same(a, b);
+}
+
+/* The shape's own invariants, for a shape that arrived in a query or a sample rather than through
+ * the reader: rows[0] is unused, N_j never rises with the round, the deepest verified position has
+ * at least one row, and verify_tokens is sum_i (1 + k_i) = n_rows + sum_j N_j. A shape that fails
+ * these measures nothing and is not priced. Allocation-free (it runs on the step path). */
+bool shape_consistent(const DraftVerifyShape& s) {
+    if (s.verify_k < 0 || s.verify_k > RAD_SCHED_MAX_SPEC) return false;
+    if (s.n_rows < 0 || s.verify_tokens < 0) return false;
+    if (s.ctx_class < 0 || s.ctx_class >= RAD_DRAFT_CTX_CLASSES) return false;
+    if (s.history_tokens < 0 || s.prefill_tokens < 0) return false;
+    if (s.rows[0] != 0) return false;
+    int64_t implied = s.n_rows;
+    for (int32_t j = 1; j <= s.verify_k; ++j) {
+        if (s.rows[j] < 0 || s.rows[j] > s.n_rows) return false;
+        if (j < s.verify_k && s.rows[j] < s.rows[j + 1]) return false;
+        implied += s.rows[j];
+    }
+    if (s.verify_k > 0 && s.rows[s.verify_k] == 0) return false;
+    return (int64_t)s.verify_tokens == implied;
+}
+
+/* The extent a bucket key is measured at. A bucket with an unknown extent (-1) matches nothing. */
+bool extent_same(const DraftCostBucket& b, int32_t rounds, int32_t draft_rows) {
+    return b.rounds == rounds && b.draft_rows == draft_rows;
+}
+
+/* An executed extent that can have run: every executed round drafts at least one row, and no round
+ * means no row. It says nothing about the verify window -- under issue_ahead the two differ. */
+bool extent_consistent(int32_t rounds, int32_t draft_rows) {
+    if (rounds < 0 || rounds > RAD_SCHED_MAX_SPEC || draft_rows < 0) return false;
+    return rounds == 0 ? draft_rows == 0 : draft_rows >= rounds;
 }
 
 /* Whether a bucket may price normal operation at all: it was measured cleanly. */
@@ -101,7 +139,9 @@ uint16_t bucket_class(uint16_t flags) { return (uint16_t)(flags & kDisturbing); 
 
 /* The conservative fallback may only borrow from an anchor of the same context class, sampling
  * and replay, and the same history/prefill presence: K0 with the drafter loaded carries history,
- * K0 in a process without one does not, and their times are different measurements. */
+ * K0 in a process without one does not, and their times are different measurements. The history
+ * presence is a stopgap for the drafter-loaded/k_ceiling state, which the shared fingerprint does
+ * not carry yet (interface request) -- it guards a bound, it does not claim that axis. */
 bool anchor_class_matches(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.ctx_class == b.ctx_class && a.sampling == b.sampling && a.replay == b.replay &&
            (a.history_tokens > 0) == (b.history_tokens > 0) &&
@@ -180,6 +220,10 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
     for (int32_t j = 1; j < verify_k; ++j)
         if (s->rows[j] < s->rows[j + 1])
             return refuse(err, RAD_E_INVAL, where + "shape.rows: must not rise with the round");
+    /* A window whose deepest position verified no row is not that deep; verify_k would be lower. */
+    if (verify_k > 0 && s->rows[verify_k] == 0)
+        return refuse(err, RAD_E_INVAL, where + "shape.rows[" + std::to_string(verify_k) +
+                                            "]: the deepest verified position has no rows");
     /* verify_tokens is sum_i (1 + k_i) and sum_i k_i is sum_j N_j, so the two counts must agree;
      * a file where they do not was not produced by the measurement and is refused. */
     int64_t implied = s->n_rows;
@@ -188,6 +232,8 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.verify_tokens: is " +
                                             std::to_string(s->verify_tokens) + ", n_rows + sum(rows) is " +
                                             std::to_string(implied));
+    if (!shape_consistent(*s))
+        return refuse(err, RAD_E_INVAL, where + "shape: inconsistent");
     return RAD_OK;
 }
 
@@ -236,6 +282,8 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
                                             std::to_string(RAD_SCHED_MAX_SPEC));
     if (!get_int(*ex, "draft_rows", &out->draft_rows) || out->draft_rows < 0)
         return refuse(err, RAD_E_INVAL, where + "extent.draft_rows: missing or negative");
+    if (!extent_consistent(out->rounds, out->draft_rows))
+        return refuse(err, RAD_E_INVAL, where + "extent: no executed round drafts no row");
 
     const auto tm = b.find("time_ms");
     if (tm == b.end() || !tm->is_object())
@@ -321,7 +369,8 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
         rc = parse_bucket((*buckets)[i], (int32_t)i, &b, err);
         if (rc < 0) return rc;
         for (const DraftCostBucket& prev : out->buckets)
-            if (bucket_class(prev.flags) == bucket_class(b.flags) && shape_same(prev.shape, b.shape))
+            if (bucket_class(prev.flags) == bucket_class(b.flags) && shape_same(prev.shape, b.shape) &&
+                extent_same(prev, b.rounds, b.draft_rows))
                 return refuse(err, RAD_E_INVAL,
                               "buckets[" + std::to_string(i) + "]: duplicates an earlier bucket");
         out->buckets.push_back(b);
@@ -379,14 +428,18 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
 int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) const {
     if (!out) return RAD_E_INVAL;
     *out = DraftCostEstimate{};
-    if (s.verify_k < 0 || s.verify_k > RAD_SCHED_MAX_SPEC || s.n_rows < 0 ||
-        s.ctx_class < 0 || s.ctx_class >= RAD_DRAFT_CTX_CLASSES || s.verify_tokens < 0)
-        return RAD_E_INVAL;
+    if (!shape_consistent(s)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no profile: invalid estimate, the caller's named baseline */
+
+    /* The extent this shape would be executed at: its own draft window. A bucket measured at
+     * another extent ran another pipeline depth, so it does not price this one. */
+    const int32_t rounds = s.verify_k;
+    const int32_t draft_rows = s.verify_tokens - s.n_rows;
 
     /* 1. The shape itself. */
     for (const DraftCostBucket& b : buckets_) {
-        if (!bucket_usable(b) || !shape_same(b.shape, s)) continue;
+        if (!bucket_usable(b) || !shape_same(b.shape, s) || !extent_same(b, rounds, draft_rows))
+            continue;
         out->ms = b.mean_ms;
         out->unc_ms = b.unc_ms;
         out->coverage = b.n;
@@ -396,11 +449,12 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 2. The one documented interpolation step: the neighbouring context class, same shape
-     * otherwise. The result is a real measurement; only its uncertainty is widened, and ties go
-     * to the larger class (more context, higher cost). */
+     * otherwise -- N_j included, and the same extent. The result is a real measurement; only its
+     * uncertainty is widened, and ties go to the larger class (more context, higher cost). */
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
+        if (!extent_same(b, rounds, draft_rows)) continue;
         if (std::abs(b.shape.ctx_class - s.ctx_class) != 1) continue;
         if (!near || b.shape.ctx_class > near->shape.ctx_class) near = &b;
     }
@@ -415,17 +469,20 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 3. No bucket at all for this shape: a bound scaled from the nearest measured anchor of the
-     * same class. The ratio is never below 1, so the bound never prices a shape under a measured
-     * one, and the margin is reported as uncertainty rather than hidden. */
+     * same class, preferring an anchor at the same pipeline depth. The ratio is never below 1, so
+     * the bound never prices a shape under a measured one, and the margin is reported as
+     * uncertainty rather than hidden. */
     const DraftCostBucket* anchor = nullptr;
+    int32_t anchor_rank = INT32_MAX;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
         if (b.shape.verify_tokens <= 0) continue;
-        if (!anchor) { anchor = &b; continue; }
-        const int d_new  = std::abs(b.shape.verify_k - s.verify_k);
-        const int d_old  = std::abs(anchor->shape.verify_k - s.verify_k);
-        if (d_new < d_old || (d_new == d_old && b.shape.verify_k > anchor->shape.verify_k))
+        const int32_t rank = (extent_same(b, rounds, draft_rows) ? 0 : 1000) +
+                             std::abs(b.shape.verify_k - s.verify_k);
+        if (rank < anchor_rank) {
             anchor = &b;
+            anchor_rank = rank;
+        }
     }
     if (anchor && s.verify_tokens > 0) {
         const double ratio = std::max(1.0, (double)s.verify_tokens / (double)anchor->shape.verify_tokens);
@@ -444,19 +501,24 @@ int DraftCostTable::estimate_thunk(void* ctx, const DraftVerifyShape& shape, Dra
     return static_cast<DraftCostTable*>(ctx)->estimate(shape, out);
 }
 
-DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uint16_t flags) {
+DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uint16_t flags,
+                                              int32_t rounds, int32_t draft_rows) {
     for (DraftCostBucket& b : buckets_)
-        if (bucket_class(b.flags) == bucket_class(flags) && shape_same(b.shape, shape)) return &b;
+        if (bucket_class(b.flags) == bucket_class(flags) && shape_same(b.shape, shape) &&
+            extent_same(b, rounds, draft_rows))
+            return &b;
     if ((int32_t)buckets_.size() >= capacity_) { ++dropped_; return nullptr; }
     DraftCostBucket b;
     b.shape = shape;
     b.flags = flags;
+    b.rounds = rounds;
+    b.draft_rows = draft_rows;
     buckets_.push_back(b);
     return &buckets_.back();
 }
 
 void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
-    DraftCostBucket* b = find_mutable(s.shape, flags);
+    DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_rows);
     if (!b) return;
     const double x = s.total_ms;
     if (b->n == 0) {
@@ -469,8 +531,6 @@ void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
     }
     ++b->n;
     if (flags & kDraftSampleAhead) ++b->n_ahead;
-    b->rounds = s.rounds;
-    b->draft_rows = s.draft_rows;
     if (s.target_ms >= 0.0 && finite(s.target_ms)) b->target_ms = s.target_ms;
     if (s.draft_ms >= 0.0 && finite(s.draft_ms)) b->draft_ms = s.draft_ms;
     if (s.host_ms >= 0.0 && finite(s.host_ms)) b->host_ms = s.host_ms;
@@ -478,17 +538,29 @@ void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
 
 int DraftCostTable::observe(const DraftObservation& observation, const DraftCostSample& sample) {
     if (!observation.complete) return RAD_E_INVAL;
-    if (observation.cycle_id != 0 && sample.cycle_id != 0 &&
-        observation.cycle_id != sample.cycle_id)
-        return RAD_E_INVAL;
-    if (observation.policy_version != 0 && sample.policy_version != 0 &&
-        observation.policy_version != sample.policy_version)
-        return RAD_E_INVAL;
+
+    /* Identity first: an unattributed sample (0 = unattributed, draft_types.h) cannot be traced to
+     * a cycle or a policy, so it teaches nothing and must not be folded into a bucket. A sample
+     * whose identity disagrees with the observation's is a wiring error, not a measurement. */
+    if (observation.cycle_id == 0 || sample.cycle_id == 0) return RAD_E_INVAL;
+    if (observation.cycle_id != sample.cycle_id) return RAD_E_INVAL;
+    if (observation.policy_version == 0 || sample.policy_version == 0) return RAD_E_INVAL;
+    if (observation.policy_version != sample.policy_version) return RAD_E_INVAL;
+
+    /* The sample describes the window the paired step verified, so it must be the window the plan
+     * named. Under issue_ahead verify_k != max_k: a shape filled from the current plan would be
+     * self-consistent but false, and is refused here rather than learned. */
+    const DraftPlan* plan = observation.plan;
+    if (!plan) return RAD_E_INVAL;
+    if (plan->cycle_id != observation.cycle_id) return RAD_E_INVAL;
+    if (plan->policy_version != observation.policy_version) return RAD_E_INVAL;
+    if (plan->verify_k != sample.shape.verify_k) return RAD_E_INVAL;
+    if (plan->n_seq != sample.shape.n_rows) return RAD_E_INVAL;
+    if (sample.rounds > plan->max_k) return RAD_E_INVAL;
+
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
-    if (sample.shape.verify_k < 0 || sample.shape.verify_k > RAD_SCHED_MAX_SPEC ||
-        sample.shape.n_rows < 0 || sample.shape.ctx_class < 0 ||
-        sample.shape.ctx_class >= RAD_DRAFT_CTX_CLASSES || sample.shape.verify_tokens < 0)
-        return RAD_E_INVAL;
+    if (!shape_consistent(sample.shape)) return RAD_E_INVAL;
+    if (!extent_consistent(sample.rounds, sample.draft_rows)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no usable profile: nothing to learn into */
 
     if (draft_sample_attributable(sample)) {

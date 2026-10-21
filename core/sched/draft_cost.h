@@ -6,6 +6,20 @@
  * the whole shape -- verify tokens and N_j, context class, history and prefill tokens, sampling
  * and replay state -- never by (rows, max K) alone.
  *
+ * `shape` is the verify window of the associated cycle, not its draft window: verify_k is the
+ * deepest position the paired step verified and rows[j] is the N_j of that verify step. Under
+ * issue_ahead the cycle drafts a different window than it verifies, so the executed draft extent
+ * (rounds, draft_rows) is a second part of the key: the same verify shape at another pipeline
+ * depth is a different bucket, never averaged in.
+ *
+ * Two axes this reader cannot key yet are interface requests against the shared header, not
+ * approximations made here: (1) the planned draft extent in the lookup key -- DraftVerifyShape
+ * carries the verify window only, so estimate() derives the query's extent from the shape itself
+ * (rounds = verify_k, draft_rows = verify_tokens - n_rows) until the P00 shape carries the plan's
+ * planned distribution; (2) the drafter-loaded/k_ceiling state, which the fingerprint does not
+ * carry. Until it does, the conservative fallback refuses to borrow across a change of history
+ * presence as a stopgap -- that is a bound, not a measurement of the other state.
+ *
  * The reader runs off the step path: read()/configure() happen at startup. estimate() and
  * observe() are allocation-free. The bucket vector is reserved at configure; an observation that
  * would need a bucket past that capacity is counted in dropped() instead of growing the vector,
@@ -16,10 +30,12 @@
  * nearest measured anchor; with no anchor at all the estimate is invalid and the caller uses its
  * named fixed baseline. A unitless prior is never reported as milliseconds.
  *
- * Only a sample draft_sample_attributable() accepts updates a measured bucket. Recording, audit,
- * warmup, admission and placement brackets are kept as diagnostic records with their flags and
- * are never returned by estimate(). An ahead sample may update (the caller checked its bracket)
- * and stays flagged through n_ahead so the model can weigh it.
+ * Only a sample draft_sample_attributable() accepts updates a measured bucket, and only when its
+ * identity is known: a sample whose cycle_id or policy_version is 0 (unattributed) is refused, and
+ * so is one that disagrees with its observation or with the plan the observation names. Recording,
+ * audit, warmup, admission and placement brackets are kept as diagnostic records with their flags
+ * and are never returned by estimate(). An ahead sample may update (the caller checked its
+ * bracket) and keeps the ahead flag.
  */
 #pragma once
 #include "rad_core.h"
@@ -59,18 +75,20 @@ struct DraftCostRuntime {
     DraftCostExecution   execution = DraftCostExecution::Rectangular;
 };
 
-/* One measured bucket. `shape` is the lookup key; `flags` are the attribution flags of the
- * samples it was built from. A bucket carrying a disturbing flag is a diagnostic record: it is
- * never used to price a shape. */
+/* One measured bucket. `shape` plus the executed extent `rounds`/`draft_rows` is the lookup key:
+ * two cycles that verified the same window but ran a different draft extent are different
+ * pipeline depths and stay separate. `flags` are the attribution flags of the samples it was
+ * built from. A bucket carrying a disturbing flag is a diagnostic record: it is never used to
+ * price a shape. */
 struct DraftCostBucket {
     DraftVerifyShape shape;
     uint16_t flags = 0;
-    int32_t  rounds = -1;       /* deepest draft round executed, -1 unknown */
-    int32_t  draft_rows = -1;   /* sum_j N_j actually executed, -1 unknown */
+    int32_t  rounds = -1;       /* key: deepest draft round executed, -1 unknown (matches no query) */
+    int32_t  draft_rows = -1;   /* key: sum_j N_j actually executed, -1 unknown (matches no query) */
     double   mean_ms = 0.0;     /* the amortised batch time at the same pipeline depth */
     double   unc_ms = 0.0;      /* half-width of mean_ms */
     int32_t  n = 0;             /* samples behind the mean */
-    int32_t  n_ahead = 0;       /* of them issued ahead (kDraftSampleAhead) */
+    int32_t  n_ahead = 0;       /* of them issued ahead; online only -- a profile keeps the flag, not the count */
     /* Split timings, -1 when not timed. Under overlap they do not add up to mean_ms. */
     double   target_ms = -1.0;
     double   draft_ms = -1.0;
@@ -124,13 +142,18 @@ public:
     int64_t dropped() const { return dropped_; }   /* buckets dropped at capacity */
     int64_t ignored() const { return ignored_; }   /* observations with no timing to learn from */
 
-    /* Prices one shape: Measured from an exact bucket, Interpolated from the neighbouring context
-     * class, or a ConservativeFallback scaled from the nearest anchor. valid = false when there
-     * is no anchor at all. Allocation-free. */
+    /* Prices one shape. The query's draft extent follows from the shape (rounds = verify_k,
+     * draft_rows = verify_tokens - n_rows); a bucket measured at another extent is a different
+     * pipeline depth and does not price it. Measured from an exact bucket, Interpolated from the
+     * neighbouring context class, or a ConservativeFallback scaled from the nearest anchor.
+     * valid = false when there is no anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
-    /* Learns from one completed cycle. Refuses an incomplete observation, a cycle or policy
-     * version that disagrees with the sample, and a non-finite or non-positive time. Only an
+    /* Learns from one completed cycle. Refuses an incomplete observation, an unattributed one
+     * (cycle_id or policy_version 0), a sample whose identity disagrees with the observation or
+     * with the plan it names, and a non-finite or non-positive time. The sample's verify window is
+     * checked against that plan (plan->verify_k, plan->n_seq), so a shape filled from the current
+     * plan under issue_ahead -- verify_k != max_k -- is refused rather than learned. Only an
      * attributable sample updates a measured bucket; the rest are kept as diagnostics. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
@@ -146,7 +169,8 @@ private:
     int64_t ignored_ = 0;
     bool active_ = false;
 
-    DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags);
+    DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
+                                  int32_t draft_rows);
     void record(const DraftCostSample& sample, uint16_t flags);
 };
 

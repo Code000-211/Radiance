@@ -113,10 +113,27 @@ DraftCostSample sample_of(const DraftVerifyShape& s, double ms,
     return c;
 }
 
-DraftObservation completed_cycle(uint64_t cycle = 1) {
+/* The plan the observation names. max_k defaults to the verify window; an issue_ahead cycle
+ * passes its own draft depth, which is what makes verify_k != max_k legal. */
+DraftPlan plan_for(const DraftVerifyShape& s, uint64_t cycle = 1, uint32_t version = 1,
+                   int32_t max_k = -1) {
+    DraftPlan p;
+    p.cycle_id = cycle;
+    p.policy_version = version;
+    p.n_seq = s.n_rows;
+    p.cap = s.n_rows;
+    p.k_ceiling = s.verify_k;
+    p.verify_k = s.verify_k;
+    p.max_k = max_k < 0 ? s.verify_k : max_k;
+    return p;
+}
+
+DraftObservation completed_cycle(const DraftPlan& p) {
     DraftObservation o;
-    o.cycle_id = cycle;
-    o.policy_version = 1;
+    o.cycle_id = p.cycle_id;
+    o.policy_version = p.policy_version;
+    o.n_seq = p.n_seq;
+    o.plan = &p;
     o.complete = true;
     return o;
 }
@@ -124,6 +141,10 @@ DraftObservation completed_cycle(uint64_t cycle = 1) {
 }  /* namespace */
 
 TEST(the_reader_accepts_the_documented_profile) {
+    /* The format example from docs/ADAPTIVE-MTP.md, verbatim, to check field handling. Its 43.0 ms
+     * is the example's own value -- a format sample, not the measured C8 K3 figure; the documented
+     * C8 numbers are replayed in the_documented_c8_gradient_is_reproduced_without_a_new_measurement
+     * and the two must not be conflated. */
     const std::string text = R"({
       "format": "rad-draft-profile/1",
       "fingerprint": {
@@ -152,7 +173,12 @@ TEST(the_reader_accepts_the_documented_profile) {
     CHECK_EQ(b.shape.verify_tokens, 32);
     CHECK_EQ(b.mean_ms, 43.0);
     CHECK_EQ(b.n, 5);
+    CHECK_EQ(b.rounds, 3);
+    CHECK_EQ(b.draft_rows, 24);
     CHECK((b.flags & kDraftSampleAhead) != 0);
+    /* The format carries the ahead flag, not how many samples were ahead: a loaded bucket claims
+     * no online count, and the flag alone keeps it visible. */
+    CHECK_EQ(b.n_ahead, 0);
     CHECK(b.target_ms > 0.0 && b.draft_ms > 0.0 && b.host_ms > 0.0);
 }
 
@@ -307,11 +333,13 @@ TEST(only_an_attributable_sample_updates_a_measured_bucket) {
     CHECK(t.active());
 
     const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, 40.0)), RAD_OK);
+    const DraftPlan p3 = plan_for(k3);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 40.0)), RAD_OK);
     CHECK_EQ((int)t.buckets().size(), 1);
 
     /* A recording bracket is kept, flagged, and never folded into the measured bucket. */
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, 200.0, kDraftSampleValid | kDraftSampleRecord)),
+    CHECK_EQ(t.observe(completed_cycle(p3),
+                       sample_of(k3, 200.0, kDraftSampleValid | kDraftSampleRecord)),
              RAD_OK);
     CHECK_EQ((int)t.buckets().size(), 2);
     DraftCostEstimate e;
@@ -324,19 +352,22 @@ TEST(only_an_attributable_sample_updates_a_measured_bucket) {
     CHECK(saw_record);
 
     /* A sample that did not time its shape teaches nothing. */
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, 90.0, kDraftSampleAhead)), RAD_OK);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 90.0, kDraftSampleAhead)), RAD_OK);
     CHECK_EQ(t.ignored(), 1);
     CHECK_EQ((int)t.buckets().size(), 2);
     CHECK_EQ(t.estimate(k3, &e), RAD_OK);
     CHECK_EQ(e.ms, 40.0);
 
     /* An ahead sample whose bracket the caller checked may update; it stays visible. */
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, 44.0, kDraftSampleValid | kDraftSampleAhead)),
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 44.0, kDraftSampleValid | kDraftSampleAhead)),
              RAD_OK);
     CHECK_EQ(t.estimate(k3, &e), RAD_OK);
     CHECK_EQ(e.ms, 42.0);
     CHECK_EQ(e.coverage, 2);
     CHECK_EQ((int)t.buckets().size(), 2);
+    int32_t ahead = 0;
+    for (const DraftCostBucket& b : t.buckets()) ahead += b.n_ahead;
+    CHECK_EQ(ahead, 1);
 }
 
 TEST(a_depth_change_under_overlap_lands_in_its_own_bucket) {
@@ -345,8 +376,10 @@ TEST(a_depth_change_under_overlap_lands_in_its_own_bucket) {
 
     const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
     const DraftVerifyShape k6 = query(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 });
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, 30.0)), RAD_OK);
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k6, 60.0, kDraftSampleValid | kDraftSampleAhead)),
+    const DraftPlan p3 = plan_for(k3);
+    const DraftPlan p6 = plan_for(k6);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 30.0)), RAD_OK);
+    CHECK_EQ(t.observe(completed_cycle(p6), sample_of(k6, 60.0, kDraftSampleValid | kDraftSampleAhead)),
              RAD_OK);
 
     DraftCostEstimate e;
@@ -362,29 +395,198 @@ TEST(an_incomplete_or_inconsistent_observation_is_refused) {
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
     const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    const DraftPlan p3 = plan_for(k3);
 
-    DraftObservation incomplete = completed_cycle();
+    DraftObservation incomplete = completed_cycle(p3);
     incomplete.complete = false;
     CHECK_EQ(t.observe(incomplete, sample_of(k3, 40.0)), RAD_E_INVAL);
 
-    DraftObservation other_cycle = completed_cycle(2);
-    CHECK_EQ(t.observe(other_cycle, sample_of(k3, 40.0)), RAD_E_INVAL);
-
     /* A NaN or a non-positive bracket must not enter the mean. */
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, std::nan(""))), RAD_E_INVAL);
-    CHECK_EQ(t.observe(completed_cycle(), sample_of(k3, -1.0)), RAD_E_INVAL);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, std::nan(""))), RAD_E_INVAL);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, -1.0)), RAD_E_INVAL);
     CHECK(t.buckets().empty());
+}
+
+TEST(an_unattributed_identity_is_refused) {
+    /* A sample with no cycle or policy identity cannot be traced to a measurement; folding it in
+     * would mix cycles the model cannot tell apart. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+
+    const DraftPlan p3 = plan_for(k3);
+    DraftCostSample zero_cycles = sample_of(k3, 40.0);
+    zero_cycles.cycle_id = 0;
+    CHECK_EQ(t.observe(completed_cycle(p3), zero_cycles), RAD_E_INVAL);
+    DraftCostSample zero_version = sample_of(k3, 40.0);
+    zero_version.policy_version = 0;
+    CHECK_EQ(t.observe(completed_cycle(p3), zero_version), RAD_E_INVAL);
+
+    /* An observation at 5/4 and a sample at 0/0 do not describe the same measurement either. */
+    const DraftPlan other = plan_for(k3, 5, 4);
+    DraftObservation o5 = completed_cycle(other);
+    CHECK_EQ(t.observe(o5, zero_cycles), RAD_E_INVAL);
+    /* And an identity that disagrees with the observation is a wiring error. */
+    CHECK_EQ(t.observe(o5, sample_of(k3, 40.0)), RAD_E_INVAL);
+    CHECK(t.buckets().empty());
+}
+
+TEST(a_sample_must_match_the_plan_that_produced_it) {
+    /* Under issue_ahead the verify window belongs to the paired step, not to this cycle's draft
+     * depth. A shape filled from the current plan (verify_k 3, max_k 6) is self-consistent and
+     * false: the plan says the verified window was 3, the sample claims 6. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    const DraftVerifyShape k6 = query(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 });
+
+    const DraftPlan ahead_plan = plan_for(k3, 1, 1, 6);   /* verifies 3, drafts 6 */
+    CHECK_EQ(t.observe(completed_cycle(ahead_plan), sample_of(k6, 60.0)), RAD_E_INVAL);
+    CHECK(t.buckets().empty());
+
+    /* A cycle that did draft 6 rounds while verifying 3 is the legal shape of the same cycle. */
+    DraftCostSample ahead = sample_of(k3, 40.0);
+    ahead.rounds = 6;
+    ahead.draft_rows = 48;
+    CHECK_EQ(t.observe(completed_cycle(ahead_plan), ahead), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 1);
+    CHECK_EQ(t.buckets()[0].shape.verify_k, 3);
+    CHECK_EQ(t.buckets()[0].rounds, 6);
+
+    /* The row count is part of the same identity: a consistent 4-row shape from an 8-row plan. */
+    DraftCostTable h;
+    CHECK_EQ(h.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape four = query(0, 4, 3, { 0, 4, 4, 4 });
+    CHECK_EQ(h.observe(completed_cycle(plan_for(k3)), sample_of(four, 40.0)), RAD_E_INVAL);
+    /* A draft extent deeper than the plan's own max_k cannot have run. */
+    const DraftPlan shallow = plan_for(k3, 1, 1, 2);
+    CHECK_EQ(h.observe(completed_cycle(shallow), sample_of(k3, 40.0)), RAD_E_INVAL);
+    CHECK(h.buckets().empty());
+}
+
+TEST(an_impossible_or_inconsistent_shape_is_refused) {
+    /* rows[0] unused and the deepest verified position must have run a row: [0,0,0,0] is not a
+     * K3 window, it is a K0 window wearing verify_k = 3. */
+    DraftCostProfile p;
+    std::string err;
+    json degenerate = bucket_json(0, 8, 3, { 0, 0, 0, 0 }, 40.0);
+    degenerate["extent"] = { { "rounds", 1 }, { "draft_rows", 3 } };
+    CHECK_EQ(draft_cost_profile_parse(profile_text({ degenerate }), &p, &err), RAD_E_INVAL);
+    CHECK(has(err, "deepest verified position"));
+
+    /* estimate() holds a query to the same invariants, not just the reader. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    DraftVerifyShape bad = query(0, 8, 3, { 0, 8, 8, 8 });
+    bad.rows[3] = 0;
+    bad.verify_tokens = 24;   /* n_rows + rows[1] + rows[2] */
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(bad, &e), RAD_E_INVAL);
+    bad = query(0, 8, 3, { 0, 8, 8, 8 });
+    bad.verify_tokens = 31;   /* disagrees with n_rows + sum(rows) */
+    CHECK_EQ(t.estimate(bad, &e), RAD_E_INVAL);
+
+    /* A bucket extent that cannot have run: no round means no row, a round means at least one. */
+    json no_rows = bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0);
+    no_rows["extent"] = { { "rounds", 3 }, { "draft_rows", 0 } };
+    CHECK_EQ(draft_cost_profile_parse(profile_text({ no_rows }), &p, &err), RAD_E_INVAL);
+    CHECK(has(err, "extent"));
+}
+
+TEST(the_same_verify_shape_at_another_extent_is_another_bucket) {
+    /* R1: one verify window (K6, 8 rows), two cycles that drafted a different number of rounds.
+     * total_ms is an amortised batch time at one pipeline depth, so the two must not be averaged:
+     * a K6 candidate plan is priced by the K6 cycle, never by (60 + 30) / 2. */
+    const DraftVerifyShape k6 = query(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 });
+    const json deep = bucket_json(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 }, 60.0, 0.6, 5);
+    json shallow = bucket_json(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 }, 30.0, 0.4, 3);
+    shallow["extent"] = { { "rounds", 3 }, { "draft_rows", 24 } };
+
+    /* Same shape, different extent: both buckets are legal, they are not duplicates. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({ deep, shallow })), runtime()), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 2);
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(k6, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 60.0);
+    CHECK_EQ(e.coverage, 5);
+
+    /* Online: the same rule keeps two cycles apart instead of averaging them. */
+    DraftCostTable h;
+    CHECK_EQ(h.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftPlan p6 = plan_for(k6);
+    CHECK_EQ(h.observe(completed_cycle(p6), sample_of(k6, 60.0)), RAD_OK);
+    DraftCostSample shallow_cycle = sample_of(k6, 30.0);
+    shallow_cycle.cycle_id = 2;
+    shallow_cycle.rounds = 3;
+    shallow_cycle.draft_rows = 24;
+    CHECK_EQ(h.observe(completed_cycle(plan_for(k6, 2, 1, 6)), shallow_cycle), RAD_OK);
+    CHECK_EQ((int)h.buckets().size(), 2);
+    CHECK_EQ(h.estimate(k6, &e), RAD_OK);
+    CHECK_EQ(e.ms, 60.0);
+    CHECK_EQ(e.coverage, 1);
 }
 
 TEST(a_full_table_drops_and_counts_instead_of_growing) {
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime(), 2), RAD_OK);
     for (int k = 0; k <= 2; ++k) {
-        const DraftVerifyShape s = query(0, 4, k, k ? std::vector<int32_t>{ 0, 4, 4, 4 } : std::vector<int32_t>{ 0 });
-        CHECK_EQ(t.observe(completed_cycle(), sample_of(s, 10.0 + k)), RAD_OK);
+        /* rows is exactly verify_k + 1 long: index 0 unused, N_j = 4 above it. */
+        std::vector<int32_t> rows((size_t)k + 1, 4);
+        rows[0] = 0;
+        const DraftVerifyShape s = query(0, 4, k, rows);
+        const DraftPlan p = plan_for(s);
+        CHECK_EQ(t.observe(completed_cycle(p), sample_of(s, 10.0 + k)), RAD_OK);
     }
     CHECK_EQ((int)t.buckets().size(), 2);
     CHECK_EQ(t.dropped(), 1);
+}
+
+TEST(an_interpolation_needs_the_whole_key_but_the_context_class) {
+    /* R3: the neighbouring context class borrows a measurement only when everything else is the
+     * same shape. Same depth, different N_j is a different kernel and must not be borrowed: with
+     * no same-class anchor the answer is "no number", not a silently wrong one. */
+    const json rect = bucket_json(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 }, 61.0, 0.6, 6);
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({ rect })), runtime()), RAD_OK);
+
+    DraftCostEstimate e;
+    const DraftVerifyShape mix = query(1, 8, 6, { 0, 8, 8, 2, 2, 2, 2 });
+    CHECK_EQ(t.estimate(mix, &e), RAD_OK);
+    CHECK(!e.valid);
+    CHECK(e.source == DraftCostSource::ConservativeFallback);
+
+    /* The same N_j at the neighbouring class is the documented one-step interpolation. */
+    CHECK_EQ(t.estimate(query(1, 8, 6, { 0, 8, 8, 8, 8, 8, 8 }), &e), RAD_OK);
+    CHECK(e.valid);
+    CHECK(e.source == DraftCostSource::Interpolated);
+    CHECK_EQ(e.ms, 61.0);
+}
+
+TEST(the_documented_c8_gradient_is_reproduced_without_a_new_measurement) {
+    /* The C8 case from the plan: depth 3 costs 36.3 ms for 22.3 emitted tokens per step, depth 5
+     * costs 43.0 ms for 23.3. These are the documented figures replayed as profile buckets -- no
+     * new measurement is claimed here -- and the model must price K3 strictly below K5, with K5
+     * worse per emitted token. The verify window's verify_tokens is the pass's token count
+     * (8 + sum N_j), not the emitted count. */
+    const double k3_ms = 36.3, k3_tokens = 22.3;
+    const double k5_ms = 43.0, k5_tokens = 23.3;
+    CHECK(k3_ms < k5_ms);
+    CHECK(k5_ms / k5_tokens > k3_ms / k3_tokens);
+
+    const json c8_k3 = bucket_json(0, 8, 3, { 0, 8, 8, 8 }, k3_ms, 0.5, 5);
+    const json c8_k5 = bucket_json(0, 8, 5, { 0, 8, 8, 8, 8, 8 }, k5_ms, 0.7, 5);
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({ c8_k3, c8_k5 })), runtime()), RAD_OK);
+
+    DraftCostEstimate a, b;
+    CHECK_EQ(t.estimate(query(0, 8, 3, { 0, 8, 8, 8 }), &a), RAD_OK);
+    CHECK_EQ(t.estimate(query(0, 8, 5, { 0, 8, 8, 8, 8, 8 }), &b), RAD_OK);
+    CHECK(a.source == DraftCostSource::Measured && b.source == DraftCostSource::Measured);
+    CHECK_EQ(a.ms, k3_ms);
+    CHECK_EQ(b.ms, k5_ms);
+    CHECK(a.ms < b.ms);   /* the policy's comparison: K3 wins */
 }
 
 RAD_TEST_MAIN()
