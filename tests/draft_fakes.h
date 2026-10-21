@@ -56,11 +56,13 @@ struct CostModel {
     double ms[RAD_SCHED_MAX_SPEC + 1] = {};
     bool   measured = false;
     int    calls = 0;
+    DraftVerifyShape last;   /* what the policy last asked to price */
 };
 
 inline int estimate(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* out) {
     auto* s = static_cast<CostModel*>(ctx);
     ++s->calls;
+    s->last = shape;
     if (!out) return RAD_E_INVAL;
     *out = DraftCostEstimate{};
     const int k = shape.verify_k;
@@ -87,6 +89,7 @@ struct Policy {
     enum class Mode { Legacy, Cost };
     Mode mode = Mode::Legacy;
     int  legacy_k = 3;
+    int  history_tokens = 8;   /* MTP history/QSA rows every request carries */
     int  calls = 0;
 };
 
@@ -95,8 +98,8 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     auto* s = static_cast<Policy*>(ctx);
     ++s->calls;
     (void)pred;   /* the fake does not use position estimates; cost and legacy share one K */
-    if (!plan || !plan->k || !plan->rows || plan->cap < view.n_seq || !plan->req_id ||
-        !plan->slot || !plan->slot_gen)
+    if (!plan || !plan->k || !plan->rows || !plan->fill || plan->cap < view.n_seq ||
+        !plan->req_id || !plan->slot || !plan->slot_gen)
         return RAD_E_INVAL;
 
     int want = s->legacy_k;
@@ -111,8 +114,10 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     plan->source = s->mode == Policy::Mode::Cost ? DraftPlanSource::Cost : DraftPlanSource::Legacy;
     plan->fallback = DraftFallback::None;
     plan->probe = DraftProbe::None;
+    plan->replay = DraftReplay::None;   /* the fake does not run a replay pass */
+    plan->timing_valid = true;          /* a sample's bracket is taken as a real duration */
+    plan->prefill_tokens = view.prefill_tokens;
 
-    int32_t eligible = 0;
     int32_t top = 0;
     for (int32_t i = 0; i < view.n_seq; ++i) {
         const DraftSeqView& v = view.seq[i];
@@ -120,13 +125,17 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         plan->slot[i] = v.slot;
         plan->slot_gen[i] = v.slot_gen;
         plan->why[i] = DraftFallback::None;
+        plan->ctx_class[i] = v.ctx_class;
+        plan->history_tokens[i] = s->history_tokens;
         int k = 0;
         if (v.eligibility == DraftEligibility::Eligible) {
-            ++eligible;
             k = want < v.remaining ? want : v.remaining;
             if (k < want) plan->why[i] = DraftFallback::Resources;
         }
         plan->k[i] = k;
+        /* Who may fill the budget: the head when there is one to spend, nobody at K 0. The fake
+         * never chooses the n-gram fallback; a test that wants that state sets it by hand. */
+        plan->fill[i] = k > 0 ? DraftDrafter::Serial : DraftDrafter::None;
         if (k > top) top = k;
     }
     plan->max_k = top;
@@ -134,9 +143,17 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     if (s->mode == Policy::Mode::Cost) {
         if (!costs.estimate) return RAD_E_UNSUPPORTED;   /* no model wired: say so */
         DraftVerifyShape shape;
-        shape.n_rows = eligible;
+        shape.n_rows = view.n_seq;   /* every row verifies its committed token, eligible or not */
         shape.verify_k = top;
         shape.ctx_class = 0;
+        /* The fake is a steady state: it prices and verifies the same window, so the plan's
+         * verify_k is the shape's. Reading max_k here would be the verify-K/max-K confusion. */
+        plan->verify_k = shape.verify_k;
+        /* The loaded drafter, which is not who fills k[]: at K0 with the head loaded this stays
+         * Serial, so the two K0 arms are distinct keys. */
+        shape.drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+        shape.history_tokens = s->history_tokens;
+        shape.prefill_tokens = view.prefill_tokens;
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int k = plan->k[i];
             shape.verify_tokens += 1 + k;
@@ -168,6 +185,9 @@ struct Observer {
 inline int observe(void* ctx, const DraftObservation& obs, const DraftCostSample& sample) {
     auto* s = static_cast<Observer*>(ctx);
     if (!obs.complete) return RAD_E_INVAL;   /* only after a safe completion */
+    /* The rows must be the ones the named plan issued: same cycle, same policy version, same
+     * request identities. A recycled slot or a newer cycle is another plan's work. */
+    if (!obs.plan || !draft_plan_identifies(*obs.plan, obs)) return RAD_E_INVAL;
     ++s->calls;
     s->cycle_id = obs.cycle_id;
     s->accepted = 0;
@@ -191,6 +211,9 @@ struct Fixture {
     int32_t          slot[kMaxSeq];
     uint32_t         slot_gen[kMaxSeq];
     int32_t          k[kMaxSeq];
+    DraftDrafter     fill[kMaxSeq];
+    int32_t          ctx_class[kMaxSeq];
+    int32_t          history_tokens[kMaxSeq];
     DraftFallback    why[kMaxSeq];
     int32_t          rows[RAD_SCHED_MAX_SPEC + 1];
     DraftPlan        plan;
@@ -212,6 +235,9 @@ struct Fixture {
         plan.slot = slot;
         plan.slot_gen = slot_gen;
         plan.k = k;
+        plan.fill = fill;
+        plan.ctx_class = ctx_class;
+        plan.history_tokens = history_tokens;
         plan.why = why;
         plan.rows = rows;
     }

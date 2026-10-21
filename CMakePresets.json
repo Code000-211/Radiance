@@ -6,7 +6,11 @@
       "name": "default",
       "displayName": "RelWithDebInfo in build/, HIP when a card is found",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build"
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/rocm/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/rocm/llvm/bin/clang++"
+      }
     },
     {
       "name": "asan",

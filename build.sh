@@ -51,6 +51,18 @@ case "$SAN" in
 esac
 [ "$CLEAN" = 1 ] && rm -rf "$BUILD"
 
+# The engine's compiler is ROCm's clang, the one hipcc drives -- not whatever `cc` is on PATH and
+# not a system GCC. A build with another compiler is not comparable and does not verify a change,
+# so this script names both compilers itself; a deliberate other compiler is a separate configure.
+ENGINE_CC="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang"
+ENGINE_CXX="${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++"
+if [ ! -x "$ENGINE_CC" ] || [ ! -x "$ENGINE_CXX" ]; then
+    echo "build.sh: the engine's compiler is missing: $ENGINE_CXX" >&2
+    echo "build.sh: install ROCm's clang or set ROCM_PATH; a system compiler is not a substitute" >&2
+    exit 2
+fi
+CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_COMPILER=$ENGINE_CC -DCMAKE_CXX_COMPILER=$ENGINE_CXX"
+
 cmake -S . -B "$BUILD" -G Ninja $CMAKE_ARGS
 cmake --build "$BUILD" -j"$(nproc)"
 ctest --test-dir "$BUILD" -L '^fast$' -j8 --no-tests=error --output-on-failure

@@ -28,27 +28,49 @@ prediction and sample.
   owns, sized at `max_seqs` (requests) or `RAD_SCHED_MAX_SPEC` (draft positions). A whole hook call
   is allocation-free. Profile I/O and its buffers stay outside the step path.
 - **Arrays are bounded by `RAD_SCHED_MAX_SPEC` (64)**, libr4d's verify query-row band. K is
-  counted after the committed token; the first target is K = 0..6.
+  counted after the committed token; the first target is K = 0..6. `draft_plan_rows` and
+  `draft_plan_valid` refuse `n_seq > cap` before reading `k[]`, so a caller cannot make the
+  contract check read past the storage it sized.
 - **A plan is immutable from issue until every pass it names is consumed.** `choose` writes it
   once; no other hook writes into it, and `observe` takes only const inputs. Historical plans stay
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles
   in advance, and a telemetry overflow drops and counts records rather than blocking the card.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
-  request. The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:
+  request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
+  handed came from the plan they name — the observation carries both the identity arrays and the
+  plan pointer, and either one alone can be stale. One memory set per live cycle: a plan is not
+  rewritten while an observation or an issued-ahead pass still names it.
+- **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
+- **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
+  `None` exactly where K is 0, the serial head or the n-gram fallback where K is positive. A
+  request the plan puts at K 0 stays empty; the scheduler's n-gram fallback is a drafter too and
+  may not fill it (`draft_plan_bars_fill`). The view's batch-wide `ngram_allowed` is the gate the
+  plan is chosen under, not a licence to override the plan.
+- **The plan carries the shape it was priced on.** Per request `ctx_class` and `history_tokens`,
+  cycle-wide `prefill_tokens`, `replay` and `timing_valid`. A historical plan kept alive by
+  `issue_ahead()` can then still say what it priced, and a K0 plan with `history_tokens > 0` is
+  "policy K0 with history", not "no work".
 - **Verify shape and draft extent are separate.** `DraftVerifyShape` keys the cost model on verify
   tokens, context class, history tokens and `N_j` (requests reaching round j), not just
   `(rows, max K)`. `DraftCostSample` carries the rounds and rows actually executed beside it.
 - **Labels only where measured.** `draft_label` returns a label for the accepted prefix (1) and
-  the first real rejection (0), and nothing past `checked`. EOG, `max_tokens`, cancellation and
-  the context end are `DraftCensor` reasons; they never become labels. Raw match length, commit
+  the first real rejection (0), and nothing after that: a position the target computed past the
+  first rejection was not measured, even when `checked` covers it. EOG, `max_tokens`, cancellation
+  and the context end are `DraftCensor` reasons: they cut `checked`, and the cut is what keeps the
+  censored tail out — the reason names why, it is not itself a position. Raw match length, commit
   length, and the censor reason are separate fields.
 - **Units are milliseconds or nothing.** An unmeasured shape is `valid = false` or
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
-- **Only cleanly attributed samples update a measured bucket** (`draft_sample_attributable`):
-  a positive bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement
-  flag. Real DMA cost is routed away by its flag, not discarded as an outlier. An `ahead` sample
-  stays flagged so the model can weigh it.
+- **Only cleanly attributed samples update a measured play bucket** (`draft_sample_attributable`):
+  the sample names the cycle and policy version the observation names, has a finite positive
+  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement flag. A
+  sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
+  total is not a duration. Real DMA cost is routed away by its flag, not discarded as an outlier.
+  An `ahead` sample stays flagged so the model can weigh it.
+- **Non-play buckets have their own path.** A record or audit bracket is stored through
+  `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
+  bucket; there is no flag combination that makes it attributable.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.
@@ -97,7 +119,8 @@ The K0 rules are in the plan: K0 with the drafter loaded stays a temporary opera
 weights, buffers and arena geometry unchanged (history for the MTP KV/QSA keeps being maintained),
 and it is measured separately from a process started with `--num-speculative-tokens 0` and no
 drafter. Initialisation is explicitly not depth 0. A speculation-off plan is never filled by the
-n-gram fallback: "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
+n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
+"MTP off, n-gram allowed" would be a separate state with its own costs and labels.
 
 ## Draft profile format, version 1
 
@@ -130,7 +153,8 @@ refused by name, not reinterpreted.
         "prefill_tokens": 0,
         "rows": [0, 8, 8, 8],
         "sampling": "greedy",
-        "replay": "play"
+        "replay": "play",
+        "drafter": "serial"
       },
       "extent": { "rounds": 3, "draft_rows": 24 },
       "time_ms": { "mean": 43.0, "unc": 0.6, "n": 5 },
@@ -149,7 +173,8 @@ refused by name, not reinterpreted.
   execution invalidates the old file rather than rescaling it.
 - **`shape` is the lookup key.** It is the verify token count and length distribution
   (`n_rows`, `verify_k`, `verify_tokens`), context class, history tokens, prefill tokens, `N_j`,
-  sampling class and replay state. `T(B, maxK)` alone is not a key.
+  sampling class, replay state and the loaded drafter. `T(B, maxK)` alone is not a key, and K0
+  with the head loaded is not the same bucket as K0 with no drafter process.
 - **`ctx_class`.** 0 = below 4K, 1 = 4K–32K, 2 = 32K–128K, 3 = 128K and above
   (`draft_ctx_class`). Profiles only carry the classes the configured capacity can reach.
 - **Coverage and uncertainty.** Each bucket carries its sample count and uncertainty. A missing
@@ -218,12 +243,51 @@ that name their axes.
 
 ## Verifying P00 on the host
 
+**Compiler.** Every build and compiled test — P00 and strands A–F — uses the compiler the engine
+ships with, ROCm's clang at `${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++` (the compiler `hipcc`
+drives). A system compiler is not a substitute; if the toolchain is missing, the blocker is
+reported rather than worked around. The intended entry point names it: `./build.sh` passes both
+compiler paths itself and refuses to configure without them, and the `default` CMake preset sets
+the same pair. Name it explicitly, in a build directory of its own so a differently compiled tree
+cannot be mistaken for this one:
+
 ```bash
-cmake -S . -B build-mtp-host -G Ninja -DRAD_WITH_HIP=OFF
-cmake --build build-mtp-host --parallel 8
-ctest --test-dir build-mtp-host --output-on-failure -R '^draft_types_test$' -j 4
-ctest --test-dir build-mtp-host --output-on-failure \
-  -R '^(sched_test|sample_test|runtime_test|config_test)$' -j 4
+/opt/rocm/llvm/bin/clang++ --version   # the proof: path and version beside the result
+
+./build.sh -b build-mtp-clang --no-hip   # configure + build + ctest -L fast
+ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
+The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD clang 23.0.0git, ROCm
+llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
+Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
+`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 236 checks over 15 cases), and the
+broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Five of the six failures fail
+identically on `cb5a69a` with the same compiler and configuration; the sixth, `glm5next_test`,
+passes there at 9.3 s and crosses its 10 s CPU budget only under the broad run's parallel load (it
+passes again in the 94-test fast tier). None of them is caused by P00:
+
+| Failure | Reason | Baseline `cb5a69a` |
+|---------|--------|--------------------|
+| `images_test` | 9 checks, HTTP 500: no FFmpeg on this host | same 500s |
+| `videos_test` | 8 checks, `encoding_failed` / 400: no FFmpeg | same |
+| `gbnf_test_shard3` | `json_schema_walks_write_only_valid_instances` (`gbnf_test.cpp:1857`) | same failure |
+| `gbnf_test_shard2` | CPU budget 31.5 s > 10 s, all 7 cases ok | 21.2 s > 10 s |
+| `tokenizer_test` | CPU budget 32.2 s > 20 s, all 23 cases ok | 25.7 s > 20 s |
+| `glm5next_test` | CPU budget 10.9 s > 10 s, all 16 cases ok | 9.3 s, passes |
+
+The last three are wall-clock budgets under an eight-way parallel run on this host, not check
+failures; `glm5next_test` is the one that moved across the line and needs headroom, not a fix.
+None of the six touches `core/sched/`.
+
+The whole-tree clang build needs the `build/clang23-libavx` commit first (the two kernel-source
+incompatibilities noted below); the broad run above was made with that patch applied to the
+working tree only, and P00 itself contains no libavx change.
+
 The test binary is picked up by the existing `*_test.cpp` glob; no CMake edit is needed.
+
+The linker now states `--build-id` explicitly, which Debian's GCC driver passed by itself and
+clang's does not, so rad-kbench keeps a plugin identity whichever compiler links. The two libavx
+incompatibilities clang 23 has with GCC-built kernel sources (a duplicated `target` attribute and a
+bf16 intrinsic inside an OpenMP-outlined loop) are **not** part of P00; they are on branch
+`build/clang23-libavx` (commit `dcb4e6f`, from `cb5a69a`) and must land for a whole-tree clang build.

@@ -14,6 +14,7 @@
 #include "draft_fakes.h"
 
 #include <cstring>
+#include <limits>
 #include <string>
 
 using namespace rad;
@@ -98,6 +99,103 @@ TEST(plan_rows_refuses_a_k_past_the_plans_maximum) {
     CHECK_EQ(f.plan.rows[0], 0);
 }
 
+TEST(a_k0_plan_bars_every_drafter_including_the_ngram_fallback) {
+    draft_fake::Fixture f;
+    f.view.k_ceiling = 6;          /* the head is loaded: K0 is a temporary state, not a process */
+    f.view.ngram_allowed = true;   /* the view allows the fallback; the plan still decides */
+    f.add(0, 1);
+    f.add(1, 2);
+
+    draft_fake::Policy policy;
+    policy.legacy_k = 0;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+    for (int32_t i = 0; i < 2; ++i) {
+        CHECK(f.plan.fill[i] == DraftDrafter::None);
+        CHECK(draft_plan_bars_fill(f.plan, i));
+    }
+
+    /* A drafting plan names its filler; the fallback still may not take the request over. */
+    f.plan.k[0] = 2;
+    f.plan.max_k = 2;
+    f.plan.fill[0] = DraftDrafter::Serial;
+    CHECK_EQ(draft_plan_rows(f.plan), RAD_OK);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+    CHECK(!draft_plan_bars_fill(f.plan, 0));
+
+    /* K 0 with a filler claimed, and K > 0 with nobody to fill it, are both refused. */
+    f.plan.fill[1] = DraftDrafter::Ngram;
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "fill"));
+    f.plan.fill[1] = DraftDrafter::None;
+    f.plan.fill[0] = DraftDrafter::None;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+}
+
+TEST(a_k0_plan_says_which_shape_it_was_priced_on) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 0;
+    policy.history_tokens = 8;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    /* "Policy K0 with history", not "no work": the head is loaded and its history still runs. */
+    CHECK_EQ(f.plan.history_tokens[0], 8);
+    CHECK_EQ(f.plan.ctx_class[0], 0);
+    CHECK_EQ(f.plan.prefill_tokens, 0);
+    CHECK(f.plan.timing_valid);
+    CHECK(f.plan.replay == DraftReplay::None);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+
+    /* The fields are part of the checked plan, not decoration. */
+    f.plan.history_tokens[0] = -1;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+    f.plan.history_tokens[0] = 0;
+    f.plan.ctx_class[0] = RAD_DRAFT_CTX_CLASSES;   /* a class the profile never carries */
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+    f.plan.ctx_class[0] = 0;
+    f.plan.prefill_tokens = -1;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+}
+
+TEST(plan_rows_refuses_more_requests_than_the_caller_sized) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+
+    const int32_t saved = f.plan.n_seq;
+    f.plan.n_seq = f.plan.cap + 1;   /* would read k[] past the caller's array */
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_rows(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "exceeds"));
+    CHECK_EQ(f.plan.rows[1], 1);     /* nothing was counted from the out-of-range request */
+    f.plan.n_seq = saved;
+}
+
+TEST(plan_validation_refuses_a_max_k_above_the_deepest_k) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    f.add(1, 2);
+    draft_fake::Policy policy;
+    policy.legacy_k = 3;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+
+    f.plan.k[0] = 2;
+    f.plan.k[1] = 0;
+    f.plan.fill[1] = DraftDrafter::None;   /* K 0 and nobody to fill it */
+    f.plan.max_k = 5;
+    /* draft_plan_rows fills rows[] for what k[] says and then refuses max_k != deepest. Those
+     * rows are consistent, so only the max_k rule is left to catch the plan. */
+    const std::string rows_log = stderr_of([&] { CHECK_EQ(draft_plan_rows(f.plan), RAD_E_INVAL); });
+    CHECK(has(rows_log, "deepest"));
+    CHECK_EQ(f.plan.rows[2], 1);
+    CHECK_EQ(f.plan.rows[5], 0);
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "no request drafts that far"));
+}
+
 TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     DraftSeqObservation o;
     o.accepted = 1;
@@ -120,6 +218,18 @@ TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     CHECK_EQ(label, 1.0f);
     CHECK(!draft_label(all, 3, &label));
 
+    /* The reviewer's repro: checked covers four positions but the first rejection is at 1. */
+    DraftSeqObservation long_tail;
+    long_tail.accepted = 1;
+    long_tail.checked = 4;
+    long_tail.verified = 6;
+    REQUIRE(draft_label(long_tail, 0, &label));
+    CHECK_EQ(label, 1.0f);
+    REQUIRE(draft_label(long_tail, 1, &label));
+    CHECK_EQ(label, 0.0f);
+    CHECK(!draft_label(long_tail, 2, &label));
+    CHECK(!draft_label(long_tail, 3, &label));
+
     DraftSeqObservation cut;
     cut.accepted = 1;
     cut.checked = 1;   /* an EOG cut after the committed prefix */
@@ -132,6 +242,7 @@ TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
 
 TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
     DraftCostSample s;
+    s.cycle_id = 7;
     s.total_ms = 10.0;
     CHECK(!draft_sample_attributable(s));   /* not marked valid */
 
@@ -148,8 +259,26 @@ TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
     }
 
     DraftCostSample untimed;
+    untimed.cycle_id = 7;
     untimed.flags = kDraftSampleValid;
     CHECK(!draft_sample_attributable(untimed));   /* no positive bracket */
+
+    /* A sample that names no cycle, or does not name a duration, is not attributable. */
+    DraftCostSample unnamed = s;
+    unnamed.cycle_id = 0;
+    CHECK(!draft_sample_attributable(unnamed));
+    DraftCostSample infinite = s;
+    infinite.total_ms = std::numeric_limits<double>::infinity();
+    CHECK(!draft_sample_attributable(infinite));
+    CHECK(!draft_sample_storable(infinite));
+
+    /* Record and audit brackets have their own path: stored, never folded into a play bucket. */
+    for (uint16_t flag : { kDraftSampleRecord, kDraftSampleAudit }) {
+        DraftCostSample nonplay = s;
+        nonplay.flags = kDraftSampleValid | flag;
+        CHECK(draft_sample_storable(nonplay));
+        CHECK(!draft_sample_attributable(nonplay));
+    }
 }
 
 TEST(a_missing_profile_falls_back_visibly_instead_of_inventing_a_price) {
@@ -220,8 +349,10 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
 
     DraftCostSample sample;
     sample.cycle_id = f.view.cycle_id;
+    sample.policy_version = f.plan.policy_version;
     sample.total_ms = 12.0;
     sample.flags = kDraftSampleValid;
+    CHECK(draft_sample_attributable(obs, sample));
 
     draft_fake::Observer observer;
     CHECK_EQ(draft_fake::observe(&observer, obs, sample), RAD_OK);
@@ -232,10 +363,80 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     for (int i = 0; i < draft_fake::Fixture::kMaxSeq; ++i) CHECK_EQ(f.plan.k[i], k_before[i]);
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(f.plan.rows[j], rows_before[j]);
 
+    /* The observation must name this plan's cycle and identities, not just any complete one. */
+    CHECK(draft_plan_identifies(f.plan, obs));
+    DraftObservation next_cycle = obs;
+    next_cycle.cycle_id = obs.cycle_id + 1;
+    CHECK(!draft_plan_identifies(f.plan, next_cycle));
+    CHECK_EQ(draft_fake::observe(&observer, next_cycle, sample), RAD_E_INVAL);
+
+    uint64_t recycled[2] = { f.req_id[0], f.req_id[1] + 1 };   /* slot reused, new generation */
+    DraftObservation other_req = obs;
+    other_req.req_id = recycled;
+    CHECK(!draft_plan_identifies(f.plan, other_req));
+    CHECK_EQ(draft_fake::observe(&observer, other_req, sample), RAD_E_INVAL);
+    CHECK_EQ(observer.calls, 1);
+
+    DraftObservation unnamed = obs;
+    unnamed.plan = nullptr;
+    CHECK(!draft_plan_identifies(f.plan, unnamed));
+    CHECK_EQ(draft_fake::observe(&observer, unnamed, sample), RAD_E_INVAL);
+
+    DraftCostSample other_cycle_sample = sample;
+    other_cycle_sample.cycle_id = obs.cycle_id + 1;
+    CHECK(!draft_sample_attributable(obs, other_cycle_sample));   /* not this cycle's timing */
+
     /* A cycle the caller has not declared complete is refused, not observed. */
     obs.complete = false;
     CHECK_EQ(draft_fake::observe(&observer, obs, sample), RAD_E_INVAL);
     CHECK_EQ(observer.calls, 1);
+}
+
+TEST(the_verify_shape_names_the_loaded_drafter_so_the_two_k0_arms_differ) {
+    draft_fake::Fixture f;
+    f.view.k_ceiling = 6;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.mode = draft_fake::Policy::Mode::Cost;
+    policy.legacy_k = 0;
+    draft_fake::CostModel model;
+    model.measured = true;
+    model.ms[0] = 4.0;
+
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    CHECK(model.last.drafter == DraftDrafter::Serial);   /* K0 with the head loaded */
+
+    f.view.k_ceiling = 0;   /* a process with no drafter at all */
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    CHECK(model.last.drafter == DraftDrafter::None);
+}
+
+TEST(the_fake_prices_the_shape_the_plan_names) {
+    draft_fake::Fixture f;
+    f.add(0, 1);                                  /* eligible, drafts three */
+    f.add(1, 2, 64, DraftEligibility::Grammar);   /* ineligible: a plain decode row */
+    draft_fake::Policy policy;
+    policy.mode = draft_fake::Policy::Mode::Cost;
+    policy.legacy_k = 3;
+    draft_fake::CostModel model;
+    model.measured = true;
+    model.ms[3] = 9.0;
+
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    /* The plan's verify_k is the shape's, not its max_k read twice. */
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK_EQ(f.plan.verify_k, 3);
+    CHECK_EQ(model.last.verify_k, f.plan.verify_k);
+    /* Both rows verify their committed token; only one of them drafts, so N_j and the token
+     * count agree: 2 rows, 2 + 3 tokens. */
+    CHECK_EQ(model.last.n_rows, 2);
+    CHECK_EQ(model.last.verify_tokens, 2 + 3);
+    CHECK_EQ(model.last.rows[1], 1);
+    CHECK(model.last.drafter == DraftDrafter::Serial);
 }
 
 TEST(a_cost_plan_without_a_cost_model_is_unsupported) {

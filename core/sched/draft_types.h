@@ -33,6 +33,7 @@
 #pragma once
 #include "rad_core.h"
 
+#include <cmath>
 #include <cstdint>
 
 namespace rad {
@@ -80,6 +81,16 @@ enum class DraftFallback : uint8_t {
     UnknownShape = 2, /* no measured or interpolable cost for this shape */
     Resources = 3,    /* token/KV/latency budget cut the plan */
     Unsupported = 4,  /* a mode this runtime does not implement; never a silent substitute */
+};
+
+/* Who may fill a request's draft budget. `k[]` is the budget for every drafter, not for the head
+ * alone: a request the plan puts at K = 0 must stay empty, so the n-gram fallback may only fill a
+ * request the plan assigned to it. The view's batch-wide `ngram_allowed` is the gate the plan is
+ * chosen under; once a plan exists, its per-request answer is the one the scheduler follows. */
+enum class DraftDrafter : uint8_t {
+    None = 0,   /* no drafter: k[] must be 0, and no fallback may fill it */
+    Serial = 1, /* the model's draft head fills k[], capped by k[] */
+    Ngram = 2,  /* the prompt-lookup fallback fills k[], capped by k[] */
 };
 
 /* Where a cycle-level plan came from. `Fallback` is a fixed baseline chosen because the cost
@@ -166,6 +177,9 @@ struct DraftVerifyShape {
     int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
     DraftSampling sampling = DraftSampling::Greedy;
     DraftReplay   replay = DraftReplay::None;
+    /* The drafter loaded for the pass, not who filled k[]: K0 with the head loaded (its history
+     * and KV still maintained) and K0 with no drafter process are different buckets. */
+    DraftDrafter  drafter = DraftDrafter::None;
 };
 
 /* One completed cycle's timing, tied to the plan that shaped it. Verify shape and draft extent
@@ -226,9 +240,10 @@ struct DraftPredictions {
 /* ------------------------------------------------------------------ the plan */
 
 /* The cycle's frozen plan. choose() fills it once; every consumer reads the same pointers. `k[i]`
- * is request i's drafts, and `rows[j]` the number of requests that reach round j. `verify_k` (the
- * window the paired step verifies, chosen by the previous cycle) and `max_k` (the deepest window
- * this cycle drafts) are separate numbers: reading one for the other is how a proposal from
+ * is request i's drafts, and `rows[j]` the number of requests that reach round j. It is a budget
+ * for every drafter, so `fill[i]` names who may spend it; where k is 0 that is None. `verify_k`
+ * (the window the paired step verifies, chosen by the previous cycle) and `max_k` (the deepest
+ * window this cycle drafts) are separate numbers: reading one for the other is how a proposal from
  * another generation leaks into a step. */
 struct DraftPlan {
     uint64_t cycle_id = 0;
@@ -241,12 +256,22 @@ struct DraftPlan {
     DraftPlanSource source = DraftPlanSource::Legacy;
     DraftFallback   fallback = DraftFallback::None;  /* set when source is Fallback */
     DraftProbe      probe = DraftProbe::None;
+    DraftReplay     replay = DraftReplay::None;      /* the cycle's replay state, part of its shape */
+    bool            timing_valid = false;            /* total_ms is a real bracket for this plan */
+    int32_t         prefill_tokens = 0;              /* prefill sharing the step; 0 decode-only */
+
+    /* The shape the plan was priced on, per request where it varies: a historical plan read under
+     * issue_ahead() must still say it, and a K0 plan with history_tokens > 0 is "policy K0 with
+     * history", not "no work". */
+    int32_t*        ctx_class = nullptr;      /* [cap] draft_ctx_class of the request's context */
+    int32_t*        history_tokens = nullptr; /* [cap] MTP history/QSA rows the request carried */
 
     /* Caller-provided. Request arrays are sized at cap; `rows` at RAD_SCHED_MAX_SPEC + 1. */
     uint64_t*       req_id = nullptr;   /* [cap] */
     int32_t*        slot = nullptr;     /* [cap] */
     uint32_t*       slot_gen = nullptr; /* [cap] */
     int32_t*        k = nullptr;        /* [cap] drafts per request, 0..max_k */
+    DraftDrafter*   fill = nullptr;    /* [cap] who may fill k[]; None exactly where k[] is 0 */
     DraftFallback*  why = nullptr;      /* [cap] the request's own downgrade reason, else None */
     int32_t*        rows = nullptr;     /* [RAD_SCHED_MAX_SPEC + 1] N_j; index 0 unused */
 };
@@ -317,10 +342,33 @@ struct DraftHooks {
 
 /* ------------------------------------------------------------------ contract checks */
 
+/* Whether `o` observes the plan it names: the same memory set, the same cycle and policy version,
+ * and per row the same request identity. A ring slot reused by a newer cycle changes req_id or
+ * slot_gen, so this is the check that stops one cycle's rows from teaching another cycle's plan.
+ * One memory set per live cycle is the caller's rule: a plan must not be rewritten while an
+ * observation or an issued-ahead pass still names it. */
+inline bool draft_plan_identifies(const DraftPlan& p, const DraftObservation& o) {
+    if (o.plan != &p) return false;
+    if (p.cycle_id == 0 || p.cycle_id != o.cycle_id) return false;
+    if (p.policy_version != o.policy_version) return false;
+    if (p.n_seq != o.n_seq || p.n_seq < 0 || o.n_seq > o.cap) return false;
+    if (p.n_seq == 0) return true;
+    if (!p.req_id || !p.slot || !p.slot_gen || !o.req_id || !o.slot || !o.slot_gen) return false;
+    for (int32_t i = 0; i < p.n_seq; ++i) {
+        if (p.req_id[i] != o.req_id[i] || p.slot[i] != o.slot[i] || p.slot_gen[i] != o.slot_gen[i])
+            return false;
+    }
+    return true;
+}
+
 /* Fill rows[1..max_k] with N_j for the plan's k[]. Requires max_k == the deepest k and every k in
  * 0..max_k; index 0 and the rest of the array are zeroed. RAD_OK, or RAD_E_INVAL. */
 inline int draft_plan_rows(DraftPlan& p) {
     if (!p.k || !p.rows) return RAD_E_INVAL;
+    if (p.n_seq < 0 || p.n_seq > p.cap) {
+        RAD_ERR("draft plan: n_seq %d exceeds the caller's %d slots", (int)p.n_seq, (int)p.cap);
+        return RAD_E_INVAL;
+    }
     if (p.max_k < 0 || p.max_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) p.rows[j] = 0;
     int32_t top = 0;
@@ -350,7 +398,9 @@ inline int draft_plan_valid(const DraftPlan& p) {
         return RAD_E_INVAL;
     }
     if (p.verify_k < 0 || p.verify_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
-    if (!p.k || !p.rows || (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen))) return RAD_E_INVAL;
+    if (!p.k || !p.rows || !p.fill || !p.ctx_class || !p.history_tokens) return RAD_E_INVAL;
+    if (p.prefill_tokens < 0) return RAD_E_INVAL;
+    if (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen)) return RAD_E_INVAL;
     int32_t count[RAD_SCHED_MAX_SPEC + 1] = {};
     for (int32_t i = 0; i < p.n_seq; ++i) {
         if (p.k[i] < 0 || p.k[i] > p.max_k) {
@@ -358,7 +408,22 @@ inline int draft_plan_valid(const DraftPlan& p) {
                     (int)p.max_k);
             return RAD_E_INVAL;
         }
+        if ((p.k[i] == 0) != (p.fill[i] == DraftDrafter::None)) {
+            RAD_ERR("draft plan: request %d has k %d and fill %d", (int)i, (int)p.k[i],
+                    (int)p.fill[i]);
+            return RAD_E_INVAL;
+        }
+        if (p.ctx_class[i] < 0 || p.ctx_class[i] >= RAD_DRAFT_CTX_CLASSES ||
+            p.history_tokens[i] < 0) {
+            RAD_ERR("draft plan: request %d has ctx class %d and %d history rows", (int)i,
+                    (int)p.ctx_class[i], (int)p.history_tokens[i]);
+            return RAD_E_INVAL;
+        }
         for (int j = 1; j <= p.k[i]; ++j) ++count[j];
+    }
+    if (p.max_k > 0 && count[p.max_k] == 0) {
+        RAD_ERR("draft plan: max_k is %d but no request drafts that far", (int)p.max_k);
+        return RAD_E_INVAL;
     }
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) {
         if (p.rows[j] != count[j]) {
@@ -370,23 +435,50 @@ inline int draft_plan_valid(const DraftPlan& p) {
     return RAD_OK;
 }
 
+/* True when request i may not be filled by any drafter this cycle. The scheduler's n-gram
+ * fallback is a drafter too and must ask this before it fills an empty proposal: a K0 plan is a
+ * plan, not an absence of one, and `k[]` is the budget for every drafter. */
+inline bool draft_plan_bars_fill(const DraftPlan& p, int32_t i) {
+    return p.k && p.fill && i >= 0 && i < p.n_seq && p.k[i] == 0 && p.fill[i] == DraftDrafter::None;
+}
+
 /* The label for draft position j (0-based), if this cycle measured one: 1 when the position was
- * accepted, 0 at the first real rejection. False past `checked` -- an unreached position has no
- * label, and neither does one past a censor. */
+ * accepted, 0 at the first real rejection, and nothing past it. `checked` counts the positions
+ * with a label, so it always ends at the first rejection; a censor cuts the cycle earlier and the
+ * reason is recorded, not the position. */
 inline bool draft_label(const DraftSeqObservation& o, int j, float* label) {
     if (j < 0 || j >= (int)o.checked) return false;
+    if (j > (int)o.accepted) return false;   /* positions past the first rejection were not measured */
     if (label) *label = j < (int)o.accepted ? 1.0f : 0.0f;
     return true;
 }
 
-/* Only a sample that timed its own shape and carried no recording, audit, admission, placement or
- * warmup inside the bracket may update a measured bucket. An ahead sample may, if the caller
- * checked the bracket; it stays flagged so the model can weigh it. Real DMA cost is not an
- * outlier: the placement flag routes it away from the decode bucket, it is not dropped. */
+/* A bracket that may be stored at all: marked valid, finite and positive. Storage and attribution
+ * are different questions -- a record or audit bracket is stored (storable) in its own bucket but
+ * never updates a play bucket (not attributable). */
+inline bool draft_sample_storable(const DraftCostSample& s) {
+    return (s.flags & kDraftSampleValid) && std::isfinite(s.total_ms) && s.total_ms > 0.0;
+}
+
+/* Only a sample that names the cycle it timed, is storable, and carried no recording, audit,
+ * admission, placement or warmup inside the bracket may update a measured play bucket. An ahead
+ * sample may, if the caller checked the bracket; it stays flagged so the model can weigh it. Real
+ * DMA cost is not an outlier: the placement flag routes it to its own bucket, it is not dropped.
+ * Record and audit samples have no path here at all; they are stored through
+ * draft_sample_storable and never folded into a play bucket. */
 inline bool draft_sample_attributable(const DraftCostSample& s) {
     const uint16_t disturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
                                 kDraftSampleAdmission | kDraftSamplePlacement;
-    return (s.flags & kDraftSampleValid) && !(s.flags & disturbing) && s.total_ms > 0.0;
+    if (s.cycle_id == 0) return false;   /* nothing to attribute it to */
+    return draft_sample_storable(s) && !(s.flags & disturbing);
+}
+
+/* The sample must also describe the cycle the observation names: a sample from another cycle or
+ * policy version is not this observation's timing, however clean its bracket. */
+inline bool draft_sample_attributable(const DraftObservation& o, const DraftCostSample& s) {
+    return o.plan && draft_plan_identifies(*o.plan, o) && s.cycle_id != 0 &&
+           s.cycle_id == o.cycle_id && s.policy_version == o.policy_version &&
+           draft_sample_attributable(s);
 }
 
 }  /* namespace rad */
