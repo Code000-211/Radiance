@@ -60,10 +60,15 @@ prediction and sample.
   length, and the censor reason are separate fields.
 - **Units are milliseconds or nothing.** An unmeasured shape is `valid = false` or
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
-- **Only cleanly attributed samples update a measured bucket** (`draft_sample_attributable`):
-  a positive bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement
-  flag. Real DMA cost is routed away by its flag, not discarded as an outlier. An `ahead` sample
-  stays flagged so the model can weigh it.
+- **Only cleanly attributed samples update a measured play bucket** (`draft_sample_attributable`):
+  the sample names the cycle and policy version the observation names, has a finite positive
+  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement flag. A
+  sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
+  total is not a duration. Real DMA cost is routed away by its flag, not discarded as an outlier.
+  An `ahead` sample stays flagged so the model can weigh it.
+- **Non-play buckets have their own path.** A record or audit bracket is stored through
+  `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
+  bucket; there is no flag combination that makes it attributable.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.

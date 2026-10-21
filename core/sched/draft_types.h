@@ -33,6 +33,7 @@
 #pragma once
 #include "rad_core.h"
 
+#include <cmath>
 #include <cstdint>
 
 namespace rad {
@@ -441,14 +442,32 @@ inline bool draft_label(const DraftSeqObservation& o, int j, float* label) {
     return true;
 }
 
-/* Only a sample that timed its own shape and carried no recording, audit, admission, placement or
- * warmup inside the bracket may update a measured bucket. An ahead sample may, if the caller
- * checked the bracket; it stays flagged so the model can weigh it. Real DMA cost is not an
- * outlier: the placement flag routes it away from the decode bucket, it is not dropped. */
+/* A bracket that may be stored at all: marked valid, finite and positive. Storage and attribution
+ * are different questions -- a record or audit bracket is stored (storable) in its own bucket but
+ * never updates a play bucket (not attributable). */
+inline bool draft_sample_storable(const DraftCostSample& s) {
+    return (s.flags & kDraftSampleValid) && std::isfinite(s.total_ms) && s.total_ms > 0.0;
+}
+
+/* Only a sample that names the cycle it timed, is storable, and carried no recording, audit,
+ * admission, placement or warmup inside the bracket may update a measured play bucket. An ahead
+ * sample may, if the caller checked the bracket; it stays flagged so the model can weigh it. Real
+ * DMA cost is not an outlier: the placement flag routes it to its own bucket, it is not dropped.
+ * Record and audit samples have no path here at all; they are stored through
+ * draft_sample_storable and never folded into a play bucket. */
 inline bool draft_sample_attributable(const DraftCostSample& s) {
     const uint16_t disturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
                                 kDraftSampleAdmission | kDraftSamplePlacement;
-    return (s.flags & kDraftSampleValid) && !(s.flags & disturbing) && s.total_ms > 0.0;
+    if (s.cycle_id == 0) return false;   /* nothing to attribute it to */
+    return draft_sample_storable(s) && !(s.flags & disturbing);
+}
+
+/* The sample must also describe the cycle the observation names: a sample from another cycle or
+ * policy version is not this observation's timing, however clean its bracket. */
+inline bool draft_sample_attributable(const DraftObservation& o, const DraftCostSample& s) {
+    return o.plan && draft_plan_identifies(*o.plan, o) && s.cycle_id != 0 &&
+           s.cycle_id == o.cycle_id && s.policy_version == o.policy_version &&
+           draft_sample_attributable(s);
 }
 
 }  /* namespace rad */

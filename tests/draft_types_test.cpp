@@ -14,6 +14,7 @@
 #include "draft_fakes.h"
 
 #include <cstring>
+#include <limits>
 #include <string>
 
 using namespace rad;
@@ -205,6 +206,7 @@ TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
 
 TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
     DraftCostSample s;
+    s.cycle_id = 7;
     s.total_ms = 10.0;
     CHECK(!draft_sample_attributable(s));   /* not marked valid */
 
@@ -221,8 +223,26 @@ TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
     }
 
     DraftCostSample untimed;
+    untimed.cycle_id = 7;
     untimed.flags = kDraftSampleValid;
     CHECK(!draft_sample_attributable(untimed));   /* no positive bracket */
+
+    /* A sample that names no cycle, or does not name a duration, is not attributable. */
+    DraftCostSample unnamed = s;
+    unnamed.cycle_id = 0;
+    CHECK(!draft_sample_attributable(unnamed));
+    DraftCostSample infinite = s;
+    infinite.total_ms = std::numeric_limits<double>::infinity();
+    CHECK(!draft_sample_attributable(infinite));
+    CHECK(!draft_sample_storable(infinite));
+
+    /* Record and audit brackets have their own path: stored, never folded into a play bucket. */
+    for (uint16_t flag : { kDraftSampleRecord, kDraftSampleAudit }) {
+        DraftCostSample nonplay = s;
+        nonplay.flags = kDraftSampleValid | flag;
+        CHECK(draft_sample_storable(nonplay));
+        CHECK(!draft_sample_attributable(nonplay));
+    }
 }
 
 TEST(a_missing_profile_falls_back_visibly_instead_of_inventing_a_price) {
@@ -293,8 +313,10 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
 
     DraftCostSample sample;
     sample.cycle_id = f.view.cycle_id;
+    sample.policy_version = f.plan.policy_version;
     sample.total_ms = 12.0;
     sample.flags = kDraftSampleValid;
+    CHECK(draft_sample_attributable(obs, sample));
 
     draft_fake::Observer observer;
     CHECK_EQ(draft_fake::observe(&observer, obs, sample), RAD_OK);
@@ -323,6 +345,10 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     unnamed.plan = nullptr;
     CHECK(!draft_plan_identifies(f.plan, unnamed));
     CHECK_EQ(draft_fake::observe(&observer, unnamed, sample), RAD_E_INVAL);
+
+    DraftCostSample other_cycle_sample = sample;
+    other_cycle_sample.cycle_id = obs.cycle_id + 1;
+    CHECK(!draft_sample_attributable(obs, other_cycle_sample));   /* not this cycle's timing */
 
     /* A cycle the caller has not declared complete is refused, not observed. */
     obs.complete = false;
