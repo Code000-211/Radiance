@@ -278,6 +278,25 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     for (int i = 0; i < draft_fake::Fixture::kMaxSeq; ++i) CHECK_EQ(f.plan.k[i], k_before[i]);
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(f.plan.rows[j], rows_before[j]);
 
+    /* The observation must name this plan's cycle and identities, not just any complete one. */
+    CHECK(draft_plan_identifies(f.plan, obs));
+    DraftObservation next_cycle = obs;
+    next_cycle.cycle_id = obs.cycle_id + 1;
+    CHECK(!draft_plan_identifies(f.plan, next_cycle));
+    CHECK_EQ(draft_fake::observe(&observer, next_cycle, sample), RAD_E_INVAL);
+
+    uint64_t recycled[2] = { f.req_id[0], f.req_id[1] + 1 };   /* slot reused, new generation */
+    DraftObservation other_req = obs;
+    other_req.req_id = recycled;
+    CHECK(!draft_plan_identifies(f.plan, other_req));
+    CHECK_EQ(draft_fake::observe(&observer, other_req, sample), RAD_E_INVAL);
+    CHECK_EQ(observer.calls, 1);
+
+    DraftObservation unnamed = obs;
+    unnamed.plan = nullptr;
+    CHECK(!draft_plan_identifies(f.plan, unnamed));
+    CHECK_EQ(draft_fake::observe(&observer, unnamed, sample), RAD_E_INVAL);
+
     /* A cycle the caller has not declared complete is refused, not observed. */
     obs.complete = false;
     CHECK_EQ(draft_fake::observe(&observer, obs, sample), RAD_E_INVAL);

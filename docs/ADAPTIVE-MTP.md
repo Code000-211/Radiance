@@ -34,7 +34,11 @@ prediction and sample.
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles
   in advance, and a telemetry overflow drops and counts records rather than blocking the card.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
-  request. The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:
+  request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
+  handed came from the plan they name — the observation carries both the identity arrays and the
+  plan pointer, and either one alone can be stale. One memory set per live cycle: a plan is not
+  rewritten while an observation or an issued-ahead pass still names it.
+- **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
 - **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
   `None` exactly where K is 0, the serial head or the n-gram fallback where K is positive. A

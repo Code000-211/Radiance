@@ -171,6 +171,9 @@ struct Observer {
 inline int observe(void* ctx, const DraftObservation& obs, const DraftCostSample& sample) {
     auto* s = static_cast<Observer*>(ctx);
     if (!obs.complete) return RAD_E_INVAL;   /* only after a safe completion */
+    /* The rows must be the ones the named plan issued: same cycle, same policy version, same
+     * request identities. A recycled slot or a newer cycle is another plan's work. */
+    if (!obs.plan || !draft_plan_identifies(*obs.plan, obs)) return RAD_E_INVAL;
     ++s->calls;
     s->cycle_id = obs.cycle_id;
     s->accepted = 0;

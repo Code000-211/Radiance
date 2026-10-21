@@ -329,6 +329,25 @@ struct DraftHooks {
 
 /* ------------------------------------------------------------------ contract checks */
 
+/* Whether `o` observes the plan it names: the same memory set, the same cycle and policy version,
+ * and per row the same request identity. A ring slot reused by a newer cycle changes req_id or
+ * slot_gen, so this is the check that stops one cycle's rows from teaching another cycle's plan.
+ * One memory set per live cycle is the caller's rule: a plan must not be rewritten while an
+ * observation or an issued-ahead pass still names it. */
+inline bool draft_plan_identifies(const DraftPlan& p, const DraftObservation& o) {
+    if (o.plan != &p) return false;
+    if (p.cycle_id == 0 || p.cycle_id != o.cycle_id) return false;
+    if (p.policy_version != o.policy_version) return false;
+    if (p.n_seq != o.n_seq || p.n_seq < 0 || o.n_seq > o.cap) return false;
+    if (p.n_seq == 0) return true;
+    if (!p.req_id || !p.slot || !p.slot_gen || !o.req_id || !o.slot || !o.slot_gen) return false;
+    for (int32_t i = 0; i < p.n_seq; ++i) {
+        if (p.req_id[i] != o.req_id[i] || p.slot[i] != o.slot[i] || p.slot_gen[i] != o.slot_gen[i])
+            return false;
+    }
+    return true;
+}
+
 /* Fill rows[1..max_k] with N_j for the plan's k[]. Requires max_k == the deepest k and every k in
  * 0..max_k; index 0 and the rest of the array are zeroed. RAD_OK, or RAD_E_INVAL. */
 inline int draft_plan_rows(DraftPlan& p) {
