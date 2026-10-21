@@ -99,13 +99,26 @@ __device__ __forceinline__ void r4d_ar_hc_write_word(const unsigned short* __res
   float v[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) v[j] = bf2f(yv[j]);
+  if (hc <= 0) return;
+
+  float g_curr = bf2f(inj[(long)row * irow]);
+  int4 hv_curr = *reinterpret_cast<const int4*>(h + (long)row * hrow + i0);
+
   for (int c = 0; c < hc; ++c) {
-    const float g = bf2f(inj[(long)row * irow + c]);
-    int4* hp = reinterpret_cast<int4*>(h + (long)row * hrow + (long)c * n + i0);
-    int4 hv = *hp;
-    unsigned short* he = reinterpret_cast<unsigned short*>(&hv);
+    const bool more = c + 1 < hc;
+    float g_next;
+    int4 hv_next;
+    if (more) {
+      g_next = bf2f(inj[(long)row * irow + c + 1]);
+      hv_next = *reinterpret_cast<const int4*>(h + (long)row * hrow + (long)(c + 1) * n + i0);
+    }
+    unsigned short* he = reinterpret_cast<unsigned short*>(&hv_curr);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) he[j] = f2bf(bf2f(he[j]) + g * v[j]);
-    *hp = hv;
+    for (int j = 0; j < 8; ++j) he[j] = f2bf(bf2f(he[j]) + g_curr * v[j]);
+    *reinterpret_cast<int4*>(h + (long)row * hrow + (long)c * n + i0) = hv_curr;
+    if (more) {   /* nothing to carry past the last stream */
+      g_curr = g_next;
+      hv_curr = hv_next;
+    }
   }
 }
