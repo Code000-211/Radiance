@@ -82,6 +82,16 @@ enum class DraftFallback : uint8_t {
     Unsupported = 4,  /* a mode this runtime does not implement; never a silent substitute */
 };
 
+/* Who may fill a request's draft budget. `k[]` is the budget for every drafter, not for the head
+ * alone: a request the plan puts at K = 0 must stay empty, so the n-gram fallback may only fill a
+ * request the plan assigned to it. The view's batch-wide `ngram_allowed` is the gate the plan is
+ * chosen under; once a plan exists, its per-request answer is the one the scheduler follows. */
+enum class DraftDrafter : uint8_t {
+    None = 0,   /* no drafter: k[] must be 0, and no fallback may fill it */
+    Serial = 1, /* the model's draft head fills k[], capped by k[] */
+    Ngram = 2,  /* the prompt-lookup fallback fills k[], capped by k[] */
+};
+
 /* Where a cycle-level plan came from. `Fallback` is a fixed baseline chosen because the cost
  * path could not price the shape (see DraftFallback for why); it is a visible answer, not a
  * pretend-selection. */
@@ -226,9 +236,10 @@ struct DraftPredictions {
 /* ------------------------------------------------------------------ the plan */
 
 /* The cycle's frozen plan. choose() fills it once; every consumer reads the same pointers. `k[i]`
- * is request i's drafts, and `rows[j]` the number of requests that reach round j. `verify_k` (the
- * window the paired step verifies, chosen by the previous cycle) and `max_k` (the deepest window
- * this cycle drafts) are separate numbers: reading one for the other is how a proposal from
+ * is request i's drafts, and `rows[j]` the number of requests that reach round j. It is a budget
+ * for every drafter, so `fill[i]` names who may spend it; where k is 0 that is None. `verify_k`
+ * (the window the paired step verifies, chosen by the previous cycle) and `max_k` (the deepest
+ * window this cycle drafts) are separate numbers: reading one for the other is how a proposal from
  * another generation leaks into a step. */
 struct DraftPlan {
     uint64_t cycle_id = 0;
@@ -247,6 +258,7 @@ struct DraftPlan {
     int32_t*        slot = nullptr;     /* [cap] */
     uint32_t*       slot_gen = nullptr; /* [cap] */
     int32_t*        k = nullptr;        /* [cap] drafts per request, 0..max_k */
+    DraftDrafter*   fill = nullptr;    /* [cap] who may fill k[]; None exactly where k[] is 0 */
     DraftFallback*  why = nullptr;      /* [cap] the request's own downgrade reason, else None */
     int32_t*        rows = nullptr;     /* [RAD_SCHED_MAX_SPEC + 1] N_j; index 0 unused */
 };
@@ -350,12 +362,18 @@ inline int draft_plan_valid(const DraftPlan& p) {
         return RAD_E_INVAL;
     }
     if (p.verify_k < 0 || p.verify_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
-    if (!p.k || !p.rows || (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen))) return RAD_E_INVAL;
+    if (!p.k || !p.rows || !p.fill) return RAD_E_INVAL;
+    if (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen)) return RAD_E_INVAL;
     int32_t count[RAD_SCHED_MAX_SPEC + 1] = {};
     for (int32_t i = 0; i < p.n_seq; ++i) {
         if (p.k[i] < 0 || p.k[i] > p.max_k) {
             RAD_ERR("draft plan: request %d drafts %d, outside 0..%d", (int)i, (int)p.k[i],
                     (int)p.max_k);
+            return RAD_E_INVAL;
+        }
+        if ((p.k[i] == 0) != (p.fill[i] == DraftDrafter::None)) {
+            RAD_ERR("draft plan: request %d has k %d and fill %d", (int)i, (int)p.k[i],
+                    (int)p.fill[i]);
             return RAD_E_INVAL;
         }
         for (int j = 1; j <= p.k[i]; ++j) ++count[j];
@@ -368,6 +386,13 @@ inline int draft_plan_valid(const DraftPlan& p) {
         }
     }
     return RAD_OK;
+}
+
+/* True when request i may not be filled by any drafter this cycle. The scheduler's n-gram
+ * fallback is a drafter too and must ask this before it fills an empty proposal: a K0 plan is a
+ * plan, not an absence of one, and `k[]` is the budget for every drafter. */
+inline bool draft_plan_bars_fill(const DraftPlan& p, int32_t i) {
+    return p.k && p.fill && i >= 0 && i < p.n_seq && p.k[i] == 0 && p.fill[i] == DraftDrafter::None;
 }
 
 /* The label for draft position j (0-based), if this cycle measured one: 1 when the position was

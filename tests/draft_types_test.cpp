@@ -98,6 +98,40 @@ TEST(plan_rows_refuses_a_k_past_the_plans_maximum) {
     CHECK_EQ(f.plan.rows[0], 0);
 }
 
+TEST(a_k0_plan_bars_every_drafter_including_the_ngram_fallback) {
+    draft_fake::Fixture f;
+    f.view.k_ceiling = 6;          /* the head is loaded: K0 is a temporary state, not a process */
+    f.view.ngram_allowed = true;   /* the view allows the fallback; the plan still decides */
+    f.add(0, 1);
+    f.add(1, 2);
+
+    draft_fake::Policy policy;
+    policy.legacy_k = 0;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 0);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+    for (int32_t i = 0; i < 2; ++i) {
+        CHECK(f.plan.fill[i] == DraftDrafter::None);
+        CHECK(draft_plan_bars_fill(f.plan, i));
+    }
+
+    /* A drafting plan names its filler; the fallback still may not take the request over. */
+    f.plan.k[0] = 2;
+    f.plan.max_k = 2;
+    f.plan.fill[0] = DraftDrafter::Serial;
+    CHECK_EQ(draft_plan_rows(f.plan), RAD_OK);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+    CHECK(!draft_plan_bars_fill(f.plan, 0));
+
+    /* K 0 with a filler claimed, and K > 0 with nobody to fill it, are both refused. */
+    f.plan.fill[1] = DraftDrafter::Ngram;
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "fill"));
+    f.plan.fill[1] = DraftDrafter::None;
+    f.plan.fill[0] = DraftDrafter::None;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+}
+
 TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     DraftSeqObservation o;
     o.accepted = 1;

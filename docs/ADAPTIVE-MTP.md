@@ -36,6 +36,11 @@ prediction and sample.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request. The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:
   reading one for the other is how a proposal from another generation leaks into a step.
+- **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
+  `None` exactly where K is 0, the serial head or the n-gram fallback where K is positive. A
+  request the plan puts at K 0 stays empty; the scheduler's n-gram fallback is a drafter too and
+  may not fill it (`draft_plan_bars_fill`). The view's batch-wide `ngram_allowed` is the gate the
+  plan is chosen under, not a licence to override the plan.
 - **Verify shape and draft extent are separate.** `DraftVerifyShape` keys the cost model on verify
   tokens, context class, history tokens and `N_j` (requests reaching round j), not just
   `(rows, max K)`. `DraftCostSample` carries the rounds and rows actually executed beside it.
@@ -97,7 +102,8 @@ The K0 rules are in the plan: K0 with the drafter loaded stays a temporary opera
 weights, buffers and arena geometry unchanged (history for the MTP KV/QSA keeps being maintained),
 and it is measured separately from a process started with `--num-speculative-tokens 0` and no
 drafter. Initialisation is explicitly not depth 0. A speculation-off plan is never filled by the
-n-gram fallback: "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
+n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
+"MTP off, n-gram allowed" would be a separate state with its own costs and labels.
 
 ## Draft profile format, version 1
 

@@ -95,8 +95,8 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     auto* s = static_cast<Policy*>(ctx);
     ++s->calls;
     (void)pred;   /* the fake does not use position estimates; cost and legacy share one K */
-    if (!plan || !plan->k || !plan->rows || plan->cap < view.n_seq || !plan->req_id ||
-        !plan->slot || !plan->slot_gen)
+    if (!plan || !plan->k || !plan->rows || !plan->fill || plan->cap < view.n_seq ||
+        !plan->req_id || !plan->slot || !plan->slot_gen)
         return RAD_E_INVAL;
 
     int want = s->legacy_k;
@@ -127,6 +127,9 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
             if (k < want) plan->why[i] = DraftFallback::Resources;
         }
         plan->k[i] = k;
+        /* Who may fill the budget: the head when there is one to spend, nobody at K 0. The fake
+         * never chooses the n-gram fallback; a test that wants that state sets it by hand. */
+        plan->fill[i] = k > 0 ? DraftDrafter::Serial : DraftDrafter::None;
         if (k > top) top = k;
     }
     plan->max_k = top;
@@ -191,6 +194,7 @@ struct Fixture {
     int32_t          slot[kMaxSeq];
     uint32_t         slot_gen[kMaxSeq];
     int32_t          k[kMaxSeq];
+    DraftDrafter     fill[kMaxSeq];
     DraftFallback    why[kMaxSeq];
     int32_t          rows[RAD_SCHED_MAX_SPEC + 1];
     DraftPlan        plan;
@@ -212,6 +216,7 @@ struct Fixture {
         plan.slot = slot;
         plan.slot_gen = slot_gen;
         plan.k = k;
+        plan.fill = fill;
         plan.why = why;
         plan.rows = rows;
     }
