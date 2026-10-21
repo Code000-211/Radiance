@@ -303,6 +303,13 @@ public:
     int64_t     ar_calls() const { return ar_calls_.load(std::memory_order_relaxed); }
     int64_t     ar_bytes() const { return ar_bytes_.load(std::memory_order_relaxed); }
 
+    /* Which pass the per-kind counters below belong to: the trunk pass, the draft head's history
+     * pass (draft_pass < 0), or a draft round (draft_pass > 0). */
+    enum PassKind : int { kPassTrunk = 0, kPassHistory = 1, kPassDraft = 2, kPassKinds = 3 };
+    struct PassKindCounts {
+        int64_t played = 0, issued = 0, recorded = 0, audited = 0;
+    };
+
     /* How each pass was run. A play writes recorded packets; every other outcome walks the issue
      * path. `issued_*` split unplayed passes by cause: no key, key refused, key seen first time.
      * `audited` counts plays re-issued to check the tape. `dispatched` is the kernels plays wrote,
@@ -311,6 +318,17 @@ public:
         int64_t played = 0, recorded = 0, audited = 0;
         int64_t issued_unkeyed = 0, issued_refused = 0, issued_first = 0;
         int64_t dispatched = 0, unordered = 0;
+        /* The tape cache's coverage. `keys_live` is the number of tapes held now, `keys_peak` the
+         * most held at once (both at most kTapes); `evicted` counts tapes dropped to make room and
+         * `rerecorded` keys recorded again after their tape had been evicted. A non-zero
+         * `rerecorded` is the evidence that the cache is too small for this workload's keys; a
+         * full cache alone is not, since a dropped key may never be asked for again. */
+        int64_t evicted = 0, rerecorded = 0, keys_live = 0, keys_peak = 0;
+        /* The same outcomes per pass kind. A draft cycle runs one trunk pass, one history pass and
+         * up to six rounds, and only the last of those shrink under E2; separate counts keep a
+         * rising host-issue share attributable to the round that caused it. `issued` counts passes
+         * that walked the architecture's issue path (that includes those recorded/audited). */
+        PassKindCounts kind[kPassKinds];
     };
     PassCounts  pass_counts() const {
         PassCounts c;
@@ -322,6 +340,16 @@ public:
         c.issued_first   = pc_first_.load(std::memory_order_relaxed);
         c.dispatched     = pc_dispatched_.load(std::memory_order_relaxed);
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
+        c.evicted        = pc_evicted_.load(std::memory_order_relaxed);
+        c.rerecorded     = pc_rerecorded_.load(std::memory_order_relaxed);
+        c.keys_live      = pc_keys_live_.load(std::memory_order_relaxed);
+        c.keys_peak      = pc_keys_peak_.load(std::memory_order_relaxed);
+        for (int k = 0; k < kPassKinds; ++k) {
+            c.kind[k].played   = pk_played_[k].load(std::memory_order_relaxed);
+            c.kind[k].issued   = pk_issued_[k].load(std::memory_order_relaxed);
+            c.kind[k].recorded = pk_recorded_[k].load(std::memory_order_relaxed);
+            c.kind[k].audited  = pk_audited_[k].load(std::memory_order_relaxed);
+        }
         return c;
     }
     void*       arena_base()   const { return arena_.base(); }
@@ -506,6 +534,28 @@ private:
     int      run_pass(const RadBatch* b);
     int      record_pass(const RadBatch* b, uint64_t key, PassTape* out);
     int      play_pass(PassTape& t);
+    static int pass_kind(const RadBatch& b) {
+        return b.draft_pass == 0 ? kPassTrunk : (b.draft_pass < 0 ? kPassHistory : kPassDraft);
+    }
+    /* Issues the pass for real, counting it against its kind. Every live issue goes through here,
+     * so `kind[].issued` covers recording and auditing as well. */
+    void     issue_live(const RadBatch* b) {
+        pk_issued_[pass_kind(*b)].fetch_add(1, std::memory_order_relaxed);
+        arch_step_(this, b);
+    }
+    /* Keys whose tape the LRU dropped, so a second record of one is the cache thrashing. A ring:
+     * a key evicted long before it comes back is no longer recognised, which under-counts rather
+     * than inventing evidence. */
+    static constexpr size_t kEvictedKeys = 32;
+    uint64_t evicted_keys_[kEvictedKeys] = {};
+    size_t   evicted_at_ = 0;
+    void     note_evicted(uint64_t key) { evicted_keys_[evicted_at_++ % kEvictedKeys] = key; }
+    bool     take_re_recorded(uint64_t key) {
+        for (uint64_t& k : evicted_keys_) {
+            if (k == key) { k = 0; return true; }
+        }
+        return false;
+    }
     void     tape_cut();                        /* while recording: close the current play step */
     /* While recording: `st` becomes a host step that re-runs at every play. Closes the current
      * play step, appends `st` on this lane, and runs `run` with the device tape paused. */
@@ -746,6 +796,9 @@ private:
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
     std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};
+    std::atomic<int64_t> pc_evicted_{0}, pc_rerecorded_{0}, pc_keys_live_{0}, pc_keys_peak_{0};
+    std::atomic<int64_t> pk_played_[kPassKinds] = {}, pk_issued_[kPassKinds] = {};
+    std::atomic<int64_t> pk_recorded_[kPassKinds] = {}, pk_audited_[kPassKinds] = {};
 };
 
 }  /* namespace rad */
