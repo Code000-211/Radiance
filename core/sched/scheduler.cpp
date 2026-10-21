@@ -125,6 +125,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    /* The plan's caller-provided arrays are sized at max_seqs (draft_types.h). */
+    dp.max_seqs = cfg.max_seqs;
     /* The adaptive window (draft.h) prices a draft by the measured cost of the step it adds to.
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
@@ -150,6 +152,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     RAD_TRY(draft_.configure(dp));
     draft_est_.clear();
     draft_est_.reserve((size_t)cfg.max_seqs);
+    /* The cost policy's per-cycle storage, sized here so nothing on the step path allocates. */
+    draft_view_seq_.assign((size_t)cfg.max_seqs, DraftSeqView{});
+    draft_pred_seq_.assign((size_t)cfg.max_seqs, DraftPrediction{});
+    draft_pred_id_.assign((size_t)cfg.max_seqs, 0);
+    draft_view_ = DraftBatchView{};
+    draft_view_.cap = (int32_t)draft_view_seq_.size();
+    draft_view_.seq = draft_view_seq_.data();
+    draft_preds_ = DraftPredictions{};
+    draft_preds_.cap = (int32_t)draft_pred_seq_.size();
+    draft_preds_.req_id = draft_pred_id_.data();
+    draft_preds_.seq = draft_pred_seq_.data();
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     /* The builder's bound, not a second derivation: the block tables were sized for it. */
@@ -265,6 +278,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     SchedReq& s = *reqs_[(size_t)slot];
     s.req = std::move(r);
     s.arrival = ++arrival_;
+    s.gen = ++slot_gen_;
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
     s.slot = slot;
@@ -320,7 +334,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
      * sequence and expect_draft() cut this one's count to its window, so a longer proposal is cut
      * to the planned count (the window may have moved at the commit since). */
     if (next_open_ && s.entry_next >= 0) {
-        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
+        if ((draft_.adaptive() || draft_.cost_policy()) && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -1269,10 +1283,16 @@ const RadBatch* Scheduler::step() {
              * its acceptance of the head's drafts pays for. That estimate says nothing about the
              * n-gram fallback, so the fallback is held to the step's window, as deep as the head
              * drafts this step and no deeper. */
-            const int cap = draft_.adaptive() ? draft_cap(s) : depth;
+            const int cap = draft_cap(s);   /* the ceiling, the adaptive window, or the plan */
+            const int pk  = planned_k(s);
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0) {
+            else if (s.n_draft == 0 && pk != 0) {
+                /* A cost plan that names this row with K=0 is a speculation-off decision, not a
+                 * vacancy: filling it here would measure n-gram work in the MTP-off arm and mix
+                 * its labels with the head's (docs/ADAPTIVE-MTP.md). A row the plan lets draft
+                 * (K>0) but for which the head published nothing keeps the fallback, bounded by
+                 * cap; a row the plan does not name keeps the legacy behaviour. */
                 s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
                 ngram = s.n_draft > 0;
             }
@@ -1642,6 +1662,7 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
+    if (draft_.cost_policy()) { draft_cost_cycle(); return; }
     if (!draft_.adaptive()) return;
     /* The rows the opening step will decode: every running sequence past its prompt. Those that
      * may speculate choose D through their estimates; the rest emit one token each, which still
@@ -1659,6 +1680,64 @@ void Scheduler::draft_cycle() {
     (void)draft_.plan_step(draft_est_.data(), (int)draft_est_.size(), n_rows);
 }
 
+/* The cost policy opens its cycle here: one view of the decode rows, one frozen plan. The plan
+ * decides each row's K for the whole cycle, K=0 included: a speculation-off decision is not a
+ * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
+void Scheduler::draft_cost_cycle() {
+    if (!draft_.cost_policy()) return;
+    int32_t n = 0;
+    for (int32_t slot : running_) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running) continue;
+        const Request& r = *s.req;
+        /* A row still prefilling is not in the view: it emits nothing to speculate about. */
+        if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
+        if (n >= draft_view_.cap) break;
+
+        DraftSeqView& v = draft_view_seq_[(size_t)n++];
+        v = DraftSeqView{};
+        v.req_id   = r.id;
+        v.slot     = s.slot;
+        v.slot_gen = s.gen;
+        v.ctx_len  = r.n_computed > INT32_MAX ? INT32_MAX : (int32_t)r.n_computed;
+        v.ctx_class = draft_ctx_class(v.ctx_len);
+        int64_t room = r.max_tokens > 0 ? r.max_tokens - (int64_t)r.output.size()
+                                        : (int64_t)INT32_MAX;
+        if (ctx_limit_ > 0 && ctx_limit_ - s.seq_len() < room) room = ctx_limit_ - s.seq_len();
+        v.remaining = room > INT32_MAX ? INT32_MAX : room > 0 ? (int32_t)room : 0;
+        v.sampling  = r.sp.temp > 0.0f ? DraftSampling::Sampled : DraftSampling::Greedy;
+        v.prefill   = false;
+        /* The grammar path is the one the scheduler can name today; a scored prompt is a
+         * request the policy must not draft for either. */
+        v.eligibility = !r.may_speculate ? DraftEligibility::NoDrafter
+                      : v.remaining <= 0 ? DraftEligibility::OutputExhausted
+                                         : DraftEligibility::Eligible;
+    }
+
+    draft_view_.cycle_id       = ++draft_cycle_id_;
+    draft_view_.policy_version = RAD_DRAFT_POLICY_VERSION;
+    draft_view_.n_seq          = n;
+    draft_view_.k_ceiling      = cfg_.n_spec;
+    /* Budgets and the n-gram gate are the integrator's to fill (telemetry/config wiring). 0 is
+     * "not constrained", the view's default. */
+    draft_view_.token_budget   = 0;
+    draft_view_.kv_budget      = 0;
+    draft_view_.prefill_tokens = 0;
+    draft_view_.ngram_allowed  = true;
+
+    const int rc = draft_.open_cycle(draft_view_, &draft_preds_);
+    if (rc < 0) {
+        /* No plan this cycle: draft_cap() falls back to next_depth() and the cycle runs legacy.
+         * Logged once, so a broken hook does not flood the log every step. */
+        if (!draft_cost_failed_)
+            RAD_ERR("draft policy: cycle %llu has no plan (%s); drafting at the ceiling %d",
+                    (unsigned long long)draft_view_.cycle_id, rad_strerror(rc), cfg_.n_spec);
+        draft_cost_failed_ = true;
+    } else {
+        draft_cost_failed_ = false;
+    }
+}
+
 /* ------------------------------------------------------------------ the next step */
 void Scheduler::expect_draft(uint64_t id, int n) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1666,9 +1745,10 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     if (it == by_id_.end()) return;
     SchedReq& s = *reqs_[(size_t)it->second];
     /* Under the adaptive window the rounds ran for the deepest sequence; this one verifies the
-     * first of them up to its own window. That is the cap serial_begin used: nothing commits
-     * between the two, and D is the cycle's (draft_cycle). */
-    if (draft_.adaptive() && n > 0) {
+     * first of them up to its own window. The same holds for a cost plan, whose K per request is
+     * the frozen choice. That is the cap serial_begin used: nothing commits between the two, and
+     * D is the cycle's (draft_cycle). */
+    if ((draft_.adaptive() || draft_.cost_policy()) && n > 0) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
@@ -2087,7 +2167,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * them (expect_draft, set_draft); a round past the deepest window drafts for nobody. Only a
      * row that will draft counts. With none, the rounds stay as they are, because round 0 is the
      * history pass. The lookahead reservation below then matches the rounds that will run. */
-    if (may_draft && draft_.adaptive()) {
+    if (may_draft && (draft_.adaptive() || draft_.cost_policy())) {
         int want = 0;
         for (const StepEntry& e : plan_.e) {
             if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
@@ -2120,6 +2200,11 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
         const int64_t head_max = vstart + e.n_spec;
         bool can_draft = may_draft && e.produces_token;
+        /* A cost plan may have given this row K=0 while the batch runs deeper. The row then owes
+         * its history (positions it already holds blocks for) and drafts nothing, which is the
+         * 0 -> 6 path without lost history; a shared head has no history to owe and is skipped
+         * below. */
+        if (can_draft && planned_k(s) == 0) can_draft = false;
 
         /* Lookahead KV: round k writes the head's K and V at head + k - 1, past the committed end,
          * so blocks must exist up to the furthest head acceptance could leave. The next verify

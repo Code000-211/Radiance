@@ -67,7 +67,61 @@ int DraftController::configure(const Params& p) {
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
                  "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
                  kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst, kHold);
+
+    /* The cost policy's seam. It stays off unless a mode was asked for, and it is refused --
+     * not silently mapped to legacy -- when either hook it chooses from is missing. */
+    DraftPolicyConfig pc = p.policy;
+    pc.k_ceiling = p.max_depth;
+    const bool want_cost = pc.mode == DraftPolicyMode::Cost;
+    if (want_cost && (!p.predictor.predict || !p.costs.estimate)) {
+        RAD_ERR("--draft-policy cost needs a predictor and a cost model: this build has %s%s",
+                p.predictor.predict ? "" : "no predictor", p.costs.estimate ? "" : "no cost model");
+        p_.policy.mode = DraftPolicyMode::Legacy;
+        planner_ = DraftPlanner{};
+        return RAD_E_UNSUPPORTED;
+    }
+    const int rc = planner_.configure(pc);
+    if (rc < 0) return rc;
+    have_plan_ = false;
+    cost_failed_ = false;
+    const size_t cap = (size_t)(p.max_seqs > 0 ? p.max_seqs : 0);
+    plan_id_.assign(cap, 0);
+    plan_slot_.assign(cap, -1);
+    plan_gen_.assign(cap, 0);
+    plan_k_.assign(cap, 0);
+    plan_why_.assign(cap, DraftFallback::None);
+    plan_rows_.assign(RAD_SCHED_MAX_SPEC + 1, 0);
+    plan_ = DraftPlan{};
+    plan_.cap       = (int)cap;
+    plan_.req_id    = plan_id_.data();
+    plan_.slot      = plan_slot_.data();
+    plan_.slot_gen  = plan_gen_.data();
+    plan_.k         = plan_k_.data();
+    plan_.why       = plan_why_.data();
+    plan_.rows      = plan_rows_.data();
     return RAD_OK;
+}
+
+int DraftController::open_cycle(const DraftBatchView& view, DraftPredictions* preds) {
+    have_plan_ = false;
+    if (!cost_policy() || !preds) return RAD_OK;
+    if (view.n_seq > plan_.cap) return RAD_E_INVAL;
+    if (preds->cap < view.n_seq || !preds->seq || !preds->req_id) return RAD_E_INVAL;
+
+    int rc = p_.predictor.predict(p_.predictor.ctx, view, preds);
+    if (rc < 0) return rc;
+    rc = planner_.choose(view, *preds, p_.costs, &plan_);
+    if (rc < 0) return rc;
+    have_plan_ = true;
+    return RAD_OK;
+}
+
+int DraftController::planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const {
+    if (!have_plan_) return -1;
+    for (int32_t i = 0; i < plan_.n_seq; ++i)
+        if (plan_.req_id[i] == req_id && plan_.slot[i] == slot && plan_.slot_gen[i] == slot_gen)
+            return plan_.k[i];
+    return -1;
 }
 
 void DraftController::observe(int drafted, int accepted) {

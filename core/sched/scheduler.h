@@ -29,6 +29,10 @@ struct SchedReq {
     std::unique_ptr<Request> req;
     uint64_t arrival = 0;        /* monotonic; the tiebreak below priority. A preempted request
                                   * keeps it, so it re-enters ahead of later arrivals */
+    /* The slot's generation: bumped every time this SchedReq is handed to another request. A
+     * cost plan names (req_id, slot, gen) so a recycled slot is never read as the request the
+     * plan was written for (core/sched/draft_types.h). */
+    uint32_t gen = 0;
     int32_t  slot = -1;
     /* The card's index for this sequence: the StepSlot the advance reads and writes (advance.h),
      * and the sequence identity a batch carries. Not `slot`, which is taken on arrival and can
@@ -451,11 +455,24 @@ private:
     }
 
     /* The window a sequence may draft into: the configured depth, or under the adaptive window
-     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use).
-     * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
-     * rounds in serial_begin(). With the policy off it is next_depth(). */
+     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use), or
+     * under the cost policy what this cycle's frozen plan assigns it. Every site that caps a
+     * proposal applies it: step(), set_draft(), expect_draft() and the rounds in serial_begin().
+     * With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
+        if (draft_.cost_policy()) {
+            const int k = planned_k(s);
+            if (k >= 0) return k;
+            return draft_.next_depth();   /* no plan covers it: legacy for this cycle */
+        }
         return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+    }
+
+    /* This cycle's planned K for the request, or -1 when the cost policy is off or its plan
+     * does not name it. A planned 0 is a decision: the n-gram fallback must not fill it. */
+    int planned_k(const SchedReq& s) const {
+        if (!draft_.cost_policy() || !s.req) return -1;
+        return draft_.planned_k(s.req->id, s.slot, s.gen);
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
@@ -468,6 +485,19 @@ private:
      * allocate. */
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
+
+    /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
+     * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
+     * the step path does not allocate. */
+    void    draft_cost_cycle();
+    std::vector<DraftSeqView>    draft_view_seq_;
+    std::vector<DraftPrediction> draft_pred_seq_;
+    std::vector<uint64_t>        draft_pred_id_;
+    DraftBatchView               draft_view_;
+    DraftPredictions             draft_preds_;
+    uint64_t                     draft_cycle_id_ = 0;
+    uint32_t                     slot_gen_ = 0;
+    bool                         draft_cost_failed_ = false;
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
