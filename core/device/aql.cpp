@@ -40,7 +40,12 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+/* ROCm ships 1.16, which carries signal_event_data that the kernel's 1.11 header lacks. */
+#if __has_include(<rocm_smi/kfd_ioctl.h>)
+#include <rocm_smi/kfd_ioctl.h>
+#else
 #include <linux/kfd_ioctl.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
