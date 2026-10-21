@@ -108,11 +108,6 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
-# kbench names a plugin by the build-id in its ELF note (kb::build_id_of). Debian's GCC driver
-# passes --build-id by itself, clang's does not, so a plugin linked with clang has no identity to
-# name. Stating it here keeps the identity the same whichever compiler links.
-add_link_options(-Wl,--build-id)
-
 # Before the ABI: its INSTALL_INTERFACE path uses CMAKE_INSTALL_INCLUDEDIR, which would otherwise
 # expand to nothing and silently export the wrong include directory.
 include(GNUInstallDirs)
