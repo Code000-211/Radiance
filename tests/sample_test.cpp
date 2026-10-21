@@ -3253,4 +3253,371 @@ TEST(a_dry_row_with_breakers_has_its_raw_logprob) {
     CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
 }
 
+/* ================================================================== the narrow candidate plan
+ *
+ * RADIANCE_SAMPLE_CANDIDATES64 selects a 64-wide candidate plan BESIDE the deployment's own. What
+ * these tests pin is the two things that can go wrong and that a "it ran" check would miss:
+ *
+ *   1. WHICH batches it can serve. A batch with one row the narrow width cannot serve has to keep
+ *      the WHOLE batch on the wide plan -- a plan is one set of buffers, so half a batch cannot read
+ *      from one width and half from another. top_k = 0 is the row that makes this a correctness
+ *      requirement and not an optimisation detail: it means "the whole candidate width", so it
+ *      samples from a DIFFERENT SUPPORT at either width.
+ *
+ *   2. THAT THE TOKEN IS THE SAME. Accepted batches are compared against the wide plan token for
+ *      token, on the cases where the width could plausibly matter: ties at the cut, logits so low
+ *      that the f32 sum underflows, a grammar mask, and the filter stages that walk the candidate
+ *      list in order.
+ *
+ * Each test declares TWO chains -- one with the flag unset, one with it set -- and compares their
+ * outputs. Nothing here observes which internal plan was chosen; the token is the observable, and a
+ * width that changed an answer shows up as a token mismatch.
+ *
+ * The flag is read at declare, so each test sets it around its chain and restores it -- a test that
+ * left it set would change what every later test in this file declares. */
+namespace {
+
+struct NarrowFlag {
+    bool had = false;
+    std::string prev;
+    explicit NarrowFlag(bool on) {
+        if (const char* v = std::getenv("RADIANCE_SAMPLE_CANDIDATES64")) { had = true; prev = v; }
+        if (on) setenv("RADIANCE_SAMPLE_CANDIDATES64", "1", 1);
+        else    unsetenv("RADIANCE_SAMPLE_CANDIDATES64");
+    }
+    ~NarrowFlag() {
+        if (had) setenv("RADIANCE_SAMPLE_CANDIDATES64", prev.c_str(), 1);
+        else     unsetenv("RADIANCE_SAMPLE_CANDIDATES64");
+    }
+};
+
+/* One step for one request, returning its token, or INT32_MIN if the step failed. */
+int32_t one_token(HostChain& ch, Request& r, const std::vector<float>& lg) {
+    std::vector<int32_t> tok;
+    const int st = ch.step({ &r }, lg, &tok);
+    ch.s.end_request(r.id);
+    return st == RAD_OK && !tok.empty() ? tok[0] : INT32_MIN;
+}
+
+}  /* namespace */
+
+/* top_k 1, 20 AND 64 -- the ends of the range the narrow plan accepts, and the default in the
+ * middle -- pick the same token at both widths. The logits are shaped so the answer depends on the
+ * cut and not on the argmax: a dominant token is not the point, a tie at rank k is. */
+TEST(a_batch_inside_the_narrow_width_picks_the_same_token_as_the_wide_plan) {
+    for (int k : { 1, 20, 64 }) {
+        SamplingParams sp;
+        sp.temp = 1.0f;
+        sp.top_k = k;
+        sp.seed = 12345;
+        /* A strict descending tail except for a TIE at the k-th and (k+1)-th place, which is the
+         * only place a width change could reorder anything: ties break on the lower id, so the
+         * narrow plan must keep the lower id too. */
+        std::vector<float> lg(256, -40.0f);
+        for (int i = 0; i < k; ++i) lg[(size_t)i] = 8.0f - 0.01f * (float)i;
+        lg[(size_t)k] = lg[(size_t)(k - 1)];
+
+        NarrowFlag off(false);
+        HostChain wide(256, 1, 0, nullptr, 1024);
+        NEED_CHAIN(wide)
+        Request a = make_req(1, { 0 }, sp);
+        const int32_t tw = one_token(wide, a, lg);
+
+        NarrowFlag on(true);
+        HostChain narrow(256, 1, 0, nullptr, 1024);
+        NEED_CHAIN(narrow)
+        Request b = make_req(1, { 0 }, sp);
+        const int32_t tn = one_token(narrow, b, lg);
+        CHECK_EQ(tn, tw);
+        CHECK(tn != INT32_MIN);
+    }
+}
+
+/* FINITE UNDERFLOW: every candidate is so far below the maximum that exp(v - max) underflows to
+ * zero in f32. The wide plan sums a thousand of those zeroes and the narrow one sixty-four, and the
+ * token must not change -- 0.0f is the exact additive identity, so the sum, and therefore the CDF,
+ * is the same value at either width. The pick then falls through every comparison to its last live
+ * candidate, at both widths. */
+TEST(logits_that_underflow_the_f32_sum_pick_the_same_token_at_either_width) {
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 64;
+    sp.seed = 7;
+    std::vector<float> lg(256, -3.0e38f);
+    lg[0]  = -1.0e38f;               /* the maximum; v - max is a huge negative for the rest */
+    lg[63] = -1.0e38f;
+
+    NarrowFlag off(false);
+    HostChain wide(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(wide)
+    Request a = make_req(1, { 0 }, sp);
+    const int32_t tw = one_token(wide, a, lg);
+
+    NarrowFlag on(true);
+    HostChain narrow(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(narrow)
+    Request b = make_req(1, { 0 }, sp);
+    const int32_t tn = one_token(narrow, b, lg);
+    CHECK_EQ(tn, tw);
+    CHECK(tn >= 0);
+}
+
+/* top_k 0 IS THE WHOLE CANDIDATE WIDTH: at 64 it would sample from 64 candidates instead of 1024,
+ * which is a different support and a different answer. The token it must return is one only the
+ * wider support contains. */
+TEST(a_row_at_top_k_zero_can_reach_a_token_beyond_the_narrow_width) {
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 0;
+    sp.seed = 3;
+    std::vector<float> lg(256, -60.0f);
+    for (int i = 0; i < 200; ++i) lg[(size_t)i] = -1.0f - 0.001f * (float)i;
+    lg[200] = 20.0f;                /* outside a 64-wide support, inside the wide one, and so far
+                                     * above the tail that every other candidate's exp(v - max)
+                                     * underflows: the draw is not a matter of luck. */
+
+    NarrowFlag on(true);
+    HostChain ch(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(ch)
+    Request a = make_req(1, { 0 }, sp);
+    /* The winning token is #200 of 256. A step that ran this row on a 64-candidate support could
+     * not return it at any seed, so the token itself is the proof that top_k = 0 kept the whole
+     * candidate width -- no interior state has to be inspected. */
+    CHECK_EQ(one_token(ch, a, lg), 200);
+}
+
+/* MORE THAN 64 IS ADMITTED -- the admission bound is max_candidates, not the narrow width -- and
+ * the token it returns is one only the wider support contains. Without this the flag would be a
+ * silent admission change, which is the one thing it must never be. */
+TEST(a_row_above_the_narrow_width_is_admitted_and_reaches_its_own_candidates) {
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 200;
+    sp.seed = 9;
+    std::vector<float> lg(256, -60.0f);
+    for (int i = 0; i < 200; ++i) lg[(size_t)i] = -1.0f - 0.001f * (float)i;
+    lg[150] = 20.0f;                /* rank 0, and candidate slot 0 of a 200-wide top-k; dominant
+                                     * enough that the draw is deterministic. */
+
+    NarrowFlag on(true);
+    HostChain ch(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(ch)
+    std::string why;
+    CHECK_OK(ch.s.check_request(sp, &why));      /* admitted at all */
+    Request a = make_req(1, { 0 }, sp);
+    CHECK_EQ(one_token(ch, a, lg), 150);
+}
+
+/* MIXED ELIGIBLE/INELIGIBLE: one top_k 8 row and one top_k 0 row in the same batch. The top_k 0
+ * row's only viable candidate is token 200, which a 64-wide support cannot hold -- so its token
+ * proves the WHOLE batch stayed wide, the eligible row included. A per-row choice would have
+ * starved row 1 and returned something else (or -1) while row 0 still looked right. */
+TEST(one_ineligible_row_keeps_the_whole_batch_at_the_full_width) {
+    SamplingParams tiny;
+    tiny.temp = 1.0f;
+    tiny.top_k = 8;
+    tiny.seed = 11;
+    SamplingParams whole;
+    whole.temp = 1.0f;
+    whole.top_k = 0;
+    whole.seed = 12;
+
+    std::vector<float> lg(2 * 256, -60.0f);
+    lg[3]  = 20.0f;                   /* row 0: a clear winner inside 8 */
+    lg[256 + 200] = 20.0f;            /* row 1: only reachable with the whole width */
+
+    NarrowFlag on(true);
+    HostChain ch(256, 2, 0, nullptr, 1024);
+    NEED_CHAIN(ch)
+    Request a = make_req(1, { 0 }, tiny);
+    Request b = make_req(2, { 0 }, whole);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a, &b }, lg, &tok));
+    CHECK_EQ(tok[0], 3);
+    CHECK_EQ(tok[1], 200);
+    ch.s.end_request(a.id);
+    ch.s.end_request(b.id);
+}
+
+/* GREEDY BESIDE STOCHASTIC ON THE NARROW PLAN: a greedy row carries no candidates, so it cannot
+ * constrain the width, and the sampled row's token must match the wide plan's for the same seed.
+ * This is the mixed-filter case too -- the sampled row runs temperature, top-k, top-p and min-p,
+ * all of which walk the candidate list in order. */
+TEST(a_greedy_row_beside_a_filtered_sampled_row_matches_the_wide_plan) {
+    for (uint64_t seed = 1; seed <= 8; ++seed) {
+        SamplingParams g = greedy_params();
+        g.seed = seed;
+        SamplingParams s;
+        s.temp = 0.9f;
+        s.top_k = 32;
+        s.top_p = 0.9f;
+        s.min_p = 0.01f;
+        s.seed = seed;
+
+        std::vector<float> lg(2 * 256, -30.0f);
+        for (int i = 0; i < 40; ++i) lg[(size_t)i] = 2.0f - 0.05f * (float)i;   /* row 0 */
+        for (int i = 0; i < 40; ++i) lg[256 + (size_t)i] = 1.5f - 0.03f * (float)i; /* row 1 */
+
+        NarrowFlag off(false);
+        HostChain wide(256, 2, 0, nullptr, 1024);
+        NEED_CHAIN(wide)
+        Request a = make_req(10 + seed, { 0 }, g);
+        Request b = make_req(20 + seed, { 0 }, s);
+        std::vector<int32_t> wt;
+        CHECK_OK(wide.step({ &a, &b }, lg, &wt));
+        wide.s.end_request(a.id);
+        wide.s.end_request(b.id);
+
+        NarrowFlag on(true);
+        HostChain narrow(256, 2, 0, nullptr, 1024);
+        NEED_CHAIN(narrow)
+        Request c = make_req(10 + seed, { 0 }, g);
+        Request d = make_req(20 + seed, { 0 }, s);
+        std::vector<int32_t> nt;
+        CHECK_OK(narrow.step({ &c, &d }, lg, &nt));
+        CHECK_EQ(nt[0], wt[0]);
+        CHECK_EQ(nt[1], wt[1]);
+        narrow.s.end_request(c.id);
+        narrow.s.end_request(d.id);
+    }
+}
+
+/* A GRAMMAR MASK AND ITS HIGH ADMISSIBLE ID. The mask is this rank's shard of the vocabulary, and a
+ * top-k over a masked row fills its width with the forbidden tail at -infinity. The narrow plan
+ * must still return the one admissible token, which sits at id 31 of 32 -- inside the shard and
+ * inside the first 64 candidates -- and the wide plan must agree. */
+TEST(a_grammar_masked_row_on_the_narrow_plan_keeps_its_only_admissible_token) {
+    static SimpleVocab vocab({ "a", "b", "c", "d" });
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 64;
+    sp.seed = 21;
+    sp.grammar = "root ::= \"d\"";
+    std::vector<float> lg(32, -20.0f);
+    lg[3] = 1.0f;                    /* the grammar admits "d" = id 3 and nothing else */
+
+    NarrowFlag off(false);
+    HostChain wide(32, 1, 0, &vocab, 1024);
+    NEED_CHAIN(wide)
+    Request a = make_req(1, { 0 }, sp);
+    const int32_t tw = one_token(wide, a, lg);
+
+    NarrowFlag on(true);
+    HostChain narrow(32, 1, 0, &vocab, 1024);
+    NEED_CHAIN(narrow)
+    Request b = make_req(1, { 0 }, sp);
+    const int32_t tn = one_token(narrow, b, lg);
+    CHECK_EQ(tn, 3);
+    CHECK_EQ(tn, tw);
+}
+
+/* A HIGH TOKEN ID IS NOT A HIGH CANDIDATE SLOT. A grammar admits only token 200 of 256, which is
+ * beyond the narrow plan's 64 slots if you confuse the token id with the candidate index, but
+ * sample_topk ranks by logit and the masked row has one live candidate, so the admitted token lands
+ * in slot 0 and a 64-wide plane holds it. Both widths therefore agree, and this pins that they do:
+ * the width bounds SLOTS, and the token ids in them stay global. */
+TEST(a_high_token_id_lands_in_a_low_candidate_slot_and_both_widths_agree) {
+    /* Every piece is the same length, so no piece is a prefix of another and the grammar's literal
+     * names exactly ONE token. A spelling like "t200" beside "t2" would admit the shorter word as a
+     * prefix of it, and the mask would stop being a singleton. */
+    static SimpleVocab vocab = [] {
+        std::vector<std::string> w;
+        for (int i = 0; i < 256; ++i) {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "<%03d>", i);
+            w.push_back(buf);
+        }
+        return SimpleVocab(std::move(w));
+    }();
+
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 64;
+    sp.seed = 31;
+    sp.grammar = "root ::= \"<200>\"";
+
+    std::vector<float> lg(256, 10.0f);   /* the high id is not the largest logit at all */
+    lg[0] = 20.0f;
+
+    NarrowFlag off(false);
+    HostChain wide(256, 1, 0, &vocab, 1024);
+    NEED_CHAIN(wide)
+    Request a = make_req(1, { 0 }, sp);
+    const int32_t tw = one_token(wide, a, lg);
+
+    NarrowFlag on(true);
+    HostChain narrow(256, 1, 0, &vocab, 1024);
+    NEED_CHAIN(narrow)
+    Request b = make_req(1, { 0 }, sp);
+    const int32_t tn = one_token(narrow, b, lg);
+    CHECK_EQ(tn, 200);
+    CHECK_EQ(tn, tw);
+}
+
+/* THE FLAG IS EXACTLY "1". Anything else -- a typo, a word, an empty string -- is OFF, so a
+ * deployment that mis-spells it serves the plan it always served rather than half-declaring a
+ * second one. The check is the observable: a top_k 0 row can reach token 200 only on the wide
+ * plan, and it does at every spelling here. */
+TEST(the_narrow_flag_needs_exactly_one) {
+    for (const char* v : { "0", "2", "true", "on", "", " 1" }) {
+        setenv("RADIANCE_SAMPLE_CANDIDATES64", v, 1);
+        SamplingParams sp;
+        sp.temp = 1.0f;
+        sp.top_k = 0;
+        sp.seed = 5;
+        std::vector<float> lg(256, -60.0f);
+        for (int i = 0; i < 200; ++i) lg[(size_t)i] = -1.0f - 0.001f * (float)i;
+        lg[200] = 20.0f;
+        HostChain ch(256, 1, 0, nullptr, 1024);
+        if (ch.ok) {
+            Request a = make_req(1, { 0 }, sp);
+            CHECK_EQ(one_token(ch, a, lg), 200);
+        }
+    }
+    unsetenv("RADIANCE_SAMPLE_CANDIDATES64");
+}
+
+/* A LOGPROBS ROW KEEPS THE BATCH ON THE WIDE PLAN, and its logprob is the one the wide plan
+ * reports. logprobs_for recovers the token's raw logit from the candidate plane the pick drew it
+ * at, at the pinned buffer's max_candidates stride; a 64-wide plane would make that read wrong.
+ * The token and the logprob are both compared against the flag-off chain. */
+TEST(a_logprobs_row_keeps_the_wide_plan_and_reports_the_same_logprob) {
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.top_k = 20;
+    sp.seed = 41;
+    sp.n_probs = 5;
+    std::vector<float> lg(256, -30.0f);
+    for (int i = 0; i < 20; ++i) lg[(size_t)i] = 4.0f - 0.05f * (float)i;
+    const double z = log_sum_exp(lg);
+
+    NarrowFlag off(false);
+    HostChain wide(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(wide)
+    Request a = make_req(1, { 0 }, sp);
+    std::vector<int32_t> wt;
+    CHECK_OK(wide.step({ &a }, lg, &wt));
+    int64_t wn = 0;
+    wide.s.staged_params(&wn);
+    TokenLogprobs wlp;
+    CHECK_OK(wide.s.logprobs_for(0, wt[0], &wlp));
+    wide.s.end_request(a.id);
+
+    NarrowFlag on(true);
+    HostChain narrow(256, 1, 0, nullptr, 1024);
+    NEED_CHAIN(narrow)
+    Request b = make_req(1, { 0 }, sp);
+    std::vector<int32_t> nt;
+    CHECK_OK(narrow.step({ &b }, lg, &nt));
+    int64_t nn = 0;
+    narrow.s.staged_params(&nn);
+    TokenLogprobs nlp;
+    CHECK_OK(narrow.s.logprobs_for(0, nt[0], &nlp));
+    narrow.s.end_request(b.id);
+
+    CHECK_EQ(nt[0], wt[0]);
+    CHECK_NEAR(nlp.logprob, wlp.logprob, 0.0f);
+    CHECK_NEAR(nlp.logprob, (float)((double)lg[(size_t)nt[0]] - z), 1e-5);
+}
+
 RAD_TEST_MAIN()

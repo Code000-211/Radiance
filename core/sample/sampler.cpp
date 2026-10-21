@@ -92,6 +92,70 @@ void Sampler::shard_mask(uint32_t* dst) const {
     }
 }
 
+/* ================================================================== the narrow plan's admission
+ *
+ * WHICH BATCHES THE 64-WIDE PLAN CAN SERVE WITHOUT CHANGING ONE TOKEN. The narrow plan is the same
+ * ops over the same arithmetic at a smaller candidate width, so the question is exactly: for which
+ * rows does every candidate-plane stage produce bit-identical output when the tail holes above the
+ * row's live candidates are removed?
+ *
+ * THE ARGUMENT, PER STAGE, and it rests on one fact about the layout rather than on the values:
+ *
+ *   sample_topk        writes `got = min(top_k, live)` live entries in slots [0, got) in descending
+ *                      (logit, ~id) order and holes above. It sorts `sn = next_pow2(got)` words and
+ *                      reads `n_cand` only as an upper bound on `k`, so a smaller `n_cand` that is
+ *                      still >= got produces the same first `got` entries. Requiring top_k <= 64
+ *                      per row and 64 >= 64 makes `got <= 64` hold at either width.
+ *
+ *   the cuts           read every slot, skip `id < 0`, and reduce with block_max / block_sum. Every
+ *                      slot is held by its own lane at index < 256, so slot i lands in the same lane
+ *                      at either width. Adding holes above 64 contributes nothing to a max and adds
+ *                      exp(-inf - mx) = 0.0f to a sum -- the exact additive identity -- so no lane's
+ *                      partial changes. The three narrowing stages are per-candidate predicates over
+ *                      live slots, and their `mass`/`cum` walks are ordered by candidate index, so
+ *                      the removed tail comes strictly after every live index and is never visited:
+ *                      those walks are identical by prefix.
+ *
+ *   sample_pick        the same tree sum, then a SEQUENTIAL inverse-CDF walk in candidate order -- a
+ *                      prefix, identical up to the last live slot, and a live -infinity candidate
+ *                      adds 0.0f and cannot be chosen. Its `last` fallback only reads live slots.
+ *
+ *   the merge          (tensor parallel) selection-sorts `n_in = world_size * n_cand` gathered pairs
+ *                      into `n_cand` outputs, and the row's own top_k -- not the buffer width --
+ *                      bounds `keep`. The pairs that disappear are the holes each rank wrote above
+ *                      its own `got`; a hole is skipped by `id < 0`, so the selection order over the
+ *                      remaining pairs is the same set in the same order.
+ *
+ * AND THE ROWS THAT FAIL IT KEEP THE WHOLE BATCH WIDE, because a plan is a pair of buffers and a set
+ * of op handles: one row cannot read half its candidates from a 64-wide plane and half from a
+ * 1024-wide one. `top_k == 0` is the case that makes this mandatory rather than cautious -- it means
+ * "the whole candidate width", so its SUPPORT IS `n_cand` and the two widths would sample from
+ * different supports. That is a different answer, not a rounding difference, and it is why the
+ * narrow plan is a second plan and not a smaller admission bound.
+ *
+ * The width comparison below is over the STAGED rows, after build_step has rewritten a greedy row to
+ * top_k = 1 over a split vocabulary; that is the value the kernel reads. */
+bool Sampler::narrow_suits(const DeviceSampleParams* rows, int64_t n) const {
+    if (!narrow_declared_ || n <= 0) return false;
+    for (int64_t i = 0; i < n; ++i) {
+        /* A greedy-flagged row is an ARGMAX row in an unsplit batch: every candidate stage skips
+         * it and its token never touches a candidate plane, so it constrains nothing. */
+        if (rows[i].flags & RAD_SP_GREEDY) continue;
+        /* A LOGPROBS ROW KEEPS THE BATCH WIDE. logprobs_for recovers a token's raw logit from the
+         * candidate plane the pick drew it at, and rank 0 copies that plane back at the pinned
+         * buffer's `max_candidates` stride. Serving it from a 64-wide plane would either read the
+         * wrong columns or need a second pinned stride for a feature this flag was not asked to
+         * change. Excluded rather than plumbed: the narrow plan is a candidate-byte saving, not a
+         * logprobs redesign. */
+        if (rows[i].flags & RAD_SP_LOGPROBS) return false;
+        /* 0 is the whole candidate width, which the two plans give different answers to. Negative
+         * is refused at admission and never staged; treated the same way here rather than trusted. */
+        if (rows[i].top_k <= 0) return false;
+        if (rows[i].top_k > (int32_t)kSampleNarrowCand) return false;
+    }
+    return true;
+}
+
 /* rad_runtime.h's RAD_B / RAD_W macros are C compound literals, legal C++ only as an extension,
  * and core code builds -Wall -Wextra clean, so operands are built the ordinary way. */
 /* Operands are always narrowed to this step's rows. `M` is only the band's upper bound, so
@@ -145,6 +209,15 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     const int64_t rows = rows_for(cfg_);
     const int64_t nv   = cfg_.n_vocab_local;
+
+    /* A second declare on the same object starts from no plans at all: `wide_` and `narrow_` hold
+     * handles from the builder that is being replaced, and a step that kept one would issue ops
+     * the new program never declared. */
+    wide_ = Plan{};
+    narrow_ = Plan{};
+    narrow_declared_ = false;
+    plan_ = &wide_;
+
     if (vocab_parallel() && cfg_.max_candidates * cfg_.world_size > kSampleMergeCandidates) {
         const int64_t cap = kSampleMergeCandidates / cfg_.world_size;
         RAD_INFO("sampler: candidate width %lld a rank -> %lld: the merge of %d ranks' candidate "
@@ -179,16 +252,6 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
      * penalised). Resolved on the host, which has the vocabulary. */
     buf_brk_    = decl("sampler.dry_breakers", RAD_U8, rows, cfg_.max_hist, RAD_BUF_PERSIST);
     buf_mask_   = decl("sampler.mask", RAD_U32, rows, mask_words_, RAD_BUF_PERSIST);
-    buf_cand_i_ = decl("sampler.cand_idx", RAD_I32, rows, ncand, RAD_BUF_TRANSIENT);
-    buf_cand_v_ = decl("sampler.cand_val", RAD_F32, rows, ncand, RAD_BUF_TRANSIENT);
-    if (vocab_parallel()) {
-        /* sample_topk packs this rank's candidates into `pairs` as (u32 global id, f32 logit);
-         * the all-gather lays every rank's pairs for a row side by side, so the merge reads one
-         * row at a single stride. */
-        buf_pairs_  = decl("sampler.cand_pairs", RAD_U32, rows, ncand * 2, RAD_BUF_TRANSIENT);
-        buf_gather_ = decl("sampler.cand_gathered", RAD_U32, rows,
-                           ncand * cfg_.world_size * 2, RAD_BUF_TRANSIENT);
-    }
 
     /* The logprobs summary is PERSIST too: no declared op reads it (rank 0 copies it to the host
      * behind the pick), so liveness would let the candidate planes reuse its bytes. */
@@ -197,17 +260,16 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         buf_lp_g_ = decl("sampler.logprobs_gathered", RAD_F32, rows,
                          lp_width() * cfg_.world_size, RAD_BUF_PERSIST);
 
-    if (!buf_params_ || !buf_params_late_ || !buf_hist_ || !buf_brk_ || !buf_mask_ ||
-        !buf_cand_i_ || !buf_cand_v_ || !buf_lp_ ||
-        (vocab_parallel() && (!buf_pairs_ || !buf_gather_ || !buf_lp_g_))) {
+    if (!buf_params_ || !buf_params_late_ || !buf_hist_ || !buf_brk_ || !buf_mask_ || !buf_lp_ ||
+        (vocab_parallel() && !buf_lp_g_)) {
         RAD_ERR("sampler: a staging buffer failed to declare");
         return RAD_E_NOMEM;
     }
 
     /* ---------------------------------------------------------- ops */
-    /* Every op is declared unconditionally and may fail to resolve; check_request refuses the
-     * requests that need a missing one. `M` is ranged over sampled positions, so a kernel may
-     * specialise for one row versus a batch of 256 (spec §2.2). */
+    /* Every op is declared unconditionally and may fail to resolve; check_request turns that into
+     * a named refusal. `M` is ranged over sampled positions, so a kernel may specialise for one row
+     * versus a batch of 256 (spec §2.2). */
     auto op_vocab = [&](const char* name) -> rad_op {
         RadParam p[2] = {
             RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
@@ -228,49 +290,26 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         };
         return rad_decl_op(b, name, p, 3, nullptr, 0);
     };
-    /* Stages after top-k work on the candidate set, so their geometry is the candidate width. */
-    auto op_cand = [&](const char* name) -> rad_op {
-        RadParam p[2] = {
-            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
-            RadParam{ "n_cand", RAD_P_INT, (long long)ncand, 0, nullptr },
-        };
-        return rad_decl_op(b, name, p, 2, nullptr, 0);
-    };
 
     op_penalties_ = op_vocab_off("sample_penalties");
     op_dry_       = op_vocab_off("sample_dry");
     op_temp_      = op_vocab("sample_temp");
     op_mask_      = op_vocab("sample_mask");
-    op_topk_      = op_vocab_off("sample_topk");
     op_argmax_    = op_vocab("sample_argmax");
 
-    op_topp_      = op_cand("sample_topp");
-    op_minp_      = op_cand("sample_minp");
-    op_typical_   = op_cand("sample_typical");
-    op_xtc_       = op_cand("sample_xtc");
-    op_pick_      = op_cand("sample_pick");
-    /* The temperature kernel again, over the candidate plane: `n_vocab` is only a row length to
-     * it, so the candidate width works. */
-    {
-        RadParam p[2] = {
-            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
-            RadParam{ "n_vocab", RAD_P_INT, (long long)ncand, 0, nullptr },
-        };
-        op_temp_late_ = rad_decl_op(b, "sample_temp", p, 2, nullptr, 0);
-    }
-
-    if (vocab_parallel()) {
-        /* Each rank reduces its own shard and only the candidate sets are gathered: 2 KiB at
-         * k=64 and world_size=4, versus ~148 MiB for full logits (spec §9). */
-        RadParam ag[4] = {
-            RadParam{ "world_size", RAD_P_INT, (long long)cfg_.world_size, 0, nullptr },
-            RadParam{ "numel", RAD_P_INT, (long long)(rows * ncand * 2), 0, nullptr },
-            RadParam{ "dtype", RAD_P_STR, 0, 0, "f32" },
-            /* Row-interleaved, so each position's pairs from every rank are adjacent. */
-            RadParam{ "row", RAD_P_INT, (long long)(ncand * 2), 0, nullptr },
-        };
-        op_allgather_ = rad_decl_op(b, "all_gather", ag, 4, nullptr, 0);
-        op_merge_     = op_cand("sample_merge_topk");
+    /* THE TWO CANDIDATE PLANS. `wide_` keeps the names, the width and the handles it has always
+     * had; `narrow_` is the same plan at kSampleNarrowCand, and only exists when the flag asks for
+     * it and the deployment's own width is wider than that. A width at or below the narrow one
+     * would make the second plan a duplicate of the first, so it is not declared and every step
+     * stays on `wide_` -- the flag then costs one branch and no bytes. */
+    RAD_TRY(declare_plan(b, &wide_, rows, ncand, ""));
+    if (sample_candidates64_enabled() && ncand > (int64_t)kSampleNarrowCand) {
+        /* FAIL-CLOSED. A narrow plan that does not resolve is a BROKEN INITIALIZATION, not a
+         * request this deployment cannot serve, so the flag cannot be left silently inert and the
+         * declaration cannot be half-made: returning the status here is what keeps the builder's
+         * latched error visible instead of letting a later step discover it. */
+        RAD_TRY(declare_plan(b, &narrow_, rows, (int64_t)kSampleNarrowCand, "64"));
+        narrow_declared_ = true;
     }
 
     /* The raw-distribution summary, at a width that fits every request's top_logprobs. If it
@@ -297,12 +336,166 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         if (!op_lp_gather_) op_logprobs_ = RAD_NULL_HANDLE;
     }
 
+    /* The temperature kernel again, over the candidate plane: `n_vocab` is only a row length to
+     * it, so the candidate width works. It is declared AFTER the plans because it reads their value
+     * planes: `rad_op_reads` is per op and per buffer, so each plan needs its own read or the
+     * planner ends that plane's life at the pick and the arena may reuse its bytes.
+     *
+     * The late row is the FINAL one, so the op's own geometry is the wide width -- it is declared
+     * once at the deployment's candidate width and a narrow step passes it a narrower operand,
+     * which is what `n_vocab` being a row length rather than a constraint allows. */
+    {
+        RadParam p[2] = {
+            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+            RadParam{ "n_vocab", RAD_P_INT, (long long)ncand, 0, nullptr },
+        };
+        op_temp_late_ = rad_decl_op(b, "sample_temp", p, 2, nullptr, 0);
+    }
+    if (op_temp_late_) {
+        const rad_buf wv[] = { wide_.cand_v };
+        RAD_TRY(rad_op_reads(b, op_temp_late_, wv, 1));
+        if (narrow_declared_) {
+            const rad_buf nv2[] = { narrow_.cand_v };
+            RAD_TRY(rad_op_reads(b, op_temp_late_, nv2, 1));
+        }
+    }
+
     RAD_TRY(stage_alloc());
     declared_ = true;
 
     RAD_INFO("sampler: %lld-token vocabulary (%lld this rank), %lld rows, %lld mask words "
-             "(%s per row)", (long long)cfg_.n_vocab, (long long)nv, (long long)rows,
-             (long long)mask_words_, humanb(mask_words_ * 4).c_str());
+             "(%s per row)%s", (long long)cfg_.n_vocab, (long long)nv, (long long)rows,
+             (long long)mask_words_, humanb(mask_words_ * 4).c_str(),
+             narrow_declared_ ? ", narrow 64-candidate plan beside the wide one" : "");
+    return RAD_OK;
+}
+
+/* ONE CANDIDATE PLAN, cut to `n_cand`.
+ *
+ * The buffer names carry `tag` because a builder hands out one handle per name and two plans are
+ * two sets of planes. Under tensor parallel the pair plane and the gathered plane follow the same
+ * width: sample_topk packs this rank's candidates into `pairs` as (u32 global id, f32 logit), and
+ * the all-gather places every rank's pairs for a row SIDE BY SIDE, which is the one layout the
+ * merge reads at a single row stride. The merge is declared at the same width, so the two agree by
+ * construction rather than by the caller remembering to pass both. */
+int Sampler::declare_plan(RadBuilder* b, Plan* p, int64_t rows, int64_t n_cand, const char* tag) {
+    std::string name;
+    auto decl = [&](const char* base, uint32_t dt, int64_t d1, int kind) -> rad_buf {
+        name.assign(base);
+        if (*tag) { name += '.'; name += tag; }
+        RadBufDecl d{};
+        d.dtype = dt;
+        d.rank  = 2;
+        d.shape[0] = rows;
+        d.shape[1] = d1;
+        d.kind = kind;
+        d.domain = RAD_DOMAIN_DEVICE;
+        return rad_decl_buffer(b, name.c_str(), &d);
+    };
+
+    p->n_cand = n_cand;
+    p->cand_i = decl("sampler.cand_idx", RAD_I32, n_cand, RAD_BUF_TRANSIENT);
+    p->cand_v = decl("sampler.cand_val", RAD_F32, n_cand, RAD_BUF_TRANSIENT);
+    if (!p->cand_i || !p->cand_v) return RAD_E_NOMEM;
+    if (vocab_parallel()) {
+        p->pairs  = decl("sampler.cand_pairs", RAD_U32, n_cand * 2, RAD_BUF_TRANSIENT);
+        p->gather = decl("sampler.cand_gathered", RAD_U32, n_cand * cfg_.world_size * 2,
+                         RAD_BUF_TRANSIENT);
+        if (!p->pairs || !p->gather) return RAD_E_NOMEM;
+    }
+
+    /* `M` is the ranged parameter and it is the number of SAMPLED POSITIONS, not tokens: one row
+     * at decode, n_spec+1 per sequence at a verify, and a kernel written for a single row is a
+     * different kernel from one written for a batch of 256 (spec §2.2). The geometry after top-k
+     * is the candidate width, which is what makes those stages cheap. */
+    RadParam pc[2] = {
+        RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+        RadParam{ "n_cand", RAD_P_INT, (long long)n_cand, 0, nullptr },
+    };
+    auto op_cand = [&](const char* opname) -> rad_op {
+        return rad_decl_op(b, opname, pc, 2, nullptr, 0);
+    };
+
+    /* sample_topk's parameters are the VOCABULARY's, not the candidate width's: it reads a whole
+     * logits row and writes a candidate set, so its geometry is (M, n_vocab[, vocab_off]). Its
+     * output width is the candidate plane's extent, which is why the same op serves both plans. */
+    {
+        RadParam pt[3] = {
+            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+            RadParam{ "n_vocab", RAD_P_INT, (long long)cfg_.n_vocab_local, 0, nullptr },
+            RadParam{ "vocab_off", RAD_P_INT, (long long)cfg_.vocab_off, 0, nullptr },
+        };
+        const int npt = vocab_parallel() ? 3 : 2;
+        p->topk = rad_decl_op(b, "sample_topk", pt, npt, nullptr, 0);
+    }
+    p->topp    = op_cand("sample_topp");
+    p->minp    = op_cand("sample_minp");
+    p->typical = op_cand("sample_typical");
+    p->xtc     = op_cand("sample_xtc");
+    p->pick    = op_cand("sample_pick");
+
+    /* Every candidate producer and consumer must participate in liveness. Declaring only a later
+     * stage's read would make the planes live at that op alone, excluding top-k's write and every
+     * intervening cut and pick. The uploaded planes remain PERSIST. */
+    const rad_buf cand[] = {p->cand_i, p->cand_v};
+    RAD_TRY(rad_op_writes(b, p->topk, cand, 2));
+    for (rad_op op : {p->topp, p->minp, p->typical, p->xtc}) {
+        RAD_TRY(rad_op_reads(b, op, cand, 2));
+        RAD_TRY(rad_op_writes(b, op, cand, 2));
+    }
+    RAD_TRY(rad_op_reads(b, p->pick, cand, 2));
+
+    if (vocab_parallel()) {
+        RadParam ag[4] = {
+            RadParam{ "world_size", RAD_P_INT, (long long)cfg_.world_size, 0, nullptr },
+            RadParam{ "numel", RAD_P_INT, (long long)(rows * n_cand * 2), 0, nullptr },
+            RadParam{ "dtype", RAD_P_STR, 0, 0, "f32" },
+            /* Row-interleaved, so each position's pairs from every rank are adjacent. */
+            RadParam{ "row", RAD_P_INT, (long long)(n_cand * 2), 0, nullptr },
+        };
+        p->allgather = rad_decl_op(b, "all_gather", ag, 4, nullptr, 0);
+        p->merge     = op_cand("sample_merge_topk");
+        RAD_TRY(rad_op_writes(b, p->merge, cand, 2));
+    }
+
+    /* WHAT THE NARROW PLAN MUST RESOLVE: exactly what the wide one did.
+     *
+     * The wide plan is allowed to leave a stage unresolved -- a deployment that never sends
+     * `typical_p` has no use for a typical kernel, and check_request turns that into a named
+     * refusal if a request ever asks. A plan that is only ever chosen for batches the wide plan
+     * would also have served has to meet the same bar and no higher: an op the wide plan resolved
+     * and this one did not would be a stage a step silently ran without, which is the failure the
+     * whole named-refusal design exists to prevent. A plan that resolves MORE than the wide one is
+     * fine and is simply never issued.
+     *
+     * This runs at declare, where a broken initialization belongs. It is not a reason to fall back
+     * to the wide plan: falling back is for request data the narrow width cannot serve, and a
+     * kernel that will not take `n_cand = 64` is a fact about the build that the flag cannot be
+     * quietly reconciled with. Checked only when this plan is the narrow one, because the wide
+     * plan is the reference it is checked against. */
+    if (p != &wide_) {
+        struct Stage { rad_op mine; rad_op theirs; const char* name; };
+        const Stage stages[] = {
+            { p->topk,      wide_.topk,      "sample_topk"       },
+            { p->topp,      wide_.topp,      "sample_topp"       },
+            { p->minp,      wide_.minp,      "sample_minp"       },
+            { p->typical,   wide_.typical,   "sample_typical"    },
+            { p->xtc,       wide_.xtc,       "sample_xtc"        },
+            { p->pick,      wide_.pick,      "sample_pick"       },
+            { p->allgather, wide_.allgather, "all_gather"        },
+            { p->merge,     wide_.merge,     "sample_merge_topk" },
+        };
+        for (const Stage& st : stages) {
+            if (st.theirs && !st.mine) {
+                RAD_ERR("sampler: RADIANCE_SAMPLE_CANDIDATES64 declared a %lld-wide plan whose "
+                        "'%s' did not resolve, while the %lld-wide plan's did. The flag is "
+                        "fail-closed: a plan that would silently run a step without a stage the "
+                        "wide plan applies is not an acceptable fallback",
+                        (long long)n_cand, st.name, (long long)wide_.n_cand);
+                return RAD_E_NOKERNEL;
+            }
+        }
+    }
     return RAD_OK;
 }
 
@@ -432,7 +625,13 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
         return RAD_E_INVAL;
     }
 
-    /* An unresolved sampler is a named refusal, never a silent skip. */
+    /* An unresolved sampler is a named refusal, never a silent skip.
+     *
+     * ADMISSION CHECKS THE WIDE PLAN, and that is the whole point of the narrow one being a second
+     * plan rather than a smaller bound: every request a deployment admits has to be servable, and
+     * the wide plan is the one that serves all of them. The narrow plan only ever carries batches
+     * whose rows are already inside its width, so a resolved wide stage is necessary and
+     * sufficient for admission. */
     auto need = [&](bool wanted, rad_op h, const char* n) -> const char* {
         return (wanted && !h) ? n : nullptr;
     };
@@ -446,14 +645,14 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     if (!missing) missing = need(lp, op_logprobs_, "sample_logprobs");
     if (!missing) missing = need(sp.greedy() && !greedy_chain, op_argmax_, "sample_argmax");
     if (!missing) missing = need(!sp.greedy() || greedy_chain, op_temp_, "sample_temp");
-    if (!missing) missing = need(!sp.greedy() || greedy_chain, op_pick_, "sample_pick");
+    if (!missing) missing = need(!sp.greedy() || greedy_chain, wide_.pick, "sample_pick");
     /* Every chain row needs top-k, whatever its top_k: it writes the candidate set the later
      * stages read. top_k = 0 means the whole candidate width (max_candidates). */
-    if (!missing) missing = need(!sp.greedy() || greedy_chain, op_topk_, "sample_topk");
-    if (!missing) missing = need(sp.top_p < 1.0f, op_topp_, "sample_topp");
-    if (!missing) missing = need(sp.min_p > 0.0f, op_minp_, "sample_minp");
-    if (!missing) missing = need(sp.typical_p < 1.0f, op_typical_, "sample_typical");
-    if (!missing) missing = need(sp.xtc_probability > 0.0f, op_xtc_, "sample_xtc");
+    if (!missing) missing = need(!sp.greedy() || greedy_chain, wide_.topk, "sample_topk");
+    if (!missing) missing = need(sp.top_p < 1.0f, wide_.topp, "sample_topp");
+    if (!missing) missing = need(sp.min_p > 0.0f, wide_.minp, "sample_minp");
+    if (!missing) missing = need(sp.typical_p < 1.0f, wide_.typical, "sample_typical");
+    if (!missing) missing = need(sp.xtc_probability > 0.0f, wide_.xtc, "sample_xtc");
     if (!missing) missing = need(!sp.greedy() && sp.temp_last, op_temp_late_,
                                  "sample_temp (over the candidates, for temperature last)");
     if (!missing) missing = need(dry_on(sp), op_dry_, "sample_dry");
@@ -834,6 +1033,12 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
         if (walk) RAD_TRY(gr->rollback());
     }
 
+    /* WHICH CANDIDATE PLAN THIS STEP RUNS ON. Decided from the staged rows and not from the
+     * requests, because the staged rows are what `run` will issue against: a row's own top_k has
+     * already been rewritten by the greedy rule above, and it is that rewritten value the kernel
+     * reads. A batch with no row to serve keeps `wide_`. */
+    plan_ = narrow_suits(params_stage_, n_seq_) ? &narrow_ : &wide_;
+
     /* Whole build time, which is what the rank threads wait for at the barrier. */
     if ((int)log_level() >= (int)Log::Debug) {
         build_us_ += std::chrono::duration<double, std::micro>(
@@ -882,17 +1087,23 @@ int Sampler::build_greedy(int64_t n) {
     any_brk_ = false;
     any_late_ = false;
     cur_stage_ = greedy_stage_;
-    if (greedy_ready_) return RAD_OK;
-    for (int64_t i = 0; i < cap; ++i) {
-        DeviceSampleParams& p = greedy_stage_[i];
-        std::memset(&p, 0, sizeof p);
-        p.top_k    = 1;
-        p.mask_row = -1;
-        /* Over a split vocabulary a greedy row is an unflagged top-1 chain row (see
-         * build_step). */
-        p.flags    = vocab_parallel() ? 0 : RAD_SP_GREEDY;
+    if (!greedy_ready_) {
+        for (int64_t i = 0; i < cap; ++i) {
+            DeviceSampleParams& p = greedy_stage_[i];
+            std::memset(&p, 0, sizeof p);
+            p.top_k    = 1;
+            p.mask_row = -1;
+            /* Over a split vocabulary a greedy row is an unflagged top-1 chain row (see
+             * build_step). */
+            p.flags    = vocab_parallel() ? 0 : RAD_SP_GREEDY;
+        }
+        greedy_ready_ = true;
     }
-    greedy_ready_ = true;
+    /* A greedy pass is staged at top_k = 1 for every row. Over a split vocabulary those rows carry
+     * no greedy flag and take the top-k chain, so the narrow plan serves them exactly; over an
+     * unsplit vocabulary every row is an ARGMAX row and touches no candidate plane at all, so either
+     * plan is correct and `wide_` is kept -- a draft pass is not where candidate bytes matter. */
+    plan_ = (vocab_parallel() && narrow_suits(greedy_stage_, n)) ? &narrow_ : &wide_;
     return RAD_OK;
 }
 
@@ -957,8 +1168,8 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadOperand o_hist = opd_rows(buf_hist_, n_seq_);
     const RadOperand o_brk = opd_rows(buf_brk_, n_seq_);
     const RadOperand o_mask = opd_rows(buf_mask_, n_seq_);
-    const RadOperand o_ci = opd_rows(buf_cand_i_, n_seq_);
-    const RadOperand o_cv = opd_rows(buf_cand_v_, n_seq_);
+    const RadOperand o_ci = opd_rows(plan_->cand_i, n_seq_);
+    const RadOperand o_cv = opd_rows(plan_->cand_v, n_seq_);
     const RadOperand o_tok = opd_rows(out_tokens, n_seq_);
 
     auto issue = [&](rad_op op, std::initializer_list<RadOperand> ops) -> int {
@@ -1009,24 +1220,24 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (vocab_parallel()) {
         /* The fifth operand is the pair plane (global ids), which is what is gathered.
          * cand_idx/cand_val come back local and the merge overwrites both. */
-        const RadOperand o_p = opd_rows(buf_pairs_, n_seq_);
-        const RadOperand o_g = opd_rows(buf_gather_, n_seq_);
-        RAD_TRY(issue(op_topk_,      { o_logits, o_params, o_ci, o_cv, o_p }));
-        RAD_TRY(issue(op_allgather_, { o_p, o_g }));
-        RAD_TRY(issue(op_merge_,     { o_g, o_params, o_ci, o_cv }));
+        const RadOperand o_p = opd_rows(plan_->pairs, n_seq_);
+        const RadOperand o_g = opd_rows(plan_->gather, n_seq_);
+        RAD_TRY(issue(plan_->topk,      { o_logits, o_params, o_ci, o_cv, o_p }));
+        RAD_TRY(issue(plan_->allgather, { o_p, o_g }));
+        RAD_TRY(issue(plan_->merge,     { o_g, o_params, o_ci, o_cv }));
     } else {
         /* No pair plane; passed as absent because the schema has five operands. */
-        RAD_TRY(issue(op_topk_, { o_logits, o_params, o_ci, o_cv, opd_none() }));
+        RAD_TRY(issue(plan_->topk, { o_logits, o_params, o_ci, o_cv, opd_none() }));
     }
 
-    if (any_topp) RAD_TRY(issue(op_topp_,    { o_ci, o_cv, o_params }));
-    if (any_minp) RAD_TRY(issue(op_minp_,    { o_ci, o_cv, o_params }));
-    if (any_typ)  RAD_TRY(issue(op_typical_, { o_ci, o_cv, o_params }));
-    if (any_xtc)  RAD_TRY(issue(op_xtc_,     { o_ci, o_cv, o_params }));
+    if (any_topp) RAD_TRY(issue(plan_->topp,    { o_ci, o_cv, o_params }));
+    if (any_minp) RAD_TRY(issue(plan_->minp,    { o_ci, o_cv, o_params }));
+    if (any_typ)  RAD_TRY(issue(plan_->typical, { o_ci, o_cv, o_params }));
+    if (any_xtc)  RAD_TRY(issue(plan_->xtc,     { o_ci, o_cv, o_params }));
     if (late)
         RAD_TRY(issue(op_temp_late_, { o_cv, opd_rows(buf_params_late_, n_seq_) }));
 
-    RAD_TRY(issue(op_pick_, { o_ci, o_cv, o_params, o_tok }));
+    RAD_TRY(issue(plan_->pick, { o_ci, o_cv, o_params, o_tok }));
 
     /* Copy the logprobs rows to the host behind the pick, on rank 0 only (collect_step asks
      * it): the summary and the candidate planes, which logprobs_for reads when the summary lacks
@@ -1035,10 +1246,12 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         lp_lo_ = lp_rows_.front().row;
         lp_hi_ = lp_rows_.back().row + 1;
         const int64_t w = lp_width() * (vocab_parallel() ? cfg_.world_size : 1);
-        const int64_t nc = cfg_.max_candidates, n = lp_hi_ - lp_lo_;
+        /* THE PLAN'S OWN WIDTH, read back with the plan that produced it: a narrow step's
+         * candidate plane is 64 wide, and its rows are [lp_lo_, lp_hi_) of THAT plane. */
+        const int64_t nc = plan_->n_cand, n = lp_hi_ - lp_lo_;
         const char* sp = (const char*)rad_buf_ptr(c, vocab_parallel() ? buf_lp_g_ : buf_lp_);
-        const char* ci = (const char*)rad_buf_ptr(c, buf_cand_i_);
-        const char* cv = (const char*)rad_buf_ptr(c, buf_cand_v_);
+        const char* ci = (const char*)rad_buf_ptr(c, plan_->cand_i);
+        const char* cv = (const char*)rad_buf_ptr(c, plan_->cand_v);
         if (!sp || !ci || !cv) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(lp_host_ + lp_lo_ * w, sp + lp_lo_ * w * 4, n * w * 4, s));
         RAD_TRY(rad_memcpy_async(lp_ci_host_ + lp_lo_ * nc, ci + lp_lo_ * nc * 4, n * nc * 4, s));
