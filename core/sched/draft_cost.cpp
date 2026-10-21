@@ -1,14 +1,14 @@
 /* draft_cost.cpp -- strand A: the profile reader and the cost table. See draft_cost.h.
  *
  * The reader validates every field it will later rely on and refuses a file it cannot interpret
- * instead of guessing: the format id, the full fingerprint, the execution, and each bucket's
- * shape, extent and timing. Nothing here runs on the step path.
+ * instead of guessing: the format id, the full fingerprint, the execution, and each bucket's two
+ * distributions, executed extent, origin mix and timing. Nothing here runs on the step path.
  *
- * The table's lookup is a linear scan over the reserved buckets. A key is the verify shape plus the
- * executed draft extent: the same window at another pipeline depth is another bucket, because
- * total_ms is an amortised batch time at one depth. A shape key is compared cheap fields first
- * (depths, counts, classes), then N_j; the scan is over a few hundred buckets, not thousands, and
- * it runs once per priced candidate plan, not per draft token.
+ * The table's lookup is a linear scan over the reserved buckets. A key is the verify shape plus
+ * the executed draft extent; the query's extent is the plan's own distribution, which the shape
+ * carries. A shape key is compared cheap fields first (depths, counts, classes), then the two N_j
+ * arrays; the scan is over a few hundred buckets, not thousands, and it runs once per priced
+ * candidate plan, not per draft token.
  */
 #include "draft_cost.h"
 
@@ -68,64 +68,105 @@ bool get_enum(const json& j, const char* key, const char* const* names, int n, i
     return false;
 }
 
-/* Cheap half of the shape key; the N_j comparison only runs when this matches. */
+/* Reads an N_j array of exactly `len` entries into dst[0..len-1], checking each against `cap`. */
+bool get_rows(const json& j, const char* key, int32_t len, int32_t cap, int32_t* dst) {
+    const auto it = j.find(key);
+    if (it == j.end() || !it->is_array() || (int32_t)it->size() != len) return false;
+    for (int32_t j2 = 0; j2 < len; ++j2) {
+        const json& r = (*it)[(size_t)j2];
+        if (!r.is_number_integer()) return false;
+        const int64_t v = r.get<int64_t>();
+        if (v < 0 || v > cap) return false;
+        dst[j2] = (int32_t)v;
+    }
+    return true;
+}
+
+/* Cheap half of the shape key; the N_j arrays are compared only when this matches. */
 bool shape_head_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.n_rows == b.n_rows && a.verify_k == b.verify_k &&
            a.verify_tokens == b.verify_tokens && a.ctx_class == b.ctx_class &&
            a.history_tokens == b.history_tokens && a.prefill_tokens == b.prefill_tokens &&
-           a.sampling == b.sampling && a.replay == b.replay;
+           a.sampling == b.sampling && a.replay == b.replay && a.drafter == b.drafter &&
+           a.pipeline_depth == b.pipeline_depth && a.draft_k == b.draft_k;
 }
 
-bool rows_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
+/* Both distributions are part of the key: the verify N_j and the draft N_j the plan asked for. */
+bool shape_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
+    if (!shape_head_same(a, b)) return false;
     for (int j = 0; j <= a.verify_k; ++j)
         if (a.rows[j] != b.rows[j]) return false;
+    for (int j = 0; j <= a.draft_k; ++j)
+        if (a.draft_rows[j] != b.draft_rows[j]) return false;
     return true;
 }
 
-bool shape_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
-    return shape_head_same(a, b) && rows_same(a, b);
-}
-
-/* Everything the shape has except the context class: the one documented interpolation step. The
- * N_j must match too -- the same depth with a different length distribution is another kernel. */
+/* Everything the shape has except the context class: the one documented interpolation step. Both
+ * distributions, the pipeline depth and the drafter must match -- the same depths with a
+ * different length distribution are another kernel. */
 bool shape_same_except_ctx(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     if (a.ctx_class == b.ctx_class) return false;
-    return a.n_rows == b.n_rows && a.verify_k == b.verify_k &&
-           a.verify_tokens == b.verify_tokens && a.history_tokens == b.history_tokens &&
-           a.prefill_tokens == b.prefill_tokens && a.sampling == b.sampling &&
-           a.replay == b.replay && rows_same(a, b);
+    DraftVerifyShape a2 = a, b2 = b;
+    a2.ctx_class = b2.ctx_class = 0;
+    return shape_same(a2, b2);
 }
 
-/* The shape's own invariants, for a shape that arrived in a query or a sample rather than through
- * the reader: rows[0] is unused, N_j never rises with the round, the deepest verified position has
- * at least one row, and verify_tokens is sum_i (1 + k_i) = n_rows + sum_j N_j. A shape that fails
- * these measures nothing and is not priced. Allocation-free (it runs on the step path). */
-bool shape_consistent(const DraftVerifyShape& s) {
-    if (s.verify_k < 0 || s.verify_k > RAD_SCHED_MAX_SPEC) return false;
-    if (s.n_rows < 0 || s.verify_tokens < 0) return false;
-    if (s.ctx_class < 0 || s.ctx_class >= RAD_DRAFT_CTX_CLASSES) return false;
-    if (s.history_tokens < 0 || s.prefill_tokens < 0) return false;
-    if (s.rows[0] != 0) return false;
-    int64_t implied = s.n_rows;
-    for (int32_t j = 1; j <= s.verify_k; ++j) {
-        if (s.rows[j] < 0 || s.rows[j] > s.n_rows) return false;
-        if (j < s.verify_k && s.rows[j] < s.rows[j + 1]) return false;
-        implied += s.rows[j];
+/* The executed extent a bucket was measured at. An unknown extent (-1) matches nothing. */
+bool extent_same(const DraftCostBucket& b, int32_t rounds, const int32_t* round_rows) {
+    if (b.rounds != rounds || b.rounds < 0) return false;
+    for (int j = 0; j <= rounds; ++j)
+        if (b.draft_round_rows[j] != round_rows[j]) return false;
+    return true;
+}
+
+/* An executed distribution that can have run: N_j never rises with the round, the deepest round
+ * drafted at least one row, nothing survives past it, and the total is exactly their sum. It says
+ * nothing about the verify window -- under pipeline_depth > 0 the two belong to different cycles. */
+bool executed_consistent(int32_t rounds, const int32_t* round_rows, int32_t total, int32_t cap) {
+    if (rounds < 0 || rounds > RAD_SCHED_MAX_SPEC || total < 0) return false;
+    int64_t sum = 0;
+    int32_t prev = cap;
+    for (int j = 1; j <= rounds; ++j) {
+        if (round_rows[j] < 0 || round_rows[j] > prev) return false;
+        prev = round_rows[j];
+        sum += round_rows[j];
     }
-    if (s.verify_k > 0 && s.rows[s.verify_k] == 0) return false;
-    return (int64_t)s.verify_tokens == implied;
+    if (rounds > 0 && prev == 0) return false;
+    if (rounds == 0 && round_rows[0] != 0) return false;
+    for (int j = rounds + 1; j <= RAD_SCHED_MAX_SPEC; ++j)
+        if (round_rows[j] != 0) return false;
+    return (int64_t)total == sum;
 }
 
-/* The extent a bucket key is measured at. A bucket with an unknown extent (-1) matches nothing. */
-bool extent_same(const DraftCostBucket& b, int32_t rounds, int32_t draft_rows) {
-    return b.rounds == rounds && b.draft_rows == draft_rows;
+/* What actually ran cannot exceed what the plan asked for, round by round. */
+bool executed_within_plan(const DraftCostSample& s, const DraftPlan& p) {
+    if (s.rounds > p.max_k || !p.rows) return false;
+    for (int j = 1; j <= s.rounds; ++j)
+        if (s.draft_round_rows[j] > p.rows[j]) return false;
+    return true;
 }
 
-/* An executed extent that can have run: every executed round drafts at least one row, and no round
- * means no row. It says nothing about the verify window -- under issue_ahead the two differ. */
-bool extent_consistent(int32_t rounds, int32_t draft_rows) {
-    if (rounds < 0 || rounds > RAD_SCHED_MAX_SPEC || draft_rows < 0) return false;
-    return rounds == 0 ? draft_rows == 0 : draft_rows >= rounds;
+/* The origin mix the file records must fit the drafter the same bucket names: the head and the
+ * lookup fallback cannot stand in for one another, and a row that produced nothing is None. */
+bool origins_fit_drafter(const DraftOrigin* origins, int32_t n_rows, DraftDrafter drafter) {
+    for (int32_t i = 0; i < n_rows; ++i) {
+        switch (origins[i]) {
+            case DraftOrigin::None:   break;
+            case DraftOrigin::Head:   if (drafter != DraftDrafter::Serial) return false; break;
+            case DraftOrigin::Lookup: if (drafter != DraftDrafter::Ngram) return false; break;
+        }
+    }
+    return true;
+}
+
+/* At pipeline_depth 0 the plan's draft distribution and the verify window are one execution, so a
+ * file that lets them disagree was not produced by the measurement. */
+bool distributions_agree(const DraftVerifyShape& s) {
+    if (s.pipeline_depth != 0) return true;
+    if (s.draft_k != s.verify_k) return false;
+    for (int j = 0; j <= s.verify_k; ++j)
+        if (s.draft_rows[j] != s.rows[j]) return false;
+    return true;
 }
 
 /* Whether a bucket may price normal operation at all: it was measured cleanly. */
@@ -137,15 +178,12 @@ bool bucket_usable(const DraftCostBucket& b) {
  * an ahead sample belongs to the measured bucket, it only stays visible through n_ahead. */
 uint16_t bucket_class(uint16_t flags) { return (uint16_t)(flags & kDisturbing); }
 
-/* The conservative fallback may only borrow from an anchor of the same context class, sampling
- * and replay, and the same history/prefill presence: K0 with the drafter loaded carries history,
- * K0 in a process without one does not, and their times are different measurements. The history
- * presence is a stopgap for the drafter-loaded/k_ceiling state, which the shared fingerprint does
- * not carry yet (interface request) -- it guards a bound, it does not claim that axis. */
+/* The conservative fallback may only borrow from an anchor of the same context class, sampling,
+ * replay, loaded drafter and pipeline depth: a bound scaled across a different drafter process or
+ * another overlap structure would be a bound on another measurement. */
 bool anchor_class_matches(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.ctx_class == b.ctx_class && a.sampling == b.sampling && a.replay == b.replay &&
-           (a.history_tokens > 0) == (b.history_tokens > 0) &&
-           (a.prefill_tokens > 0) == (b.prefill_tokens > 0);
+           a.drafter == b.drafter && a.pipeline_depth == b.pipeline_depth;
 }
 
 bool finite(double x) { return std::isfinite(x); }
@@ -180,14 +218,20 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.verify_k: missing or outside 0.." +
                                             std::to_string(RAD_SCHED_MAX_SPEC));
     s->verify_k = verify_k;
-    if (!get_int(sh, "n_rows", &s->n_rows) || s->n_rows < 0)
-        return refuse(err, RAD_E_INVAL, where + "shape.n_rows: missing or negative");
+    if (!get_int(sh, "n_rows", &s->n_rows) || s->n_rows < 0 || s->n_rows > RAD_SCHED_MAX_SPEC)
+        return refuse(err, RAD_E_INVAL, where + "shape.n_rows: missing or outside 0.." +
+                                            std::to_string(RAD_SCHED_MAX_SPEC));
     if (!get_int(sh, "verify_tokens", &s->verify_tokens) || s->verify_tokens < 0)
         return refuse(err, RAD_E_INVAL, where + "shape.verify_tokens: missing or negative");
     if (!get_int(sh, "history_tokens", &s->history_tokens) || s->history_tokens < 0)
         return refuse(err, RAD_E_INVAL, where + "shape.history_tokens: missing or negative");
     if (!get_int(sh, "prefill_tokens", &s->prefill_tokens) || s->prefill_tokens < 0)
         return refuse(err, RAD_E_INVAL, where + "shape.prefill_tokens: missing or negative");
+    if (!get_int(sh, "pipeline_depth", &s->pipeline_depth) || s->pipeline_depth < 0)
+        return refuse(err, RAD_E_INVAL, where + "shape.pipeline_depth: missing or negative");
+    if (!get_int(sh, "draft_k", &s->draft_k) || s->draft_k < 0 || s->draft_k > RAD_SCHED_MAX_SPEC)
+        return refuse(err, RAD_E_INVAL, where + "shape.draft_k: missing or outside 0.." +
+                                            std::to_string(RAD_SCHED_MAX_SPEC));
 
     static const char* const kSampling[] = { "greedy", "sampled" };
     int sampling = 0;
@@ -201,39 +245,47 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.replay: missing or unknown");
     s->replay = (DraftReplay)replay;
 
-    const auto rows_it = sh.find("rows");
-    if (rows_it == sh.end() || !rows_it->is_array() || (int32_t)rows_it->size() != verify_k + 1)
-        return refuse(err, RAD_E_INVAL, where + "shape.rows: missing or not exactly verify_k + 1 long");
+    static const char* const kDrafter[] = { "none", "serial", "ngram" };
+    int drafter = 0;
+    if (!get_enum(sh, "drafter", kDrafter, 3, &drafter))
+        return refuse(err, RAD_E_INVAL, where + "shape.drafter: missing or unknown");
+    s->drafter = (DraftDrafter)drafter;
+
     s->ctx_class = ctx;
-    for (int32_t j = 0; j <= verify_k; ++j) {
-        const json& r = (*rows_it)[(size_t)j];
-        if (!r.is_number_integer())
-            return refuse(err, RAD_E_INVAL, where + "shape.rows[" + std::to_string(j) + "]: not an integer");
-        const int64_t v = r.get<int64_t>();
-        if (v < 0 || v > s->n_rows)
-            return refuse(err, RAD_E_INVAL, where + "shape.rows[" + std::to_string(j) +
-                                                "]: outside 0..n_rows");
-        s->rows[j] = (int32_t)v;
+    if (!get_rows(sh, "rows", verify_k + 1, s->n_rows, s->rows))
+        return refuse(err, RAD_E_INVAL, where + "shape.rows: missing, not exactly verify_k + 1 "
+                                            "long, or outside 0..n_rows");
+    if (!get_rows(sh, "draft_rows", s->draft_k + 1, s->n_rows, s->draft_rows))
+        return refuse(err, RAD_E_INVAL, where + "shape.draft_rows: missing, not exactly draft_k + 1 "
+                                            "long, or outside 0..n_rows");
+    /* draft_shape_priceable covers the monotonicity, the token sum, the deepest-round rule and the
+     * stale tails of both arrays. */
+    if (!draft_shape_priceable(*s))
+        return refuse(err, RAD_E_INVAL, where + "shape: not a priceable key (both distributions "
+                                            "must be monotone and complete, verify_tokens must be "
+                                            "n_rows + sum(rows))");
+    if (!distributions_agree(*s))
+        return refuse(err, RAD_E_INVAL, where + "shape.draft_rows: disagrees with shape.rows at "
+                                            "pipeline_depth 0, where they are one execution");
+
+    const auto orig = sh.find("origins");
+    if (orig == sh.end() || !orig->is_array() || (int32_t)orig->size() != s->n_rows)
+        return refuse(err, RAD_E_INVAL, where + "shape.origins: missing or not exactly n_rows long");
+    static const char* const kOrigin[] = { "none", "head", "lookup" };
+    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
+    for (int32_t i = 0; i < s->n_rows; ++i) {
+        const json& o = (*orig)[(size_t)i];
+        if (!o.is_string()) return refuse(err, RAD_E_INVAL, where + "shape.origins: not a string");
+        const std::string name = o.get<std::string>();
+        int v = -1;
+        for (int k = 0; k < 3; ++k)
+            if (name == kOrigin[k]) { v = k; break; }
+        if (v < 0) return refuse(err, RAD_E_INVAL, where + "shape.origins: unknown origin \"" + name + "\"");
+        origins[i] = (DraftOrigin)v;
     }
-    if (s->rows[0] != 0)
-        return refuse(err, RAD_E_INVAL, where + "shape.rows[0]: must be 0 (index 0 is unused)");
-    for (int32_t j = 1; j < verify_k; ++j)
-        if (s->rows[j] < s->rows[j + 1])
-            return refuse(err, RAD_E_INVAL, where + "shape.rows: must not rise with the round");
-    /* A window whose deepest position verified no row is not that deep; verify_k would be lower. */
-    if (verify_k > 0 && s->rows[verify_k] == 0)
-        return refuse(err, RAD_E_INVAL, where + "shape.rows[" + std::to_string(verify_k) +
-                                            "]: the deepest verified position has no rows");
-    /* verify_tokens is sum_i (1 + k_i) and sum_i k_i is sum_j N_j, so the two counts must agree;
-     * a file where they do not was not produced by the measurement and is refused. */
-    int64_t implied = s->n_rows;
-    for (int32_t j = 1; j <= verify_k; ++j) implied += s->rows[j];
-    if ((int64_t)s->verify_tokens != implied)
-        return refuse(err, RAD_E_INVAL, where + "shape.verify_tokens: is " +
-                                            std::to_string(s->verify_tokens) + ", n_rows + sum(rows) is " +
-                                            std::to_string(implied));
-    if (!shape_consistent(*s))
-        return refuse(err, RAD_E_INVAL, where + "shape: inconsistent");
+    if (!origins_fit_drafter(origins, s->n_rows, s->drafter))
+        return refuse(err, RAD_E_INVAL, where + "shape.origins: does not fit drafter \"" +
+                                            kDrafter[drafter] + "\"");
     return RAD_OK;
 }
 
@@ -271,6 +323,7 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
 
     int rc = parse_shape(b, idx, &out->shape, err);
     if (rc < 0) return rc;
+
     rc = parse_flags(b, idx, &out->flags, err);
     if (rc < 0) return rc;
 
@@ -280,10 +333,26 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
     if (!get_int(*ex, "rounds", &out->rounds) || out->rounds < 0 || out->rounds > RAD_SCHED_MAX_SPEC)
         return refuse(err, RAD_E_INVAL, where + "extent.rounds: missing or outside 0.." +
                                             std::to_string(RAD_SCHED_MAX_SPEC));
-    if (!get_int(*ex, "draft_rows", &out->draft_rows) || out->draft_rows < 0)
-        return refuse(err, RAD_E_INVAL, where + "extent.draft_rows: missing or negative");
-    if (!extent_consistent(out->rounds, out->draft_rows))
-        return refuse(err, RAD_E_INVAL, where + "extent: no executed round drafts no row");
+    if (!get_int(*ex, "draft_rows_total", &out->draft_rows_total))
+        return refuse(err, RAD_E_INVAL, where + "extent.draft_rows_total: missing");
+    if (!get_rows(*ex, "draft_round_rows", out->rounds + 1, out->shape.n_rows,
+                  out->draft_round_rows))
+        return refuse(err, RAD_E_INVAL, where + "extent.draft_round_rows: missing, not exactly "
+                                            "rounds + 1 long, or outside 0..n_rows");
+    if (!executed_consistent(out->rounds, out->draft_round_rows, out->draft_rows_total,
+                             out->shape.n_rows))
+        return refuse(err, RAD_E_INVAL, where + "extent: the executed distribution cannot have "
+                                            "run (monotone, deepest round non-empty, total is "
+                                            "the sum of the rounds)");
+    /* What ran cannot exceed what the plan asked for: not more rounds than planned, and not more
+     * rows in any round. */
+    if (out->rounds > out->shape.draft_k)
+        return refuse(err, RAD_E_INVAL, where + "extent.rounds: exceeds the planned distribution");
+    for (int j = 1; j <= out->rounds; ++j)
+        if (out->draft_round_rows[j] > out->shape.draft_rows[j])
+            return refuse(err, RAD_E_INVAL, where + "extent.draft_round_rows[" +
+                                                std::to_string(j) + "]: exceeds the planned "
+                                                "distribution");
 
     const auto tm = b.find("time_ms");
     if (tm == b.end() || !tm->is_object())
@@ -338,12 +407,15 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
     const json j = json::parse(text, nullptr, false);
     if (j.is_discarded()) return refuse(err, RAD_E_INVAL, "profile: not valid JSON");
 
+    const std::string expected = "rad-draft-profile/" + std::to_string(RAD_DRAFT_PROFILE_VERSION);
     std::string format;
     if (!get_string(j, "format", &format))
         return refuse(err, RAD_E_INVAL, "format: missing");
-    if (format != "rad-draft-profile/1")
+    if (format != expected)
         return refuse(err, RAD_E_UNSUPPORTED,
-                      "format: \"" + format + "\" is not rad-draft-profile/1");
+                      "format: \"" + format + "\" is not " + expected +
+                          " (version 1 has no draft distribution, pipeline depth or origin mix; "
+                          "a profile is regenerated, not rescaled)");
 
     const auto fp = j.find("fingerprint");
     if (fp == j.end()) return refuse(err, RAD_E_INVAL, "fingerprint: missing");
@@ -370,7 +442,7 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
         if (rc < 0) return rc;
         for (const DraftCostBucket& prev : out->buckets)
             if (bucket_class(prev.flags) == bucket_class(b.flags) && shape_same(prev.shape, b.shape) &&
-                extent_same(prev, b.rounds, b.draft_rows))
+                extent_same(prev, b.rounds, b.draft_round_rows))
                 return refuse(err, RAD_E_INVAL,
                               "buckets[" + std::to_string(i) + "]: duplicates an earlier bucket");
         out->buckets.push_back(b);
@@ -428,17 +500,17 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
 int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) const {
     if (!out) return RAD_E_INVAL;
     *out = DraftCostEstimate{};
-    if (!shape_consistent(s)) return RAD_E_INVAL;
+    if (!draft_shape_priceable(s)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no profile: invalid estimate, the caller's named baseline */
 
-    /* The extent this shape would be executed at: its own draft window. A bucket measured at
-     * another extent ran another pipeline depth, so it does not price this one. */
-    const int32_t rounds = s.verify_k;
-    const int32_t draft_rows = s.verify_tokens - s.n_rows;
+    /* The extent this shape would be executed at is its own draft distribution: a bucket measured
+     * with another distribution ran another kernel, whatever its round count and total.
+     * draft_shape_priceable already guarantees that distribution is complete and monotone. */
 
     /* 1. The shape itself. */
     for (const DraftCostBucket& b : buckets_) {
-        if (!bucket_usable(b) || !shape_same(b.shape, s) || !extent_same(b, rounds, draft_rows))
+        if (!bucket_usable(b) || !shape_same(b.shape, s) ||
+            !extent_same(b, s.draft_k, s.draft_rows))
             continue;
         out->ms = b.mean_ms;
         out->unc_ms = b.unc_ms;
@@ -449,12 +521,13 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 2. The one documented interpolation step: the neighbouring context class, same shape
-     * otherwise -- N_j included, and the same extent. The result is a real measurement; only its
-     * uncertainty is widened, and ties go to the larger class (more context, higher cost). */
+     * otherwise -- both distributions, the pipeline depth and the drafter included. The result is
+     * a real measurement; only its uncertainty is widened, and ties go to the larger class (more
+     * context, higher cost). */
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
-        if (!extent_same(b, rounds, draft_rows)) continue;
+    if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (std::abs(b.shape.ctx_class - s.ctx_class) != 1) continue;
         if (!near || b.shape.ctx_class > near->shape.ctx_class) near = &b;
     }
@@ -477,7 +550,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
         if (b.shape.verify_tokens <= 0) continue;
-        const int32_t rank = (extent_same(b, rounds, draft_rows) ? 0 : 1000) +
+        const int32_t rank = (extent_same(b, s.draft_k, s.draft_rows) ? 0 : 1000) +
                              std::abs(b.shape.verify_k - s.verify_k);
         if (rank < anchor_rank) {
             anchor = &b;
@@ -502,23 +575,27 @@ int DraftCostTable::estimate_thunk(void* ctx, const DraftVerifyShape& shape, Dra
 }
 
 DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uint16_t flags,
-                                              int32_t rounds, int32_t draft_rows) {
+                                              int32_t rounds, const int32_t* round_rows) {
     for (DraftCostBucket& b : buckets_)
         if (bucket_class(b.flags) == bucket_class(flags) && shape_same(b.shape, shape) &&
-            extent_same(b, rounds, draft_rows))
+            extent_same(b, rounds, round_rows))
             return &b;
     if ((int32_t)buckets_.size() >= capacity_) { ++dropped_; return nullptr; }
     DraftCostBucket b;
     b.shape = shape;
     b.flags = flags;
     b.rounds = rounds;
-    b.draft_rows = draft_rows;
+    b.draft_rows_total = 0;
+    for (int j = 0; j <= rounds; ++j) {
+        b.draft_round_rows[j] = round_rows[j];
+        b.draft_rows_total += round_rows[j];
+    }
     buckets_.push_back(b);
     return &buckets_.back();
 }
 
 void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
-    DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_rows);
+    DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_round_rows);
     if (!b) return;
     const double x = s.total_ms;
     if (b->n == 0) {
@@ -540,30 +617,30 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     if (!observation.complete) return RAD_E_INVAL;
 
     /* Identity first: an unattributed sample (0 = unattributed, draft_types.h) cannot be traced to
-     * a cycle or a policy, so it teaches nothing and must not be folded into a bucket. A sample
-     * whose identity disagrees with the observation's is a wiring error, not a measurement. */
-    if (observation.cycle_id == 0 || sample.cycle_id == 0) return RAD_E_INVAL;
-    if (observation.cycle_id != sample.cycle_id) return RAD_E_INVAL;
-    if (observation.policy_version == 0 || sample.policy_version == 0) return RAD_E_INVAL;
-    if (observation.policy_version != sample.policy_version) return RAD_E_INVAL;
-
-    /* The sample describes the window the paired step verified, so it must be the window the plan
-     * named. Under issue_ahead verify_k != max_k: a shape filled from the current plan would be
-     * self-consistent but false, and is refused here rather than learned. */
+     * a cycle or a policy, so it teaches nothing and must not be folded into a bucket. The
+     * observation must identify the plan it names, and the sample must be that cycle's -- the
+     * shared predicates, not a second policy here. */
     const DraftPlan* plan = observation.plan;
     if (!plan) return RAD_E_INVAL;
-    if (plan->cycle_id != observation.cycle_id) return RAD_E_INVAL;
-    if (plan->policy_version != observation.policy_version) return RAD_E_INVAL;
-    if (plan->verify_k != sample.shape.verify_k) return RAD_E_INVAL;
-    if (plan->n_seq != sample.shape.n_rows) return RAD_E_INVAL;
-    if (sample.rounds > plan->max_k) return RAD_E_INVAL;
+    if (!draft_plan_identifies(*plan, observation)) return RAD_E_INVAL;
+    if (sample.cycle_id == 0 || sample.cycle_id != observation.cycle_id) return RAD_E_INVAL;
+    if (sample.policy_version != observation.policy_version) return RAD_E_INVAL;
+
+    /* The shape must be the plan's own: both distributions, the depth and the row count. Under
+     * pipeline_depth > 0 the verify window belongs to the paired step, so a shape filled from the
+     * current plan would be self-consistent and false. A shape carrying an unknown dimension is
+     * not priced as zero, and one that could not be measured is not learned from. */
+    if (!draft_shape_matches_plan(sample.shape, *plan)) return RAD_E_INVAL;
+    if (!draft_shape_priceable(sample.shape)) return RAD_E_INVAL;
+    if (!executed_consistent(sample.rounds, sample.draft_round_rows, sample.draft_rows_total,
+                             sample.shape.n_rows))
+        return RAD_E_INVAL;
+    if (!executed_within_plan(sample, *plan)) return RAD_E_INVAL;
 
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
-    if (!shape_consistent(sample.shape)) return RAD_E_INVAL;
-    if (!extent_consistent(sample.rounds, sample.draft_rows)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no usable profile: nothing to learn into */
 
-    if (draft_sample_attributable(sample)) {
+    if (draft_sample_attributable(observation, sample)) {
         record(sample, (uint16_t)(sample.flags & kDraftSampleAhead));
         return RAD_OK;
     }

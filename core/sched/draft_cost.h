@@ -2,23 +2,26 @@
  *
  * The policy (C) compares candidate plans by their expected batch time, so it asks the
  * DraftCostModel seam for a price in milliseconds for a DraftVerifyShape. This is that price: a
- * versioned profile of measured buckets (`rad-draft-profile/1`, docs/ADAPTIVE-MTP.md), keyed by
- * the whole shape -- verify tokens and N_j, context class, history and prefill tokens, sampling
- * and replay state -- never by (rows, max K) alone.
+ * versioned profile of measured buckets (`rad-draft-profile/2`, docs/ADAPTIVE-MTP.md), keyed by
+ * the whole shape -- verify tokens and N_j, the plan's own draft distribution, the pipeline
+ * depth, context class, history and prefill tokens, sampling, replay state and the loaded
+ * drafter -- never by (rows, max K) alone.
  *
- * `shape` is the verify window of the associated cycle, not its draft window: verify_k is the
- * deepest position the paired step verified and rows[j] is the N_j of that verify step. Under
- * issue_ahead the cycle drafts a different window than it verifies, so the executed draft extent
- * (rounds, draft_rows) is a second part of the key: the same verify shape at another pipeline
- * depth is a different bucket, never averaged in.
+ * Two distributions, deliberately separate. `shape.rows[]` is the verify window of the associated
+ * cycle; `shape.draft_rows[]` is the distribution the plan asked its draft rounds to run. At
+ * pipeline_depth 0 they are the same execution, and the reader requires them to agree; above 0 the
+ * paired step verifies a window the previous cycle drafted, so they belong to different cycles and
+ * are keyed separately. `rounds` plus one total cannot tell two shrinking distributions apart, so
+ * the executed distribution travels per round: `shape.draft_rows[]` is what the plan asked for,
+ * `DraftCostBucket::draft_round_rows[]` is what ran.
  *
- * Two axes this reader cannot key yet are interface requests against the shared header, not
- * approximations made here: (1) the planned draft extent in the lookup key -- DraftVerifyShape
- * carries the verify window only, so estimate() derives the query's extent from the shape itself
- * (rounds = verify_k, draft_rows = verify_tokens - n_rows) until the P00 shape carries the plan's
- * planned distribution; (2) the drafter-loaded/k_ceiling state, which the fingerprint does not
- * carry. Until it does, the conservative fallback refuses to borrow across a change of history
- * presence as a stopgap -- that is a bound, not a measurement of the other state.
+ * A missing measurement is not a zero. A shape carrying an unknown dimension is refused by
+ * draft_shape_priceable() and by the reader, never priced as if its zeros had been measured.
+ *
+ * One axis this reader still cannot discriminate is the per-row origin mix: the file carries it
+ * and it is validated against the loaded drafter, but DraftVerifyShape has no origins field, so a
+ * query can only express the drafter, not the mix (interface request against the shared header,
+ * not an approximation made here).
  *
  * The reader runs off the step path: read()/configure() happen at startup. estimate() and
  * observe() are allocation-free. The bucket vector is reserved at configure; an observation that
@@ -75,16 +78,24 @@ struct DraftCostRuntime {
     DraftCostExecution   execution = DraftCostExecution::Rectangular;
 };
 
-/* One measured bucket. `shape` plus the executed extent `rounds`/`draft_rows` is the lookup key:
- * two cycles that verified the same window but ran a different draft extent are different
- * pipeline depths and stay separate. `flags` are the attribution flags of the samples it was
- * built from. A bucket carrying a disturbing flag is a diagnostic record: it is never used to
- * price a shape. */
+/* One measured bucket. `shape` plus the executed extent `rounds`/`draft_round_rows` is the lookup
+ * key: two cycles that verified the same window but ran a different draft distribution are
+ * different kernels and stay separate -- the same round count and the same total rows are not
+ * enough, [3,1,1] and [2,2,1] are two measurements.
+ *
+ * The origin mix (`shape.origins` in the file) is validated against the bucket's own drafter, but
+ * it is not stored here: DraftVerifyShape has no origins field, so a query could not discriminate
+ * on it anyway. See the note on that interface request above.
+ *
+ * `flags` are the attribution flags of the samples it was built from; a bucket carrying a
+ * disturbing flag is a diagnostic record and is never used to price a shape. */
 struct DraftCostBucket {
     DraftVerifyShape shape;
     uint16_t flags = 0;
-    int32_t  rounds = -1;       /* key: deepest draft round executed, -1 unknown (matches no query) */
-    int32_t  draft_rows = -1;   /* key: sum_j N_j actually executed, -1 unknown (matches no query) */
+    /* The executed extent. rounds = -1 means "unknown", which matches no query. */
+    int32_t  rounds = -1;       /* deepest draft round that actually ran */
+    int32_t  draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {};  /* actual N_j, index 0 unused */
+    int32_t  draft_rows_total = -1;                          /* sum_j draft_round_rows[j] */
     double   mean_ms = 0.0;     /* the amortised batch time at the same pipeline depth */
     double   unc_ms = 0.0;      /* half-width of mean_ms */
     int32_t  n = 0;             /* samples behind the mean */
@@ -102,8 +113,9 @@ struct DraftCostProfile {
 };
 
 /* Parses and validates one profile. RAD_OK, or a negative RAD_E_* (RAD_E_UNSUPPORTED for a
- * format id this reader does not know, RAD_E_INVAL for a malformed or inconsistent file) with
- * `err` naming the problem. */
+ * format id this reader does not know -- including rad-draft-profile/1, whose key had no draft
+ * distribution, no pipeline depth and no origin mix, RAD_E_INVAL for a malformed or inconsistent
+ * file) with `err` naming the problem. */
 int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std::string* err);
 /* Reads `path` and parses it. The file is not on the step path. */
 int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std::string* err);
@@ -142,19 +154,20 @@ public:
     int64_t dropped() const { return dropped_; }   /* buckets dropped at capacity */
     int64_t ignored() const { return ignored_; }   /* observations with no timing to learn from */
 
-    /* Prices one shape. The query's draft extent follows from the shape (rounds = verify_k,
-     * draft_rows = verify_tokens - n_rows); a bucket measured at another extent is a different
-     * pipeline depth and does not price it. Measured from an exact bucket, Interpolated from the
-     * neighbouring context class, or a ConservativeFallback scaled from the nearest anchor.
-     * valid = false when there is no anchor at all. Allocation-free. */
+    /* Prices one shape. The key is the whole shape -- both distributions, pipeline depth and the
+     * loaded drafter included; the executed extent the query asks for is the plan's own
+     * distribution, so a bucket measured at another extent is a different pipeline depth and does
+     * not price it. Measured from an exact bucket, Interpolated from the neighbouring context
+     * class, or a ConservativeFallback scaled from the nearest anchor. valid = false when there is
+     * no anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
-    /* Learns from one completed cycle. Refuses an incomplete observation, an unattributed one
-     * (cycle_id or policy_version 0), a sample whose identity disagrees with the observation or
-     * with the plan it names, and a non-finite or non-positive time. The sample's verify window is
-     * checked against that plan (plan->verify_k, plan->n_seq), so a shape filled from the current
-     * plan under issue_ahead -- verify_k != max_k -- is refused rather than learned. Only an
-     * attributable sample updates a measured bucket; the rest are kept as diagnostics. */
+    /* Learns from one completed cycle. Refuses an incomplete observation, one that does not
+     * identify the plan it names, a sample whose identity disagrees with the observation, a shape
+     * that is not the plan's own distribution or that is not priceable (an unknown dimension is
+     * refused, never priced as zero), an executed distribution that could not have run or that
+     * exceeds the plan it took, and a non-finite or non-positive time. Only an attributable sample
+     * updates a measured bucket; the rest are kept as diagnostics. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */
@@ -170,7 +183,7 @@ private:
     bool active_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
-                                  int32_t draft_rows);
+                                  const int32_t* round_rows);
     void record(const DraftCostSample& sample, uint16_t flags);
 };
 
