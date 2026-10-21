@@ -258,14 +258,30 @@ cannot be mistaken for this one:
 ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
-The P00 result recorded on 2026-10-22 used `/opt/rocm/lib/llvm/bin/clang++` (AMD clang 23.0.0git,
-ROCm llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0): the five
-suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test` pass 5/5,
-and the broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 99/104. The five remaining failures
-are named in the issue: two need FFmpeg (`images_test`, `videos_test` — this host has no
-libavformat), two exceed a CPU budget on this slower host (`gbnf_test_shard2`, `tokenizer_test`),
-and `gbnf_test_shard3` is a pre-existing grammar failure that reproduces in an independent clang
-build of a later commit. None of them touches `core/sched/`.
+The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD clang 23.0.0git, ROCm
+llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
+Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
+`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 236 checks over 15 cases), and the
+broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Each of the six failures fails
+identically on `cb5a69a` with the same compiler and configuration, so none of them is caused by
+P00:
+
+| Failure | Reason | Baseline `cb5a69a` |
+|---------|--------|--------------------|
+| `images_test` | 9 checks, HTTP 500: no FFmpeg on this host | same 500s |
+| `videos_test` | 8 checks, `encoding_failed` / 400: no FFmpeg | same |
+| `gbnf_test_shard3` | `json_schema_walks_write_only_valid_instances` (`gbnf_test.cpp:1857`) | same failure |
+| `gbnf_test_shard2` | CPU budget 31.5 s > 10 s, all 7 cases ok | 21.2 s > 10 s |
+| `tokenizer_test` | CPU budget 32.2 s > 20 s, all 23 cases ok | 25.7 s > 20 s |
+| `glm5next_test` | CPU budget 10.9 s > 10 s, all 16 cases ok | 9.3 s, passes |
+
+The last three are wall-clock budgets under an eight-way parallel run on this host, not check
+failures; `glm5next_test` is the one that moved across the line and needs headroom, not a fix.
+None of the six touches `core/sched/`.
+
+The whole-tree clang build needs the `build/clang23-libavx` commit first (the two kernel-source
+incompatibilities noted below); the broad run above was made with that patch applied to the
+working tree only, and P00 itself contains no libavx change.
 
 The test binary is picked up by the existing `*_test.cpp` glob; no CMake edit is needed.
 
