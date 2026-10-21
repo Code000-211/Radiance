@@ -24,6 +24,11 @@
  *     perturbed factor array and once against a perturbed state, and must report a difference:
  *     otherwise a passing byte comparison would prove only that the harness compares nothing.
  *
+ *  5. NOTHING WRITES PAST ITS OPERAND. Every device buffer carries a poisoned 4 KiB tail, and the
+ *     canaries are checked after each case. There is no compute-sanitizer on this host and llvm ships
+ *     no memcheck, so this is what turns an out-of-bounds write into a named 32-byte report instead
+ *     of a queue-wedging HSA fault.
+ *
  * The test needs one card. Without a visible device it reports SKIP (exit 77) rather than passing.
  */
 #include "bole_layout.h"
@@ -91,18 +96,56 @@ static float b2f(uint16_t h) {
 }
 
 /* ================================================================== device buffers */
+
+/* Every operand gets a poisoned tail. A read past the end of one is then a fault at the same place a
+ * real caller would fault, and a WRITE past the end corrupts the canary instead of silently landing
+ * in the next allocation. This is the only out-of-bounds detector on this host: there is no
+ * compute-sanitizer and llvm ships no memcheck, so the index arithmetic has to be proven by the
+ * canaries plus a byte diff against libr4d's own row. */
+static constexpr size_t BOLE_GUARD = 4096;
+static constexpr unsigned char BOLE_CANARY = 0xA5;
+
 struct Buf {
     void* p = nullptr;
     size_t bytes = 0;
     Buf() = default;
     Buf(const Buf&) = delete;
     Buf& operator=(const Buf&) = delete;
-    ~Buf() { if (p) hipFree(p); }
+    ~Buf() { if (p) (void)hipFree(p); }
     bool alloc(size_t n) {
         bytes = n ? n : 16;
-        return hipMalloc(&p, bytes) == hipSuccess;
+        return hipMalloc(&p, bytes + BOLE_GUARD) == hipSuccess;
+    }
+    /* Poison the tail. Call after the last upload to this buffer and before the launches. */
+    bool seal() {
+        std::vector<unsigned char> c(BOLE_GUARD, BOLE_CANARY);
+        return hipMemcpy((unsigned char*)p + bytes, c.data(), BOLE_GUARD,
+                         hipMemcpyHostToDevice) == hipSuccess;
+    }
+    /* How many bytes of the tail changed. Non-zero is an out-of-bounds write, and it names the
+     * operand rather than aborting the queue. */
+    size_t guard_breach() const {
+        std::vector<unsigned char> c(BOLE_GUARD, 0);
+        if (hipMemcpy(c.data(), (const unsigned char*)p + bytes, BOLE_GUARD,
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return BOLE_GUARD;
+        size_t bad = 0;
+        for (unsigned char v : c) bad += (v != BOLE_CANARY);
+        return bad;
+    }
+    /* The first changed guard offset, or -1. Distinguishes a 2-byte row overrun from a wholesale
+     * index error. */
+    long guard_first() const {
+        std::vector<unsigned char> c(BOLE_GUARD, 0);
+        if (hipMemcpy(c.data(), (const unsigned char*)p + bytes, BOLE_GUARD,
+                      hipMemcpyDeviceToHost) != hipSuccess)
+            return -1;
+        for (size_t i = 0; i < c.size(); ++i)
+            if (c[i] != BOLE_CANARY) return (long)i;
+        return -1;
     }
 };
+
 
 static bool up(Buf& b, const void* src, size_t n) {
     return hipMemcpy(b.p, src, n, hipMemcpyHostToDevice) == hipSuccess;
@@ -306,6 +349,13 @@ int main() {
             up(d_nw, h.nw.data(), h.V * 4) && up(d_acc, h.acc.data(), h.N * 4);
         ok("case inputs uploaded", a);
         if (!a) continue;
+        /* Before any kernel runs, poison every tail: a stray write is then the canary, not a fault. */
+        bool sealed = true;
+        for (Buf* b : { &d_x, &d_cw, &d_cb, &d_cst_ref, &d_cst_bol, &d_ci, &d_a, &d_b, &d_alog,
+                        &d_dtb, &d_st_ref, &d_st_bol, &d_si_ref, &d_si_bol, &d_cu, &d_par, &d_ctx,
+                        &d_z, &d_nw, &d_fact, &d_o_ref, &d_o_bol, &d_oq, &d_os, &d_acc })
+            sealed = sealed && b->seal();
+        ok("case guard tails poisoned", sealed);
 
         RadTensor t_ref[18] = {
             tens(d_x.p, RAD_BF16, { h.tokens, cd }), tens(d_cw.p, RAD_BF16, { cd, 4 }),
@@ -352,7 +402,9 @@ int main() {
         };
         RadParam p_bol[13]{};
         int mb = 0;
-        p_bol[mb++] = RAD_RANGE("q_len", 1, h.T);
+        /* A selector collapses the ranged `q_len` to a single integer before a launch; a direct caller
+         * must hand the launch the integer it collapsed to, not the range the schema declares. */
+        p_bol[mb++] = RAD_INT("q_len", h.T);
         p_bol[mb++] = RAD_INT("head_k", 128);
         p_bol[mb++] = RAD_INT("head_v", 128);
         p_bol[mb++] = RAD_INT("conv_width", 4);
@@ -390,6 +442,30 @@ int main() {
         ok(fmt("%s: both rows accepted the geometry", nm).c_str(),
            rc_ref == RAD_OK && rc_v == RAD_OK && rc_c == RAD_OK && sync,
            fmt("rc_ref=%d rc_verify=%d rc_commit=%d", rc_ref, rc_v, rc_c));
+
+        /* An out-of-bounds write names its operand here. A fault would have aborted the process
+         * before this point, so reaching it with a clean canary set means the index arithmetic wrote
+         * only inside its tensors. */
+        {
+            size_t breach = 0;
+            const char* who = "none";
+            struct { Buf* b; const char* n; } g[] = {
+                { &d_x, "x" }, { &d_cw, "conv_w" }, { &d_cb, "conv_b" }, { &d_cst_bol, "conv_state" },
+                { &d_ci, "conv_idx" }, { &d_a, "a" }, { &d_b, "b" }, { &d_alog, "A_log" },
+                { &d_dtb, "dt_bias" }, { &d_st_bol, "state" }, { &d_si_bol, "state_idx" },
+                { &d_cu, "cu" }, { &d_par, "parent" }, { &d_ctx, "ctx_before" }, { &d_z, "z" },
+                { &d_nw, "norm_w" }, { &d_fact, "factors" }, { &d_o_bol, "o" }, { &d_oq, "o_q" },
+                { &d_os, "o_scale" }, { &d_acc, "num_accepted" },
+            };
+            for (auto& e : g) {
+                const size_t k = e.b->guard_breach();
+                if (k && !breach) { breach = k; who = e.n; }
+                if (k) std::printf("        guard: %-12s %2zu bytes, first at +%ld of %zu\n", e.n, k,
+                                   e.b->guard_first(), e.b->bytes);
+            }
+            ok(fmt("%s: no operand writes past its guard", nm).c_str(), breach == 0,
+               breach ? fmt("%zu guard bytes changed, first %s", breach, who) : "");
+        }
 
         /* ---- the commit's state against the reference's LAST candidate slot, byte for byte. */
         std::vector<float> st_ref(st_elems), st_bol(st_elems);
@@ -552,9 +628,9 @@ int main() {
             /* The check runs on the device, so a launch that is submitted cannot report it; what the
              * row must guarantee is that it wrote nothing. */
             std::vector<uint16_t> o((size_t)h.tokens * h.H * h.V, 0x7777);
-            hipMemcpy(bo.p, o.data(), o.size() * 2, hipMemcpyHostToDevice);
+            (void)hipMemcpy(bo.p, o.data(), o.size() * 2, hipMemcpyHostToDevice);
             const int rc2 = rows.verify(&args, nullptr);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
             std::vector<uint16_t> got(o.size());
             down(got.data(), bo, got.size() * 2);
             bool untouched = true;

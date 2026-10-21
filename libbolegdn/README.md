@@ -65,6 +65,10 @@ Both rows validate before launching and return a negative `RAD_E_*` rather than 
 they would compute differently:
 
 - `head_k`/`head_v` other than 128, `conv_width` other than 4;
+- a state cache whose `[H, V, K]` disagrees with the head widths, or a projection row whose width
+  does not decompose as `2·Hg·K + H·V` (the head **counts** are read off those shapes, as `libr4d`
+  reads them; the parameters are head **widths**);
+- a projection row wider than the history workgroups cover;
 - `q_len` outside `1..16` (the node budget the LDS tables are sized for);
 - `conv_depth` outside `1..64`, or disagreeing with the conv cache's extent;
 - `l2_eps` other than `1e-6`;
@@ -73,8 +77,10 @@ they would compute differently:
 - `cu`, `conv_idx`, `ctx_before` or `state_idx` inconsistent with the sequence count.
 
 The device rows also re-check the metadata — including the parent array, where a parent must name an
-earlier node — and publish that verdict to the whole block before any read or write, so a direct op
-caller cannot drive a walk off the array or leave a half-committed state behind.
+earlier node, the two slot indices against the caches' real slot counts, and `num_accepted` against
+the conv cache's depth — and publish that verdict to the whole block before any read or write, so a
+direct op caller cannot drive a walk off the array or leave a half-committed state behind. A negative
+slot is refused rather than treated as padding: the conv read in this op has no padding path.
 
 ## What is NOT ported, and why
 

@@ -25,7 +25,14 @@ enum {
 struct BoleCall {
     void*   t[BOLE_N_OPS];
     int64_t s[BOLE_N_OPS][4];
-    int     nseq, tokens, hk, hv, q_len, sigmoid, conv_w;
+    int     nseq, tokens, q_len, sigmoid, conv_w;
+    /* Widths and counts are separate fields on purpose. `kw`/`vw` are the head WIDTHS (both 128, the
+     * compiled row, and what the `head_k`/`head_v` parameters mean); `nkg`/`nhv` are the number of key
+     * and value heads, which is a property of the state cache. Collapsing the two -- reading the
+     * grid and every per-head offset off a width -- is a device memory fault, not a wrong number. */
+    int     kw, vw, nkg, nhv;
+    /* Slot counts, so the metadata gate can refuse an index the caches cannot back. */
+    int     slots, cslots, cdepth, cdim;
     float   scale, eps, l2_eps, softplus_thr;
 };
 
@@ -55,6 +62,10 @@ struct BoleCall {
  * heads of a two-key-head group is the engine's own 384; four is the headroom the launcher checks
  * against the real channel count before using it). */
 #define BOLE_COMMIT_HIST_WG 4
+
+/* libr4d's recurrent-block shape: 128 value rows, two k halves. Declared here because the host row
+ * uses it to bound the projection width the history arm can cover, not only the kernel. */
+#define BOLE_THR 256
 
 /* The launches, defined beside the kernels in bole_tree.hip and called from bole_rows.cpp with the
  * flattened call the host built. A failure is a RAD_E_* status, never a partial success. */

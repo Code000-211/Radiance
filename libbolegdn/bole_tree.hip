@@ -51,8 +51,8 @@
 
 #include <hip/hip_runtime.h>
 
-/* libr4d's recurrent-block shape: 128 value rows, two k halves. */
-#define BOLE_THR 256
+/* libr4d's recurrent-block shape: 128 value rows, two k halves (BOLE_THR, in bole_layout.h so the
+ * host row can bound the projection width the history arm covers). */
 #define BOLE_HK 64
 
 static __device__ __forceinline__ int64_t boff(const BoleCall& f, int t, int64_t a, int64_t b = 0,
@@ -68,6 +68,12 @@ static __device__ __forceinline__ float bflt(const BoleCall& f, int t, int a, in
 static __device__ __forceinline__ float bsp(float x, float thr) {
     if (x > thr) return x;
     return (x > 0.0f) ? (x + __logf(1.0f + __expf(-x))) : __logf(1.0f + __expf(x));
+}
+/* The group a value head belongs to: `hv / (H / Hg)` in libr4d, i.e. nhv/nkg value heads per key
+ * head. The head WIDTHS are separate (both 128); using a width here would divide 128 by 1 and index
+ * the projection row from channel 12800. */
+static __device__ __forceinline__ int bole_khead(const BoleCall& f, int head) {
+    return head / (f.nhv / f.nkg);
 }
 /* The linear chain: with no PARENT operand, node i's parent is i-1 and the root's is -1. */
 static __device__ __forceinline__ int bparent(const BoleCall& f, int bos, int node) {
@@ -86,7 +92,22 @@ static __device__ __forceinline__ bool bole_meta(const BoleCall& f, int seq) {
         const int p = bparent(f, bos, i);
         if ((i == 0 && p != -1) || (i > 0 && (p < 0 || p >= i))) return false;
     }
-    if (bint(f, BCIDX, seq) < 0 || bint(f, BCTX, seq) < 0 || bint(f, BSIDX, seq) < 0) return false;
+    /* Slot indices are checked HERE, against the caches' actual slot counts, not only by the host: an
+     * index past the cache would make the state or the conv-history read walk off its tensor. A
+     * negative index is refused too -- libr4d treats it as padding and skips the sequence, but this
+     * op's conv read has no padding path, so serving it would read before the array. */
+    const int ci = bint(f, BCIDX, seq), si = bint(f, BSIDX, seq);
+    if (ci < 0 || ci >= f.cslots) return false;
+    if (si < 0 || si >= f.slots) return false;
+    if (bint(f, BCTX, seq) < 0) return false;
+    /* num_accepted is the cache row the last accepted token left, and both the conv read and the
+     * history shift index from it. It is a caller value, so it is gated: off = nacc - 1 must land
+     * inside the cache, and the deepest node's oldest tap is off + q_len - 1, which the host has
+     * already bounded against `cdepth - (conv_width - 2)`. */
+    if (f.t[BNACC]) {
+        const int na = bint(f, BNACC, seq);
+        if (na < 1 || na - 1 + f.q_len > f.cdepth) return false;
+    }
     return true;
 }
 
@@ -118,16 +139,29 @@ static __device__ __forceinline__ unsigned short bole_conv(const BoleCall& f, in
     (void)ctx;
     float acc = f.t[BCB] ? bole_bf2f(
         static_cast<const unsigned short*>(f.t[BCB])[boff(f, BCB, ch)]) : 0.0f;
+    /* libr4d's conv lambda, tap for tap: `win[CW-1] = x[t]; acc = bias + sum_i wt[i]*win[i]`, then
+     * the window shifts. So tap i reads the sample at position t - (CW-1) + i, paired with weight i.
+     * A node sits at t = depth - 1 on its path, so tap i reads position p = depth - CW + i: an
+     * ancestor when p >= 0, else the history at off + 3 + p = off + depth - 1 + i.
+     *
+     * The tap index IS the lag. Pairing the weights with `CW-1-i` instead reverses the kernel and,
+     * worse, moves the history read from off + depth - 1 + i (at most off + 2) to off + depth + 2,
+     * which for a five-token window reads seven rows past the cache row -- the original fault. */
 #pragma unroll
     for (int tap = 0; tap < BOLE_CONV_W; ++tap) {
-        const int lag = BOLE_CONV_W - 1 - tap, pos = depth - BOLE_CONV_W + lag;
-        float x = 0.0f;
+        const int pos = depth - BOLE_CONV_W + tap;
+        float x;
+        /* `path` is stored NODE-FIRST (path[0] is the node, path[depth-1] the root), which is the
+         * order the backward adjoint walk needs. A window position counts from the ROOT, so position
+         * `pos` is path[depth - 1 - pos]. Indexing path[pos] instead mirrors the window: at depth 3
+         * and beyond every node reads its own input where its ancestor's belongs, which is a wrong
+         * number on the linear chain, not a fault. */
         if (pos >= 0)
-            x = bole_bf2f(
-                static_cast<const unsigned short*>(f.t[BX])[boff(f, BX, bos + path[pos], ch)]);
+            x = bole_bf2f(static_cast<const unsigned short*>(f.t[BX])[
+                boff(f, BX, bos + path[depth - 1 - pos], ch)]);
         else
             x = bole_bf2f(static_cast<const unsigned short*>(f.t[BCST])[
-                boff(f, BCST, slot, ch, off + depth - 1 + lag)]);
+                boff(f, BCST, slot, ch, off + depth - 1 + tap)]);
         const float w = bole_bf2f(
             static_cast<const unsigned short*>(f.t[BCW])[boff(f, BCW, ch, tap)]);
         acc += w * x;
@@ -173,7 +207,7 @@ __global__ __launch_bounds__(BOLE_THR) void bole_verify_kernel(BoleCall f) {
     const int hslot = bint(f, BCIDX, seq), ctx = bint(f, BCTX, seq), slot = bint(f, BSIDX, seq);
     /* libr4d's history read offset: the cache row the last ACCEPTED token left. */
     const int off = f.t[BNACC] ? bint(f, BNACC, seq) - 1 : 0;
-    const int kh = head / (f.hv / f.hk);
+    const int kh = bole_khead(f, head);
 
     if (tid < nnode) par[tid] = bparent(f, bos, tid);
     __syncthreads();
@@ -192,8 +226,8 @@ __global__ __launch_bounds__(BOLE_THR) void bole_verify_kernel(BoleCall f) {
     /* Every node's q, k and v: one channel per thread, three channel classes per node. */
     for (int e = tid; e < nnode * 384; e += BOLE_THR) {
         const int node = e / 384, channel = e % 384, col = channel & 127;
-        const int ch = channel < 128 ? kh * 128 + col :
-                       channel < 256 ? (f.hk + kh) * 128 + col : (2 * f.hk + head) * 128 + col;
+        const int ch = channel < 128 ? kh * f.kw + col :
+                       channel < 256 ? (f.nkg + kh) * f.kw + col : (2 * f.nkg + head) * f.vw + col;
         const unsigned short v = bole_conv(f, bos, ch, hslot, ctx, off, path[node], depth[node]);
         if (channel < 128) qo[node][col] = bole_bf2f(v);
         else if (channel < 256) kn[node][col] = bole_bf2f(v);
@@ -260,8 +294,18 @@ __global__ __launch_bounds__(BOLE_THR) void bole_verify_kernel(BoleCall f) {
         on0 += bole_xor<1>(on0);
     }
     /* ---- nodes 1..: eight waves a pass, wave n of a pass walking node pass*8+n. Its two 16-lane
-     * rows walk q and gamma*k over the node's non-root ancestors; both run the same depth, so every
-     * DPP exchange sees a full wave. */
+     * rows walk q and gamma*k over the node's non-root path, both over the same steps so every DPP
+     * exchange sees a full wave.
+     *
+     * `path` is NODE-FIRST (path[node][0] is the node, path[node][depth-1] the root), so s = 0 is the
+     * node itself and s = depth-2 is the child of the root. The root is excluded deliberately: the
+     * anchor h1 is already the state AFTER the root's update, so folding the root in again would
+     * apply it twice. dots[kind][node][a] is k_a . x just before a's update -- the coefficient the
+     * contraction pairs with the rounding residual w[a].
+     *
+     * The q walk starts at the node (o_node needs u_node (k_node . q_node)); the gamma*k walk
+     * describes h_parent . (gamma_node k_node), so it starts at the PARENT and skips the node's own
+     * update. */
     for (int pass = 0; pass < (BOLE_NODES + 7) / 8; ++pass) {
         const int node = pass * 8 + (tid >> 5), kind = (tid >> 4) & 1, lane = tid & 15;
         if (node && node < nnode) {
@@ -371,8 +415,11 @@ __global__ __launch_bounds__(BOLE_THR) void bole_verify_kernel(BoleCall f) {
         const float sig = 1.0f / (1.0f + __expf(-z));
         on *= sc * nw * (f.sigmoid ? sig : z * sig);
         const unsigned short ob = bole_f2bf(on);
+        /* `o` is [tokens, H, V]: three indices. Passing `head*128 + row` as the second index
+         * multiplies it by the V stride and writes (H*V) rows past the tensor. z and o_q are
+         * [tokens, H*V], which is why they legitimately take the flattened column. */
         if (!half)
-            static_cast<unsigned short*>(f.t[BO])[boff(f, BO, tok, head * 128 + row)] = ob;
+            static_cast<unsigned short*>(f.t[BO])[boff(f, BO, tok, head, row)] = ob;
         __syncthreads();
         if (f.t[BOQ]) {
             const float ov = bole_bf2f(ob);
@@ -434,7 +481,7 @@ __global__ __launch_bounds__(BOLE_THR) void bole_commit_kernel(BoleCall f) {
 
     const int bos = bint(f, BCU, seq), len = bint(f, BCU, seq + 1) - bos;
 
-    if (unit < f.hv) {
+    if (unit < f.nhv) {
         const int slot = bint(f, BSIDX, seq), row = tid >> 1, k0 = (tid & 1) * BOLE_HK;
         const int64_t cs = f.s[BSTATE][3];
         float* const h0 = static_cast<float*>(f.t[BSTATE]) +
@@ -475,9 +522,11 @@ __global__ __launch_bounds__(BOLE_THR) void bole_commit_kernel(BoleCall f) {
      * offsets 0 and 1, then append this step's raw convolution inputs from offset conv_width - 2.
      * Anything else would leave the cache in a layout the next decode step reads with a shifted
      * window. */
-    const int ch = (unit - f.hv) * BOLE_THR + tid;
-    const int nc = (int)f.s[BCST][1];
-    if (ch >= nc) return;
+    const int ch = (unit - f.nhv) * BOLE_THR + tid;
+    /* The packed width is the projection row's, not a stride: f.s[BCST][1] is the conv cache's
+     * channel stride, which equals the width only when the cache happens to be dense. Reading it as
+     * a count made a padded cache read past the row and a sparse one drop channels. */
+    if (ch >= f.cdim) return;
     const int cslot = bint(f, BCIDX, seq);
     if (cslot < 0) return;                        /* padding: nothing to shift */
     const int64_t hi = f.s[BCST][2];
@@ -494,7 +543,7 @@ __global__ __launch_bounds__(BOLE_THR) void bole_commit_kernel(BoleCall f) {
 /* ================================================================== the launches */
 int bole_verify_launch(const BoleCall* f, void* stream) {
     const BoleCall c = *f;
-    hipLaunchKernelGGL(bole_verify_kernel, dim3((unsigned)c.nseq, (unsigned)c.hv, 1),
+    hipLaunchKernelGGL(bole_verify_kernel, dim3((unsigned)c.nseq, (unsigned)c.nhv, 1),
                        dim3(BOLE_THR), 0, (hipStream_t)stream, c);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -502,7 +551,7 @@ int bole_verify_launch(const BoleCall* f, void* stream) {
 int bole_commit_launch(const BoleCall* f, void* stream) {
     const BoleCall c = *f;
     hipLaunchKernelGGL(bole_commit_kernel,
-                       dim3((unsigned)c.nseq, (unsigned)(c.hv + BOLE_COMMIT_HIST_WG), 1),
+                       dim3((unsigned)c.nseq, (unsigned)(c.nhv + BOLE_COMMIT_HIST_WG), 1),
                        dim3(BOLE_THR), 0, (hipStream_t)stream, c);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

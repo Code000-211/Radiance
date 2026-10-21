@@ -160,6 +160,27 @@ static int bole_prepare(const RadArgs* a, bool commit, BoleArgs* out) {
      * the cache's extent -- a device memory fault, not a wrong number. */
     if (q_len > cdepth - (BOLE_CONV_W - 2)) return RAD_E_UNSUPPORTED;
     if (cu->rank != 1 || cu->shape[0] < 2) return RAD_E_SHAPE;
+    /* Head counts. The parameters `head_k`/`head_v` are the head WIDTHS (128, the compiled row); the
+     * number of heads is a property of the tensors, exactly as libr4d reads it. The state cache is
+     * [slots, H, V, K] and the projection row is [q | k | v] with conv_dim = 2*Hg*K + H*V, so both
+     * counts come out of shapes the caller cannot get wrong without failing these checks. */
+    if (st->rank != 4) return RAD_E_SHAPE;
+    if (st->shape[2] != hv || st->shape[3] != hk) return RAD_E_SHAPE;
+    if (x->rank != 2) return RAD_E_SHAPE;
+    const long long nhv = st->shape[1];
+    const long long conv_dim = x->shape[1];
+    if (nhv <= 0 || conv_dim <= nhv * hv) return RAD_E_SHAPE;
+    if ((conv_dim - nhv * hv) % (2 * hk)) return RAD_E_SHAPE;
+    const long long nkg = (conv_dim - nhv * hv) / (2 * hk);
+    if (nkg <= 0 || nhv % nkg) return RAD_E_SHAPE;
+    /* The conv history arm walks one packed channel per thread, BOLE_COMMIT_HIST_WG workgroups wide;
+     * a wider projection row would be silently dropped by its `ch >= nc` return. Refuse instead. */
+    if (conv_dim > (long long)BOLE_COMMIT_HIST_WG * BOLE_THR) return RAD_E_UNSUPPORTED;
+    /* An optional n_head_v must agree with the state cache, as libr4d's does. */
+    long long nhv_arg = 0;
+    if (rad_args_geti(a, "n_head_v", &nhv_arg) && nhv_arg > 0 && nhv_arg != nhv)
+        return RAD_E_SHAPE;
+
     const int nseq = (int)(cu->shape[0] - 1);
     if (si->shape[0] != nseq || ci->shape[0] != nseq || cx->shape[0] != nseq ||
         acc->shape[0] != nseq)
@@ -180,8 +201,14 @@ static int bole_prepare(const RadArgs* a, bool commit, BoleArgs* out) {
     memset(&f, 0, sizeof f);
     f.nseq = nseq;
     f.tokens = (int)x->shape[0];
-    f.hk = (int)hk;
-    f.hv = (int)hv;
+    f.kw = (int)hk;
+    f.vw = (int)hv;
+    f.nkg = (int)nkg;
+    f.nhv = (int)nhv;
+    f.slots = (int)st->shape[0];
+    f.cslots = (int)cst->shape[0];
+    f.cdepth = (int)cdepth;
+    f.cdim = (int)conv_dim;
     f.q_len = (int)q_len;
     f.conv_w = (int)cwid;
     f.scale = (float)rad_args_getf_or(a, "scale", 1.0);
