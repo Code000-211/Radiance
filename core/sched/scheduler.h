@@ -164,6 +164,10 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* The serial head's valid-history end for a sequence (`SchedReq::draft_filled`), or -1 when the
+     * id is not live. The watermark is otherwise only visible through the next history pass, which
+     * for a history-only row starts where the watermark already is. */
+    int64_t  draft_watermark(uint64_t id) const;
 
     /* Requests that reached a terminal state since the last call, oldest first, swapped into
      * `out` under the lock (old contents discarded). Only the engine consumes it, to drop
@@ -611,6 +615,10 @@ private:
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
+    /* Whether this snapshot's round-0 (history) pass was built. A row's history is written by that
+     * pass; a snapshot opened and ended without it (the engine's build came back null and the pass
+     * was skipped) must not move the watermark. */
+    bool                serial_hist_built_ = false;
 
     /* The block drafter's rows, valid between block_begin() and block_end(): one per entry of the
      * trunk step just run, in order, with `ctx_len`/`n_tokens` mirroring it. The drafter reads

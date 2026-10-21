@@ -61,7 +61,8 @@ struct Cycle {
 };
 
 /* A model whose cost grows with the tokens the pass computes instead of only with the deepest
- * window: the shape in which a mixed plan can beat every homogeneous one. */
+ * window: the shape in which a mixed plan can beat every homogeneous one. At pipeline_depth 0 the
+ * verify pass computes this cycle's drafts, so verify_tokens alone carries the candidate. */
 struct TokenPriced {
     double base = 1.0;
     double per_token = 0.1;
@@ -105,7 +106,7 @@ int row_predict(void* ctx, const DraftBatchView& view, DraftPredictions* out) {
     auto* s = static_cast<RowPredictor*>(ctx);
     if (!out || !out->seq || !out->req_id || out->cap < view.n_seq) return RAD_E_INVAL;
     out->n_seq = view.n_seq;
-    out->version = 1;
+    out->version = view.policy_version;
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->req_id[i] = view.seq[i].req_id;
         for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
@@ -523,6 +524,7 @@ TEST(the_verify_depth_of_a_cycle_comes_from_the_frozen_plan_not_from_a_scalar) {
      * K0 row that is still there, so the new plan's verify_k is 0 -- the previous plan's max of 6
      * is not the window that runs. */
     Cycle c;
+    c.f.view.pipeline_depth = 1;   /* issued ahead: the paired step verifies the frozen plan */
     c.pred.a = 0.95f;
     c.add(0, 11);
     c.add(1, 12, 64, DraftEligibility::OutputExhausted);

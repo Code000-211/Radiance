@@ -122,6 +122,9 @@ int DraftController::open_cycle(const DraftBatchView& view, DraftPredictions* pr
 
     int rc = p_.predictor.predict(p_.predictor.ctx, view, preds);
     if (rc < 0) return rc;
+    /* A prediction set describes the view it was computed for: a stale version or a row list
+     * that is not this view's would let another cycle's numbers choose this plan. */
+    if (!draft_predictions_current(view, *preds)) return RAD_E_INVAL;
     rc = planner_.choose(view, *preds, p_.costs, &slot.plan);
     if (rc < 0) return rc;
     plan_cur_      = next;

@@ -13,15 +13,12 @@ namespace rad {
 
 namespace {
 
-/* A request's own cap: no draft past its remaining output (the verified token takes one of
- * them), no draft past the declared ceiling, none at all when it may not draft. */
+/* A request's own cap: no draft past its remaining output (the verified token and the bonus token
+ * take one each), no draft past the declared ceiling, none at all when it may not draft. */
 int32_t cap_of(const DraftSeqView& v, int32_t ceiling) {
     if (v.eligibility != DraftEligibility::Eligible) return 0;
-    int32_t cap = v.remaining - 1;
-    if (cap < 0) cap = 0;
-    if (cap > ceiling) cap = ceiling;
-    if (cap > RAD_SCHED_MAX_SPEC) cap = RAD_SCHED_MAX_SPEC;
-    return cap;
+    const int32_t cap = draft_budget_k(v.remaining, ceiling);
+    return cap > RAD_SCHED_MAX_SPEC ? RAD_SCHED_MAX_SPEC : cap;
 }
 
 }  /* namespace */
@@ -113,21 +110,31 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
     /* This runtime plays no tape (core/runtime/stager.h); a recorded or replayed shape is a
      * different key, never this one. */
     s->replay = DraftReplay::None;
+    s->pipeline_depth = view.pipeline_depth;
     bool sampled = false;
     for (int32_t i = 0; i < view.n_seq; ++i) {
+        /* The draft side is what this cycle asks its rounds to run. */
         const int32_t want = k[i];
         const int32_t ki = clamp_to >= 0 && want > clamp_to ? clamp_to : want;
-        if (ki > s->verify_k) s->verify_k = ki;
-        s->verify_tokens += 1 + ki;
-        for (int32_t j = 1; j <= ki; ++j) ++s->rows[j];
-        if (view.seq[i].ctx_class > s->ctx_class) s->ctx_class = view.seq[i].ctx_class;
-        if (view.seq[i].sampling == DraftSampling::Sampled) sampled = true;
+        if (ki > s->draft_k) s->draft_k = ki;
+        for (int32_t j = 1; j <= ki; ++j) ++s->draft_rows[j];
+        /* At pipeline_depth 0 the paired step verifies exactly what this cycle drafts; only when
+         * the plan is issued ahead (publish-then-verify) does it verify the frozen previous
+         * plan's window instead. */
+        const int32_t fk = view.pipeline_depth > 0 ? frozen_k_of(view, i) : ki;
+        if (fk > s->verify_k) s->verify_k = fk;
+        s->verify_tokens += 1 + fk;
+        for (int32_t j = 1; j <= fk; ++j) ++s->rows[j];
         /* The history the paired step owes this row: one row for the verified token, plus one per
          * draft it verifies (Scheduler::serial_begin's hist_n, lead zero on a decode row). With no
-         * head loaded nothing is carried. The frozen window is what the paired step verifies,
-         * which is this cycle's draft window only when the two do not differ. */
-        if (view.k_ceiling > 0) s->history_tokens += 1 + frozen_k_of(view, i);
+         * head loaded nothing is carried. */
+        if (view.k_ceiling > 0) s->history_tokens += 1 + fk;
+        if (view.seq[i].ctx_class > s->ctx_class) s->ctx_class = view.seq[i].ctx_class;
+        if (view.seq[i].sampling == DraftSampling::Sampled) sampled = true;
     }
+    /* Every dimension above is known here: history from the frozen plan, prefill from the view,
+     * no tape, and both distributions from the cycle. A missing one would set the bit instead. */
+    s->unknown = 0;
     s->sampling = sampled ? DraftSampling::Sampled : DraftSampling::Greedy;
 }
 
@@ -211,12 +218,17 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->replay         = DraftReplay::None;
     out->timing_valid   = false;   /* the planner does not time the cycle */
     out->prefill_tokens = view.prefill_tokens;
+    out->pipeline_depth = view.pipeline_depth;
     if (out->cap < view.n_seq) return RAD_E_INVAL;
+    /* The window the paired step verifies: this plan's own deepest draft when it verifies what
+     * this cycle drafts, the frozen previous plan's otherwise. */
+    out->verify_k = view.pipeline_depth > 0 ? frozen_verify_k(view) : max_k;
     /* The shape the plan priced, per row; `k[]` is the budget for whichever drafter may fill it,
      * and a K0 row has none. The history is the one the paired step owes (shape_of). */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->ctx_class[i]      = view.seq[i].ctx_class;
-        out->history_tokens[i] = view.k_ceiling > 0 ? 1 + frozen_k_of(view, i) : 0;
+        const int32_t verifies = view.pipeline_depth > 0 ? frozen_k_of(view, i) : out->k[i];
+        out->history_tokens[i] = view.k_ceiling > 0 ? 1 + verifies : 0;
         out->fill[i] = out->k[i] > 0 ? DraftDrafter::Serial : DraftDrafter::None;
     }
     if (draft_plan_rows(*out) < 0) return RAD_E_INVAL;
@@ -241,10 +253,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         out->why[i]      = DraftFallback::None;
         out->k[i]        = 0;
     }
-    /* verify_k is the window the paired step verifies: the frozen plan's distribution, over the
-     * rows that are still here. A row the frozen plan did not name was issued nothing, so it
-     * verifies nothing. */
-    out->verify_k = frozen_verify_k(view);
+    /* verify_k is set in finish(), where max_k is known: it is this plan's own deepest draft when
+     * the paired step verifies what this cycle drafts, the frozen plan's window otherwise. */
 
     if (c_.mode == DraftPolicyMode::Legacy) {
         const int32_t want = c_.legacy_k > 0 ? c_.legacy_k : c_.k_ceiling;

@@ -219,6 +219,7 @@ struct Predictions {
 int predict(void* ctx, const DraftBatchView& view, DraftPredictions* out) {
     const Predictions& t = *static_cast<Predictions*>(ctx);
     out->n_seq = view.n_seq;
+    out->version = view.policy_version;   /* this view's, not a later one */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->req_id[i] = view.seq[i].req_id;
         out->seq[i] = DraftPrediction{};
@@ -229,15 +230,18 @@ int predict(void* ctx, const DraftBatchView& view, DraftPredictions* out) {
     return RAD_OK;
 }
 
-/* Additive in the drafts this cycle runs: 1.0 ms of verify plus 0.05 ms per draft. Batching is
+/* Additive in the rows this cycle runs: 1.0 ms of verify plus 0.05 ms per draft round. Batching is
  * already in the constant, so a draft pays exactly when its survival probability exceeds 0.05.
+ * The draft side is what the candidate chooses; the verify side is not (it is the frozen window
+ * every candidate shares), so the draft rounds must carry the difference.
  * A shape it cannot price is returned unpriced -- never a zero posing as a measurement. */
 int price(void*, const DraftVerifyShape& s, DraftCostEstimate* out) {
     *out = DraftCostEstimate{};
     if (s.n_rows < 1) return RAD_OK;
-    const int32_t drafts = s.verify_tokens - s.n_rows;
+    int32_t drafts = 0;
+    for (int32_t j = 1; j <= s.draft_k; ++j) drafts += s.draft_rows[j];
     if (drafts < 0) return RAD_OK;
-    out->ms       = 1.0 + 0.05 * (double)drafts;
+    out->ms       = 1.0 + 0.05 * (double)(s.verify_tokens + drafts);
     out->coverage = 4;
     out->source   = DraftCostSource::Measured;
     out->valid    = true;
@@ -494,6 +498,99 @@ TEST(a_row_planned_off_still_owes_its_history_and_resumes_at_six) {
     REQUIRE(h6 != nullptr);
     CHECK_EQ(h6->n_tok, 7);
     CHECK_EQ(h6->ctx_lens[0], (int32_t)before_e);
+}
+
+/* ================================================================== the history watermark */
+/* serial_end() moves a sequence's watermark only for a pass that ran. A drafting row needs a draft
+ * round on top of the round-0 history pass; a history-only row owes nothing but that pass, so it
+ * counts when the pass was built and not when the build came back null and the engine skipped it.
+ * Each call gets a freshly opened snapshot: serial_end() ends the one it reads, so a second call
+ * would check an empty one. */
+TEST(a_draft_rows_watermark_needs_a_round_and_a_history_pass) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+
+    /* Cycle A: six planned, nothing published yet, so one token is verified. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+    /* Cycle B: six verified. A fresh snapshot, its history pass built, four rounds ran. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(entry_of(f.sch, id)->n_spec, 6);
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 1);
+    REQUIRE(f.sch.serial_batch(0, 2) != nullptr);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    const int64_t after_rounds = f.sch.find(id)->n_computed;
+    f.sch.serial_end(4);
+    CHECK_EQ(f.sch.draft_watermark(id), after_rounds);
+
+    /* Cycle C: another fresh snapshot with its history pass built, but zero rounds. The verified
+     * positions were never written, so the watermark stays where cycle B left it. */
+    REQUIRE(f.sch.step() != nullptr);
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 1);
+    REQUIRE(f.sch.serial_batch(0, 3) != nullptr);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    const int64_t after_abort = f.sch.find(id)->n_computed;
+    CHECK(after_abort > after_rounds);
+    f.sch.serial_end(0);
+    CHECK_EQ(f.sch.draft_watermark(id), after_rounds);
+}
+
+TEST(a_history_only_rows_watermark_needs_its_pass) {
+    Fixture f;
+    f.build();
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    /* Longer than one chunk: the first step is mid-prompt, which owes history and no token. */
+    const uint64_t id = f.submit(700);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK(e->is_prefill);
+    CHECK(!e->produces_token);
+    const int64_t hist_end = e->ctx_len + e->n_tokens;
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+
+    /* A fresh snapshot whose history pass is built and runs, with no draft round at all. */
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);   /* nobody drafts */
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK_EQ(hb->n_draft_out, 0);
+    f.commit_plain(11);
+    f.sch.serial_end(0);
+    CHECK_EQ(f.sch.draft_watermark(id), hist_end);
+
+    /* The next chunk, on a fresh snapshot whose history pass is never built: the step commits, but
+     * nothing wrote the head's history, so the watermark must not move. */
+    REQUIRE(f.sch.step() != nullptr);
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);
+    f.commit_plain(11);
+    CHECK(f.sch.find(id)->n_computed > hist_end);
+    f.sch.serial_end(0);
+    CHECK_EQ(f.sch.draft_watermark(id), hist_end);
 }
 
 /* ================================================================== the real limits win */
@@ -789,9 +886,13 @@ TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
     CHECK_EQ(first->history_tokens[0], first_hist);
 }
 
-/* The A/C seam against the real model: a profile measured for this deployment, read by A's
- * table, prices every candidate the planner considers. The profile says a two-draft verify is
- * the cheapest per emitted token here, so the plan must choose 2 because the model said so. */
+/* The A/C seam against the real model: a version-2 profile measured for this deployment, read by
+ * A's table, prices every candidate the planner considers. The profile says a two-draft cycle is
+ * the cheapest per emitted token here, so the plan must choose 2 because the model said so.
+ *
+ * The buckets are keyed the way this runtime runs: publish-then-verify at pipeline depth 1, so a
+ * bucket's verify window is the previous cycle's distribution (nothing yet, on the first cycle)
+ * and its draft distribution is the cycle's own. */
 TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
     Fixture f;
     f.build();
@@ -804,20 +905,23 @@ TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
 
     const int cls = draft_ctx_class(8);
     auto bucket = [&](int k, double ms) {
-        std::string rows = "0";
-        for (int j = 1; j <= k; ++j) rows += ",1";
+        std::string draft = "0";
+        for (int j = 1; j <= k; ++j) draft += ",1";
         return "{\"ctx_class\": " + std::to_string(cls) +
-               ", \"shape\": {\"n_rows\": 1, \"verify_k\": " + std::to_string(k) +
-               ", \"verify_tokens\": " + std::to_string(1 + k) +
-               ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"rows\": [" + rows +
-               "], \"sampling\": \"greedy\", \"replay\": \"none\"},"
+               ", \"shape\": {\"n_rows\": 1, \"verify_k\": 0, \"verify_tokens\": 1"
+               ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"pipeline_depth\": 1"
+               ", \"rows\": [0], \"draft_k\": " + std::to_string(k) +
+               ", \"draft_rows\": [" + draft + "]"
+               ", \"origins\": [\"head\"], \"sampling\": \"greedy\", \"replay\": \"none\""
+               ", \"drafter\": \"serial\"},"
                " \"extent\": {\"rounds\": " + std::to_string(k) +
-               ", \"draft_rows\": " + std::to_string(k) + "},"
+               ", \"draft_rows_total\": " + std::to_string(k) +
+               ", \"draft_round_rows\": [" + draft + "]},"
                " \"time_ms\": {\"mean\": " + std::to_string(ms) + ", \"unc\": 0.01, \"n\": 9}}";
     };
     /* 1 token / 2.0 ms, 3 / 1.3, 7 / 5.0: K=2 pays, K=6 does not. */
     const std::string profile =
-        "{\"format\": \"rad-draft-profile/1\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
+        "{\"format\": \"rad-draft-profile/2\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
         "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
         "\"placement\": \"vram\"}, \"execution\": \"rectangular\", \"buckets\": [" +
         bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "]}";
@@ -855,17 +959,27 @@ TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
     REQUIRE(p != nullptr);
     CHECK_EQ(last_shape.n_rows, 1);
     CHECK_EQ(last_shape.history_tokens, 1);
+    CHECK_EQ(last_shape.pipeline_depth, 1);
+    CHECK_EQ(last_shape.verify_k, 0);      /* nothing was published before this cycle */
+    CHECK_EQ(last_shape.verify_tokens, 1);
+    CHECK_EQ(last_shape.unknown, 0u);
     CHECK(p->source == DraftPlanSource::Cost);
     CHECK_EQ(p->k[0], 2);
+    CHECK_EQ(p->pipeline_depth, 1);
     /* The model really priced the shape this plan names: its own estimate for it is measured. */
     DraftVerifyShape shape;
     shape.n_rows = 1;
-    shape.verify_k = 2;
-    shape.verify_tokens = 3;
+    shape.verify_k = 0;
+    shape.verify_tokens = 1;
     shape.history_tokens = 1;
     shape.ctx_class = cls;
-    shape.rows[1] = 1;
-    shape.rows[2] = 1;
+    shape.pipeline_depth = 1;
+    shape.draft_k = 2;
+    shape.draft_rows[1] = 1;
+    shape.draft_rows[2] = 1;
+    shape.drafter = DraftDrafter::Serial;
+    CHECK(draft_shape_priceable(shape));
+    CHECK(draft_shape_matches_plan(shape, *p));
     DraftCostEstimate est;
     CHECK_OK(table.estimate(shape, &est));
     CHECK(est.valid);
