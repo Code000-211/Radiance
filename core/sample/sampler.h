@@ -77,6 +77,8 @@
 #include "host_ref.h"
 #include "vocab_view.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -110,6 +112,30 @@ struct SamplerConfig {
      * larger top-k is refused at admission, not silently narrowed. */
     int64_t max_candidates = kSampleCandidates;
 };
+
+/* ================================================================== the narrow candidate width */
+
+/* RADIANCE_SAMPLE_CANDIDATES64=1 declares a SECOND candidate plan 64 wide beside the wide one and
+ * runs a batch on it when every row's top_k fits. Off, the driver declares the wide plan only and
+ * this header's behaviour is the one it always had.
+ *
+ * It is NOT a smaller max_candidates. `max_candidates` is the admission bound and stays as the
+ * deployment configured it: a request asking for top_k 70 is still admitted, and still served, by
+ * the wide plan, for the whole batch it lands in. What the narrow plan buys is that a batch of
+ * ordinary requests (top_k 20, say) stops paying for a 1024-wide candidate plane in the narrowing
+ * stages and the pick.
+ *
+ * The width is 64 because that is the width this engine's own sampler rows are written against
+ * (`REF_SAMPLE_CAND` in libref/ref_shapes.cpp, `n_cand` in libr4d/r4d_shapes.cpp), so a 64-wide
+ * candidate plane is the one every resolved sampler already has a kernel for. */
+enum { kSampleNarrowCand = 64 };
+
+/* Exactly "1", like every other RADIANCE_* switch here: a typo is off, never something else. */
+inline bool sample_candidates64_enabled() {
+    const char* v = std::getenv("RADIANCE_SAMPLE_CANDIDATES64");
+    return v && !std::strcmp(v, "1");
+}
+
 
 /* ================================================================== the driver */
 
@@ -235,17 +261,40 @@ private:
     rad_op op_temp_      = RAD_NULL_HANDLE;
     rad_op op_temp_late_ = RAD_NULL_HANDLE;   /* sample_temp over the candidates (temp_last) */
     rad_op op_mask_      = RAD_NULL_HANDLE;
-    rad_op op_topk_      = RAD_NULL_HANDLE;
-    rad_op op_topp_      = RAD_NULL_HANDLE;
-    rad_op op_minp_      = RAD_NULL_HANDLE;
-    rad_op op_typical_   = RAD_NULL_HANDLE;
-    rad_op op_xtc_       = RAD_NULL_HANDLE;
-    rad_op op_pick_      = RAD_NULL_HANDLE;
     rad_op op_argmax_    = RAD_NULL_HANDLE;
-    rad_op op_allgather_ = RAD_NULL_HANDLE;
-    rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
+
+    /* ONE CANDIDATE PLAN: the width its planes are cut to, the ops declared over that width, and
+     * the planes themselves.
+     *
+     * THE SAME PLAN TYPE DECLARED TWICE is what makes RADIANCE_SAMPLE_CANDIDATES64 an A/B instead
+     * of a second code path: `wide_` is the deployment's `max_candidates` and is what every batch
+     * ran on before the flag existed; `narrow_` is the same ops, the same buffers and the same
+     * issue order, cut to kSampleNarrowCand. A batch runs on exactly one of them, whole, and the
+     * ops after top-k read their geometry off the plan rather than off a member that could
+     * disagree with the buffers it was handed. */
+    struct Plan {
+        int64_t  n_cand    = 0;
+        rad_op   topk      = RAD_NULL_HANDLE;
+        rad_op   topp      = RAD_NULL_HANDLE;
+        rad_op   minp      = RAD_NULL_HANDLE;
+        rad_op   typical   = RAD_NULL_HANDLE;
+        rad_op   xtc       = RAD_NULL_HANDLE;
+        rad_op   pick      = RAD_NULL_HANDLE;
+        rad_op   allgather = RAD_NULL_HANDLE;   /* tensor parallel only */
+        rad_op   merge     = RAD_NULL_HANDLE;   /* and the merge beside it */
+        rad_buf  cand_i    = RAD_NULL_HANDLE;
+        rad_buf  cand_v    = RAD_NULL_HANDLE;
+        rad_buf  pairs     = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
+        rad_buf  gather    = RAD_NULL_HANDLE;
+    };
+    Plan wide_{};
+    Plan narrow_{};
+    /* Was `narrow_` declared at all? False without the flag, and false when the deployment's own
+     * width is already at or below the narrow one -- declaring a plan identical to `wide_` would
+     * be one more handle for no candidate byte saved. */
+    bool narrow_declared_ = false;
 
     /* Device-side buffers, from the ordinary buffer plan. */
     rad_buf buf_params_  = RAD_NULL_HANDLE;
@@ -253,10 +302,6 @@ private:
     rad_buf buf_hist_    = RAD_NULL_HANDLE;
     rad_buf buf_brk_     = RAD_NULL_HANDLE;   /* DRY's single-token breaker marks, beside history */
     rad_buf buf_mask_    = RAD_NULL_HANDLE;
-    rad_buf buf_cand_i_  = RAD_NULL_HANDLE;
-    rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
-    rad_buf buf_gather_  = RAD_NULL_HANDLE;
-    rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
     rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
     rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
 
@@ -279,6 +324,9 @@ private:
 
     int64_t mask_words_ = 0;      /* words for this rank's shard; what the mask op indexes */
     int64_t n_seq_      = 0;
+    /* THE PLAN THIS STEP RUNS ON, chosen in build_step and read by run. Never null once declared:
+     * a batch with any row the narrow plan cannot serve keeps `wide_`, whole. */
+    const Plan* plan_   = &wide_;
     /* Whether any DRY row this step has breakers; only then is the breaker plane uploaded and
      * passed to sample_dry. */
     bool    any_brk_    = false;
@@ -300,6 +348,18 @@ private:
     double  accept_us_     = 0.0;
     int64_t accept_n_      = 0;
     void shard_mask(uint32_t* dst) const;
+
+    /* Declare one candidate plan at width `n_cand`: its two planes, its pair and gathered planes
+     * under tensor parallel, and the ops that read them. `tag` distinguishes the two plans' buffer
+     * names, because a builder hands out one handle per name. Returns RAD_OK, or the first status
+     * a declaration refused. */
+    int declare_plan(RadBuilder* b, Plan* p, int64_t rows, int64_t n_cand, const char* tag);
+
+    /* May this step run on the narrow plan? EVERY active row must be one the narrow width serves
+     * with the same answer the wide width gives, and the test is per BATCH: one row that fails it
+     * puts the whole batch back on `wide_`, because a plan is a set of buffers and a stage cannot
+     * read half a row from one width and half from another. */
+    bool narrow_suits(const DeviceSampleParams* rows, int64_t n) const;
 
     /* Requests whose grammar died this step. The engine drains and cancels them, so one bad
      * request does not stop the step loop. */
