@@ -18,14 +18,22 @@
  * (cycle_id, policy_version, req_id, slot, slot_gen): none of those may be inferred from an index
  * alone, because slots are recycled.
  *
+ * Lifetime: a plan and its observation live in the cycle ring, keyed by that identity, until the
+ * observation is delivered or abandoned. Preemption stops the work but does not discard a cycle
+ * that already ran; recycling a slot resets slot state but must not free or rewrite a plan or
+ * observation still in flight; resume starts a new cycle with a new plan, and the old observation
+ * never merges into it. Delivery never consults the live slot, so a recycled generation cannot
+ * make a measured row unobservable (draft_observation_deliverable).
+ *
  * Units: milliseconds wherever a duration appears. A value that is not a duration is never
  * presented as one -- DraftCostSource says where an estimate came from, and an unmeasured shape is
  * an invalid estimate or a named conservative fallback, not a unitless prior labelled ms.
  *
- * Labels: only checked positions are labels (draft_label). The accepted prefix is 1, the first
- * real rejection is 0, and positions past it were never measured. EOG, max_tokens, cancellation
- * and the context end censor a cycle; they are recorded as the reason and do not turn into
- * labels.
+ * Labels: only checked positions are labels (draft_label). The accepted prefix is 1 and the first
+ * real rejection is 0. A cycle that stopped at a token the draft itself proposed (EOG,
+ * max_tokens) has that position compared but not committed: `end` says so, and the position gets
+ * no label at all -- never a fabricated reject. EOG, max_tokens, cancellation and the context end
+ * remain the censor reason; a censor does not delete a rejection measured before it.
  *
  * K counts drafts after the committed token. The first target is K = 0..6; the arrays are sized
  * for RAD_SCHED_MAX_SPEC so a wider window the kernel band allows still has storage.
@@ -44,7 +52,7 @@ enum { RAD_SCHED_MAX_SPEC = 64 };
 
 /* The draft profile's on-disk format (docs/ADAPTIVE-MTP.md). A file whose header differs is
  * refused by name, never reinterpreted under the current keys. */
-enum { RAD_DRAFT_PROFILE_VERSION = 1 };
+enum { RAD_DRAFT_PROFILE_VERSION = 2 };
 
 /* Context-length buckets of the profile key. A bucket is a property of the text, not of the
  * deployment: profiles only carry the buckets the configured capacity can reach. */
@@ -54,6 +62,15 @@ inline int draft_ctx_class(int32_t ctx_len) {
     if (ctx_len < 32768)  return 1;
     if (ctx_len < 131072) return 2;
     return 3;
+}
+
+/* Drafts a request may run for `want` given its output budget. The verify step emits the bonus
+ * token -- the target's own draw after the accepted prefix -- whether or not a draft was accepted,
+ * so the drafts are bounded by remaining - 1, never by remaining. remaining <= 1 leaves room for
+ * the bonus token alone. */
+inline int32_t draft_budget_k(int32_t remaining, int32_t want) {
+    if (remaining <= 1 || want <= 0) return 0;
+    return want < remaining - 1 ? want : remaining - 1;
 }
 
 /* ------------------------------------------------------------------ small vocabularies */
@@ -102,8 +119,29 @@ enum class DraftPlanSource : uint8_t { Legacy = 0, Cost = 1, Fallback = 2, Probe
 enum class DraftProbe : uint8_t { None = 0, Recovery = 1, Uncertainty = 2, Age = 3 };
 
 /* Why a draft prefix ended before its last position was checked. Every value except None censors
- * the labels past the cut. */
+ * the labels past the cut. A censor is the reason, not a label: a real rejection measured just
+ * before the cut keeps its 0 (DraftSeqEnd::Rejected). */
 enum class DraftCensor : uint8_t { None = 0, Eog = 1, MaxTokens = 2, Cancelled = 3, ContextEnd = 4 };
+
+/* How the labelled span ends. The three cases are different measurements and one label mask cannot
+ * guess between them: `Rejected` is a real 0 at `accepted` (the target drew another token, even
+ * when the cycle then censors); `Stopped` is the target and the draft agreeing on a stopping token
+ * that is not committed -- compared, not a reject, so no label there; `AllAccepted` ends because
+ * no position was left to check. `Unset` is refused: a caller that did not classify the cut gets
+ * no label, never a guessed reject. */
+enum class DraftSeqEnd : uint8_t {
+    Unset = 0,
+    AllAccepted = 1,
+    Rejected = 2,
+    Stopped = 3,
+};
+
+/* Who produced a request's proposals, per request. The fact, where DraftPlan::fill[] is the
+ * permission: the plan says who may spend k[], the observation says who did. `Head` maps to
+ * fill Serial and `Lookup` to fill Ngram; `None` means nothing was produced (K 0, or a preempted
+ * row) and requires generated == 0. Never an implicit default -- a row whose origin is unknown is
+ * not priced as head. */
+enum class DraftOrigin : uint8_t { None = 0, Head = 1, Lookup = 2 };
 
 /* Where a cost estimate came from. A prior that is not a duration is ConservativeFallback (with
  * invalid set when it cannot even bound the cost), never Measured. */
@@ -137,7 +175,8 @@ struct DraftSeqView {
     uint32_t slot_gen = 0;
     int32_t  ctx_len = 0;    /* tokens computed before the cycle: the context the draft reads */
     int32_t  ctx_class = 0;  /* draft_ctx_class(ctx_len) */
-    int32_t  remaining = 0;  /* output tokens still allowed; a draft past this is wasted */
+    int32_t  remaining = 0;  /* output tokens still allowed, including the bonus token the verify
+                              * step will emit; drafts are bounded by draft_budget_k() */
     DraftSampling    sampling = DraftSampling::Greedy;
     DraftEligibility eligibility = DraftEligibility::Eligible;
     bool prefill = false;    /* this request still carries prefill work in the same step */
@@ -154,6 +193,8 @@ struct DraftBatchView {
 
     int32_t k_ceiling = 0;        /* the declared maximum (--num-speculative-tokens); 0 = no
                                    * drafter loaded, which is a process, not a temporary K0 */
+    int32_t pipeline_depth = 0;  /* cycles this plan is issued ahead of its verification; 0 = the
+                                   * paired step verifies exactly what this cycle drafts */
     int32_t token_budget = 0;     /* draft/verify tokens this cycle may add */
     int32_t kv_budget = 0;        /* KV tokens available for draft lookahead */
     int32_t prefill_tokens = 0;   /* prefill tokens sharing the step; 0 decode-only */
@@ -163,9 +204,22 @@ struct DraftBatchView {
 /* ------------------------------------------------------------------ A: the cost key */
 
 /* What a verify pass computes, separated from what the draft rounds actually ran. `rows[j]` is
- * N_j, the number of requests whose K reaches position j: a rectangular window has all N_j equal,
- * E2's shrinking rounds do not. The profile versions the two executions apart, so a shape keyed
- * only by (rows, max K) would mix them. */
+ * N_j, the number of requests whose verify reaches position j: a rectangular window has all N_j
+ * equal, E2's shrinking rounds do not. `draft_rows[j]` is the plan's own N_j for the drafting
+ * rounds, so the shape can be checked against the cycle that asked for it instead of against a
+ * total. The profile versions the two executions apart, and keying a shape on (rows, max K) alone
+ * would mix a rectangular cycle with a shrinking one.
+ *
+ * `unknown` exists because a missing measurement is not a zero: a caller that lacks history,
+ * prefill, replay or the plan's draft distribution sets the flag, and the model refuses the shape
+ * (draft_shape_priceable) rather than pricing the zeros as measured. */
+enum DraftShapeUnknown : uint32_t {
+    kDraftShapeHistoryUnknown = 1u << 0,
+    kDraftShapePrefillUnknown = 1u << 1,
+    kDraftShapeReplayUnknown  = 1u << 2,
+    kDraftShapeDraftUnknown   = 1u << 3,  /* no cycle-bound draft distribution, not "no drafts" */
+};
+
 struct DraftVerifyShape {
     int32_t n_rows = 0;         /* decode sequences in the batch */
     int32_t verify_k = 0;       /* deepest window verified; 0 is a plain decode step */
@@ -173,23 +227,33 @@ struct DraftVerifyShape {
     int32_t ctx_class = 0;      /* draft_ctx_class over the rows (the deepest one) */
     int32_t history_tokens = 0; /* MTP history/QSA rows carried in the same cycle */
     int32_t prefill_tokens = 0; /* prefill tokens sharing the step; 0 decode-only */
-    /* N_j for j = 1..verify_k; index 0 unused. */
+    /* N_j for j = 1..verify_k of the verify pass; index 0 unused. */
     int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
+    /* The plan's draft distribution, separate from the verify distribution above: N_j for
+     * j = 1..draft_k, index 0 unused. Under pipeline_depth > 0 the paired step verifies a window
+     * the previous cycle drafted, so the two distributions are not interchangeable. */
+    int32_t draft_k = 0;
+    int32_t draft_rows[RAD_SCHED_MAX_SPEC + 1] = {};
+    int32_t pipeline_depth = 0; /* cycles between drafting this plan and verifying it */
     DraftSampling sampling = DraftSampling::Greedy;
     DraftReplay   replay = DraftReplay::None;
     /* The drafter loaded for the pass, not who filled k[]: K0 with the head loaded (its history
      * and KV still maintained) and K0 with no drafter process are different buckets. */
     DraftDrafter  drafter = DraftDrafter::None;
+    uint32_t      unknown = 0;  /* DraftShapeUnknown bits; nonzero = not a measured key */
 };
 
 /* One completed cycle's timing, tied to the plan that shaped it. Verify shape and draft extent
- * are separate because their costs scale with different counts (rows vs rounds). */
+ * are separate because their costs scale with different counts (rows vs rounds). The executed
+ * draft distribution is kept per round: two cycles with the same `rounds` and total can shrink
+ * differently and cost differently. */
 struct DraftCostSample {
     uint64_t cycle_id = 0;      /* the plan this sample belongs to; 0 = unattributed */
     uint32_t policy_version = 0;
     DraftVerifyShape shape;
     int32_t rounds = 0;         /* deepest draft round the head actually ran */
-    int32_t draft_rows = 0;     /* sum_j N_j actually executed */
+    int32_t draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {}; /* actual N_j per round, index 0 unused */
+    int32_t draft_rows_total = 0; /* sum_j draft_round_rows[j] actually executed */
     int32_t drafted = 0;        /* draft tokens produced */
     double  total_ms = 0.0;     /* the whole cycle: trunk step, draft rounds, commit */
     /* Split timings, -1 when the phase was not timed. Under overlap they do not add up to
@@ -253,6 +317,8 @@ struct DraftPlan {
     int32_t  k_ceiling = 0;   /* copied from the view so telemetry needs no view */
     int32_t  max_k = 0;       /* deepest k[]; 0 = no drafts this cycle */
     int32_t  verify_k = 0;    /* deepest window under verification in the paired step */
+    int32_t  pipeline_depth = 0; /* cycles this plan is issued ahead; 0 = verified by the next
+                                  * step. Part of the plan's immutable record, not a live query. */
     DraftPlanSource source = DraftPlanSource::Legacy;
     DraftFallback   fallback = DraftFallback::None;  /* set when source is Fallback */
     DraftProbe      probe = DraftProbe::None;
@@ -282,14 +348,18 @@ enum { RAD_DRAFT_MAX_FEATURES = 4 };
 
 /* One request's verify outcome. The counts are separate on purpose: a draft can be generated and
  * not published, published and not verified, verified and not checked (past the first rejection),
- * and checked and still censored before it is committed. */
+ * and checked and still censored before it is committed. `end` classifies the cut; `origin` says
+ * who produced this row (the plan's fill[] is only the permission). Both are part of the
+ * observation, so no caller keeps a side list that can drift from the cycle. */
 struct DraftSeqObservation {
     uint64_t raw_match = 0;  /* consecutive drafts that matched the target's own draw, uncensored */
     uint8_t  generated = 0;  /* draft tokens the head produced */
     uint8_t  published = 0;  /* tokens actually published to the proposal buffer */
-    uint8_t  verified = 0;   /* positions the target computed */
+    uint8_t  verified = 0;   /* draft positions the target computed (never the bonus token) */
     uint8_t  checked = 0;    /* positions with a label: accepted prefix plus the first rejection */
     uint8_t  accepted = 0;   /* drafts committed (the emitted prefix) */
+    DraftSeqEnd end = DraftSeqEnd::Unset;
+    DraftOrigin origin = DraftOrigin::None;
     DraftCensor censor = DraftCensor::None;
     float   feat[RAD_DRAFT_MAX_FEATURES] = {};  /* optional head features (margin, ...) */
     uint8_t feat_valid = 0;                     /* bit i: feat[i] is meaningful */
@@ -399,7 +469,7 @@ inline int draft_plan_valid(const DraftPlan& p) {
     }
     if (p.verify_k < 0 || p.verify_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
     if (!p.k || !p.rows || !p.fill || !p.ctx_class || !p.history_tokens) return RAD_E_INVAL;
-    if (p.prefill_tokens < 0) return RAD_E_INVAL;
+    if (p.prefill_tokens < 0 || p.pipeline_depth < 0) return RAD_E_INVAL;
     if (p.n_seq > 0 && (!p.req_id || !p.slot || !p.slot_gen)) return RAD_E_INVAL;
     int32_t count[RAD_SCHED_MAX_SPEC + 1] = {};
     for (int32_t i = 0; i < p.n_seq; ++i) {
@@ -442,15 +512,136 @@ inline bool draft_plan_bars_fill(const DraftPlan& p, int32_t i) {
     return p.k && p.fill && i >= 0 && i < p.n_seq && p.k[i] == 0 && p.fill[i] == DraftDrafter::None;
 }
 
-/* The label for draft position j (0-based), if this cycle measured one: 1 when the position was
- * accepted, 0 at the first real rejection, and nothing past it. `checked` counts the positions
- * with a label, so it always ends at the first rejection; a censor cuts the cycle earlier and the
- * reason is recorded, not the position. */
+/* Two version checks, deliberately different. A prediction set describes the view it was computed
+ * for, so its version and rows must be the view's; reading the hook's current version instead
+ * would hide a stale set. An observation describes the plan it names, so its version must be that
+ * plan's (draft_plan_identifies), not the version the hooks carry now: a plan issued under an
+ * older policy stays observable while it is alive. Neither check is the other's guard. */
+inline bool draft_predictions_current(const DraftBatchView& view, const DraftPredictions& p) {
+    if (p.version != view.policy_version) return false;
+    if (p.n_seq != view.n_seq || p.n_seq < 0 || p.n_seq > p.cap) return false;
+    if (p.n_seq == 0) return true;
+    if (!p.req_id || !p.seq || !view.seq) return false;
+    for (int32_t i = 0; i < p.n_seq; ++i) {
+        if (p.req_id[i] != view.seq[i].req_id) return false;
+    }
+    return true;
+}
+
+/* A row that may be learned from: the counts are ordered (generated >= published >= verified >=
+ * checked >= accepted), the raw match covers the committed prefix, and `end` classifies the cut.
+ * An unclassified row is refused instead of guessed; a rejection is exactly one position past the
+ * accepted prefix, and a matched stop carries no label position at all. */
+inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
+    const int a = (int)o.accepted, c = (int)o.checked, v = (int)o.verified;
+    if (a > RAD_SCHED_MAX_SPEC || c > RAD_SCHED_MAX_SPEC || v > RAD_SCHED_MAX_SPEC) return false;
+    if (o.published > o.generated) return false;
+    if (a > (int)o.published || v > (int)o.published) return false;
+    if (a > c || c > v) return false;
+    if (o.raw_match < (uint64_t)a) return false;
+    switch (o.end) {
+        case DraftSeqEnd::AllAccepted: return c == a;
+        case DraftSeqEnd::Rejected:    return c == a + 1;   /* the measured 0 */
+        case DraftSeqEnd::Stopped:     return c == a;       /* compared, not committed, no label */
+        case DraftSeqEnd::Unset:       return false;
+    }
+    return false;
+}
+
+/* The actual origin must fit the plan's permission: a row nobody was allowed to fill may not claim
+ * proposals (that is the K0/fallback leak), and the head and the lookup fallback cannot stand in
+ * for one another. A row that produced nothing is None, whatever its budget was. */
+inline bool draft_origin_fits_plan(const DraftPlan& p, int32_t i, const DraftSeqObservation& o) {
+    if (i < 0 || i >= p.n_seq || !p.k || !p.fill) return false;
+    switch (o.origin) {
+        case DraftOrigin::None:   return o.generated == 0;
+        case DraftOrigin::Head:   return p.k[i] > 0 && p.fill[i] == DraftDrafter::Serial;
+        case DraftOrigin::Lookup: return p.k[i] > 0 && p.fill[i] == DraftDrafter::Ngram;
+    }
+    return false;
+}
+
+/* The lifetime gate for a completed cycle, and the only one. It never consults the live slot: a
+ * request preempted after its pass ran, a slot recycled for a new generation, and a resumed
+ * request all leave this observation deliverable, because its rows are the plan's and both
+ * identities travel with it. Refusing on "the slot now holds another generation" would drop a
+ * measured cycle; accepting a row that does not fit its plan's permission would teach another
+ * cycle's work. */
+inline bool draft_observation_deliverable(const DraftObservation& o) {
+    if (!o.complete || !o.plan) return false;
+    if (!draft_plan_identifies(*o.plan, o)) return false;
+    if (o.n_seq > 0 && !o.seq) return false;
+    for (int32_t i = 0; i < o.n_seq; ++i) {
+        if (!draft_seq_observation_valid(o.seq[i])) return false;
+        if (!draft_origin_fits_plan(*o.plan, i, o.seq[i])) return false;
+    }
+    return true;
+}
+
+/* Whether the shape is a key the profile may be asked for. `unknown` is the explicit "not
+ * measured" marker: a missing history, prefill, replay or draft distribution is refused, never
+ * priced as a zero. Both distributions must be monotone and complete, verify_tokens must equal
+ * n_rows + sum_j rows[j], and no stale entry may survive past the deepest round of either. */
+inline bool draft_shape_priceable(const DraftVerifyShape& s) {
+    if (s.unknown != 0) return false;
+    if (s.n_rows < 0 || s.n_rows > RAD_SCHED_MAX_SPEC) return false;
+    if (s.verify_k < 0 || s.verify_k > RAD_SCHED_MAX_SPEC) return false;
+    if (s.draft_k < 0 || s.draft_k > RAD_SCHED_MAX_SPEC) return false;
+    if (s.ctx_class < 0 || s.ctx_class >= RAD_DRAFT_CTX_CLASSES) return false;
+    if (s.history_tokens < 0 || s.prefill_tokens < 0 || s.pipeline_depth < 0) return false;
+    int32_t tokens = s.n_rows, prev = s.n_rows;
+    for (int j = 1; j <= s.verify_k; ++j) {
+        if (s.rows[j] < 0 || s.rows[j] > prev) return false;
+        prev = s.rows[j];
+        tokens += prev;
+    }
+    if (s.verify_tokens != tokens) return false;
+    prev = s.n_rows;
+    for (int j = 1; j <= s.draft_k; ++j) {
+        if (s.draft_rows[j] < 0 || s.draft_rows[j] > prev) return false;
+        prev = s.draft_rows[j];
+    }
+    if (s.draft_k > 0 && s.draft_rows[s.draft_k] == 0) return false;
+    for (int j = s.verify_k + 1; j <= RAD_SCHED_MAX_SPEC; ++j) {
+        if (s.rows[j] != 0) return false;
+    }
+    for (int j = s.draft_k + 1; j <= RAD_SCHED_MAX_SPEC; ++j) {
+        if (s.draft_rows[j] != 0) return false;
+    }
+    return true;
+}
+
+/* The planned draft distribution must be the cycle's own: same request count, same deepest round,
+ * same N_j as the plan's k[], and the same pipeline depth. The verify distribution is not compared
+ * with this plan -- under pipeline_depth > 0 it belongs to the cycle the paired step verifies --
+ * but it is still bounded by draft_shape_priceable. */
+inline bool draft_shape_matches_plan(const DraftVerifyShape& s, const DraftPlan& p) {
+    if (s.n_rows != p.n_seq || s.draft_k != p.max_k) return false;
+    if (s.pipeline_depth != p.pipeline_depth) return false;
+    if (p.max_k == 0) return true;
+    if (!p.rows) return false;
+    for (int j = 1; j <= p.max_k; ++j) {
+        if (s.draft_rows[j] != p.rows[j]) return false;
+    }
+    return true;
+}
+
+/* The label for draft position j (0-based), if this cycle measured one: 1 on the accepted prefix,
+ * 0 at a real rejection, and nothing else. The position at `accepted` is labelled only when
+ * `end == Rejected` -- a matched stopping token (Stopped) is compared and not committed, so giving
+ * it a 0 would teach the head that a correct EOG was wrong. `checked` ends the labelled span, so a
+ * censor past a rejection does not erase it. */
 inline bool draft_label(const DraftSeqObservation& o, int j, float* label) {
     if (j < 0 || j >= (int)o.checked) return false;
-    if (j > (int)o.accepted) return false;   /* positions past the first rejection were not measured */
-    if (label) *label = j < (int)o.accepted ? 1.0f : 0.0f;
-    return true;
+    if (j < (int)o.accepted) {
+        if (label) *label = 1.0f;
+        return true;
+    }
+    if (o.end == DraftSeqEnd::Rejected && j == (int)o.accepted) {
+        if (label) *label = 0.0f;
+        return true;
+    }
+    return false;
 }
 
 /* A bracket that may be stored at all: marked valid, finite and positive. Storage and attribution

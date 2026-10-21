@@ -35,11 +35,31 @@ prediction and sample.
   once; no other hook writes into it, and `observe` takes only const inputs. Historical plans stay
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles
   in advance, and a telemetry overflow drops and counts records rather than blocking the card.
+- **Lifecycle: Preempt → Recycle → Resume.** A plan and its observation live in the cycle ring,
+  keyed by identity, until the observation is delivered or abandoned. Preemption stops the work but
+  does not discard a cycle that already ran: its observation is delivered when `complete`.
+  Recycling a slot resets slot state but must not free or rewrite a plan or observation still in
+  flight; resume starts a new cycle with a new plan, and the old observation never merges into it.
+  Delivery is `draft_observation_deliverable`, which never consults the live slot — so a recycled
+  generation cannot drop a measured cycle — and refuses a row whose origin does not fit its plan.
+  The ring owns copies of `req_id`, `slot` and `slot_gen`; pointers into live slot state would
+  change identity under the observation.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
   handed came from the plan they name — the observation carries both the identity arrays and the
   plan pointer, and either one alone can be stale. One memory set per live cycle: a plan is not
   rewritten while an observation or an issued-ahead pass still names it.
+- **Version checks are two, and they are not interchangeable.** A prediction set describes the
+  view it was computed for: `draft_predictions_current` requires `predictions.version` and the
+  request rows to be the view's, so a set left over from an older policy is stale rather than
+  silently reused. An observation describes the plan it names: its version must equal that plan's,
+  not the hooks' current version, so a consistent plan issued under an older policy stays
+  observable while it is alive.
+- **Origin is part of the cycle, not a side list.** `DraftPlan::fill[]` is the permission (who may
+  spend `k[]`); `DraftSeqObservation::origin` is the fact (who produced the row: `Head`, `Lookup`
+  or `None`). `draft_origin_fits_plan` refuses a lookup row behind a head budget, a head row behind
+  a lookup budget, and any proposal on a K0 row the plan barred — the K0/fallback leak. An
+  observation with no origin is not priced as head.
 - **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
 - **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
@@ -48,18 +68,32 @@ prediction and sample.
   may not fill it (`draft_plan_bars_fill`). The view's batch-wide `ngram_allowed` is the gate the
   plan is chosen under, not a licence to override the plan.
 - **The plan carries the shape it was priced on.** Per request `ctx_class` and `history_tokens`,
-  cycle-wide `prefill_tokens`, `replay` and `timing_valid`. A historical plan kept alive by
-  `issue_ahead()` can then still say what it priced, and a K0 plan with `history_tokens > 0` is
-  "policy K0 with history", not "no work".
-- **Verify shape and draft extent are separate.** `DraftVerifyShape` keys the cost model on verify
-  tokens, context class, history tokens and `N_j` (requests reaching round j), not just
-  `(rows, max K)`. `DraftCostSample` carries the rounds and rows actually executed beside it.
-- **Labels only where measured.** `draft_label` returns a label for the accepted prefix (1) and
-  the first real rejection (0), and nothing after that: a position the target computed past the
-  first rejection was not measured, even when `checked` covers it. EOG, `max_tokens`, cancellation
-  and the context end are `DraftCensor` reasons: they cut `checked`, and the cut is what keeps the
-  censored tail out — the reason names why, it is not itself a position. Raw match length, commit
-  length, and the censor reason are separate fields.
+  cycle-wide `prefill_tokens`, `replay`, `timing_valid` and `pipeline_depth`. A historical plan
+  kept alive by `issue_ahead()` can then still say what it priced, and a K0 plan with
+  `history_tokens > 0` is "policy K0 with history", not "no work".
+- **Verify distribution and planned draft distribution are separate keys.** `DraftVerifyShape`
+  carries `rows[]` for the verify pass and `draft_rows[]`/`draft_k` for the draft rounds the plan
+  asks for; under `pipeline_depth > 0` they belong to different cycles. `rounds` plus one total
+  cannot tell two shrinking distributions apart, so `DraftCostSample` carries the executed
+  distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan` checks the planned
+  distribution against the plan's `k[]`; `draft_shape_priceable` requires both distributions to be
+  monotone and complete and `verify_tokens` to equal `n_rows + sum_j rows[j]`.
+- **A missing measurement is not zero.** `DraftVerifyShape::unknown` names an absent history,
+  prefill, replay or plan distribution; `draft_shape_priceable` refuses the shape, and the caller
+  takes its named fallback. A zero is only a zero when it was measured as one.
+- **Labels only where measured.** `draft_label` returns 1 on the accepted prefix and 0 at a real
+  rejection, and nothing else. `DraftSeqEnd` says how the labelled span ends: `Rejected` (a real
+  0 at `accepted`), `Stopped` (the target agreed on a stopping token that is not committed —
+  compared, *not* a reject, no label), `AllAccepted`, or `Unset` (refused, never guessed). EOG,
+  `max_tokens`, cancellation and the context end remain the `DraftCensor` reason; a censor does not
+  erase a rejection measured before it. Raw match length, commit length, and the censor reason are
+  separate fields, which is what lets F assert a correctly hit but uncommitted EOG without
+  inventing a reject label.
+- **The output budget includes the bonus token.** `remaining` counts the tokens the request may
+  still emit, and the verify step always emits the target's bonus token after the accepted prefix.
+  Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
+  request drafts nothing. A plan that clamps at `remaining` overruns the output budget by one
+  token per verify step.
 - **Units are milliseconds or nothing.** An unmeasured shape is `valid = false` or
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
 - **Only cleanly attributed samples update a measured play bucket** (`draft_sample_attributable`):
@@ -122,15 +156,16 @@ drafter. Initialisation is explicitly not depth 0. A speculation-off plan is nev
 n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
 "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
 
-## Draft profile format, version 1
+## Draft profile format, version 2
 
 `core/sched/draft_cost.cpp` (A) reads and validates this; the parser never runs on the step path.
-The format id is `rad-draft-profile/1` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id is
-refused by name, not reinterpreted.
+The format id is `rad-draft-profile/2` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id —
+including `rad-draft-profile/1`, whose key had no draft distribution, origin or pipeline depth — is
+refused by name, not reinterpreted under the current keys.
 
 ```json
 {
-  "format": "rad-draft-profile/1",
+  "format": "rad-draft-profile/2",
   "fingerprint": {
     "model": "Qwen3.8-Flash-Next",
     "quant": "gguf-q4_k_m",
@@ -151,12 +186,17 @@ refused by name, not reinterpreted.
         "verify_tokens": 32,
         "history_tokens": 0,
         "prefill_tokens": 0,
+        "pipeline_depth": 0,
         "rows": [0, 8, 8, 8],
+        "draft_k": 3,
+        "draft_rows": [0, 8, 8, 8],
+        "origins": ["head"],
         "sampling": "greedy",
         "replay": "play",
         "drafter": "serial"
       },
-      "extent": { "rounds": 3, "draft_rows": 24 },
+      "extent": { "rounds": 3, "draft_rows_total": 24,
+                  "draft_round_rows": [0, 8, 8, 8] },
       "time_ms": { "mean": 43.0, "unc": 0.6, "n": 5 },
       "components_ms": { "target": 25.9, "draft": 12.1, "host": 4.2, "valid": true },
       "flags": ["ahead"]
@@ -173,8 +213,17 @@ refused by name, not reinterpreted.
   execution invalidates the old file rather than rescaling it.
 - **`shape` is the lookup key.** It is the verify token count and length distribution
   (`n_rows`, `verify_k`, `verify_tokens`), context class, history tokens, prefill tokens, `N_j`,
-  sampling class, replay state and the loaded drafter. `T(B, maxK)` alone is not a key, and K0
-  with the head loaded is not the same bucket as K0 with no drafter process.
+  sampling class, replay state and the loaded drafter. The planned draft distribution
+  (`draft_k`, `draft_rows`) and the pipeline depth are part of the key too: the same `rounds` and
+  total rows can shrink differently, and an issued-ahead cycle prices a different pair of
+  distributions than a synchronous one. Origins name the mix of rows (`head`, `lookup`); a head
+  row does not price a lookup row. `T(B, maxK)` alone is not a key, and K0 with the head loaded is
+  not the same bucket as K0 with no drafter process.
+- **Version 2 is not version 1 with new fields.** A version-1 file has no `draft_k`/`draft_rows`,
+  no `pipeline_depth` and no origin mix, so its buckets cannot be mapped onto the current key by
+  assuming zeros. The reader refuses it by format id; a profile is regenerated, never rescaled.
+  The parser also refuses a bucket whose `draft_rows` disagrees with `rows` where the two
+  distributions are the same execution, and a shape carrying an `unknown` dimension.
 - **`ctx_class`.** 0 = below 4K, 1 = 4K–32K, 2 = 32K–128K, 3 = 128K and above
   (`draft_ctx_class`). Profiles only carry the classes the configured capacity can reach.
 - **Coverage and uncertainty.** Each bucket carries its sample count and uncertainty. A missing
@@ -261,7 +310,7 @@ ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD clang 23.0.0git, ROCm
 llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
 Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
-`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 236 checks over 15 cases), and the
+`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 310 checks over 23 cases), and the
 broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Five of the six failures fail
 identically on `cb5a69a` with the same compiler and configuration; the sixth, `glm5next_test`,
 passes there at 9.3 s and crosses its 10 s CPU budget only under the broad run's parallel load (it
