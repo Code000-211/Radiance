@@ -16,6 +16,15 @@ double settle_weight(uint16_t n, double prior_weight, double alpha) {
     return mean > alpha ? mean : alpha;
 }
 
+/* The effective sample size after one more label of weight w. Past labels keep their relative
+ * weights, so mixing a new observation with a past distribution of ESS `e` gives
+ * 1 / (w^2 + (1-w)^2 / e); with a constant w = alpha it converges to (2 - alpha) / alpha. */
+double settle_ess(double e, double w) {
+    if (e <= 0.0) return 1.0;
+    const double q = 1.0 - w;
+    return 1.0 / (w * w + q * q / e);
+}
+
 }  /* namespace */
 
 int DraftPredictModel::configure(const Params& p, DraftPredictState* states, int32_t cap) {
@@ -38,11 +47,18 @@ int DraftPredictModel::configure(const Params& p, DraftPredictState* states, int
         RAD_ERR("draft predictor: %d slots but no state table", (int)cap);
         return RAD_E_INVAL;
     }
+    /* A new table, or a change to what shapes the estimate, starts over. A version bump alone does
+     * not: policies are provenance, and a live cycle planned under the old one must still teach. */
+    const bool reset = states_ != states || cap_ != cap || p.max_depth != p_.max_depth ||
+                       p.prior != p_.prior || p.half_life != p_.half_life ||
+                       p.prior_weight != p_.prior_weight;
     p_ = p;
     states_ = states;
     cap_ = cap;
     alpha_ = 1.0 - std::exp2(-1.0 / (double)p_.half_life);
-    for (int32_t i = 0; i < cap_; ++i) start(states_[i], 0, 0);
+    if (reset) {
+        for (int32_t i = 0; i < cap_; ++i) start(states_[i], 0, 0);
+    }
     return RAD_OK;
 }
 
@@ -52,6 +68,7 @@ void DraftPredictModel::start(DraftPredictState& s, uint64_t req_id, uint32_t sl
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
         s.a[j] = p_.prior;
         s.n[j] = 0;
+        s.ess[j] = p_.prior_weight;
     }
 }
 
@@ -59,9 +76,10 @@ float DraftPredictModel::unc_at(const DraftPredictState& s, int j) const {
     double p = (double)s.a[j];
     if (p < 0.0) p = 0.0;
     if (p > 1.0) p = 1.0;
-    /* A Beta-like half-width: the prior's pseudo-observations and the real ones both narrow it,
-     * and the +1 keeps a run of identical labels from claiming zero uncertainty. */
-    const double denom = (double)s.n[j] + (double)p_.prior_weight + 1.0;
+    /* A Beta-like half-width over the effective evidence, not the raw count: an EMA with a
+     * half-life cannot carry more than (2 - alpha) / alpha labels, and a policy reading n must
+     * see that ceiling rather than a number that grows forever. */
+    const double denom = (double)s.ess[j] + 1.0;
     double u = (double)p_.unc_z * std::sqrt(p * (1.0 - p) / denom);
     if (u > 1.0) u = 1.0;
     return (float)u;
@@ -74,6 +92,13 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
     if (view.n_seq > out->cap) {
         RAD_ERR("draft predictor: %d requests but predictions hold %d", (int)view.n_seq,
                 (int)out->cap);
+        return RAD_E_INVAL;
+    }
+    /* A prediction is for the policy that asks for it; a plan made under another version is not
+     * this prediction's. Observations are judged by their plan instead -- see observe(). */
+    if (view.policy_version != p_.version) {
+        RAD_ERR("draft predictor: view is policy version %u, this model %u",
+                (unsigned)view.policy_version, (unsigned)p_.version);
         return RAD_E_INVAL;
     }
     out->n_seq = view.n_seq;
@@ -96,7 +121,10 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
             const bool in = j < D;
             pr.a[j] = in ? s.a[j] : 0.0f;
             pr.unc[j] = in ? unc_at(s, j) : 0.0f;
-            pr.n[j] = in ? s.n[j] : 0;
+            double data = in ? (double)s.ess[j] - (double)p_.prior_weight : 0.0;
+            if (data < 0.0) data = 0.0;
+            const long count = std::lround(data);
+            pr.n[j] = (uint16_t)(count > 65535 ? 65535 : count);
             if (in && s.n[j] > 0) valid |= 1ull << j;
         }
         pr.valid = valid;
@@ -111,37 +139,36 @@ int DraftPredictModel::predict_hook(void* self, const DraftBatchView& view,
 }
 
 void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o,
-                              DraftProposalSource src) const {
+                              DraftDrafter src) const {
     /* Another drafter's matches are not this head's acceptance, and a K0 row measured nothing. */
-    if (src != DraftProposalSource::Head || o.generated == 0 || p_.max_depth <= 0) return;
+    if (src != DraftDrafter::Serial || o.generated == 0 || p_.max_depth <= 0) return;
 
     int accepted = (int)o.accepted;
-    if (accepted > (int)o.checked) accepted = (int)o.checked;  /* the prefix cannot outrun the labels */
-    /* A censor ends the cycle at the accepted prefix: the position after it was never a real
-     * rejection. Without a censor the first rejection is the only zero label; `checked` past it --
-     * a caller's mistake -- buys no more evidence. */
+    if (accepted > (int)o.checked) accepted = (int)o.checked;  /* observe() refuses this already */
+    /* draft_label()'s mask: checked ends at the first rejection, and nothing past it was measured.
+     * A censor is a reason, not a position -- a rejection checked before it stays a label. */
     int labeled = (int)o.checked;
     if (labeled > accepted + 1) labeled = accepted + 1;
-    if (o.censor != DraftCensor::None) labeled = accepted;
     const int D = p_.max_depth;
-    const int upto = labeled < D ? labeled : D;
-    for (int j = 0; j < upto; ++j) {
+    if (labeled > D) labeled = D;
+    for (int j = 0; j < labeled; ++j) {
         const double w = settle_weight(s.n[j], (double)p_.prior_weight, alpha_);
         const double x = j < accepted ? 1.0 : 0.0;
         s.a[j] = (float)((double)s.a[j] + w * (x - (double)s.a[j]));
+        s.ess[j] = (float)settle_ess((double)s.ess[j], w);
         if (s.n[j] < UINT16_MAX) ++s.n[j];
     }
-    /* Positions past the deepest label drift toward it. No count, no valid bit: this is a prior
-     * moving with the text, not an observation. */
-    const int edge_at = upto - 1;
-    if (edge_at < 0) return;
-    const double edge = (double)s.a[edge_at];
-    for (int j = upto; j < D; ++j)
+    /* Positions past the window the verify computed drift toward its deepest position, the same
+     * basis and step as DraftController::adapt_observe. No count, no valid bit. */
+    int verified = (int)o.verified;
+    if (verified > D) verified = D;
+    if (verified <= 0) return;
+    const double edge = (double)s.a[verified - 1];
+    for (int j = verified; j < D; ++j)
         s.a[j] = (float)((double)s.a[j] + alpha_ * (edge - (double)s.a[j]));
 }
 
-int DraftPredictModel::observe(const DraftObservation& obs,
-                               const DraftProposalSource* source) const {
+int DraftPredictModel::observe(const DraftObservation& obs) const {
     if (!obs.complete) {
         RAD_ERR("draft predictor: cycle %llu is not complete; no label is taken from it",
                 (unsigned long long)obs.cycle_id);
@@ -154,29 +181,30 @@ int DraftPredictModel::observe(const DraftObservation& obs,
         RAD_ERR("draft predictor: no state table configured");
         return RAD_E_INVAL;
     }
-    if (obs.policy_version != p_.version) {
-        RAD_ERR("draft predictor: cycle %llu was planned under policy version %u, not %u",
-                (unsigned long long)obs.cycle_id, (unsigned)obs.policy_version,
-                (unsigned)p_.version);
+    /* Origin, cycle and identity are part of the immutable cycle contract. Without the plan a row
+     * has no provenance, and a missing array must never be read as "the head". */
+    if (obs.n_seq > 0 && !obs.plan) {
+        RAD_ERR("draft predictor: cycle %llu names no plan; its origin is unknown",
+                (unsigned long long)obs.cycle_id);
         return RAD_E_INVAL;
     }
-    /* A plan stays alive while issue_ahead() may name it; an observation that names another
-     * cycle's plan, or another generation's row, is stale and teaches nothing. */
     if (obs.plan) {
         const DraftPlan& plan = *obs.plan;
-        if (plan.cycle_id != obs.cycle_id || plan.policy_version != obs.policy_version ||
-            plan.n_seq != obs.n_seq ||
-            (obs.n_seq > 0 && (!plan.req_id || !plan.slot || !plan.slot_gen))) {
+        /* draft_plan_identifies() reads the plan's [cap] rows; its n_seq must fit that cap. */
+        if (obs.n_seq > plan.cap) {
+            RAD_ERR("draft predictor: cycle %llu has %d rows but its plan holds %d",
+                    (unsigned long long)obs.cycle_id, (int)obs.n_seq, (int)plan.cap);
+            return RAD_E_INVAL;
+        }
+        if (!draft_plan_identifies(plan, obs)) {
             RAD_ERR("draft predictor: observation %llu does not match its plan",
                     (unsigned long long)obs.cycle_id);
             return RAD_E_INVAL;
         }
-        for (int32_t i = 0; i < obs.n_seq; ++i) {
-            if (plan.req_id[i] != obs.req_id[i] || plan.slot[i] != obs.slot[i] ||
-                plan.slot_gen[i] != obs.slot_gen[i]) {
-                RAD_ERR("draft predictor: observation row %d differs from its plan", (int)i);
-                return RAD_E_INVAL;
-            }
+        if (obs.n_seq > 0 && !plan.fill) {
+            RAD_ERR("draft predictor: cycle %llu does not say who drafted its rows",
+                    (unsigned long long)obs.cycle_id);
+            return RAD_E_INVAL;
         }
     }
     /* Validate every row before any state moves: a half-applied cycle is not a smaller update,
@@ -188,6 +216,12 @@ int DraftPredictModel::observe(const DraftObservation& obs,
                     (int)cap_ - 1);
             return RAD_E_INVAL;
         }
+        const DraftSeqObservation& o = obs.seq[i];
+        if (o.accepted > o.checked || o.checked > o.verified) {
+            RAD_ERR("draft predictor: row %d has accepted %u, checked %u, verified %u",
+                    (int)i, (unsigned)o.accepted, (unsigned)o.checked, (unsigned)o.verified);
+            return RAD_E_INVAL;
+        }
         const DraftPredictState& s = states_[slot];
         if (s.req_id != obs.req_id[i] || s.slot_gen != obs.slot_gen[i]) {
             RAD_ERR("draft predictor: slot %d holds request %llu/%u, not %llu/%u", (int)slot,
@@ -196,10 +230,8 @@ int DraftPredictModel::observe(const DraftObservation& obs,
             return RAD_E_INVAL;
         }
     }
-    for (int32_t i = 0; i < obs.n_seq; ++i) {
-        learn(states_[obs.slot[i]], obs.seq[i],
-              source ? source[i] : DraftProposalSource::Head);
-    }
+    for (int32_t i = 0; i < obs.n_seq; ++i)
+        learn(states_[obs.slot[i]], obs.seq[i], obs.plan ? obs.plan->fill[i] : DraftDrafter::None);
     return RAD_OK;
 }
 

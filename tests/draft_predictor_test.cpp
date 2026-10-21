@@ -1,15 +1,19 @@
 /* draft_predictor_test.cpp -- B's position-wise acceptance model (core/sched/draft_predictor.h).
  *
- * What is checked here is what the policy may rely on: a label exists only where the target
- * checked the position, and a censoring cycle has no rejection label; lookups and K0 rows never
- * enter the head's estimate; extrapolation moves a prior without inflating evidence; a recycled
- * slot starts over while preemption keeps its history; uncertainty narrows with labels; and an
- * offline replay of code -> prose -> code gives the same answer whatever the batch order.
+ * What is checked here is what the policy may rely on: a label exists only where draft_label()
+ * measured one, and a cycle censored after a checked rejection keeps that rejection; lookups and
+ * K0 rows never enter the head's estimate, and an observation without its plan is refused rather
+ * than read as the head; extrapolation moves a prior without inflating evidence; a recycled slot
+ * starts over while an unchanged identity keeps its history; the reported n is the effective
+ * sample size, not the cycle count; and an offline replay of code -> prose -> code gives the same
+ * answer whatever the batch order.
  *
- * No card, no scheduler: the observations are the ones E will publish.
+ * No card, no scheduler, no RNG: the observations are the ones E will publish, and nothing here
+ * claims a target-sampling or device property.
  */
 #include "rad_test.h"
 
+#include "sched/draft.h"
 #include "sched/draft_predictor.h"
 
 #include <cmath>
@@ -25,8 +29,9 @@ namespace {
 constexpr int32_t kCap = 8;
 
 /* The scheduler-side storage: one state per slot, the view it fills, the predictions it receives,
- * and the observation it hands back. */
+ * the plan a cycle was frozen under, and the observation it hands back. */
 struct Rig {
+    DraftPredictModel::Params params;
     DraftPredictState      state[kCap];
     DraftPredictModel      model;
     DraftSeqView           seq[kCap];
@@ -39,20 +44,28 @@ struct Rig {
     uint64_t               oid[kCap];
     int32_t                oslot[kCap];
     uint32_t               ogen[kCap];
-    DraftProposalSource    src[kCap];
-    const DraftProposalSource* srcs = nullptr;
+    DraftPlan              plan;
+    int32_t                plan_k[kCap];
+    DraftFallback          plan_why[kCap];
+    int32_t                plan_rows[RAD_SCHED_MAX_SPEC + 1];
+    uint64_t               plan_id[kCap];
+    int32_t                plan_slot[kCap];
+    uint32_t               plan_gen[kCap];
+    DraftDrafter           plan_fill[kCap];
+    int32_t                plan_ctx[kCap];
+    int32_t                plan_hist[kCap];
     uint64_t               cycle = 0;
 
-    explicit Rig(int depth = 6) {
-        DraftPredictModel::Params p;
-        p.max_depth = depth;
-        CHECK_OK(model.configure(p, state, kCap));
+    explicit Rig(int depth = 6, uint32_t version = 1) {
+        params.max_depth = depth;
+        params.version = version;
+        CHECK_OK(model.configure(params, state, kCap));
         for (DraftSeqView& v : seq) v = DraftSeqView{};
         view.seq = seq;
         view.cap = kCap;
         view.cycle_id = 1;
         view.k_ceiling = depth;
-        view.policy_version = p.version;
+        view.policy_version = version;
         pred.seq = pseq;
         pred.req_id = pid;
         pred.cap = kCap;
@@ -62,9 +75,20 @@ struct Rig {
         obs.slot = oslot;
         obs.slot_gen = ogen;
         obs.seq = sobs;
-        obs.policy_version = p.version;
+        obs.policy_version = version;
         obs.complete = true;
-        for (DraftProposalSource& s : src) s = DraftProposalSource::Head;
+        plan.cap = kCap;
+        plan.policy_version = version;
+        plan.k_ceiling = depth;
+        plan.k = plan_k;
+        plan.why = plan_why;
+        plan.rows = plan_rows;
+        plan.req_id = plan_id;
+        plan.slot = plan_slot;
+        plan.slot_gen = plan_gen;
+        plan.fill = plan_fill;
+        plan.ctx_class = plan_ctx;
+        plan.history_tokens = plan_hist;
     }
 
     /* Request i of the next batch: identity, slot and generation. */
@@ -83,11 +107,19 @@ struct Rig {
 
     int predict() { return model.predict(view, &pred); }
 
-    /* One head observation for the identity last predicted at `slot`. */
-    int observe(uint64_t id, int drafted, int accepted, DraftCensor censor = DraftCensor::None,
-                int checked = -1, int generated = -1,
-                DraftProposalSource source = DraftProposalSource::Head, int32_t slot = 0,
-                uint32_t gen = 1) {
+    /* A policy bump on the same table: what predict serves changes, the learned state does not.
+     * The observation and plan of a cycle already in flight keep their version. */
+    void bump(uint32_t version) {
+        params.version = version;
+        CHECK_OK(model.configure(params, state, kCap));
+        view.policy_version = version;
+    }
+
+    /* One head observation for the identity last predicted at `slot`, with the plan it came from.
+     * `drafted` is the verified window; the plan's k[] and fill[] say who drafted it. */
+    void arm(uint64_t id, int drafted, int accepted, DraftCensor censor = DraftCensor::None,
+             int checked = -1, int generated = -1, DraftDrafter fill = DraftDrafter::Serial,
+             int32_t slot = 0, uint32_t gen = 1) {
         obs.cycle_id = ++cycle;
         view.cycle_id = obs.cycle_id;
         obs.n_seq = 1;
@@ -99,12 +131,33 @@ struct Rig {
         sobs[0].checked = (uint8_t)(checked < 0
                                         ? accepted + (accepted < drafted ? 1 : 0)
                                         : checked);
-        sobs[0].verified = (uint8_t)(drafted < 0 ? sobs[0].checked : drafted);
+        sobs[0].verified = (uint8_t)drafted;
         sobs[0].generated = (uint8_t)(generated < 0 ? drafted : generated);
         sobs[0].published = sobs[0].generated;
         sobs[0].censor = censor;
-        src[0] = source;
-        return model.observe(obs, src);
+
+        plan.cycle_id = obs.cycle_id;
+        plan.cap = kCap;
+        plan.n_seq = 1;
+        plan.max_k = drafted > 0 ? drafted : 0;
+        plan.verify_k = plan.max_k;
+        plan_id[0] = id;
+        plan_slot[0] = slot;
+        plan_gen[0] = gen;
+        plan_k[0] = plan.max_k;
+        plan_why[0] = DraftFallback::None;
+        plan_fill[0] = plan.max_k == 0 ? DraftDrafter::None : fill;
+        plan_ctx[0] = 0;
+        plan_hist[0] = 0;
+        CHECK_OK(draft_plan_rows(plan));
+        obs.plan = &plan;
+    }
+
+    int observe(uint64_t id, int drafted, int accepted, DraftCensor censor = DraftCensor::None,
+                int checked = -1, int generated = -1,
+                DraftDrafter fill = DraftDrafter::Serial, int32_t slot = 0, uint32_t gen = 1) {
+        arm(id, drafted, accepted, censor, checked, generated, fill, slot, gen);
+        return model.observe(obs);
     }
 };
 
@@ -128,7 +181,7 @@ TEST(predict_starts_every_position_at_the_prior_with_no_evidence) {
     for (int j = 0; j < 4; ++j) {
         CHECK_EQ(r.pseq[0].a[j], 0.8f);
         CHECK_EQ(r.pseq[0].n[j], 0);
-        CHECK_NEAR(r.pseq[0].unc[j], 0.3577709, 1e-5);  /* 2 * sqrt(.16 / 5) */
+        CHECK_NEAR(r.pseq[0].unc[j], 0.3577709, 1e-5);  /* 2 * sqrt(.16 / (4 + 1)) */
     }
     CHECK_EQ(r.pseq[0].valid, 0u);
     /* Past the configured depth there is nothing to predict. */
@@ -153,9 +206,41 @@ TEST(labels_are_the_accepted_prefix_and_the_first_rejection) {
     const DraftPrediction p = predicted(r, 10, 0);
     CHECK_EQ(p.valid, 0x7ull);
     CHECK_EQ(p.n[3], 0);
-    /* The unreached positions drifted toward the rejection but carry no evidence. */
-    CHECK(p.a[3] < 0.8f);
-    CHECK_NEAR(p.a[3], 0.8f + (1.0 - std::exp2(-1.0 / 16.0)) * (0.64f - 0.8f), 1e-6);
+    /* The window reached six, so the drift starts at six: nothing in 3..5 moves on this cycle,
+     * the same basis as DraftController::adapt_observe. */
+    CHECK_EQ(p.a[3], 0.8f);
+}
+
+/* The seam with the half of the policy that already exists: on every cycle the controller can
+ * express (no censor, so checked = accepted + 1), B's estimate and its drift move to the same
+ * numbers as DraftController::adapt_observe -- same basis, same first weight, same edge and step.
+ * Two arithmetics at this seam would price a position differently depending on which half saw the
+ * verify, so this is checked rather than asserted in prose. */
+TEST(the_estimate_and_drift_are_the_controllers_arithmetic) {
+    DraftController ctrl;
+    DraftController::Params cp;
+    cp.max_depth = 6;
+    cp.adapt = true;
+    REQUIRE_EQ(ctrl.configure(cp), RAD_OK);
+
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    DraftAdapt adapt;
+    REQUIRE_EQ(ctrl.window_for(adapt), 6);   /* starts the estimate at kPrior, as Rig did */
+
+    /* Full window with a rejection, full window with none, then a shallow one whose tail drifts. */
+    const int drafted[3]  = {6, 6, 3};
+    const int accepted[3] = {2, 0, 2};
+    for (int i = 0; i < 3; ++i) {
+        CHECK_OK(r.observe(10, drafted[i], accepted[i]));
+        ctrl.adapt_observe(adapt, drafted[i], accepted[i]);
+        for (int j = 0; j < 6; ++j) {
+            CHECK_EQ(r.state[0].a[j], adapt.a[j]);
+            CHECK_EQ(r.state[0].n[j], adapt.n[j]);
+        }
+    }
+    /* And the shallow cycle moved the tail, so the loop above is not comparing a frozen array. */
+    CHECK(r.state[0].a[5] < 0.8f);
 }
 
 TEST(checked_past_the_first_rejection_does_not_buy_more_labels) {
@@ -173,33 +258,49 @@ TEST(checked_past_the_first_rejection_does_not_buy_more_labels) {
     CHECK_EQ(predicted(r, 10, 0).valid, 0x3ull);
 }
 
-TEST(a_censoring_cycle_has_no_rejection_label) {
-    const DraftCensor censors[] = { DraftCensor::Eog, DraftCensor::MaxTokens,
-                                    DraftCensor::Cancelled, DraftCensor::ContextEnd };
-    for (DraftCensor c : censors) {
+TEST(a_censored_cycle_keeps_the_rejection_it_checked) {
+    {
+        /* The draft missed the EOG: position 1 is a real, checked rejection, and the censor that
+         * ended the cycle afterwards does not erase it. */
         Rig r(6);
         REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
-        /* accepted=2 but checked=3: the naive count would turn EOG into a rejection at 2. */
-        CHECK_OK(r.observe(10, 3, 2, c, 3));
-        CHECK_EQ(r.state[0].n[0], 1);
+        CHECK_OK(r.observe(10, 2, 1, DraftCensor::Eog));
         CHECK_EQ(r.state[0].n[1], 1);
-        CHECK_EQ(r.state[0].n[2], 0);
-        CHECK_NEAR(r.state[0].a[2], 0.8f + (1.0 - std::exp2(-1.0 / 16.0)) * (0.84f - 0.8f), 1e-6);
+        CHECK_NEAR(r.state[0].a[1], 0.64, 1e-6);
         CHECK_EQ(predicted(r, 10, 0).valid, 0x3ull);
     }
-    /* The same numbers without a censor do label the rejection. */
-    Rig plain(6);
-    REQUIRE_EQ(predicted(plain, 10, 0).valid, 0u);
-    CHECK_OK(plain.observe(10, 3, 2, DraftCensor::None, 3));
-    CHECK_EQ(plain.state[0].n[2], 1);
-    CHECK_NEAR(plain.state[0].a[2], 0.64, 1e-6);
+    {
+        /* The draft hit the EOG but the token was not committed: checked ends at the accepted
+         * prefix, so the position gets no false rejection. */
+        Rig r(6);
+        REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+        CHECK_OK(r.observe(10, 3, 2, DraftCensor::Eog, 2));
+        CHECK_EQ(r.state[0].n[2], 0);
+        CHECK_EQ(r.state[0].a[2], 0.8f);
+        CHECK_EQ(predicted(r, 10, 0).valid, 0x3ull);
+    }
+    {
+        /* Censored before anything was checked: nothing to learn. */
+        Rig r(6);
+        REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+        CHECK_OK(r.observe(10, 1, 0, DraftCensor::Eog, 0));
+        for (int j = 0; j < 6; ++j) CHECK_EQ(r.state[0].n[j], 0);
+    }
+    {
+        /* The same numbers without a censor label the rejection. */
+        Rig r(6);
+        REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+        CHECK_OK(r.observe(10, 3, 2, DraftCensor::None, 3));
+        CHECK_EQ(r.state[0].n[2], 1);
+        CHECK_NEAR(r.state[0].a[2], 0.64, 1e-6);
+    }
 }
 
 TEST(lookups_and_k0_rows_never_enter_the_head_estimate) {
     Rig r(6);
     REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
 
-    CHECK_OK(r.observe(10, 6, 6, DraftCensor::None, -1, -1, DraftProposalSource::Lookup));
+    CHECK_OK(r.observe(10, 6, 6, DraftCensor::None, -1, -1, DraftDrafter::Ngram));
     for (int j = 0; j < 6; ++j) {
         CHECK_EQ(r.state[0].n[j], 0);
         CHECK_EQ(r.state[0].a[j], 0.8f);
@@ -223,14 +324,25 @@ TEST(lookups_and_k0_rows_never_enter_the_head_estimate) {
     CHECK_EQ(r.state[0].n[2], 1);
 }
 
-TEST(a_recycled_slot_starts_over_and_preemption_keeps_the_estimate) {
+TEST(an_observation_without_its_plan_is_refused) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    r.arm(10, 3, 3);
+    r.obs.plan = nullptr;
+    const std::string refused = stderr_of([&] { CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL); });
+    CHECK(has(refused, "names no plan"));
+    /* A missing side list must not mean "the head". */
+    CHECK_EQ(r.state[0].n[0], 0);
+}
+
+TEST(a_recycled_slot_starts_over_and_an_unchanged_identity_keeps_the_estimate) {
     Rig r(6);
     REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
     CHECK_OK(r.observe(10, 3, 3));
     const float learned = r.state[0].a[1];
     CHECK(learned > 0.8f);
 
-    /* Same request, same slot: preemption does not reset it. */
+    /* Same request, same slot, same generation: preemption does not reset it. */
     r.add(0, 10, 0, 1);
     CHECK_OK(r.predict());
     CHECK_NEAR(r.state[0].a[1], learned, 0.0);
@@ -242,6 +354,16 @@ TEST(a_recycled_slot_starts_over_and_preemption_keeps_the_estimate) {
     CHECK_EQ(fresh.valid, 0u);
     CHECK_EQ(fresh.a[0], 0.8f);
 
+    /* A cycle of the old identity is still live: its labels are refused, not mixed into request
+     * 11. The scheduler keeps a slot until the plan's observation has landed. */
+    const std::string refused = stderr_of([&] {
+        CHECK_EQ(r.observe(10, 3, 3, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 1),
+                 RAD_E_INVAL);
+    });
+    CHECK(has(refused, "holds request"));
+    CHECK_EQ(r.state[0].req_id, 11u);
+    CHECK_EQ(r.state[0].n[0], 0);
+
     /* And the old request on another slot starts over too (the scheduler moves state itself). */
     r.add(0, 10, 1, 1);
     CHECK_OK(r.predict());
@@ -249,7 +371,7 @@ TEST(a_recycled_slot_starts_over_and_preemption_keeps_the_estimate) {
     CHECK_EQ(r.pseq[0].n[0], 0);
 }
 
-TEST(uncertainty_narrows_with_evidence_and_stays_a_bound) {
+TEST(uncertainty_is_computed_from_the_effective_sample_size) {
     Rig r(6);
     REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
     float previous = r.pseq[0].unc[0];
@@ -260,14 +382,22 @@ TEST(uncertainty_narrows_with_evidence_and_stays_a_bound) {
         CHECK(p.unc[0] < previous);
         CHECK(p.unc[0] >= 0.0f);
         previous = p.unc[0];
-        if (i % 8 == 0) CHECK_EQ(p.n[0], i);
     }
     CHECK_NEAR(r.state[0].a[0], 1.0, 0.05);
+    CHECK_EQ(r.state[0].n[0], 32);          /* the EMA's own count keeps growing ... */
+    const DraftPrediction saturated = predicted(r, 10, 0);
+    CHECK(saturated.n[0] <= 43);            /* ... the reported evidence does not: (2-a)/a - prior */
+    CHECK(saturated.n[0] >= 20);
 
-    /* A rejection run narrows it again around the other answer, never past the bound. */
-    for (int i = 0; i < 96; ++i) CHECK_OK(r.observe(10, 6, 0, DraftCensor::None, 1));
+    /* 1400 alternating labels: the estimate still rests on ~42 effective labels, so the reported
+     * uncertainty stays near 2*sqrt(.25/47) instead of collapsing with the cycle count. */
+    for (int i = 0; i < 1400; ++i)
+        CHECK_OK(r.observe(10, 6, i % 2 == 0 ? 6 : 0));
     const DraftPrediction p = predicted(r, 10, 0);
-    CHECK_NEAR(r.state[0].a[0], 0.0, 0.05);
+    CHECK_EQ(r.state[0].n[0], 1432);
+    CHECK(p.n[0] <= 43);
+    CHECK(p.unc[0] > 0.12f);
+    CHECK(p.unc[0] < 0.18f);
     CHECK(p.unc[0] >= 0.0f && p.unc[0] <= 1.0f);
 }
 
@@ -282,40 +412,37 @@ TEST(an_observation_must_name_a_complete_cycle_and_its_own_generation) {
     r.obs.complete = true;
 
     /* A plan for another cycle is stale; its rows are not this cycle's. */
-    int32_t k[kCap] = { 2 };
-    DraftFallback why[kCap] = {};
-    int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
-    uint64_t plan_id[kCap] = { 10 };
-    int32_t plan_slot[kCap] = { 0 };
-    uint32_t plan_gen[kCap] = { 1 };
-    DraftPlan plan;
-    plan.cycle_id = 99;
-    plan.policy_version = r.obs.policy_version;
-    plan.n_seq = 1;
-    plan.cap = kCap;
-    plan.k_ceiling = 6;
-    plan.max_k = 2;
-    plan.req_id = plan_id;
-    plan.slot = plan_slot;
-    plan.slot_gen = plan_gen;
-    plan.k = k;
-    plan.why = why;
-    plan.rows = rows;
-    REQUIRE_EQ(draft_plan_rows(plan), RAD_OK);
-    r.obs.plan = &plan;
-    const std::string stale = stderr_of([&] { CHECK_EQ(r.observe(10, 3, 3), RAD_E_INVAL); });
+    r.arm(10, 3, 3);
+    r.plan.cycle_id = 99;
+    const std::string stale = stderr_of([&] { CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL); });
     CHECK(has(stale, "does not match its plan"));
     CHECK_EQ(r.state[0].n[0], 0);
 
+    /* A plan whose row names another request is not this observation's plan. */
+    r.arm(10, 3, 3);
+    r.plan_id[0] = 11;
+    CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL);
+
+    /* A plan that holds fewer rows than the observation reads is refused before a row is read. */
+    r.arm(10, 3, 3);
+    r.plan.cap = 0;
+    const std::string oob = stderr_of([&] { CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL); });
+    CHECK(has(oob, "but its plan holds"));
+
+    /* A row that contradicts itself teaches nothing. */
+    r.arm(10, 3, 3, DraftCensor::None, 4);   /* checked > verified */
+    CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL);
+    r.arm(10, 3, 3, DraftCensor::None, 2);   /* accepted > checked */
+    CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL);
+    CHECK_EQ(r.state[0].n[0], 0);
+
     /* The same plan, the same cycle: the labels land. */
-    plan.cycle_id = r.cycle + 1;
     CHECK_OK(r.observe(10, 3, 3));
     CHECK_EQ(r.state[0].n[0], 1);
-    r.obs.plan = nullptr;
 
     /* Another generation in the same slot is refused rather than mixed. */
     r.ogen[0] = 3;
-    CHECK_EQ(r.model.observe(r.obs, nullptr), RAD_E_INVAL);
+    CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL);
     CHECK_EQ(r.state[0].n[0], 1);
 }
 
@@ -369,8 +496,7 @@ TEST(a_replay_is_order_independent_and_recovers_after_prose) {
         CHECK_OK(mixed.observe(10, s.drafted, s.accepted, s.censor));
         mixed.add(0, 20, 1, 7);
         CHECK_OK(mixed.predict());
-        CHECK_OK(mixed.observe(20, 5, 4, DraftCensor::None, -1, -1,
-                               DraftProposalSource::Head, 1, 7));
+        CHECK_OK(mixed.observe(20, 5, 4, DraftCensor::None, -1, -1, DraftDrafter::Serial, 1, 7));
     }
     const DraftPrediction in_batch = predicted(mixed, 10, 0);
 
@@ -384,46 +510,71 @@ TEST(a_replay_is_order_independent_and_recovers_after_prose) {
      * deeper label than 2 during the prose stretch. */
     CHECK(end_of_prose < 0.7f);
     CHECK(alone.a[2] > end_of_prose);
-    CHECK(alone.n[2] == 34u);
+    CHECK_EQ(solo.state[0].n[2], 34u);    /* the raw label count */
+    CHECK(alone.n[2] <= 43);             /* what the policy sees: the effective one */
 }
 
-TEST(sampling_classes_do_not_couple_across_requests) {
-    /* Greedy and sampled requests have their own RNG coordinates; nothing in B may average one
-     * request's labels into another's estimate. */
+TEST(requests_do_not_couple_across_slots) {
+    /* Each slot's estimate is its own. This says nothing about sampling classes: the model has no
+     * sampling dimension, so a request that changes class lands in one EMA. */
     Rig both(6);
     both.add(0, 10, 0);
     both.add(1, 20, 1);
     CHECK_OK(both.predict());
-    both.seq[0].sampling = DraftSampling::Greedy;
-    both.seq[1].sampling = DraftSampling::Sampled;
 
-    Rig greedy(6);
-    REQUIRE_EQ(predicted(greedy, 10, 0).valid, 0u);
-    Rig sampled(6);
-    REQUIRE_EQ(predicted(sampled, 20, 1).valid, 0u);
+    Rig first(6);
+    REQUIRE_EQ(predicted(first, 10, 0).valid, 0u);
+    Rig second(6);
+    REQUIRE_EQ(predicted(second, 20, 1).valid, 0u);
 
     for (int i = 0; i < 8; ++i) {
         both.view.n_seq = 2;
         CHECK_OK(both.predict());
-        CHECK_OK(greedy.observe(10, 6, 6));
-        CHECK_OK(sampled.observe(20, 6, 2, DraftCensor::None, -1, -1,
-                                 DraftProposalSource::Head, 1));
+        CHECK_OK(first.observe(10, 6, 6));
+        CHECK_OK(second.observe(20, 6, 2, DraftCensor::None, -1, -1,
+                                DraftDrafter::Serial, 1));
         CHECK_OK(both.observe(10, 6, 6));
         CHECK_OK(both.observe(20, 6, 2, DraftCensor::None, -1, -1,
-                              DraftProposalSource::Head, 1));
+                              DraftDrafter::Serial, 1));
     }
 
     for (int j = 0; j < 6; ++j) {
-        CHECK_EQ(both.state[0].a[j], greedy.state[0].a[j]);
-        CHECK_EQ(both.state[1].a[j], sampled.state[1].a[j]);
-        CHECK_EQ(both.state[0].n[j], greedy.state[0].n[j]);
-        CHECK_EQ(both.state[1].n[j], sampled.state[1].n[j]);
+        CHECK_EQ(both.state[0].a[j], first.state[0].a[j]);
+        CHECK_EQ(both.state[1].a[j], second.state[1].a[j]);
+        CHECK_EQ(both.state[0].n[j], first.state[0].n[j]);
+        CHECK_EQ(both.state[1].n[j], second.state[1].n[j]);
     }
+}
+
+TEST(an_older_consistent_cycle_still_teaches_after_a_version_bump) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    CHECK_OK(r.observe(10, 3, 3));
+    const float learned = r.state[0].a[0];
+
+    /* A second cycle is predicted under v1 and is still in flight when the policy moves to v2. */
+    r.add(0, 10, 0);
+    CHECK_OK(r.predict());
+    r.bump(2);
+    CHECK_NEAR(r.state[0].a[0], learned, 0.0);   /* the bump is provenance, not a reset */
+    CHECK_OK(r.predict());                        /* v2 predictions are served */
+
+    /* Its observation still names its v1 plan, and plan and observation agree: it must teach. */
+    CHECK_OK(r.observe(10, 3, 3));
+    CHECK_EQ(r.state[0].n[0], 2);
+    CHECK_NEAR(r.state[0].a[0], 0.8666667, 1e-6);   /* 0.84 + 1/6 * (1 - 0.84) */
+
+    /* A prediction for the old version, however, is not this model's to make. */
+    r.view.policy_version = 1;
+    CHECK_EQ(r.predict(), RAD_E_INVAL);
 }
 
 TEST(predict_refuses_a_batch_it_cannot_fill) {
     Rig r(6);
     r.add(0, 10, 0);
+    r.view.policy_version = 99;
+    CHECK_EQ(r.model.predict(r.view, &r.pred), RAD_E_INVAL);
+    r.view.policy_version = 1;
     CHECK_EQ(r.model.predict(r.view, nullptr), RAD_E_INVAL);
     r.pred.cap = 0;
     CHECK_EQ(r.model.predict(r.view, &r.pred), RAD_E_INVAL);
