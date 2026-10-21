@@ -74,6 +74,11 @@
  * begin_pass, which the run phase calls before updating the weight tables. A draft pass in
  * between reads none of the trunk's layers and leaves them.
  *
+ * A stager destroyed between two steps therefore dies holding those places (the server stopping
+ * after a chunk). The destructor publishes their units at their pool slots before it destroys the
+ * places' events: the mover outlives the stager and keeps the residency table, so a place left
+ * published would name ring bytes the slab refills on the next step that lends the arena top.
+ *
  * ---- trunk only --------------------------------------------------------------------------------
  *
  * A draft head's routed layer is not staged. The head runs in its own passes; over a prefill chunk

@@ -2696,6 +2696,267 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     rad_stream_destroy(compute);
 }
 
+/* A STAGER MAY DIE HOLDING THE NEXT PASS'S LAYERS. end_pass stages the next trunk pass's first
+ * lead() layers into the ring when the step's prompt continues (set_next_prefill), and they stay
+ * published there until that pass adopts them. A server that stops after such a step destroys the
+ * stager with those copies in place; the mover outlives it and keeps its residency table, so a
+ * weight left naming the ring names bytes the arena's next loan refills with another expert's.
+ *
+ * Every row here holds one byte value of its own, so a row that reads another unit's bytes is a
+ * wrong byte, not a plausible one. */
+TEST(a_stager_destroyed_while_the_next_passes_layers_are_published_leaves_no_weight_naming_its_ring) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 3, kE = 8;
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 4;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    /* The pool holds each weight's bytes before anything is staged: one value per weight. */
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    std::vector<uint8_t> fill((size_t)MiB);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        home[w] = m.residency()->lookup(w)->ptr;
+        REQUIRE(home[w] != nullptr);
+        std::memset(fill.data(), (int)(uint8_t)w, fill.size());
+        CHECK_OK(rad_memcpy_async(home[w], fill.data(), (int64_t)fill.size(), compute));
+        CHECK_OK(rad_stream_sync(compute));
+    }
+
+    /* Only the units the plan left in the pinned pool can be staged; a resident one has no copy.
+     * Every layer must have some, since the pass's end publishes the first lead() layers. */
+    std::vector<std::vector<rad_weight>> pw(kL);
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        REQUIRE(!pw[(size_t)l].empty());
+    }
+
+    /* The region is the top of the arena: the slab's to refill whenever a step lends it, and the
+     * stager's only while a full-plan step runs. Device memory, as the arena is. The ring spans
+     * the region (ring_bytes()), so the loan below is exactly the bytes a full-plan step keeps for
+     * the stager -- and the bytes the slab refills once a smaller step lends them. */
+    const int64_t layer = align_up(1 * MiB, RAD_ALIGN_UNIT) * kE;
+    const int64_t lead = PrefillStager::lead();
+    const int64_t region_bytes = 2 * (lead + 1) * layer;
+    char* const region = (char*)rad_dev_alloc(region_bytes, RAD_MEM_DEVICE);
+    REQUIRE(region != nullptr);
+    CHECK_OK(m.lend_from(Mover::kLendArena, {{region + region_bytes, region_bytes, 1, 1}}));
+    CHECK_OK(m.set_loan(Mover::kLendArena, 0));
+    REQUIRE(m.loan_ceiling(Mover::kLendArena) > 0);
+
+    auto inside = [&](const void* p) {
+        return (const char*)p >= region && (const char*)p < region + region_bytes;
+    };
+    auto at_home = [&](int l) {
+        for (rad_weight w : pw[(size_t)l])
+            if (m.residency()->lookup(w)->ptr != home[w]) return false;
+        return true;
+    };
+
+    {
+        PrefillStager st;
+        CHECK_OK(st.init(f.prog, plan, &m, region, nullptr, region_bytes, 64));
+        REQUIRE(st.enabled());
+        REQUIRE_EQ(st.n_layers(), (size_t)kL);
+        RadBatch b{};
+        b.n_tok = 128;
+        st.set_ring(st.ring_full());
+        st.set_next_prefill(true);
+        CHECK(st.begin_pass(&b));
+        bool resync = false;
+        for (int h = 0; h < 1 + 2 * kL; ++h) {
+            CHECK_OK(st.before_op(h, compute, &resync));
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.end_pass(compute));
+        CHECK_OK(rad_stream_sync(m.transfer_stream()));
+        CHECK_OK(rad_stream_sync(compute));
+        /* The prompt continues, so the next trunk pass's first lead() layers are published at the
+         * ring and wait there to be adopted. This is the state the stager can die in. */
+        CHECK(st.staged());
+        for (int l = 0; l < kL; ++l)
+            for (rad_weight w : pw[(size_t)l]) {
+                CHECK(inside(m.residency()->lookup(w)->ptr));
+                CHECK(std::memcmp(m.residency()->lookup(w)->ptr, home[w],
+                                  (size_t)f.prog.weights[w].logical_bytes) == 0);
+            }
+    }
+
+    /* Destroyed. The places are gone, and with them the events that ordered their readers, so
+     * nothing may still name the ring: the mover outlives the stager and keeps the table. */
+    for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+
+    /* And the ring is the slab's again: the moved loan fills those bytes with the experts it
+     * promotes, so a weight still published there would read another expert's bytes -- a value no
+     * weight of this fixture holds. The refill is a nudge, not a premise: the byte check below
+     * holds whether or not the slab has a unit to promote. */
+    CHECK_OK(rad_memset_async(region, 0xee, region_bytes, compute));
+    CHECK_OK(rad_stream_sync(compute));      /* before the slab's fill writes the same bytes */
+    CHECK_OK(m.set_loan(Mover::kLendArena, m.loan_ceiling(Mover::kLendArena)));
+    for (Deadline dl(5); !dl.passed() && m.flex_used_bytes() == 0;) CHECK_OK(m.idle_tick(nullptr));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+
+    std::vector<uint8_t> probe(f.prog.weights.size() * 2, 0);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        const void* p = m.residency()->lookup(w)->ptr;
+        REQUIRE(p != nullptr);
+        const int64_t n = f.prog.weights[w].logical_bytes;
+        CHECK_OK(rad_memcpy_async(&probe[(size_t)w * 2], p, 1, compute));
+        CHECK_OK(rad_memcpy_async(&probe[(size_t)w * 2 + 1], (const char*)p + n - 1, 1, compute));
+    }
+    CHECK_OK(rad_stream_sync(compute));
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        CHECK_EQ((int)probe[(size_t)w * 2], (int)(uint8_t)w);
+        CHECK_EQ((int)probe[(size_t)w * 2 + 1], (int)(uint8_t)w);
+    }
+    CHECK_OK(rad_stream_sync(compute));
+    rad_dev_free(region, RAD_MEM_DEVICE);
+    rad_stream_destroy(compute);
+}
+
+TEST(a_stage_that_cannot_issue_gives_its_place_back_and_the_stager_keeps_staging) {
+    /* stage_layer takes a place out of `spare_` and commits nothing until its copy issues. A copy
+     * the mover's stream refuses -- here its queue is full behind a closed gate, which on the host
+     * backend costs no ring slot, and on a card a fault in the step -- must therefore give that
+     * place back. Otherwise every refused step loses one of the sixteen for good, and a server
+     * that hits sixteen of them stops staging for the rest of its life while still reporting
+     * enabled(). */
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 3, kE = 8;
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 4;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<std::vector<rad_weight>> pw(kL);
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        REQUIRE(!pw[(size_t)l].empty());
+    }
+
+    const int64_t layer = align_up(1 * MiB, RAD_ALIGN_UNIT) * kE;
+    const int64_t region_bytes = 8 * layer;      /* room for every layer at once */
+    char* const region = (char*)rad_dev_alloc(region_bytes, RAD_MEM_DEVICE);
+    REQUIRE(region != nullptr);
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region, nullptr, region_bytes, 64));
+    REQUIRE(st.enabled());
+    REQUIRE_EQ(st.n_layers(), (size_t)kL);
+
+    /* The mover's stream is full behind a closed gate: every copy the pass issues is refused, so
+     * each armed pass spends a place and cannot use its copy. The gate is the queue's first task,
+     * so the worker blocks on it before anything behind it can run, and nothing retires. The
+     * queue's depth is the backend's (1 KiB tasks on the host, 4096 packets on a card), so the fill
+     * runs until the backend refuses rather than to a constant of this test. */
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(m.transfer_stream(), &gate), RAD_OK);
+    REQUIRE(gate != nullptr);
+    int refused = 0;
+    for (int i = 0; i < 65536 && !refused; ++i) {
+        const int r = rad_memset_async(region, i & 0xff, 1, m.transfer_stream());
+        if (r < 0) {
+            /* A refusal: RAD_E_STATE from the host backend, RAD_E_DEVICE through the card's blit
+             * (a_memset_async maps every launch failure onto this backend's one device code).
+             * Either way the op did not issue, which is what the rollback answers. */
+            refused = 1;
+        }
+    }
+    CHECK_EQ(refused, 1);
+
+    /* Twice the place table's entries in armed passes, each driven through every op so the learned
+     * per-kind bound (pass_last_) keeps the pass's real extent. Every copy is refused, so every
+     * pass spends a place at its first op. Each must be given back: with the rollback every pass
+     * reports the refusal, and without it the sixteenth empties the table and the rest of the
+     * passes silently stage nothing. */
+    RadBatch b{};
+    b.n_tok = 128;
+    st.set_ring(st.ring_full());
+    st.set_next_prefill(false);
+    const int n_ops = 1 + 2 * kL;
+    constexpr int kPasses = 2 * 16;
+    int failures = 0;
+    for (int pass = 0; pass < kPasses; ++pass) {
+        CHECK(st.begin_pass(&b));
+        for (int h = 0; h < n_ops; ++h) {
+            bool resync = false;
+            if (st.before_op(h, compute, &resync) < 0) ++failures;
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.end_pass(compute));
+    }
+    CHECK(failures >= kPasses);   /* every pass was refused, and none of them lost a place */
+
+    /* With the table whole, one pass on the quiet stream stages every layer again. */
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(rad_stream_sync(compute));
+    const uint64_t before = m.stats().stage_layers;
+    bool resync = false;
+    CHECK(st.begin_pass(&b));
+    for (int h = 0; h < n_ops; ++h) {
+        CHECK_OK(st.before_op(h, compute, &resync));
+        CHECK_OK(st.after_op(h, compute));
+    }
+    CHECK_OK(st.end_pass(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_EQ(m.stats().stage_layers - before, (uint64_t)kL);
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+    for (int l = 0; l < kL; ++l)
+        for (rad_weight w : pw[(size_t)l])
+            CHECK(m.residency()->lookup(w)->ptr != nullptr);
+    rad_dev_free(region, RAD_MEM_DEVICE);
+    rad_stream_destroy(compute);
+}
+
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     /* The production path. Pools has already allocated the weights pool as one block; allocating
      * beside it would spend the budget twice and surface later as an unrelated out-of-memory.
