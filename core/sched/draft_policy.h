@@ -28,6 +28,13 @@
  * depth change under issue_ahead() is priced on the verify window until the shared contract
  * carries both (see the cost request in the issue).
  *
+ * The priced shape is written down, not left at its defaults. `history_tokens` is the history the
+ * paired step owes per row (one row for the verified token plus one per draft it verifies, the
+ * serial head's rule), `prefill_tokens` comes from the view, `drafter` names what is loaded, and
+ * `replay` is None because this runtime plays no tape. The plan carries the same per-row numbers
+ * (`ctx_class`, `history_tokens`) and who may spend each `k[]` (`fill`): a K0 plan with history is
+ * "policy K0 with history", and the n-gram fallback is a drafter too, barred where `k[]` is 0.
+ *
  * No allocation per candidate: every candidate is written into the caller's `out->k`, and every
  * evaluation is one call to the cost model's `estimate`. The frozen window is reserved at
  * configure(), or grown once on the first cycle when the caller did not size it.
@@ -118,6 +125,12 @@ private:
     /* The deepest K the frozen plan issued among the rows this view still holds; 0 when it names
      * none of them. Identity, never an index. */
     int32_t frozen_verify_k(const DraftBatchView& view) const;
+    /* The frozen plan's K for the view's row i, 0 when it names none. */
+    int32_t frozen_k_of(const DraftBatchView& view, int32_t i) const;
+    /* The shape assignment `k[]` verifies (clamped to `clamp_to` when that is >= 0), with the
+     * history the paired step owes and the drafter that is loaded. */
+    void    shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
+                     DraftVerifyShape* s) const;
     void    remember(const DraftBatchView& view, const int32_t* k);
 
     DraftPolicyConfig c_{};

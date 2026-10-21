@@ -180,8 +180,11 @@ public:
     /* Fill `preds` through the predictor and choose the cycle's plan. Returns RAD_OK, or the
      * failing hook's error; on any error no plan is in force and the cycle runs legacy. */
     int  open_cycle(const DraftBatchView& view, DraftPredictions* preds);
-    /* The plan in force, or null. */
-    const DraftPlan* plan() const { return have_plan_ ? &plan_ : nullptr; }
+    /* The plan in force, or null. A plan is written once when its cycle opens and is not touched
+     * again until the same storage comes round: the next cycle writes the other of two sets, so a
+     * pointer handed out here keeps its rows across one further open_cycle(). A reader that must
+     * survive two cycles (an issued-ahead pass and its observation) copies it. */
+    const DraftPlan* plan() const { return plan_cur_ >= 0 ? &plan_slots_[plan_cur_].plan : nullptr; }
     /* This cycle's K for the request, or -1 when the plan does not cover it. Identity, never an
      * index: a recycled slot with another generation is another request. */
     int  planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const;
@@ -234,16 +237,24 @@ private:
     double  cost_ms_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
     int64_t cost_n_ [RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
 
-    /* The cost policy's plan and its storage (reserved at configure, outside the step path). */
+    /* The cost policy's plan and its storage (reserved at configure, outside the step path). Two
+     * sets: the caller reads one while the next cycle fills the other. */
+    struct PlanSlot {
+        DraftPlan plan;
+        std::vector<uint64_t>      id;
+        std::vector<int32_t>       slot;
+        std::vector<uint32_t>      gen;
+        std::vector<int32_t>       k;
+        std::vector<DraftFallback> why;
+        std::vector<int32_t>       rows;
+        std::vector<int32_t>       ctx_class;
+        std::vector<int32_t>       history_tokens;
+        std::vector<DraftDrafter>  fill;
+    };
     DraftPlanner planner_;
-    DraftPlan    plan_;
-    std::vector<uint64_t>       plan_id_;
-    std::vector<int32_t>        plan_slot_;
-    std::vector<uint32_t>       plan_gen_;
-    std::vector<int32_t>        plan_k_;
-    std::vector<DraftFallback>  plan_why_;
-    std::vector<int32_t>        plan_rows_;
-    bool have_plan_   = false;
+    PlanSlot     plan_slots_[2];
+    int          plan_cur_ = -1;   /* the slot plan() returns; -1 = no plan this cycle */
+    int          plan_cur_prev_ = 0;   /* the slot the last opened cycle wrote */
     bool cost_failed_ = false;   /* the open_cycle error was logged */
 
     /* Fill a sequence's estimate from the prior and set its first stop. */

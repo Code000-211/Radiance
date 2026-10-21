@@ -14,10 +14,12 @@
 #include "rad_test.h"
 
 #include "sched/scheduler.h"
+#include "sched/draft_cost.h"
 
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "sched_fakes.h"
@@ -664,5 +666,209 @@ TEST(an_admission_in_flight_keeps_the_next_step_from_being_issued_ahead) {
     REQUIRE(el != nullptr);
     CHECK(el->is_prefill);
     CHECK_EQ(el->n_spec, 0);
+}
+/* The priced shape is written down, not left at its defaults. A K0 plan with history is "policy
+ * K0 with history", so every row of a cycle with the head loaded carries the verified token's
+ * history row (frozen K 0 here), the prefill sharing the step is named, the loaded drafter is
+ * Serial, and this runtime plays no tape. The plan says the same per row. */
+struct ShapeLog {
+    DraftVerifyShape last;
+    int calls = 0;
+};
+
+/* A's real table behind the seam, recording the shape it was asked to price. */
+struct RealPrice {
+    DraftCostTable*  table = nullptr;
+    DraftVerifyShape* last = nullptr;
+};
+
+int real_price(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    RealPrice* r = static_cast<RealPrice*>(ctx);
+    if (r->last) *r->last = s;
+    return r->table->estimate(s, out);
+}
+
+int price_and_record(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    ShapeLog* log = static_cast<ShapeLog*>(ctx);
+    log->last = s;
+    ++log->calls;
+    *out = DraftCostEstimate{};
+    if (s.n_rows < 1) return RAD_OK;
+    out->ms = 1.0 + 0.05 * (double)(s.verify_tokens - s.n_rows);
+    out->coverage = 4;
+    out->source = DraftCostSource::Measured;
+    out->valid = true;
+    return RAD_OK;
+}
+
+TEST(the_priced_shape_carries_history_prefill_and_the_loaded_drafter) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    ShapeLog log;
+    const uint64_t id = f.submit(8);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 6;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = DraftCostModel{ &log, price_and_record };
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    const uint64_t late = f.submit(600);
+    f.sch.find(id)->sp.temp = 0.0f;   /* greedy: the profile below keys on that */
+    REQUIRE(f.sch.step() != nullptr);
+    /* Cycle 2: one decoding row, nothing verifies yet, the long prompt is still queued. */
+    CHECK(log.calls > 0);
+    CHECK_EQ(log.last.n_rows, 1);
+    CHECK_EQ(log.last.history_tokens, 1);   /* the verified token's own history row */
+    CHECK_EQ(log.last.prefill_tokens, 0);   /* nothing running prefills yet */
+    CHECK(log.last.drafter == DraftDrafter::Serial);
+    CHECK(log.last.replay == DraftReplay::None);
+
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    CHECK_EQ(p->history_tokens[0], 1);
+    CHECK_EQ(p->ctx_class[0], draft_ctx_class(8));
+    CHECK(p->fill[0] == (p->k[0] > 0 ? DraftDrafter::Serial : DraftDrafter::None));
+
+    /* Cycle 3: the long prompt is running mid-prefill, so the step the plan pairs with shares
+     * prefill work, and the row now verifies the previous plan's window (its history rows). */
+    const int prev_k = p->k[0];
+    f.commit_plain(11);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(log.last.prefill_tokens, 600 - 256);   /* one chunk admitted, the rest pending */
+    CHECK_EQ(log.last.history_tokens, 1 + prev_k);
+    const StepEntry* el = entry_of(f.sch, late);
+    REQUIRE(el != nullptr);
+    CHECK(el->is_prefill);
+}
+
+/* A plan is written once and read for the cycle it names; the next cycle writes the other set, so
+ * a pointer handed out under issue_ahead() still says what it priced after the next open. */
+TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t a = f.submit(160);
+    const uint64_t b = f.submit(180);
+    pred.set(a, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    pred.set(b, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    use_cost_policy(f, pred);
+    f.prefill(a);
+    f.prefill(b);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* first = f.sch.draft().plan();
+    REQUIRE(first != nullptr);
+    const uint64_t first_cycle = first->cycle_id;
+    const int32_t  first_k     = first->k[0];
+    const int32_t  first_hist  = first->history_tokens[0];
+
+    f.commit_plain(11);
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* next = f.sch.draft().plan();
+    REQUIRE(next != nullptr);
+    CHECK(next != first);
+    CHECK_EQ(first->cycle_id, first_cycle);
+    CHECK_EQ(first->k[0], first_k);
+    CHECK_EQ(first->history_tokens[0], first_hist);
+}
+
+/* The A/C seam against the real model: a profile measured for this deployment, read by A's
+ * table, prices every candidate the planner considers. The profile says a two-draft verify is
+ * the cheapest per emitted token here, so the plan must choose 2 because the model said so. */
+TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(8);
+    pred.set(id, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
+
+    const int cls = draft_ctx_class(8);
+    auto bucket = [&](int k, double ms) {
+        std::string rows = "0";
+        for (int j = 1; j <= k; ++j) rows += ",1";
+        return "{\"ctx_class\": " + std::to_string(cls) +
+               ", \"shape\": {\"n_rows\": 1, \"verify_k\": " + std::to_string(k) +
+               ", \"verify_tokens\": " + std::to_string(1 + k) +
+               ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"rows\": [" + rows +
+               "], \"sampling\": \"greedy\", \"replay\": \"none\"},"
+               " \"extent\": {\"rounds\": " + std::to_string(k) +
+               ", \"draft_rows\": " + std::to_string(k) + "},"
+               " \"time_ms\": {\"mean\": " + std::to_string(ms) + ", \"unc\": 0.01, \"n\": 9}}";
+    };
+    /* 1 token / 2.0 ms, 3 / 1.3, 7 / 5.0: K=2 pays, K=6 does not. */
+    const std::string profile =
+        "{\"format\": \"rad-draft-profile/1\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
+        "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
+        "\"placement\": \"vram\"}, \"execution\": \"rectangular\", \"buckets\": [" +
+        bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "]}";
+
+    DraftCostProfile parsed;
+    std::string err;
+    CHECK_OK(draft_cost_profile_parse(profile, &parsed, &err));
+    DraftCostRuntime rt;
+    rt.fingerprint = parsed.fingerprint;
+    rt.execution   = DraftCostExecution::Rectangular;
+    DraftCostTable table;
+    CHECK_OK(table.configure(parsed, rt));
+    CHECK(table.active());
+
+    /* A's table behind a recorder, so the shape the planner prices is visible. */
+    DraftVerifyShape last_shape;
+    RealPrice real{ &table, &last_shape };
+
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 6;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = DraftCostModel{ &real, real_price };
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    f.sch.find(id)->sp.temp = 0.0f;   /* greedy, as the profile's buckets are keyed */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    CHECK_EQ(last_shape.n_rows, 1);
+    CHECK_EQ(last_shape.history_tokens, 1);
+    CHECK(p->source == DraftPlanSource::Cost);
+    CHECK_EQ(p->k[0], 2);
+    /* The model really priced the shape this plan names: its own estimate for it is measured. */
+    DraftVerifyShape shape;
+    shape.n_rows = 1;
+    shape.verify_k = 2;
+    shape.verify_tokens = 3;
+    shape.history_tokens = 1;
+    shape.ctx_class = cls;
+    shape.rows[1] = 1;
+    shape.rows[2] = 1;
+    DraftCostEstimate est;
+    CHECK_OK(table.estimate(shape, &est));
+    CHECK(est.valid);
+    CHECK(est.source == DraftCostSource::Measured);
 }
 RAD_TEST_MAIN()

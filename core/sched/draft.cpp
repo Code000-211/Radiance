@@ -83,45 +83,58 @@ int DraftController::configure(const Params& p) {
     }
     const int rc = planner_.configure(pc);
     if (rc < 0) return rc;
-    have_plan_ = false;
+    plan_cur_ = -1;
     cost_failed_ = false;
     const size_t cap = (size_t)(p.max_seqs > 0 ? p.max_seqs : 0);
-    plan_id_.assign(cap, 0);
-    plan_slot_.assign(cap, -1);
-    plan_gen_.assign(cap, 0);
-    plan_k_.assign(cap, 0);
-    plan_why_.assign(cap, DraftFallback::None);
-    plan_rows_.assign(RAD_SCHED_MAX_SPEC + 1, 0);
-    plan_ = DraftPlan{};
-    plan_.cap       = (int)cap;
-    plan_.req_id    = plan_id_.data();
-    plan_.slot      = plan_slot_.data();
-    plan_.slot_gen  = plan_gen_.data();
-    plan_.k         = plan_k_.data();
-    plan_.why       = plan_why_.data();
-    plan_.rows      = plan_rows_.data();
+    for (PlanSlot& s : plan_slots_) {
+        s.id.assign(cap, 0);
+        s.slot.assign(cap, -1);
+        s.gen.assign(cap, 0);
+        s.k.assign(cap, 0);
+        s.why.assign(cap, DraftFallback::None);
+        s.rows.assign(RAD_SCHED_MAX_SPEC + 1, 0);
+        s.ctx_class.assign(cap, 0);
+        s.history_tokens.assign(cap, 0);
+        s.fill.assign(cap, DraftDrafter::None);
+        s.plan          = DraftPlan{};
+        s.plan.cap      = (int)cap;
+        s.plan.req_id   = s.id.data();
+        s.plan.slot     = s.slot.data();
+        s.plan.slot_gen = s.gen.data();
+        s.plan.k        = s.k.data();
+        s.plan.why      = s.why.data();
+        s.plan.rows     = s.rows.data();
+        s.plan.ctx_class      = s.ctx_class.data();
+        s.plan.history_tokens = s.history_tokens.data();
+        s.plan.fill           = s.fill.data();
+    }
     return RAD_OK;
 }
 
 int DraftController::open_cycle(const DraftBatchView& view, DraftPredictions* preds) {
-    have_plan_ = false;
+    plan_cur_ = -1;
     if (!cost_policy() || !preds) return RAD_OK;
-    if (view.n_seq > plan_.cap) return RAD_E_INVAL;
+    /* The next cycle writes the other set, so the plan handed out last cycle keeps its rows. */
+    const int next = plan_cur_prev_ ^ 1;
+    PlanSlot& slot = plan_slots_[next];
+    if (view.n_seq > slot.plan.cap) return RAD_E_INVAL;
     if (preds->cap < view.n_seq || !preds->seq || !preds->req_id) return RAD_E_INVAL;
 
     int rc = p_.predictor.predict(p_.predictor.ctx, view, preds);
     if (rc < 0) return rc;
-    rc = planner_.choose(view, *preds, p_.costs, &plan_);
+    rc = planner_.choose(view, *preds, p_.costs, &slot.plan);
     if (rc < 0) return rc;
-    have_plan_ = true;
+    plan_cur_      = next;
+    plan_cur_prev_ = next;
     return RAD_OK;
 }
 
 int DraftController::planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const {
-    if (!have_plan_) return -1;
-    for (int32_t i = 0; i < plan_.n_seq; ++i)
-        if (plan_.req_id[i] == req_id && plan_.slot[i] == slot && plan_.slot_gen[i] == slot_gen)
-            return plan_.k[i];
+    const DraftPlan* p = plan();
+    if (!p) return -1;
+    for (int32_t i = 0; i < p->n_seq; ++i)
+        if (p->req_id[i] == req_id && p->slot[i] == slot && p->slot_gen[i] == slot_gen)
+            return p->k[i];
     return -1;
 }
 

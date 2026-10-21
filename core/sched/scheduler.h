@@ -463,9 +463,25 @@ private:
         if (draft_.cost_policy()) {
             const int k = planned_k(s);
             if (k >= 0) return k;
-            return draft_.next_depth();   /* no plan covers it: legacy for this cycle */
+            /* A plan is in force but does not name this row: it was admitted after the cycle
+             * opened and was not priced, so it drafts nothing this cycle. Only a cycle whose
+             * plan failed outright runs legacy. */
+            return draft_.plan() ? 0 : draft_.next_depth();
         }
         return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+    }
+
+    /* Whether the plan bars the n-gram fallback from this row (draft_plan_bars_fill). A row the
+     * plan does not name is barred too while a plan is in force: k[] is the budget for every
+     * drafter, and an unpriced row has none. */
+    bool bars_fill(const SchedReq& s) const {
+        const DraftPlan* p = draft_.plan();
+        if (!p) return false;
+        if (!s.req) return true;
+        for (int32_t i = 0; i < p->n_seq; ++i)
+            if (p->req_id[i] == s.req->id && p->slot[i] == s.slot && p->slot_gen[i] == s.gen)
+                return draft_plan_bars_fill(*p, i);
+        return true;
     }
 
     /* This cycle's planned K for the request, or -1 when the cost policy is off or its plan

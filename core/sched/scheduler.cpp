@@ -1289,12 +1289,11 @@ const RadBatch* Scheduler::step() {
             const int pk  = planned_k(s);
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0 && pk != 0) {
-                /* A cost plan that names this row with K=0 is a speculation-off decision, not a
-                 * vacancy: filling it here would measure n-gram work in the MTP-off arm and mix
-                 * its labels with the head's (docs/ADAPTIVE-MTP.md). A row the plan lets draft
+            else if (s.n_draft == 0 && !bars_fill(s)) {
+                /* The plan bars this row: K=0 is a speculation-off decision, not a vacancy, and a
+                 * row the plan does not name has no budget either. A row the plan lets draft
                  * (K>0) but for which the head published nothing keeps the fallback, bounded by
-                 * cap; a row the plan does not name keeps the legacy behaviour. */
+                 * cap. Without a plan the legacy behaviour stands. */
                 s.n_draft = (int32_t)draft_ngram(s, pk >= 0 ? cap : draft_.step_window());
                 ngram = s.n_draft > 0;
             }
@@ -1720,11 +1719,26 @@ void Scheduler::draft_cost_cycle() {
     draft_view_.policy_version = RAD_DRAFT_POLICY_VERSION;
     draft_view_.n_seq          = n;
     draft_view_.k_ceiling      = cfg_.n_spec;
-    /* Budgets and the n-gram gate are the integrator's to fill (telemetry/config wiring). 0 is
-     * "not constrained", the view's default. */
-    draft_view_.token_budget   = 0;
-    draft_view_.kv_budget      = 0;
-    draft_view_.prefill_tokens = 0;
+    /* The step this cycle pairs with may add the step budget; the KV lookahead may spend what the
+     * pool has free. Both are bounds read here, not measurements (the step itself is planned
+     * after this cycle opens). */
+    draft_view_.token_budget   = cfg_.max_tok > INT32_MAX ? INT32_MAX : (int32_t)cfg_.max_tok;
+    const int64_t kv_free = kv_ ? kv_->free_blocks(0) * kv_->block_tokens(0) : 0;
+    draft_view_.kv_budget      = kv_free > INT32_MAX ? INT32_MAX : (int32_t)(kv_free > 0 ? kv_free : 0);
+    /* Prompt work still pending at the open. The chunk that shares this step is planned later, so
+     * this is what could share it: 0 is exact when nothing is left to prefill, and non-zero keeps
+     * a history/prefill-bearing step from being priced as decode-only. */
+    int64_t pending = 0;
+    for (int32_t slot : running_) {
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running) continue;
+        const int64_t left = (int64_t)s.req->prompt.size() - s.req->n_computed;
+        if (left > 0) pending += left;
+    }
+    if (pending > cfg_.max_tok) pending = cfg_.max_tok;
+    draft_view_.prefill_tokens = pending > INT32_MAX ? INT32_MAX : (int32_t)pending;
+    /* This runtime has no n-gram switch: the fallback is always available, and k[] gates it per
+     * row (bars_fill). */
     draft_view_.ngram_allowed  = true;
 
     const int rc = draft_.open_cycle(draft_view_, &draft_preds_);

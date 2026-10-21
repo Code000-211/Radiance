@@ -24,27 +24,6 @@ int32_t cap_of(const DraftSeqView& v, int32_t ceiling) {
     return cap;
 }
 
-/* The shape a candidate assignment verifies, with every k clamped to `clamp_to` when that is
- * >= 0. n_rows is every decode row; verify_tokens counts 1 + k_i for each of them, the
- * non-drafting rows included. */
-void shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
-              DraftVerifyShape* s) {
-    *s = DraftVerifyShape{};
-    s->n_rows = view.n_seq;
-    s->prefill_tokens = view.prefill_tokens;
-    bool sampled = false;
-    for (int32_t i = 0; i < view.n_seq; ++i) {
-        const int32_t want = k[i];
-        const int32_t ki = clamp_to >= 0 && want > clamp_to ? clamp_to : want;
-        if (ki > s->verify_k) s->verify_k = ki;
-        s->verify_tokens += 1 + ki;
-        for (int32_t j = 1; j <= ki; ++j) ++s->rows[j];
-        if (view.seq[i].ctx_class > s->ctx_class) s->ctx_class = view.seq[i].ctx_class;
-        if (view.seq[i].sampling == DraftSampling::Sampled) sampled = true;
-    }
-    s->sampling = sampled ? DraftSampling::Sampled : DraftSampling::Greedy;
-}
-
 }  /* namespace */
 
 int DraftPlanner::configure(const DraftPolicyConfig& c) {
@@ -112,6 +91,44 @@ int32_t DraftPlanner::frozen_verify_k(const DraftBatchView& view) const {
         }
     }
     return top;
+}
+
+int32_t DraftPlanner::frozen_k_of(const DraftBatchView& view, int32_t i) const {
+    const DraftSeqView& v = view.seq[i];
+    for (size_t j = 0; j < fr_n_; ++j) {
+        if (fr_id_[j] != v.req_id || fr_slot_[j] != v.slot || fr_gen_[j] != v.slot_gen) continue;
+        return fr_k_[j];
+    }
+    return 0;
+}
+
+void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
+                            DraftVerifyShape* s) const {
+    *s = DraftVerifyShape{};
+    s->n_rows = view.n_seq;
+    s->prefill_tokens = view.prefill_tokens;
+    /* The loaded drafter, not who spends k[]: a head that is loaded keeps the history and KV of
+     * a K0 row, so its K0 is a different bucket from a process with no head at all. */
+    s->drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+    /* This runtime plays no tape (core/runtime/stager.h); a recorded or replayed shape is a
+     * different key, never this one. */
+    s->replay = DraftReplay::None;
+    bool sampled = false;
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        const int32_t want = k[i];
+        const int32_t ki = clamp_to >= 0 && want > clamp_to ? clamp_to : want;
+        if (ki > s->verify_k) s->verify_k = ki;
+        s->verify_tokens += 1 + ki;
+        for (int32_t j = 1; j <= ki; ++j) ++s->rows[j];
+        if (view.seq[i].ctx_class > s->ctx_class) s->ctx_class = view.seq[i].ctx_class;
+        if (view.seq[i].sampling == DraftSampling::Sampled) sampled = true;
+        /* The history the paired step owes this row: one row for the verified token, plus one per
+         * draft it verifies (Scheduler::serial_begin's hist_n, lead zero on a decode row). With no
+         * head loaded nothing is carried. The frozen window is what the paired step verifies,
+         * which is this cycle's draft window only when the two do not differ. */
+        if (view.k_ceiling > 0) s->history_tokens += 1 + frozen_k_of(view, i);
+    }
+    s->sampling = sampled ? DraftSampling::Sampled : DraftSampling::Greedy;
 }
 
 void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
@@ -191,7 +208,17 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->source         = src;
     out->fallback       = fb;
     out->probe          = DraftProbe::None;
+    out->replay         = DraftReplay::None;
+    out->timing_valid   = false;   /* the planner does not time the cycle */
+    out->prefill_tokens = view.prefill_tokens;
     if (out->cap < view.n_seq) return RAD_E_INVAL;
+    /* The shape the plan priced, per row; `k[]` is the budget for whichever drafter may fill it,
+     * and a K0 row has none. The history is the one the paired step owes (shape_of). */
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        out->ctx_class[i]      = view.seq[i].ctx_class;
+        out->history_tokens[i] = view.k_ceiling > 0 ? 1 + frozen_k_of(view, i) : 0;
+        out->fill[i] = out->k[i] > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+    }
     if (draft_plan_rows(*out) < 0) return RAD_E_INVAL;
     const int rc = draft_plan_valid(*out);
     if (rc == RAD_OK) remember(view, out->k);
@@ -201,7 +228,7 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
 int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pred,
                          const DraftCostModel& costs, DraftPlan* out) {
     if (!out || !out->k || !out->rows || !out->req_id || !out->slot || !out->slot_gen ||
-        !out->why)
+        !out->why || !out->fill || !out->ctx_class || !out->history_tokens)
         return RAD_E_INVAL;
     if (view.n_seq < 0 || view.n_seq > out->cap) return RAD_E_INVAL;
     if (pred.n_seq < view.n_seq || pred.cap < view.n_seq || !pred.seq) return RAD_E_INVAL;
@@ -306,6 +333,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     /* Budgets: a positive token or KV budget caps the summed drafts. Scaling every K down is
      * the resource cut that may happen at once. */
     int32_t budget = -1;
+    bool    cut    = false;
     if (view.token_budget > 0) budget = view.token_budget;
     if (view.kv_budget > 0 && (budget < 0 || view.kv_budget < budget)) budget = view.kv_budget;
     if (budget >= 0) {
@@ -318,6 +346,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                 if (scaled < out->k[i]) {
                     out->k[i] = scaled;
                     out->why[i] = DraftFallback::Resources;
+                    cut = true;
                 }
             }
         }
@@ -326,9 +355,24 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     int32_t top = 0;
     total_k(out->k, view.n_seq, &top);
 
+    /* The cut changed the assignment `best_p` priced: price the plan as it stands, so the
+     * hysteresis below compares the plan that will actually be issued. */
+    if (cut && evals < c_.max_evals) {
+        Priced p;
+        const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
+        if (rc < 0) return rc;
+        if (p.valid) best_p = p;
+    }
+
     /* held_ counts the cycles that have run at last_k_; the plan issued here is not one of them
-     * yet. */
-    if (chosen_) { if (held_ < INT32_MAX) ++held_; } else held_ = 0;
+     * yet, and a cycle with no rows is not a cycle at the depth. */
+    if (view.n_seq == 0) {
+        /* nothing ran: the depth did not hold, it had nothing to hold over */
+    } else if (chosen_) {
+        if (held_ < INT32_MAX) ++held_;
+    } else {
+        held_ = 0;
+    }
 
     /* Hysteresis and hold: a raise waits, a reduction is immediate. A raise is judged
      * pessimistically (`ms + unc`), the incumbent at its known cost; with no price for the
