@@ -79,6 +79,13 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
     if (!std::isfinite(c.hyst) || c.hyst < 0.0 || c.hold < 0) return RAD_E_INVAL;
     c_ = c;
     reset();
+    /* Reserve the frozen window here, so no cycle allocates one. */
+    if (c_.max_seqs > 0 && fr_id_.size() < (size_t)c_.max_seqs) {
+        fr_id_.assign((size_t)c_.max_seqs, 0);
+        fr_slot_.assign((size_t)c_.max_seqs, -1);
+        fr_gen_.assign((size_t)c_.max_seqs, 0);
+        fr_k_.assign((size_t)c_.max_seqs, 0);
+    }
     if (c_.mode == DraftPolicyMode::Cost)
         RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), a raise needs %.0f%% and %d "
                  "cycles", (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
@@ -90,6 +97,38 @@ void DraftPlanner::reset() {
     last_k_ = 0;
     held_   = 0;
     chosen_ = false;
+    fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
+}
+
+int32_t DraftPlanner::frozen_verify_k(const DraftBatchView& view) const {
+    int32_t top = 0;
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        const DraftSeqView& v = view.seq[i];
+        for (size_t j = 0; j < fr_n_; ++j) {
+            if (fr_id_[j] != v.req_id || fr_slot_[j] != v.slot || fr_gen_[j] != v.slot_gen)
+                continue;
+            if (fr_k_[j] > top) top = fr_k_[j];
+            break;
+        }
+    }
+    return top;
+}
+
+void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
+    const size_t n = (size_t)view.n_seq;
+    if (fr_id_.size() < n) {   /* only when the caller did not size the storage at configure() */
+        fr_id_.resize(n);
+        fr_slot_.resize(n);
+        fr_gen_.resize(n);
+        fr_k_.resize(n);
+    }
+    for (size_t j = 0; j < n; ++j) {
+        fr_id_[j]   = view.seq[j].req_id;
+        fr_slot_[j] = view.seq[j].slot;
+        fr_gen_[j]  = view.seq[j].slot_gen;
+        fr_k_[j]    = k[j];
+    }
+    fr_n_ = n;
 }
 
 double DraftPlanner::expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k) {
@@ -154,7 +193,9 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->probe          = DraftProbe::None;
     if (out->cap < view.n_seq) return RAD_E_INVAL;
     if (draft_plan_rows(*out) < 0) return RAD_E_INVAL;
-    return draft_plan_valid(*out);
+    const int rc = draft_plan_valid(*out);
+    if (rc == RAD_OK) remember(view, out->k);
+    return rc;
 }
 
 int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pred,
@@ -173,8 +214,10 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         out->why[i]      = DraftFallback::None;
         out->k[i]        = 0;
     }
-    /* verify_k is the window the paired step verifies: the previous cycle's choice. */
-    out->verify_k = last_k_;
+    /* verify_k is the window the paired step verifies: the frozen plan's distribution, over the
+     * rows that are still here. A row the frozen plan did not name was issued nothing, so it
+     * verifies nothing. */
+    out->verify_k = frozen_verify_k(view);
 
     if (c_.mode == DraftPolicyMode::Legacy) {
         const int32_t want = c_.legacy_k > 0 ? c_.legacy_k : c_.k_ceiling;

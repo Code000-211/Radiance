@@ -7,7 +7,7 @@
  *
  * Welle 1 is deliberately ragged: one cycle verifies every row at its own K (which
  * StepEntry::n_spec already carries), and E2's shrinking rounds are not wired yet. `verify_k` in
- * the plan is the previous cycle's `max_k`; `max_k` is this cycle's.
+ * the plan is the window the frozen previous plan issued; `max_k` is this cycle's.
  *
  * The search is a heuristic, not an optimum: a few homogeneous baselines, then at most
  * `passes` deterministic coordinate passes over the requests, each change judged by the new
@@ -18,11 +18,25 @@
  * scaled down proportionally and marked `DraftFallback::Resources` -- the plan never silently
  * spends more than it was given.
  *
- * No allocation: every candidate is written into the caller's `out->k`, and every evaluation is
- * one call to the cost model's `estimate`.
+ * Two windows, not one. The plan's `k[]`/`max_k`/`rows[]` are the cycle's draft window; the pass
+ * the paired step verifies is the previous, frozen plan's distribution, and under issue_ahead()
+ * the two are different. The planner keeps that frozen distribution keyed by
+ * (req_id, slot, slot_gen) -- a recycled slot with another generation is another request -- and
+ * stamps the plan's `verify_k` from the rows that are still present. A `DraftVerifyShape` can
+ * carry one distribution, so the search still prices every candidate on the shape it verifies;
+ * when the two windows differ the draft half of that shape is not in its own estimate, and a
+ * depth change under issue_ahead() is priced on the verify window until the shared contract
+ * carries both (see the cost request in the issue).
+ *
+ * No allocation per candidate: every candidate is written into the caller's `out->k`, and every
+ * evaluation is one call to the cost model's `estimate`. The frozen window is reserved at
+ * configure(), or grown once on the first cycle when the caller did not size it.
  */
 #pragma once
 #include "draft_types.h"
+
+#include <cstddef>
+#include <vector>
 
 namespace rad {
 
@@ -38,6 +52,7 @@ enum { RAD_DRAFT_POLICY_VERSION = 1 };
 struct DraftPolicyConfig {
     DraftPolicyMode mode = DraftPolicyMode::Legacy;
     int32_t k_ceiling = 0;    /* --num-speculative-tokens; 0 = no drafter process */
+    int32_t max_seqs = 0;     /* cfg.max_seqs: the frozen window's storage; 0 = grow once */
     int32_t legacy_k = 0;     /* what a legacy plan drafts; 0 = the ceiling */
     int32_t fallback_k = 0;   /* the known fixed baseline when no shape can be priced */
     /* --draft-depth-tiers, ascending and unique, 0 first when K0 is a legal choice. */
@@ -95,14 +110,27 @@ private:
     static double expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k);
     /* Summed drafts of the plan, and its deepest K. */
     static int32_t total_k(const int32_t* k, int32_t n, int32_t* max_k);
-    /* The plan's rows and validity; the failure is the caller's to act on. */
+    /* The plan's rows and validity; the failure is the caller's to act on. Remembers the issued
+     * k[] as the next cycle's verify window. */
     int    finish(const DraftBatchView& view, int32_t max_k, DraftPlanSource src,
                   DraftFallback fb, DraftPlan* out);
+
+    /* The deepest K the frozen plan issued among the rows this view still holds; 0 when it names
+     * none of them. Identity, never an index. */
+    int32_t frozen_verify_k(const DraftBatchView& view) const;
+    void    remember(const DraftBatchView& view, const int32_t* k);
 
     DraftPolicyConfig c_{};
     int32_t last_k_ = 0;     /* the previous cycle's depth; 0 until one was chosen */
     int32_t held_   = 0;     /* cycles since it last moved */
     bool    chosen_ = false;
+    /* The last issued plan's K per request: the window the paired step verifies. `fr_n_` counts the
+     * entries in use; reset() forgets them without giving the storage back. */
+    std::vector<uint64_t> fr_id_;
+    std::vector<int32_t>  fr_slot_;
+    std::vector<uint32_t> fr_gen_;
+    std::vector<int32_t>  fr_k_;
+    size_t                fr_n_ = 0;
 };
 
 }  /* namespace rad */

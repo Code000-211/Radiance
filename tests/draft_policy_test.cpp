@@ -76,6 +76,48 @@ int token_estimate(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* 
     return RAD_OK;
 }
 
+/* The two C8 points core/rad_core.h documents -- depth 5: 43.0 ms / 23.3 tokens, depth 3:
+ * 36.3 ms / 22.3 tokens -- and nothing else. A shape the document does not cover comes back
+ * invalid, so the policy cannot lean on a price this test invented. */
+struct C8Model {
+    int calls[RAD_SCHED_MAX_SPEC + 1] = {};
+};
+int c8_estimate(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    auto* m = static_cast<C8Model*>(ctx);
+    *out = DraftCostEstimate{};
+    if (s.verify_k >= 0 && s.verify_k <= RAD_SCHED_MAX_SPEC) ++m->calls[s.verify_k];
+    /* A uniform depth-k C8 pass: 8 rows, 8 * (1 + k) tokens. */
+    if (s.n_rows == 8 && s.verify_k == 3 && s.verify_tokens == 8 * 4)      out->ms = 36.3;
+    else if (s.n_rows == 8 && s.verify_k == 5 && s.verify_tokens == 8 * 6) out->ms = 43.0;
+    else return RAD_OK;   /* not one of the documented points: nothing to price */
+    out->coverage = 1;
+    out->source = DraftCostSource::Measured;
+    out->valid = true;
+    return RAD_OK;
+}
+
+/* Per-row acceptance: the controller re-runs the predictor at every open_cycle, so a table the
+ * test changes between cycles is what the plan is chosen from. */
+struct RowPredictor {
+    float a[draft_fake::Fixture::kMaxSeq] = {};
+};
+int row_predict(void* ctx, const DraftBatchView& view, DraftPredictions* out) {
+    auto* s = static_cast<RowPredictor*>(ctx);
+    if (!out || !out->seq || !out->req_id || out->cap < view.n_seq) return RAD_E_INVAL;
+    out->n_seq = view.n_seq;
+    out->version = 1;
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        out->req_id[i] = view.seq[i].req_id;
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
+            out->seq[i].a[j] = s->a[i];
+            out->seq[i].unc[j] = 0.05f;
+            out->seq[i].n[j] = 0;
+        }
+        out->seq[i].valid = 0;
+    }
+    return RAD_OK;
+}
+
 /* Records every shape the policy asks about. */
 struct ShapeLog {
     static constexpr int kMax = 64;
@@ -434,6 +476,134 @@ TEST(config_validation_refuses_a_tier_list_it_cannot_use) {
     DraftPolicyConfig dup = cost_config(6);
     dup.tiers[0] = 1; dup.tiers[1] = 1;   /* not unique */
     CHECK_EQ(p.configure(dup), RAD_E_INVAL);
+}
+
+TEST(the_documented_c8_pair_prices_depth_three_ahead_of_depth_five) {
+    /* core/rad_core.h documents C8 at depth 5: 43.0 ms, 23.3 tokens; at depth 3: 36.3 ms,
+     * 22.3 tokens -- 0.542 against 0.614 tokens per millisecond. The acceptance below is chosen
+     * so that 8 rows reproduce exactly those two token counts; the model prices exactly those two
+     * shapes. No third measurement is claimed, and none is needed: both candidates are the
+     * document's. */
+    draft_fake::Fixture f;
+    f.view.cycle_id = 7;
+    f.view.k_ceiling = 6;
+    for (int i = 0; i < 8; ++i) f.add(i, (uint64_t)(100 + i));
+    draft_fake::Predictor pred;
+    draft_fake::predict(&pred, f.view, &f.pred);
+    const float a[5] = { 0.95f, 0.6f, 0.469298f, 0.35f, 0.335114f };
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 5; ++j) f.pred.seq[i].a[j] = a[j];
+
+    /* The same arithmetic the policy maximises, spelled out: 8 rows, E(3) and E(5). */
+    double run = 1.0, e3 = 1.0;
+    for (int j = 0; j < 3; ++j) { run *= a[j]; e3 += run; }
+    double e5 = e3;
+    for (int j = 3; j < 5; ++j) { run *= a[j]; e5 += run; }
+    CHECK_NEAR(8.0 * e3, 22.3, 1e-3);
+    CHECK_NEAR(8.0 * e5, 23.3, 1e-3);
+    CHECK(8.0 * e3 / 36.3 > 8.0 * e5 / 43.0);
+
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 3; cfg.tiers[2] = 5; cfg.n_tiers = 3;
+    C8Model model;
+    DraftPlanner p;
+    CHECK_EQ(p.configure(cfg), RAD_OK);
+    CHECK_EQ(p.choose(f.view, f.pred, DraftCostModel{ &model, c8_estimate }, &f.plan), RAD_OK);
+
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK(f.plan.source == DraftPlanSource::Cost);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(f.plan.k[i], 3);
+    CHECK(model.calls[3] > 0);   /* both documented depths were priced ... */
+    CHECK(model.calls[5] > 0);
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+}
+
+TEST(the_verify_depth_of_a_cycle_comes_from_the_frozen_plan_not_from_a_scalar) {
+    /* Two rows; the deep one leaves before the next cycle. The paired step then verifies only the
+     * K0 row that is still there, so the new plan's verify_k is 0 -- the previous plan's max of 6
+     * is not the window that runs. */
+    Cycle c;
+    c.pred.a = 0.95f;
+    c.add(0, 11);
+    c.add(1, 12, 64, DraftEligibility::OutputExhausted);
+    c.measure(1.0, 0.2);
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);
+    CHECK_EQ(c.f.plan.verify_k, 0);   /* the first cycle had nothing issued ahead of it */
+    CHECK_EQ(c.planner.last_k(), 6);
+
+    /* Request 11 is gone; 12 stays in its slot with its generation. */
+    c.f.seq[0] = c.f.seq[1];
+    c.f.view.n_seq = 1;
+    draft_fake::predict(&c.pred, c.f.view, &c.f.pred);
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 0);
+    CHECK_EQ(c.f.plan.verify_k, 0);   /* the frozen plan drafted 0 for the surviving row */
+}
+
+TEST(alternating_plans_are_read_per_request_and_never_mixed) {
+    /* The [6,2,0,0] shape: four rows, two of which stop after their second draft. Each cycle's
+     * plan is rebuilt from that cycle's view, and every lookup answers with the plan in force
+     * under the identity it was asked about -- never a value from the previous plan. */
+    draft_fake::Fixture f;
+    f.view.k_ceiling = 6;
+    f.add(0, 100);
+    f.add(1, 101);
+    f.add(2, 102);
+    f.add(3, 103);
+    RowPredictor rows;
+    rows.a[0] = 0.95f;
+    rows.a[1] = 0.7f;
+    rows.a[2] = 0.0f;
+    rows.a[3] = 0.0f;
+
+    TokenPriced model;
+    DraftController::Params dp;
+    dp.max_depth = 6;
+    dp.max_seqs = draft_fake::Fixture::kMaxSeq;
+    dp.policy = cost_config(6);
+    dp.predictor = DraftPredictor{ &rows, row_predict };
+    dp.costs = DraftCostModel{ &model, token_estimate };
+    DraftController dc;
+    CHECK_EQ(dc.configure(dp), RAD_OK);
+
+    f.view.cycle_id = 1;
+    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    const DraftPlan* p1 = dc.plan();
+    CHECK(p1 != nullptr);
+    CHECK_EQ(p1->k[0], 6);
+    CHECK_EQ(p1->k[1], 2);
+    CHECK_EQ(p1->k[2], 0);
+    CHECK_EQ(p1->k[3], 0);
+    CHECK_EQ(p1->max_k, 6);
+    CHECK_EQ(p1->rows[1], 2);
+    CHECK_EQ(p1->rows[2], 2);
+    for (int j = 3; j <= 6; ++j) CHECK_EQ(p1->rows[j], 1);
+    CHECK_EQ(draft_plan_valid(*p1), RAD_OK);
+    for (int i = 0; i < 4; ++i) CHECK_EQ(dc.planned_k(f.seq[i].req_id, f.seq[i].slot, 1), p1->k[i]);
+
+    /* The next cycle has another batch: 100 finished, 104 admitted into a free slot. The plan is
+     * rebuilt from that view and every lookup answers with it. */
+    f.seq[0] = f.seq[1];
+    f.seq[1] = f.seq[2];
+    f.seq[2] = f.seq[3];
+    f.add(3, 104);
+    f.seq[3].slot = 7;
+    rows.a[0] = 0.7f;
+    rows.a[1] = 0.0f;
+    rows.a[2] = 0.0f;
+    rows.a[3] = 0.95f;
+    f.view.cycle_id = 2;
+    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    const DraftPlan* p2 = dc.plan();
+    CHECK(p2 != nullptr);
+    CHECK_EQ(p2->cycle_id, 2u);
+    CHECK_EQ(p2->n_seq, 4);
+    CHECK_EQ(dc.planned_k(100, 0, 1), -1);   /* not in this cycle's plan at all */
+    for (int i = 0; i < 4; ++i) CHECK_EQ(dc.planned_k(f.seq[i].req_id, f.seq[i].slot, 1), p2->k[i]);
+    CHECK_EQ(dc.planned_k(104, 7, 1), p2->k[3]);
+    CHECK_EQ(dc.planned_k(104, 7, 2), -1);   /* another generation of the slot is another request */
+    CHECK_EQ(draft_plan_valid(*p2), RAD_OK);
 }
 
 RAD_TEST_MAIN()

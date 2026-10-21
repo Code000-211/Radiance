@@ -72,6 +72,7 @@ int DraftController::configure(const Params& p) {
      * not silently mapped to legacy -- when either hook it chooses from is missing. */
     DraftPolicyConfig pc = p.policy;
     pc.k_ceiling = p.max_depth;
+    pc.max_seqs = p.max_seqs;
     const bool want_cost = pc.mode == DraftPolicyMode::Cost;
     if (want_cost && (!p.predictor.predict || !p.costs.estimate)) {
         RAD_ERR("--draft-policy cost needs a predictor and a cost model: this build has %s%s",
