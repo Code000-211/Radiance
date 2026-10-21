@@ -7,22 +7,20 @@
  * can price a position by what the verify measured rather than by what the window assumed.
  *
  * What counts as evidence:
- *   - The label mask is the shared one, draft_label(): a label exists at position j only while
- *     j < checked and j <= accepted. `checked` ends at the first rejection, so a censored cycle
- *     keeps the rejection it actually checked -- a censor cuts the cycle earlier, it does not
- *     erase a measured 0. A cycle where the draft hit the EOG but the token was not committed has
- *     checked == accepted and therefore no false rejection. (DraftController infers
- *     checked = accepted + 1 from (drafted, accepted); a censored row can carry fewer labels, so
- *     here the contract's checked is authoritative.)
+ *   - The label mask is the shared one, draft_label(): 1 on the accepted prefix, 0 only at
+ *     DraftSeqEnd::Rejected, and no label at DraftSeqEnd::Stopped (the draft hit the token the
+ *     target chose, but it was not committed) -- never a fabricated reject. A censor is the
+ *     reason a cycle ended, not a position: a rejection measured before it keeps its 0. A row with
+ *     DraftSeqEnd::Unset is refused by the contract's gate, not guessed at.
  *   - Positions past the verified window (`verified`, the controller's `drafted`) drift toward
  *     a[verified - 1], exactly as DraftController::adapt_observe does. The drift is not a sample:
  *     it does not touch n[] or ess[] and never sets a valid bit, so a prior cannot turn into
  *     calibration evidence.
- *   - Only the head's own proposals teach this model. Origin is per row and comes from the cycle's
- *     immutable plan (DraftPlan::fill): Serial is the head, Ngram is prompt lookup with another
- *     length distribution. A row of any other origin is skipped, never averaged in. An observation
- *     that names no plan has no origin and no identity, so it is refused -- null never means Head.
- *   - A K0 cycle (generated == 0, fill == None) leaves the estimate untouched: the request keeps
+ *   - Only the head's own proposals teach this model. Origin is per observation row
+ *     (DraftSeqObservation::origin), and the plan's fill[] is only the permission the contract
+ *     checks with draft_origin_fits_plan. A row of any other origin is skipped, never averaged in;
+ *     an observation that names no plan is refused by the gate -- null never means Head.
+ *   - A K0 cycle (generated == 0, origin None) leaves the estimate untouched: the request keeps
  *     its history and recovers at the next drafted cycle.
  *
  * Versions: predict serves only the current policy and refuses a view of another version. observe
@@ -38,11 +36,11 @@
  *
  * Memory: DraftPredictState is one per request slot, owned by the scheduler, and nothing here
  * allocates. A slot whose (req_id, slot_gen) differs from its state is recycled and starts at the
- * prior; an unchanged identity (preemption) keeps the estimate. Recycling a slot while a cycle
- * that names its old identity is still unobserved drops that cycle: observe() refuses it rather
- * than mixing it into the new request, so the scheduler must not reuse a slot with a live plan.
- * A request that moves to another slot needs its state copied by the scheduler; a fresh slot
- * starts over.
+ * prior; an unchanged identity (preemption) keeps the estimate. Lifetime belongs to the cycle
+ * ring: draft_observation_deliverable() decides whether a cycle may be observed and never consults
+ * the live slot. When a recycled slot owns the state an old row names, the row is skipped -- the
+ * cycle is deliverable, but its measurement must not merge into the new generation. A request that
+ * moves to another slot needs its state copied by the scheduler; a fresh slot starts over.
  *
  * Sampling: the model has no sampling dimension. Labels from a request that changes class land in
  * the same EMA; a[] is a head estimate for the row it was predicted for and must not price a
@@ -92,15 +90,16 @@ public:
     static int predict_hook(void* self, const DraftBatchView& view, DraftPredictions* out);
 
     /* DraftObserveFn's B half, composed by the integrator after a cycle the caller declared
-     * complete. The observation must name the plan it came from (draft_plan_identifies); origin,
-     * cycle and identity are read from it. Refuses an incomplete cycle, a malformed row
-     * (accepted > checked > verified), a plan row set outside the plan's cap, and a slot whose
-     * current generation is not the one observed. */
+     * complete. The cycle must pass draft_observation_deliverable: it names its plan, its rows are
+     * complete and valid, and each row's origin fits the plan's permission. Refuses a malformed
+     * observation, an unclassified cut, a plan row set outside the plan's cap, and a slot outside
+     * the caller's table. A row whose slot was recycled to another identity is skipped, not
+     * merged. */
     int observe(const DraftObservation& obs) const;
 
 private:
     void  start(DraftPredictState& s, uint64_t req_id, uint32_t slot_gen) const;
-    void  learn(DraftPredictState& s, const DraftSeqObservation& o, DraftDrafter src) const;
+    void  learn(DraftPredictState& s, const DraftSeqObservation& o) const;
     float unc_at(const DraftPredictState& s, int j) const;
 
     Params p_;

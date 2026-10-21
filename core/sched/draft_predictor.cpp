@@ -138,23 +138,19 @@ int DraftPredictModel::predict_hook(void* self, const DraftBatchView& view,
     return static_cast<DraftPredictModel*>(self)->predict(view, out);
 }
 
-void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o,
-                              DraftDrafter src) const {
-    /* Another drafter's matches are not this head's acceptance, and a K0 row measured nothing. */
-    if (src != DraftDrafter::Serial || o.generated == 0 || p_.max_depth <= 0) return;
+void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o) const {
+    /* Another drafter's matches are not this head's acceptance, and a K0 row measured nothing.
+     * The plan's fill[] is the permission (draft_origin_fits_plan); this is the fact. */
+    if (o.origin != DraftOrigin::Head || o.generated == 0 || p_.max_depth <= 0) return;
 
-    int accepted = (int)o.accepted;
-    if (accepted > (int)o.checked) accepted = (int)o.checked;  /* observe() refuses this already */
-    /* draft_label()'s mask: checked ends at the first rejection, and nothing past it was measured.
-     * A censor is a reason, not a position -- a rejection checked before it stays a label. */
-    int labeled = (int)o.checked;
-    if (labeled > accepted + 1) labeled = accepted + 1;
+    /* The shared mask, not a second one: 1 on the accepted prefix, 0 at a real rejection, and no
+     * label at a matched-but-uncommitted stop. A censor past the rejection does not erase it. */
     const int D = p_.max_depth;
-    if (labeled > D) labeled = D;
-    for (int j = 0; j < labeled; ++j) {
+    for (int j = 0; j < (int)o.checked && j < D; ++j) {
+        float x = 0.0f;
+        if (!draft_label(o, j, &x)) break;
         const double w = settle_weight(s.n[j], (double)p_.prior_weight, alpha_);
-        const double x = j < accepted ? 1.0 : 0.0;
-        s.a[j] = (float)((double)s.a[j] + w * (x - (double)s.a[j]));
+        s.a[j] = (float)((double)s.a[j] + w * ((double)x - (double)s.a[j]));
         s.ess[j] = (float)settle_ess((double)s.ess[j], w);
         if (s.n[j] < UINT16_MAX) ++s.n[j];
     }
@@ -169,11 +165,6 @@ void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o
 }
 
 int DraftPredictModel::observe(const DraftObservation& obs) const {
-    if (!obs.complete) {
-        RAD_ERR("draft predictor: cycle %llu is not complete; no label is taken from it",
-                (unsigned long long)obs.cycle_id);
-        return RAD_E_INVAL;
-    }
     if (obs.n_seq < 0 || obs.n_seq > obs.cap) return RAD_E_INVAL;
     if (obs.n_seq > 0 && (!obs.req_id || !obs.slot || !obs.slot_gen || !obs.seq))
         return RAD_E_INVAL;
@@ -181,31 +172,20 @@ int DraftPredictModel::observe(const DraftObservation& obs) const {
         RAD_ERR("draft predictor: no state table configured");
         return RAD_E_INVAL;
     }
-    /* Origin, cycle and identity are part of the immutable cycle contract. Without the plan a row
-     * has no provenance, and a missing array must never be read as "the head". */
-    if (obs.n_seq > 0 && !obs.plan) {
-        RAD_ERR("draft predictor: cycle %llu names no plan; its origin is unknown",
-                (unsigned long long)obs.cycle_id);
+    /* draft_plan_identifies() reads the plan's [cap]. Check that before the shared gate, so a
+     * caller's oversized n_seq cannot walk off the plan's arrays. */
+    if (obs.plan && obs.n_seq > obs.plan->cap) {
+        RAD_ERR("draft predictor: cycle %llu has %d rows but its plan holds %d",
+                (unsigned long long)obs.cycle_id, (int)obs.n_seq, (int)obs.plan->cap);
         return RAD_E_INVAL;
     }
-    if (obs.plan) {
-        const DraftPlan& plan = *obs.plan;
-        /* draft_plan_identifies() reads the plan's [cap] rows; its n_seq must fit that cap. */
-        if (obs.n_seq > plan.cap) {
-            RAD_ERR("draft predictor: cycle %llu has %d rows but its plan holds %d",
-                    (unsigned long long)obs.cycle_id, (int)obs.n_seq, (int)plan.cap);
-            return RAD_E_INVAL;
-        }
-        if (!draft_plan_identifies(plan, obs)) {
-            RAD_ERR("draft predictor: observation %llu does not match its plan",
-                    (unsigned long long)obs.cycle_id);
-            return RAD_E_INVAL;
-        }
-        if (obs.n_seq > 0 && !plan.fill) {
-            RAD_ERR("draft predictor: cycle %llu does not say who drafted its rows",
-                    (unsigned long long)obs.cycle_id);
-            return RAD_E_INVAL;
-        }
+    /* The contract's one lifetime gate: complete, plan-identified, valid rows, origin fits the
+     * plan. It never consults the live slot, so a cycle that ran before a recycle stays
+     * deliverable; a row that does not name a plan has no provenance and is refused. */
+    if (!draft_observation_deliverable(obs)) {
+        RAD_ERR("draft predictor: cycle %llu is not a deliverable observation",
+                (unsigned long long)obs.cycle_id);
+        return RAD_E_INVAL;
     }
     /* Validate every row before any state moves: a half-applied cycle is not a smaller update,
      * it is a mix of two cycles. */
@@ -216,22 +196,15 @@ int DraftPredictModel::observe(const DraftObservation& obs) const {
                     (int)cap_ - 1);
             return RAD_E_INVAL;
         }
-        const DraftSeqObservation& o = obs.seq[i];
-        if (o.accepted > o.checked || o.checked > o.verified) {
-            RAD_ERR("draft predictor: row %d has accepted %u, checked %u, verified %u",
-                    (int)i, (unsigned)o.accepted, (unsigned)o.checked, (unsigned)o.verified);
-            return RAD_E_INVAL;
-        }
-        const DraftPredictState& s = states_[slot];
-        if (s.req_id != obs.req_id[i] || s.slot_gen != obs.slot_gen[i]) {
-            RAD_ERR("draft predictor: slot %d holds request %llu/%u, not %llu/%u", (int)slot,
-                    (unsigned long long)s.req_id, (unsigned)s.slot_gen,
-                    (unsigned long long)obs.req_id[i], (unsigned)obs.slot_gen[i]);
-            return RAD_E_INVAL;
-        }
     }
-    for (int32_t i = 0; i < obs.n_seq; ++i)
-        learn(states_[obs.slot[i]], obs.seq[i], obs.plan ? obs.plan->fill[i] : DraftDrafter::None);
+    for (int32_t i = 0; i < obs.n_seq; ++i) {
+        const int32_t slot = obs.slot[i];
+        DraftPredictState& s = states_[slot];
+        /* A recycled slot belongs to another request now. The cycle stays deliverable, but its
+         * rows must never merge into the new generation's estimate: skip them. */
+        if (s.req_id != obs.req_id[i] || s.slot_gen != obs.slot_gen[i]) continue;
+        learn(s, obs.seq[i]);
+    }
     return RAD_OK;
 }
 
