@@ -1,0 +1,76 @@
+diff --git a/libr4d/r4d_model_bf16.hip b/libr4d/r4d_model_bf16.hip
+index cb7d04d..812d002 100644
+--- a/libr4d/r4d_model_bf16.hip
++++ b/libr4d/r4d_model_bf16.hip
+@@ -53,22 +53,25 @@
+ namespace {
+ 
+ struct PleVramCache {
+-    const void* current_wte = nullptr;
+-    int32_t*    tags = nullptr;
+-    uint8_t*    heat = nullptr;
+-    uint8_t*    data = nullptr;
+-    uint32_t    num_sets = 0;
++    int32_t* tags     = nullptr;
++    uint8_t* heat     = nullptr;
++    uint8_t* data     = nullptr;
++    uint32_t num_sets = 0;
+ };
+ 
+ static std::mutex g_ple_mu;
+ static PleVramCache g_ple_caches[8];
+ 
+-static PleVramCache get_ple_vram_cache(int dev_id, const void* wte, int n_embd) {
++static PleVramCache get_ple_vram_cache(int dev_id, int n_embd) {
+     if (dev_id < 0 || dev_id >= 8 || n_embd != 160) {
+         return PleVramCache{};
+     }
+-    std::lock_guard<std::mutex> lk(g_ple_mu);
+     PleVramCache& c = g_ple_caches[dev_id];
++    if (c.tags) {
++        return c; // Fast lock-free path
++    }
++    std::lock_guard<std::mutex> lk(g_ple_mu);
++    if (c.tags) return c;
+ 
+     const char* sets_env = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+     uint32_t num_sets = sets_env ? (uint32_t)std::strtoul(sets_env, nullptr, 0) : 65536u;
+@@ -82,38 +85,30 @@ static PleVramCache get_ple_vram_cache(int dev_id, const void* wte, int n_embd)
+     const uint32_t total_entries = num_sets * 4u;
+     const size_t tag_bytes  = (size_t)total_entries * sizeof(int32_t);
+     const size_t heat_bytes = (size_t)total_entries * sizeof(uint8_t);
+-    const size_t data_bytes = (size_t)total_entries * 160u;
++    const size_t data_bytes = (size_t)total_entries * 320u; // 160 elements x 2 bytes (BF16)
+ 
+-    if (!c.tags) {
+-        (void)hipSetDevice(dev_id);
+-        if (hipMalloc((void**)&c.tags, tag_bytes) != hipSuccess) {
+-            c.tags = nullptr;
+-            return PleVramCache{};
+-        }
+-        if (hipMalloc((void**)&c.heat, heat_bytes) != hipSuccess) {
+-            (void)hipFree(c.tags);
+-            c.tags = nullptr;
+-            return PleVramCache{};
+-        }
+-        if (hipMalloc((void**)&c.data, data_bytes) != hipSuccess) {
+-            (void)hipFree(c.tags);
+-            (void)hipFree(c.heat);
+-            c.tags = nullptr;
+-            c.heat = nullptr;
+-            return PleVramCache{};
+-        }
+-        (void)hipMemset(c.tags, 0xFF, tag_bytes);
+-        (void)hipMemset(c.heat, 0, heat_bytes);
+-        c.num_sets = num_sets;
+-        c.current_wte = wte;
+-    }
++    (void)hipSetDevice(dev_id);
++    if (hipMalloc((void**)&c.tags, tag_bytes) != hipSuccess) return PleVramCache{};
++    if (hipMalloc((void**)&c.heat, heat_bytes) != hipSuccess) return PleVramCache{};
++    if (hipMalloc((void**)&c.data, data_bytes) != hipSuccess) return PleVramCache{};
++    (void)hipMemset(c.tags, 0xFF, tag_bytes);
++    (void)hipMemset(c.heat, 0, heat_bytes);
++    c.num_sets = num_sets;
++    return c;
+ }

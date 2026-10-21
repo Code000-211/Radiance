@@ -1,0 +1,49 @@
+diff --git a/core/place/stager.cpp b/core/place/stager.cpp
+index 343f978..27b94af 100644
+--- a/core/place/stager.cpp
++++ b/core/place/stager.cpp
+@@ -120,6 +120,19 @@ int PrefillStager::start(int32_t li) {
+     return RAD_OK;
+ }
+ 
++int PrefillStager::start_wrap(int32_t wrap_layer, int b) {
++    if ((size_t)wrap_layer >= layers_.size()) return RAD_OK;
++    const int rc = mover_->stage_units(layers_[(size_t)wrap_layer].units, buf_[b], cap_,
++                                       free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b]);
++    if (rc < 0) return rc;
++    if (!staged_[b].empty()) {
++        holds_[b] = wrap_layer;
++        read_[b] = false;
++        wrapped_[b] = true;
++    }
++    return RAD_OK;
++}
++
+ void PrefillStager::release(int32_t b) {
+     if (holds_[b] < 0) return;
+     if (!staged_[b].empty() && mover_) mover_->unstage_units(staged_[b]);
+@@ -220,6 +233,14 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
+         const int32_t next = li + n_bufs_;
+         if ((size_t)next < layers_.size() && !started_[(size_t)next] && will_issue(next)) {
+             RAD_TRY(start(next));
++        } else if ((size_t)next >= layers_.size() && (is_chunked_prefill_ || is_final_prefill_)) {
++            /* CHUNK-TO-CHUNK or PREFILL-TO-DECODE PREFETCH:
++             * As the final layers of this chunk (e.g. layers 45, 46, 47) complete, wrap around
++             * and pre-stage Layer 0, Layer 1, Layer 2 for the upcoming chunk / decode step! */
++            const int32_t wrap_layer = next - (int32_t)layers_.size();
++            if (wrap_layer >= 0 && wrap_layer < n_bufs_) {
++                RAD_TRY(start_wrap(wrap_layer, b));
++            }
+         }
+     }
+     return RAD_OK;
+@@ -232,6 +253,9 @@ int PrefillStager::end_pass(RadStream s) {
+     int rc = RAD_OK;
+     for (int b = 0; b < n_bufs_; ++b) {
+         if (holds_[b] >= 0) {
++            if (wrapped_[b]) {
++                continue;
++            }
+             const int r = finish(b, s);
+             if (r < 0 && rc >= 0) rc = r;
+         }

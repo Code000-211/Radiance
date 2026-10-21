@@ -1,0 +1,24 @@
+diff --git a/libr4d/r4d_ar_oneshot_2rank_exact.hip b/libr4d/r4d_ar_oneshot_2rank_exact.hip
+index ce44cd9..a1b2c3d 100644
+--- a/libr4d/r4d_ar_oneshot_2rank_exact.hip
++++ b/libr4d/r4d_ar_oneshot_2rank_exact.hip
+@@ -166,7 +166,8 @@ __global__ void r4d_ar_hc_write_kernel(
+     }
+     for (; k < end; k += nt) ps[k] = y4[k];
+   }
+-  __threadfence_system();
++  if (drain == 1) __threadfence_system();
++  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+   __syncthreads();
+   if (tid == 0) {
+     if (drain == 2) __threadfence_system();
+@@ -277,7 +278,8 @@ __global__ void r4d_ar_gather_hc_write_kernel(
+     y4[k] = out;
+     ps[k] = out;
+   }
+-  __threadfence_system();
++  if (drain == 1) __threadfence_system();
++  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+   __syncthreads();
+   if (tid == 0) {
+     if (drain == 2) __threadfence_system();

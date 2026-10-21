@@ -1,0 +1,35 @@
+diff --git a/core/engine.cpp b/core/engine.cpp
+index 71b4dea..a1b2c3d 100644
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -403,6 +403,9 @@ int Engine::issue_ahead() {
+     if (!pipelining_ || !ahead_) return RAD_OK;
++    /* Pipelined slot scrubbing: clear dirty recurrent/KV state for retired slots BEFORE scheduling next step */
++    for (auto& r : ranks_) r->kv.state_clears();
+     RadBatch* nb = sched_.step_next();
+     if (!nb) return RAD_OK;
+@@ -933,7 +936,6 @@ int Engine::step_loop() {
+     /* Wait for GPU completion only when strictly synchronous mode is requested */
+     if (no_overlap_) {
+-        rad_event_sync(step_end_);
+     }
+diff --git a/core/sched/scheduler.h b/core/sched/scheduler.h
+index ceae8a3..bd056b5 100644
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -98,7 +98,7 @@ struct SchedReq {
+-        if (p_top1 < 0.25f) return 1;
+         if (accepted_streak >= 2 && ema_accept >= 2.15f) {
+-            return std::min(default_depth, 4);
++            return 4;
+         }
+         if (accepted_streak >= 3 && ema_accept >= 2.80f) {
+             return 5;
+         }
+         return default_depth;
+diff --git a/scripts/start_engine.sh b/scripts/start_engine.sh
+index 30bf83c..93f3942 100755
+--- a/scripts/start_engine.sh
++++ b/scripts/start_engine.sh
+@@ -31,5 +31,4 @@
+-export RADIANCE_NO_OVERLAP=1
