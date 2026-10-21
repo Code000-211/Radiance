@@ -218,12 +218,36 @@ that name their axes.
 
 ## Verifying P00 on the host
 
+**Compiler.** Every build and compiled test — P00 and strands A–F — uses the compiler the engine
+ships with, ROCm's clang at `${ROCM_PATH:-/opt/rocm}/lib/llvm/bin/clang++` (the compiler `hipcc`
+drives). A system compiler is not a substitute; if the toolchain is missing, the blocker is
+reported rather than worked around. Name it explicitly, in a build directory of its own so a
+differently compiled tree cannot be mistaken for this one:
+
 ```bash
-cmake -S . -B build-mtp-host -G Ninja -DRAD_WITH_HIP=OFF
-cmake --build build-mtp-host --parallel 8
-ctest --test-dir build-mtp-host --output-on-failure -R '^draft_types_test$' -j 4
-ctest --test-dir build-mtp-host --output-on-failure \
-  -R '^(sched_test|sample_test|runtime_test|config_test)$' -j 4
+/opt/rocm/lib/llvm/bin/clang++ --version   # the proof: path and version beside the result
+
+cmake -S . -B build-mtp-clang -G Ninja -DRAD_WITH_HIP=OFF \
+  -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++
+cmake --build build-mtp-clang --parallel 8
+ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
+The P00 result recorded on 2026-10-22 used `/opt/rocm/lib/llvm/bin/clang++` (AMD clang 23.0.0git,
+ROCm llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0): the five
+suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test` pass 5/5,
+and the broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 99/104. The five remaining failures
+are named in the issue: two need FFmpeg (`images_test`, `videos_test` — this host has no
+libavformat), two exceed a CPU budget on this slower host (`gbnf_test_shard2`, `tokenizer_test`),
+and `gbnf_test_shard3` is a pre-existing grammar failure that reproduces in an independent clang
+build of a later commit. None of them touches `core/sched/`.
+
 The test binary is picked up by the existing `*_test.cpp` glob; no CMake edit is needed.
+
+Two pre-existing libavx incompatibilities with clang 23 are fixed alongside, because the mandated
+compiler has to build the whole tree: a declaration carrying two `target` attributes (clang keeps
+only the last) and a bf16 intrinsic inside an OpenMP-outlined loop (clang drops the enclosing
+target attribute). No kernel code changes; the link now states `--build-id` explicitly, which
+Debian's GCC driver passed by itself and clang's does not, so kbench keeps a plugin identity
+whichever compiler links.
