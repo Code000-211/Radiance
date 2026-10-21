@@ -296,6 +296,9 @@ add_subdirectory(libref)
 add_subdirectory(libquant)
 if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr4d/CMakeLists.txt)
   add_subdirectory(libr4d)
+  # libbolegdn: the Bole tree-GDN rows. Opt-in and out of tree; it restates libr4d's rounding
+  # boundaries, so it needs libr4d's private headers and is built only beside it.
+  add_subdirectory(libbolegdn)
 endif()
 # libavx: the production host kernels (x86 SIMD, dispatched by CPU feature), built on every x86-64.
 # Not optional: host-placed ops need a kernel other than the oracle (rad_gate_reference_kernels
