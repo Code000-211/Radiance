@@ -1984,6 +1984,7 @@ wrong.
 | `gdn_recurrent_update` | `q_len`(range) `head_k` `head_v` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `q`,`k`,`v`,`a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`?,`norm_w`w? → `o`,`o_q`?,`o_scale`? |
 | `gdn_conv_recurrent_update` | `q_len`(range) `head_k` `head_v` `conv_width` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`,`norm_w`w → `o`,`o_q`?,`o_scale`? |
 | `gdn_gated_rmsnorm` | `M`(range) `channels` `eps`:f64 `act`:str | `x`, `z`, `w`w → `o` |
+| `gdn_tree_bole` | `q_len`(range) `head_k` `head_v` `conv_width` `conv_depth` `stage`:str `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`parent`?,`ctx_before`,`z`,`norm_w`w,`factors`:inout → `o`,`o_q`?,`o_scale`? |
 
 **`kda_update` is Kimi delta attention with per-channel decay.** Per token and head it
 L2-normalizes `q` and `k` with `l2_eps`, scales `q` by `scale`, and forms the decay

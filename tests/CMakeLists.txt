@@ -240,6 +240,28 @@ if(RAD_HIP_FOUND)
   endforeach()
 endif()
 
+# ================================================================== the Bole tree-GDN rows, on a card
+#
+# bole_gdn_gpu_test compares the plugin's commit row to libr4d's own GDN row byte for byte (state and
+# conv state), holds the verify row's root to the serial value and the rest to the reorder tolerance,
+# fires two negative controls, and exercises every refusal. It dlopens both plugins from
+# RADIANCE_HOME, so it needs no link dependency -- but it needs a card, so the globbed unit entry
+# (which would run it on the host backend) is replaced by a card entry that skips without a device.
+# RUN_SERIAL: it holds device memory for its whole run, and a test beside it would fail to allocate.
+if(RAD_HIP_FOUND AND TARGET bole_gdn_gpu_test)
+  target_link_libraries(bole_gdn_gpu_test PRIVATE ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  target_include_directories(bole_gdn_gpu_test PRIVATE ${CMAKE_SOURCE_DIR}/abi)
+  add_dependencies(bole_gdn_gpu_test libbolegdn libr4d)
+  # The loop above registered `bole_gdn_gpu_test` as a host unit entry; this one is the real check.
+  add_test(NAME bole_gdn_gpu_card COMMAND bole_gdn_gpu_test)
+  set_tests_properties(bole_gdn_gpu_card bole_gdn_gpu_test PROPERTIES
+    LABELS "gpu;gdn"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 900
+    RUN_SERIAL TRUE
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
+
 # ================================================================== whole models on the CPU
 #
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on
@@ -494,6 +516,9 @@ endif()
 # parameters). Cheap, so in the fast tier. libr4d.so is added when built; the script reports
 # "  SKIP " rather than passing when a plugin will not dump.
 set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
+if(RAD_HIP_FOUND AND TARGET libbolegdn)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libbolegdn.so)
+endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
 endif()

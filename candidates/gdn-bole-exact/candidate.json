@@ -1,0 +1,60 @@
+{
+  "name": "gdn-bole-exact",
+  "status": "review-only",
+  "kind": "kernel-plugin",
+  "op": "gdn_tree_bole",
+  "plugin": "libbolegdn",
+  "rows": [
+    {
+      "name": "gdn_tree_bole_verify_k128_v128",
+      "stage": "verify",
+      "numerics": "reordered",
+      "note": "Bole solver. The root is a fixed one-node serial FP32 prefix in the engine's own instruction order; every other node's ancestor walk, contraction and rounded-u feedback accumulate in FP64. The result is therefore NOT bit-identical to a serial replay below the root, and the row does not claim it is."
+    },
+    {
+      "name": "gdn_tree_bole_commit_k128_v128",
+      "stage": "commit",
+      "numerics": "byte-exact",
+      "note": "Recomputes u from the original update data [normalized k, conv v, gamma, beta] with the recurrent kernel's FP32 instructions in the serial order, so the committed state equals a serial replay bit for bit. A stored or replayed U is deliberately not used."
+    }
+  ],
+  "provenance": {
+    "paper": "arXiv:2608.01651v1",
+    "source_worktree": "dloop_dartree (ABI 16)",
+    "ported_variant": "attic/2026-10-20_bole-vb-exact-commit",
+    "superseded_variants": [
+      "attic/2026-10-20_bole-adjoint",
+      "attic/2026-10-20_bole-neumann"
+    ]
+  },
+  "selection": {
+    "reachable_by_default": false,
+    "reason": "opt-in kernel plugin; the engine has no tree-layout seam, so no model selects gdn_tree_bole unless it names this plugin",
+    "shadows_existing_row": false
+  },
+  "measured": {
+    "this_plugin": {
+      "correctness": "see tests/bole_gdn_gpu_test: commit byte-exact to libr4d's GDN row, verify root exact, verify deeper nodes within a declared reorder tolerance, refusals exercised, negative controls fire",
+      "speed": "NOT MEASURED"
+    },
+    "source_abi16_evidence_not_transferable": {
+      "note": "different engine and ABI; quoted for provenance only, never as this plugin's result",
+      "isolated_4_node_us": [103.9, 20.2],
+      "isolated_16_node_chain_us": [143.8, 178.2],
+      "engine_smoke_tok_s": [122.25, 123.39]
+    },
+    "source_end_to_end_negative": {
+      "path": "MTP8 / tree-64 built on Bole",
+      "tok_s": [229.7, 238.0, 267.1],
+      "baseline_tok_s": 375.6,
+      "verdict": "negative"
+    }
+  },
+  "not_ported": [
+    "the tree-policy driver and scheduler (DarTree adaptive depth, node budget, pruning)",
+    "MTP8 / tree-64 speculation and its candidate profile",
+    "the pruned-DarTree selection and tree-construction kernel",
+    "any architecture wiring: no model names this op",
+    "FP16 state caches, the anchor state form, and the paged-anchor marker and factor columns"
+  ]
+}
