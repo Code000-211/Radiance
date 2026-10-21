@@ -1708,9 +1708,12 @@ void Scheduler::draft_cost_cycle() {
         v.remaining = room > INT32_MAX ? INT32_MAX : room > 0 ? (int32_t)room : 0;
         v.sampling  = r.sp.temp > 0.0f ? DraftSampling::Sampled : DraftSampling::Greedy;
         v.prefill   = false;
-        /* The grammar path is the one the scheduler can name today; a scored prompt is a
-         * request the policy must not draft for either. */
-        v.eligibility = !r.may_speculate ? DraftEligibility::NoDrafter
+        /* A cleared may_speculate means a currently constraining grammar, unless the request is a
+         * scored prompt (which never drafts either). Name the reason, not "no drafter":
+         * draft_types.h keeps them apart. */
+        v.eligibility = !r.may_speculate
+                            ? (r.token_scores ? DraftEligibility::NoDrafter
+                                              : DraftEligibility::Grammar)
                       : v.remaining <= 0 ? DraftEligibility::OutputExhausted
                                          : DraftEligibility::Eligible;
     }
