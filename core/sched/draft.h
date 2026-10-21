@@ -34,13 +34,9 @@
  * (see accept.h).
  */
 #pragma once
-#include "rad_core.h"
+#include "draft_types.h"
 
 namespace rad {
-
-/* libr4d's decode kernel serves up to 64 query rows, the verify-step band (spec §10), so 64 is
- * the largest window any batch can carry. */
-enum { RAD_SCHED_MAX_SPEC = 64 };
 
 /* One sequence's half of the adaptive policy: the drafter's record on this sequence's text and the
  * resulting stop. Stored in the scheduler's per-request state; the controller does the arithmetic.

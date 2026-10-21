@@ -47,6 +47,7 @@ data/             kernels.rkb and kernels_moe.rkb: recorded references rad-kbenc
                   no model. Two, because no one container declares the whole vocabulary.
                   recipes/: the quantisation recipes of the containers this tree serves
 docs/KERNELS.md   what rad-kbench last measured, generated and checked in
+docs/ADAPTIVE-MTP.md  the adaptive draft policy's contracts, profile/manifest formats and owners
 vendor/           llama.cpp lifts tracked to an upstream commit (vendor/UPSTREAM), changed only
                   through vendor/patches/; nlohmann/json and cpp-httplib
 tests/            ctest
