@@ -119,8 +119,8 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
- * history pass and every round, then the final proposal into the slots and their readback.
- * Nothing synchronises here; collect_step has the step's one wait. */
+ * history pass and every round, each round's proposal published into the slots behind its pass,
+ * then the slots' readback. Nothing synchronises here; collect_step has the step's one wait. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -142,6 +142,9 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
+    /* The depth each row's plan gives it, as the passes below are issued: a round's batch is the
+     * active prefix, so row i's own depth is the last round it was still in the batch. */
+    serial_k_.assign((size_t)n, 0);
 
     /* RADIANCE_DEBUG_STAGE: running means of a draft pass's host time: batch + advance, greedy
      * sampler chain, barrier release and issue. They cost the step nothing until their sum exceeds
@@ -159,8 +162,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
-         * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
-        const int drafted = rd == 0 ? (int)db->n_draft_out : n;
+         * round r-1's proposal, which the advance takes from the proposal buffer on the card.
+         *
+         * The rows this pass proposes for: a round's whole batch, the history pass's drafting rows
+         * (first in the batch, RadBatch::draft_out_ids). The rounds shrink to the rows still
+         * drafting (E2), so a round's batch is the active prefix and not every drafting row. */
+        const int drafted = rd == 0 ? (int)db->n_draft_out : (int)db->n_seq;
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
 
@@ -203,24 +210,46 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
                          "a pass", n_pass, a_batch / (double)n_pass, a_samp / (double)n_pass,
                          a_rel / (double)n_pass, a_iss / (double)n_pass);
         }
+        /* Publish this pass's proposals into the rows' slots before the prefix can shrink: a row
+         * that leaves after this round gets no later pass to read its proposal, and the deepest
+         * round's row block no longer names it (StepSlot::gen). The history pass is round 1's
+         * pass, so it takes round 1. */
+        if (drafted > 0) RAD_TRY(advance_all(ADV_TAKE, rd == 0 ? 1 : rd, true, drafted));
+        for (int i = 0; i < drafted && i < serial_rows_; ++i)
+            serial_k_[(size_t)i] = rd == 0 ? 1 : rd;
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
-    /* The last round's proposal into the slots, then rank 0's slots back to the host. Only the
-     * drafting rows: at depth 1 the last pass is the history pass, whose later rows only carried
-     * history (Scheduler::serial_batch). */
-    RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
+    /* Rank 0's slots back to the host; the proposals are already in them (one per row's own
+     * round), so nothing else names a round. */
     Rank& r0 = *ranks_[0];
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
     return RAD_OK;
 }
 
+/* One row's proposals for the step issued ahead. A refusal is fatal: that step was planned with
+ * the count expect_draft announced, and the scheduler cannot withdraw a draft for a step it
+ * already planned (set_draft only takes the count that step expects), so carrying on would
+ * verify the previous cycle's proposals. NOTFOUND is the one harmless answer: reap() only drops
+ * a request that is in no step and holds no block (scheduler.cpp), so every step still to run is
+ * unaffected by the missing publication. */
+int Engine::publish_draft(uint64_t seq, const int32_t* tok, int n) {
+    const int st = sched_.set_draft(seq, tok, n);
+    if (st == RAD_E_NOTFOUND) return RAD_OK;
+    if (st < 0)
+        RAD_ERR("drafter '%s': sequence %llu: publishing %d draft(s): %s", drafter_.name,
+                (unsigned long long)seq, n, rad_strerror(st));
+    return st;
+}
+
 /* After commit: check the host's acceptance against the card's, publish the proposals through
  * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
- * so a disagreement is a defect and the step is refused. */
+ * so a disagreement is a defect and the step is refused. Each row publishes StepSlot::gen rounds,
+ * which the card wrote per row: the cycle's deepest round is not every row's count once the rounds
+ * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
     const StepPlan& plan = sched_.plan();
@@ -238,25 +267,59 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
-    sched_.serial_end(serial_done_);
-    if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
+    if (serial_done_ <= 0 || serial_rows_ <= 0) {
+        sched_.serial_end(serial_done_);
+        return RAD_OK;
+    }
 
     Rank& r0 = *ranks_[0];
-    const int rounds = serial_rounds_, done = serial_done_;
+    const int rounds = serial_rounds_;
     draft_out_.assign((size_t)serial_rows_ * (size_t)rounds, 0);
+    /* Each row publishes the rounds it actually finished (StepSlot::gen, written by ADV_TAKE),
+     * not the cycle's deepest: with shrinking rounds a row that left the prefix after its own
+     * K has no proposal past it. The count is checked against the frozen plan, not the cycle
+     * depth: a row with k = 2 that reports 4 would publish whatever the buffer holds at its row
+     * index from a round it never ran, and `gen < k` is a publication the card dropped. So the
+     * row must report exactly the rounds its own plan gave it, and the plan must still name that
+     * sequence in that slot -- a slot recycled between issue and finish would otherwise publish
+     * another request's proposals. */
     for (int i = 0; i < serial_rows_; ++i) {
-        const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
-        for (int rd = 1; rd <= done; ++rd)
+        const Scheduler::SerialRow& R = serial_row_[(size_t)i];
+        /* Searched per row: serial_begin emits the drafting rows in plan order today, but the
+         * cycle sorts them by descending K, and a cursor would then walk past a row's entry. */
+        size_t pe = 0;
+        while (pe < plan.e.size() && plan.e[pe].seq != R.seq) ++pe;
+        const int k = serial_k_[(size_t)i];
+        if (pe >= plan.e.size() || plan.e[pe].card != R.card || plan.e[pe].slot != R.slot) {
+            RAD_ERR("drafter '%s': sequence %llu drafted in card slot %lld, which the step's "
+                    "plan no longer names for it", drafter_.name, (unsigned long long)R.seq,
+                    (long long)R.card);
+            return RAD_E_STATE;
+        }
+        const StepSlot& S = slots_host_[R.card];
+        if (S.gen != k) {
+            RAD_ERR("drafter '%s': sequence %llu finished %d draft round(s); its plan ran %d of "
+                    "the cycle's %d", drafter_.name, (unsigned long long)R.seq, (int)S.gen, k,
+                    rounds);
+            return RAD_E_STATE;
+        }
+        for (int rd = 1; rd <= k; ++rd)
             draft_out_[(size_t)i * (size_t)rounds + (size_t)(rd - 1)] = S.tok[rd];
     }
-    for (int i = 0; i < serial_rows_; ++i) {
+    int st = RAD_OK;
+    for (int i = 0; i < serial_rows_ && st >= 0; ++i) {
         /* No draft for a request the sampler will not speculate on (a constraining grammar that
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
-        sched_.set_draft(serial_row_[(size_t)i].seq,
-                         &draft_out_[(size_t)i * (size_t)rounds], done);
+        st = publish_draft(serial_row_[(size_t)i].seq,
+                           &draft_out_[(size_t)i * (size_t)rounds], serial_k_[(size_t)i]);
     }
-    return RAD_OK;
+    /* The snapshot ends here, after the publish: serial_end releases the hold that defers the
+     * release of a request cancelled or reaped while the rounds ran. Dropped earlier, the
+     * server's reap could take a request out of the scheduler between the end and its set_draft
+     * above and that publication would be lost. */
+    sched_.serial_end(serial_done_);
+    return st;
 }
 
 /* ------------------------------------------------------------------ the block driver
@@ -342,15 +405,21 @@ int Engine::run_block_drafter(int step) {
             draft_out_.assign(raw, raw + n_raw);
         }
     }
-    sched_.block_end();
-    if (n <= 0 || draft_out_.empty()) return RAD_OK;
+    if (n <= 0 || draft_out_.empty()) {
+        sched_.block_end();
+        return RAD_OK;
+    }
 
-    for (int i = 0; i < n; ++i) {
+    int st = RAD_OK;
+    for (int i = 0; i < n && st >= 0; ++i) {
         /* A request the sampler will not speculate on gets no draft; see finish_serial_drafter. */
         if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
-        sched_.set_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        st = publish_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
     }
-    return RAD_OK;
+    /* After the publish, as serial_end in finish_serial_drafter: the hold keeps reap() from
+     * dropping a row between the end and its set_draft. */
+    sched_.block_end();
+    return st;
 }
 
 /* The card's driver: both passes behind the step, without waiting. After the trunk's ranks join,
@@ -410,8 +479,10 @@ int Engine::finish_block_drafter(const StepOut& so) {
             }
         }
     }
-    sched_.block_end();
-    if (block_rows_ <= 0) return RAD_OK;
+    if (block_rows_ <= 0) {
+        sched_.block_end();
+        return RAD_OK;
+    }
 
     Rank& r0 = *ranks_[0];
     const int steps = drafter_.depth;
@@ -421,13 +492,16 @@ int Engine::finish_block_drafter(const StepOut& so) {
         for (int j = 0; j < steps; ++j)
             draft_out_[(size_t)i * (size_t)steps + (size_t)j] = S.tok[1 + j];
     }
-    for (int i = 0; i < block_rows_; ++i) {
+    int st = RAD_OK;
+    for (int i = 0; i < block_rows_ && st >= 0; ++i) {
         /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
          * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. */
         if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
-        sched_.set_draft(block_row_[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+        st = publish_draft(block_row_[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps],
+                           steps);
     }
-    return RAD_OK;
+    sched_.block_end();
+    return st;
 }
 
 }  /* namespace rad */

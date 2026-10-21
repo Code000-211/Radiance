@@ -97,6 +97,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         S.ctx = head + 1;
         S.n_acc = acc + 1;
         S.tok[0] = y[acc];
+        /* A new cycle: a row that drafts nothing this time must not publish the last cycle's
+         * proposals, which the slots still hold. */
+        S.gen = 0;
         return;
     }
     case ADV_TRUNK: {
@@ -157,7 +160,11 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         return;
     }
     case ADV_TAKE:
+        /* Row i's proposal from the pass just issued, at the buffer's own row pitch (a head's
+         * proposal buffer, else the sampler's id buffer). `round` is that pass's round, so a row
+         * that leaves the shrinking prefix keeps its last proposal at tok[its own K]. */
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
+        S.gen = a.round;
         return;
     case ADV_BLOCK: {
         /* A block drafter's query row: the anchor (the token the verify just chose) at the
