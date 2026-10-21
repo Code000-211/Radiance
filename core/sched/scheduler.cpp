@@ -1280,9 +1280,11 @@ const RadBatch* Scheduler::step() {
              * swap in a different draft. See Request::may_speculate.
              *
              * The cap is the sequence's own window: `depth`, or under the adaptive policy what
-             * its acceptance of the head's drafts pays for. That estimate says nothing about the
-             * n-gram fallback, so the fallback is held to the step's window, as deep as the head
-             * drafts this step and no deeper. */
+             * its acceptance of the head's drafts pays for, or under a cost plan the K this
+             * cycle chose for this row. That estimate says nothing about the n-gram fallback, so
+             * the fallback is held to the window the cycle planned: the step's window under the
+             * adaptive policy (as deep as the head drafts this step and no deeper), the row's own
+             * K under a cost plan (a K=2 row beside a K=6 one must not verify four). */
             const int cap = draft_cap(s);   /* the ceiling, the adaptive window, or the plan */
             const int pk  = planned_k(s);
             bool ngram = false;
@@ -1293,7 +1295,7 @@ const RadBatch* Scheduler::step() {
                  * its labels with the head's (docs/ADAPTIVE-MTP.md). A row the plan lets draft
                  * (K>0) but for which the head published nothing keeps the fallback, bounded by
                  * cap; a row the plan does not name keeps the legacy behaviour. */
-                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
+                s.n_draft = (int32_t)draft_ngram(s, pk >= 0 ? cap : draft_.step_window());
                 ngram = s.n_draft > 0;
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
