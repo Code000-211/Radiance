@@ -144,7 +144,7 @@ TEST(a_draft_cycle_keys_every_shape_it_runs) {
  * issue path, which is what the `issued` column counts; the tape outcomes stay zero because no
  * backend here can record. The block drafter's query pass (`draft_pass == 1`, a value the MTP
  * contract never uses) is its own kind: it must not be counted as a serial round. */
-TEST(the_pass_counters_name_the_round_of_each_pass) {
+TEST(the_pass_counters_name_the_kind_of_each_pass) {
     ReplayFixture f;
     CHECK_OK(f.start());
     CHECK_EQ(f.ctx.records_passes(), rad::tape_supported());
