@@ -1,0 +1,13 @@
+{
+  "description": "Bole-inspired exact node-parallel path replay, not the reordered affine solver. One fused GPU launch; original FP32/BF16/INT8 arithmetic and 257-wide factors. Ancestor work is repeated per descendant; numerical and speed eligibility must be measured. Defaults remain unchanged.",
+  "engine_env": {
+    "RADIANCE_GDN_BOLE_EXACT": "1",
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_MTP_TREE_ROUNDS": "5",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1",
+    "RADIANCE_SPECHUB": "0"
+  },
+  "engine_args": ["--num-speculative-tokens", "7"]
+}

@@ -1,0 +1,9 @@
+{
+  "build_exit": 0,
+  "mutant_exit": 1,
+  "restored_exit": 0,
+  "source_restored": true,
+  "plugin_restored": true,
+  "source_sha256": "06482f43c1ae0328a17a493c6f8a5dc61a178a989d28cdbe5176951045bb21fb",
+  "plugin_sha256": "a5f3c9a8c349e792b1ebf7bb345000f50b151b13c16f642f8f18b33fbb5f535e"
+}

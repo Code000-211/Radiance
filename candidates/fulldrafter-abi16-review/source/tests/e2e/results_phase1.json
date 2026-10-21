@@ -1,0 +1,868 @@
+{
+  "status": "PASSED",
+  "total_tests": 106,
+  "executed_tests": 106,
+  "passed": 106,
+  "failed": 0,
+  "skipped": 0,
+  "duration_seconds": 0.12,
+  "tier_counts": {
+    "tier1": 45,
+    "tier2": 45,
+    "tier3": 10,
+    "tier4": 6
+  },
+  "features_fully_covered": 9,
+  "total_features": 9,
+  "gate_certification_passed": true,
+  "records": [
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f01_gemv_numeric_precision_bf16_to_fp32",
+      "tier": "tier1",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0129,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f01_gemv_shape_and_vector_alignment_contract",
+      "tier": "tier1",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f01_gemv_single_pass_weight_streaming",
+      "tier": "tier1",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0029,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f01_gemv_six_slot_parallel_execution",
+      "tier": "tier1",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0009,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f01_gemv_tp2_shard_dimension_124160",
+      "tier": "tier1",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f02_active_vocab_masking_248077_tail_inf",
+      "tier": "tier1",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f02_in_lds_top16_reduction_ordering",
+      "tier": "tier1",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0826,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f02_lds_scratchpad_budget_under_16kb",
+      "tier": "tier1",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f02_markov_fusion_eliminates_stack_spill",
+      "tier": "tier1",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0004,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f02_markov_rank64_projection_contract",
+      "tier": "tier1",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f03_candidate_scores_strict_descending_order",
+      "tier": "tier1",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f03_cross_gpu_argmax_tp2_consistency",
+      "tier": "tier1",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f03_deterministic_tie_breaking_lower_id_wins",
+      "tier": "tier1",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f03_repeated_evaluation_bitwise_identical",
+      "tier": "tier1",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f03_tp2_cross_rank_score_equivalence",
+      "tier": "tier1",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f04_head_dimension_h64_strictly_enforced",
+      "tier": "tier1",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f04_rmsnorm_epsilon_1e6_numerical_stability",
+      "tier": "tier1",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f04_swiglu_mlp_intermediate_size_2304",
+      "tier": "tier1",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f04_transformer_block0_and_block1_pipeline",
+      "tier": "tier1",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0004,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f04_two_stage_discrete_token_boundary_wte_t6",
+      "tier": "tier1",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f05_stream_pipeline_ordered_dispatch",
+      "tier": "tier1",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f05_stream_workspace_scratch_memory_reuse",
+      "tier": "tier1",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f05_vram_headroom_compliance_384mib",
+      "tier": "tier1",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f05_zero_cpu_sync_barriers_in_forward_path",
+      "tier": "tier1",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f05_zero_dynamic_hipmalloc_during_forward",
+      "tier": "tier1",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f06_dual_gpu_concurrent_latency_balance",
+      "tier": "tier1",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f06_fulldrafter_pass_latency_ceiling_3_5ms",
+      "tier": "tier1",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f06_gpu_event_profiler_timing_measurement",
+      "tier": "tier1",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f06_per_slot_latency_budget_under_300us",
+      "tier": "tier1",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f06_warmup_vs_steady_state_latency_stability",
+      "tier": "tier1",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f07_discrete_two_stage_chaining_12_tokens_validity",
+      "tier": "tier1",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f07_dual_gpu_cross_device_token_equivalence",
+      "tier": "tier1",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f07_parity_test_suite_18_cases_all_pass",
+      "tier": "tier1",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f07_pytorch_reference_parity_cosine_similarity",
+      "tier": "tier1",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f07_standalone_gpu_exec_test_zero_exit_code",
+      "tier": "tier1",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f08_concurrent_worker_throughput_scaling",
+      "tier": "tier1",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f08_prometheus_metrics_endpoint_scraping",
+      "tier": "tier1",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f08_serving_throughput_ceiling_150_tok_s",
+      "tier": "tier1",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f08_speculative_acceptance_tau_ge_3_2",
+      "tier": "tier1",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f08_temperature_zero_greedy_deterministic_serving",
+      "tier": "tier1",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f09_context_history_accumulation_stability",
+      "tier": "tier1",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f09_multi_turn_100_requests_zero_crashes",
+      "tier": "tier1",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f09_port_8000_quarantine_hard_rejection",
+      "tier": "tier1",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f09_vram_delta_le_16mib_flatline",
+      "tier": "tier1",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier1_feature_coverage.TestTier1FeatureCoverage.test_f09_zero_nans_or_infs_in_responses",
+      "tier": "tier1",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f01_boundary_all_zero_hidden_activations",
+      "tier": "tier2",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0014,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f01_boundary_empty_batch_handling",
+      "tier": "tier2",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f01_boundary_extreme_magnitude_hidden_states",
+      "tier": "tier2",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0004,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f01_boundary_unaligned_stride_rejection",
+      "tier": "tier2",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f01_boundary_vocab_shard_boundary_indices",
+      "tier": "tier2",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f02_boundary_all_zero_logits_markov_correction",
+      "tier": "tier2",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0002,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f02_boundary_negative_infinity_masked_tail_columns",
+      "tier": "tier2",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f02_boundary_single_dominant_candidate",
+      "tier": "tier2",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f02_boundary_top16_ties_in_markov_scores",
+      "tier": "tier2",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f02_boundary_uniform_logits_maximum_entropy",
+      "tier": "tier2",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f03_boundary_extreme_negative_logits",
+      "tier": "tier2",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f03_boundary_identical_logits_lower_candidate_id_wins",
+      "tier": "tier2",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f03_boundary_reverse_sorted_input_tie_breaking",
+      "tier": "tier2",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f03_boundary_tp2_cross_rank_identical_scores",
+      "tier": "tier2",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f03_boundary_vocab_ceiling_token_id_248076",
+      "tier": "tier2",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f04_boundary_extreme_rope_theta_positional_offsets",
+      "tier": "tier2",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f04_boundary_rejects_head_dimension_h128",
+      "tier": "tier2",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f04_boundary_rmsnorm_near_zero_variance",
+      "tier": "tier2",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f04_boundary_single_token_vs_six_token_block",
+      "tier": "tier2",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f04_boundary_stage2_null_embedding_table_guard",
+      "tier": "tier2",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f05_boundary_forbid_hipDeviceSynchronize_in_forward",
+      "tier": "tier2",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f05_boundary_forbid_hipStreamSynchronize_in_forward",
+      "tier": "tier2",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f05_boundary_null_stream_handling",
+      "tier": "tier2",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f05_boundary_scratch_bytes_exact_allocation_1048576",
+      "tier": "tier2",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f05_boundary_zero_dynamic_allocation_in_step",
+      "tier": "tier2",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f06_boundary_cold_start_first_pass_anomaly_isolation",
+      "tier": "tier2",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f06_boundary_high_frequency_consecutive_passes_jitter",
+      "tier": "tier2",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f06_boundary_latency_exceeding_3_5ms_triggers_failure",
+      "tier": "tier2",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f06_boundary_nanosecond_event_timestamp_overflow",
+      "tier": "tier2",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f06_boundary_zero_elapsed_time_detector",
+      "tier": "tier2",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f07_boundary_draft_rejection_at_slot_0",
+      "tier": "tier2",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f07_boundary_draft_rejection_at_slot_11",
+      "tier": "tier2",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f07_boundary_empty_draft_proposal_fallback",
+      "tier": "tier2",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f07_boundary_full_12_token_acceptance",
+      "tier": "tier2",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f07_boundary_temperature_zero_vs_greedy_equivalence",
+      "tier": "tier2",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f08_boundary_acceptance_tau_below_3_2_fails_gate",
+      "tier": "tier2",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f08_boundary_max_concurrency_load_cliff",
+      "tier": "tier2",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f08_boundary_single_worker_minimum_throughput",
+      "tier": "tier2",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f08_boundary_throughput_below_150_fails_gate",
+      "tier": "tier2",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f08_boundary_zero_token_duration_division_guard",
+      "tier": "tier2",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f09_boundary_port_8000_in_url_immediate_abort",
+      "tier": "tier2",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f09_boundary_rapid_session_disconnects_cleanup",
+      "tier": "tier2",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f09_boundary_repeated_identical_prompts_prefix_cache",
+      "tier": "tier2",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f09_boundary_vram_delta_above_16mib_fails",
+      "tier": "tier2",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier2_boundary_corner.TestTier2BoundaryCorner.test_f09_boundary_vram_delta_at_exactly_16mib_passes",
+      "tier": "tier2",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x01_stage1_rejection_and_stage2_recovery",
+      "tier": "tier3",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0017,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x02_high_temperature_vs_zero_temperature_determinism",
+      "tier": "tier3",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x03_multi_turn_context_rollback_and_vram_stability",
+      "tier": "tier3",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x04_128bit_gemv_vectorization_and_lds_top16_fusion",
+      "tier": "tier3",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0043,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x05_async_stream_pipeline_and_latency_budget",
+      "tier": "tier3",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x06_tp2_sharded_gemv_and_cross_gpu_argmax_tie_break",
+      "tier": "tier3",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0028,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x07_transformer_backbone_h64_and_two_stage_discrete_boundary",
+      "tier": "tier3",
+      "feature_id": 7,
+      "status": "PASSED",
+      "duration": 0.0003,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x08_high_throughput_serving_and_zero_vram_leak",
+      "tier": "tier3",
+      "feature_id": 8,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x09_cold_start_vs_warm_cache_stream_pipeline_latency",
+      "tier": "tier3",
+      "feature_id": 9,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier3_cross_feature.TestTier3CrossFeature.test_x10_multi_slot_draft_rejection_at_stage_boundary",
+      "tier": "tier3",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w01_multi_turn_stress_100_requests_port_8002",
+      "tier": "tier4",
+      "feature_id": 1,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w02_live_serving_throughput_and_tau_acceptance",
+      "tier": "tier4",
+      "feature_id": 2,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w03_vram_leak_profile_and_isolation_under_16mib",
+      "tier": "tier4",
+      "feature_id": 3,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w04_port_8000_quarantine_security_enforcement",
+      "tier": "tier4",
+      "feature_id": 4,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w05_full_engine_speculative_serving_lifecycle",
+      "tier": "tier4",
+      "feature_id": 5,
+      "status": "PASSED",
+      "duration": 0.0001,
+      "detail": null
+    },
+    {
+      "test_id": "tests.e2e.test_tier4_real_world.TestTier4RealWorld.test_w06_dual_gpu_cross_device_execution_parity_end_to_end",
+      "tier": "tier4",
+      "feature_id": 6,
+      "status": "PASSED",
+      "duration": 0.0,
+      "detail": null
+    }
+  ]
+}

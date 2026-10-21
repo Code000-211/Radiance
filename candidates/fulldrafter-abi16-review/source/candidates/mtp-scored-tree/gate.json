@@ -1,0 +1,9 @@
+{
+  "engine_env": {
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_POLICY": "score",
+    "RADIANCE_MTP_TREE_ROUNDS": "3",
+    "RADIANCE_ADAPTIVE_SPEC": "0"
+  },
+  "engine_args": ["--num-speculative-tokens", "3"]
+}

@@ -1,0 +1,16 @@
+{
+  "description": "Experimental Flash-Next HC read at M=3/4. Original down/inject kernel and existing E4M3/F32 weight layout. Up projection converts unscaled E4M3 codes exactly to BF16, reorders each 80-column dot with FP32 WMMA, and retains FP32 group scales and the original four-group sum tree. Sigmoid BF16, normalized-stream BF16, mixed-output BF16 and INT8/FP8 quantization boundaries remain unchanged. Stateless quantization uses a third launch; no arrival counters or persistent scratch state. Not a gate PASS or an engine speed claim.",
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_HC_UP_WMMA": "1",
+    "RADIANCE_MTP_COUPLED": "1",
+    "RADIANCE_DARTREE": "0",
+    "RADIANCE_SPECHUB": "0",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1"
+  },
+  "engine_args": ["--num-speculative-tokens", "3"]
+}

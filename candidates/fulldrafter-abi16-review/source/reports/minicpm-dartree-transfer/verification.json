@@ -1,0 +1,18 @@
+{
+  "focused_tests": 7,
+  "focused_exit": 0,
+  "selector_cases": 16,
+  "selector_exit": 0,
+  "tiny_gpu_exit": [
+    0,
+    0
+  ],
+  "tiny_bytes": 6134968,
+  "tiny_byte_equal": true,
+  "real_gpu_exit": [
+    0,
+    0
+  ],
+  "real_bytes": 25857336,
+  "real_byte_equal": true
+}

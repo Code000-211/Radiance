@@ -1,0 +1,19 @@
+{
+  "description": "TP2 Qwen MTP5/tree7 with parent-aware attention whenever the whole batch selects the ordinary prefill band. Pure decode through five rows keeps the existing masked decode kernel. The private attention row retains BF16 queries/output and FP8 KV, with FP32 dot products, softmax, PV and split partials. This also fixes the pre-existing small-tree prefill path that ignored ancestor masks; that incorrect path is not a parity oracle. No new quantization or reduced-precision intermediate is introduced. This declaration is not a gate PASS or a performance claim.",
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_MTP_COUPLED": "0",
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_ROUNDS": "5",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_SPECHUB": "0",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_GDN_ANCHOR": "1",
+    "RADIANCE_GDN_BOLE_EXACT": "1",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1"
+  },
+  "engine_args": ["--num-speculative-tokens", "7"]
+}

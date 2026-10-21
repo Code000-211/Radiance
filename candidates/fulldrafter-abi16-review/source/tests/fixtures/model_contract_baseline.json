@@ -1,0 +1,30 @@
+{
+  "target_model_id": "Qwen/Qwen3.5-35B-A3B-FP8",
+  "target_topology": "TP2",
+  "target_hosts": ["ct105:gpu0", "ct105:gpu1"],
+  "target_embedding_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target_head_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+  "target_final_norm_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+  "trunk_taps": [1, 19, 37],
+  "trunk_hidden_size": 2048,
+  "vocab_size": 248320,
+  "freeze_rules": {
+    "embedding": "frozen_backward_gradient_allowed",
+    "end_norm": "frozen_backward_gradient_allowed",
+    "lm_head": "frozen_backward_gradient_allowed",
+    "target_trunk": "strictly_frozen_no_optimizer"
+  },
+  "drafter_architecture": {
+    "layers": 2,
+    "hidden_size": 768,
+    "intermediate_size": 2304,
+    "q_heads": 12,
+    "kv_heads": 4,
+    "head_dim": 64,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10000000.0,
+    "proposal_k": 4,
+    "context_projection": [6144, 768],
+    "output_projection": [768, 2048]
+  }
+}

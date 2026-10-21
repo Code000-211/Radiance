@@ -1,0 +1,32 @@
+{
+  "benchmark_suite": "F1_End_Test_128",
+  "num_prompts": 128,
+  "repeats": 3,
+  "r35_baseline_throughput_tok_s": 28.5,
+  "drafter_throughput_tok_s": 33.1,
+  "mean_speedup": 1.1614,
+  "paired_95_ci": [1.112, 1.215],
+  "speedup_gate_passed": true,
+  "c8_decode": {
+    "r35_latency_ms": 35.2,
+    "drafter_latency_ms": 36.1,
+    "regression_pct": 2.56,
+    "gate_passed": true
+  },
+  "prefill": {
+    "r35_latency_ms": 120.4,
+    "drafter_latency_ms": 122.8,
+    "regression_pct": 1.99,
+    "gate_passed": true
+  },
+  "guardrails": {
+    "gpu_hours_used": 14.2,
+    "gpu_hours_limit": 72.0,
+    "disk_artifacts_bytes": 1450000000,
+    "disk_limit_bytes": 8589934592,
+    "ram_cache_bytes": 2147483648,
+    "ram_limit_bytes": 4294967296,
+    "feature_disk_spool_bytes": 0,
+    "rqfn_production_hash_unmodified": true
+  }
+}
