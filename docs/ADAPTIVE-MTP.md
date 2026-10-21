@@ -28,7 +28,9 @@ prediction and sample.
   owns, sized at `max_seqs` (requests) or `RAD_SCHED_MAX_SPEC` (draft positions). A whole hook call
   is allocation-free. Profile I/O and its buffers stay outside the step path.
 - **Arrays are bounded by `RAD_SCHED_MAX_SPEC` (64)**, libr4d's verify query-row band. K is
-  counted after the committed token; the first target is K = 0..6.
+  counted after the committed token; the first target is K = 0..6. `draft_plan_rows` and
+  `draft_plan_valid` refuse `n_seq > cap` before reading `k[]`, so a caller cannot make the
+  contract check read past the storage it sized.
 - **A plan is immutable from issue until every pass it names is consumed.** `choose` writes it
   once; no other hook writes into it, and `observe` takes only const inputs. Historical plans stay
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles

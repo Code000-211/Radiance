@@ -160,6 +160,42 @@ TEST(a_k0_plan_says_which_shape_it_was_priced_on) {
     CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
 }
 
+TEST(plan_rows_refuses_more_requests_than_the_caller_sized) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+
+    const int32_t saved = f.plan.n_seq;
+    f.plan.n_seq = f.plan.cap + 1;   /* would read k[] past the caller's array */
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_rows(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "exceeds"));
+    CHECK_EQ(f.plan.rows[1], 1);     /* nothing was counted from the out-of-range request */
+    f.plan.n_seq = saved;
+}
+
+TEST(plan_validation_refuses_a_max_k_above_the_deepest_k) {
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    f.add(1, 2);
+    draft_fake::Policy policy;
+    policy.legacy_k = 3;
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan), RAD_OK);
+
+    f.plan.k[0] = 2;
+    f.plan.k[1] = 0;
+    f.plan.fill[1] = DraftDrafter::None;   /* K 0 and nobody to fill it */
+    f.plan.max_k = 5;
+    /* draft_plan_rows fills rows[] for what k[] says and then refuses max_k != deepest. Those
+     * rows are consistent, so only the max_k rule is left to catch the plan. */
+    const std::string rows_log = stderr_of([&] { CHECK_EQ(draft_plan_rows(f.plan), RAD_E_INVAL); });
+    CHECK(has(rows_log, "deepest"));
+    CHECK_EQ(f.plan.rows[2], 1);
+    CHECK_EQ(f.plan.rows[5], 0);
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "no request drafts that far"));
+}
+
 TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     DraftSeqObservation o;
     o.accepted = 1;

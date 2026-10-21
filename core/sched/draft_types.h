@@ -362,6 +362,10 @@ inline bool draft_plan_identifies(const DraftPlan& p, const DraftObservation& o)
  * 0..max_k; index 0 and the rest of the array are zeroed. RAD_OK, or RAD_E_INVAL. */
 inline int draft_plan_rows(DraftPlan& p) {
     if (!p.k || !p.rows) return RAD_E_INVAL;
+    if (p.n_seq < 0 || p.n_seq > p.cap) {
+        RAD_ERR("draft plan: n_seq %d exceeds the caller's %d slots", (int)p.n_seq, (int)p.cap);
+        return RAD_E_INVAL;
+    }
     if (p.max_k < 0 || p.max_k > RAD_SCHED_MAX_SPEC) return RAD_E_INVAL;
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) p.rows[j] = 0;
     int32_t top = 0;
@@ -413,6 +417,10 @@ inline int draft_plan_valid(const DraftPlan& p) {
             return RAD_E_INVAL;
         }
         for (int j = 1; j <= p.k[i]; ++j) ++count[j];
+    }
+    if (p.max_k > 0 && count[p.max_k] == 0) {
+        RAD_ERR("draft plan: max_k is %d but no request drafts that far", (int)p.max_k);
+        return RAD_E_INVAL;
     }
     for (int j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) {
         if (p.rows[j] != count[j]) {
