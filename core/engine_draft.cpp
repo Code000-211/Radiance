@@ -158,7 +158,18 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         if (rd > 0 && n <= 0) break;
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
-        if (!db) { if (rd == 0) continue; break; }
+        if (!db) {
+            /* A drafting row always owes its history and every round it was planned for, so while
+             * the cycle has rows nullptr is a build that failed (BatchBuilder::build, batch.cpp),
+             * not a pass nobody needed: running on would publish a round the card never ran and
+             * move the watermark over history it never wrote. */
+            if (n > 0) {
+                RAD_ERR("drafter '%s': no batch for draft pass %d of step %d with %d row(s) "
+                        "drafting; the scheduler's build failed", drafter_.name, rd, step, n);
+                return RAD_E_STATE;
+            }
+            continue;   /* nothing drafts: only the history pass could have been owed, and may not be */
+        }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
@@ -252,9 +263,11 @@ namespace {
 /* Ends the serial snapshot on every exit of the finish below, in the destructor, so that it runs
  * after the last set_draft: the hold is what keeps reap() from dropping a row between the cycle
  * and its publication. A refused cycle ends it here instead of leaving that to
- * Scheduler::step()/shutdown, and does so with 0 rounds: serial_end would otherwise move the
- * watermark over verified positions of a cycle the engine refused, i.e. record a filled history
- * for work it threw away. */
+ * Scheduler::shutdown, and does so with 0 rounds, which suppresses the draft rows' verified
+ * positions -- the cycle's work is thrown away. It does not suppress a history-only row:
+ * serial_end counts one wherever rounds_done is (counts = m.dev ? ... : true), i.e. it assumes the
+ * history pass ran. That holds here, where the cycle has rows (issue refuses a nullptr batch), and
+ * is the scheduler's to prove for a cycle that had none. */
 struct SerialHold {
     Scheduler& sched;
     bool held = true;
@@ -265,7 +278,8 @@ struct SerialHold {
 
 /* The block host driver's snapshot, armed once the context pass has run: block_end() moves the
  * filled range over that pass, so ending the snapshot before it -- or after it failed -- would
- * claim a range nobody wrote. Those exits stay with Scheduler::step()'s own clear. */
+ * claim a range nobody wrote. Those exits stay with Scheduler::shutdown (fail_loop), with step()'s
+ * clear as the next cycle's backstop. */
 struct BlockHold {
     Scheduler& sched;
     explicit BlockHold(Scheduler& s) : sched(s) {}
@@ -416,30 +430,44 @@ int Engine::run_block_drafter(int step) {
                                   rows.data(), (int)rows.size());
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
-     * drafter will need, and skipping would leave a permanent hole in its cache. A failure here
+     * drafter will need, and skipping would leave a permanent hole in its cache. A step with rows
+     * owes that mirror pass, so nullptr is a failed build and not "no pass needed"; a failure here
      * still has to clear the snapshot, but block_end would then claim the range this pass did not
-     * write; Scheduler::step() clears it instead. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+     * write, so the snapshot is left to Scheduler::shutdown (fail_loop), with step()'s clear as the
+     * next cycle's backstop. */
+    const RadBatch* cb = sched_.block_context(step);
+    if (!cb && !sched_.plan().e.empty()) {
+        RAD_ERR("drafter '%s': no context batch for step %d, which has %zu row(s); the scheduler's "
+                "build failed", drafter_.name, step, sched_.plan().e.size());
+        return RAD_E_STATE;
+    }
+    if (cb) RAD_TRY(block_pass(cb, "context", step));
 
     /* The context pass ran: every exit below -- a failed query pass, a readback that could not be
      * reserved or copied, the publish -- ends the snapshot in hold's scope. */
     BlockHold hold(sched_);
 
     /* Cleared so a query batch that could not be built does not republish the previous step's
-     * proposals. */
+     * proposals. A row that may draft was named by block_begin, so its query batch is owed:
+     * nullptr is a failed build, and carrying on would publish nothing for rows the step issued
+     * ahead waits on. */
     draft_out_.clear();
     if (n > 0) {
-        if (const RadBatch* qb = sched_.block_query(step)) {
-            RAD_TRY(block_pass(qb, "query", step));
-            const int64_t n_raw = (int64_t)n * steps;
-            int32_t* const raw = readback_.reserve(n_raw);
-            if (!raw) return RAD_E_NOMEM;
-            RAD_TRY(rad_memcpy_async(raw, prop, n_raw * 4, r0.ctx.stream()));
-            RAD_TRY(rad_stream_sync(r0.ctx.stream()));
-            draft_out_.assign(raw, raw + n_raw);
+        const RadBatch* qb = sched_.block_query(step);
+        if (!qb) {
+            RAD_ERR("drafter '%s': no query batch for step %d with %d row(s) drafting; the "
+                    "scheduler's build failed", drafter_.name, step, n);
+            return RAD_E_STATE;
         }
+        RAD_TRY(block_pass(qb, "query", step));
+        const int64_t n_raw = (int64_t)n * steps;
+        int32_t* const raw = readback_.reserve(n_raw);
+        if (!raw) return RAD_E_NOMEM;
+        RAD_TRY(rad_memcpy_async(raw, prop, n_raw * 4, r0.ctx.stream()));
+        RAD_TRY(rad_stream_sync(r0.ctx.stream()));
+        draft_out_.assign(raw, raw + n_raw);
     }
-    if (n <= 0 || draft_out_.empty()) return RAD_OK;
+    if (draft_out_.empty()) return RAD_OK;
 
     int st = RAD_OK;
     for (int i = 0; i < n && st >= 0; ++i) {
@@ -473,11 +501,22 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
-    /* Even when nothing drafts; see run_block_drafter. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+    /* Even when nothing drafts; see run_block_drafter. A step with rows owes this mirror pass, so
+     * nullptr is a failed build there, not an idle pass. */
+    const RadBatch* cb = sched_.block_context(step);
+    if (!cb && !sched_.plan().e.empty()) {
+        RAD_ERR("drafter '%s': no context batch for step %d, which has %zu row(s); the scheduler's "
+                "build failed", drafter_.name, step, sched_.plan().e.size());
+        return RAD_E_STATE;
+    }
+    if (cb) RAD_TRY(block_pass(cb, "context", step));
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
-    if (!qb) return RAD_OK;
+    if (!qb) {
+        RAD_ERR("drafter '%s': no query batch for step %d with %d row(s) drafting; the scheduler's "
+                "build failed", drafter_.name, step, n);
+        return RAD_E_STATE;
+    }
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
