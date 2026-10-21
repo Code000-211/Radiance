@@ -1298,14 +1298,16 @@ int Ctx::run_pass(const RadBatch* b) {
     bump(pk_recorded_[kind]);
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
-    if (take_re_recorded(key)) bump(pc_rerecorded_);
+    bump(pc_recorded_ok_);
+    bump(pk_recorded_ok_[kind]);
+    if (evicted_.take(key)) bump(pc_rerecorded_);
     nt.used = ++tape_clock_;
     if (tapes_.size() < kTapes) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];
         for (PassTape& x : tapes_) if (x.used < lru->used) lru = &x;
-        note_evicted(lru->key);
+        evicted_.note(lru->key);
         bump(pc_evicted_);
         tape_drop(*lru);
         *lru = std::move(nt);

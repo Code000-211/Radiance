@@ -140,15 +140,17 @@ TEST(a_draft_cycle_keys_every_shape_it_runs) {
     CHECK(f.ctx.pass_key(&f.pass(0, 7, 6, 0, 100, 4)) != trunk);
 }
 
-/* The counters attribute each pass to its kind. On the host backend every pass walks the issue
- * path, which is what the `issued` column counts; the tape outcomes stay zero because no backend
- * here can record. */
+/* The counters attribute each pass to its pass kind. On the host backend every pass walks the
+ * issue path, which is what the `issued` column counts; the tape outcomes stay zero because no
+ * backend here can record. The block drafter's query pass (`draft_pass == 1`, a value the MTP
+ * contract never uses) is its own kind: it must not be counted as a serial round. */
 TEST(the_pass_counters_name_the_round_of_each_pass) {
     ReplayFixture f;
     CHECK_OK(f.start());
     CHECK_EQ(f.ctx.records_passes(), rad::tape_supported());
 
-    const int kinds[5] = { 0, -1, 2, 2, 4 };   /* trunk, history, two rounds */
+    /* trunk, history, block query, two serial rounds */
+    const int kinds[5] = { 0, -1, 1, 2, 4 };
     for (int i = 0; i < 5; ++i) {
         const RadBatch& b = f.pass(kinds[i], kinds[i] > 1 ? 1 : 7, kinds[i] == 0 ? 6 : 0, 0, 10 + i);
         CHECK_OK(f.ctx.run_step(&b));
@@ -156,24 +158,58 @@ TEST(the_pass_counters_name_the_round_of_each_pass) {
 
     const Ctx::PassCounts c = f.ctx.pass_counts();
     CHECK_EQ(c.kind[Ctx::kPassTrunk].issued, 1ll);
-    CHECK_EQ(c.kind[Ctx::kPassHistory].issued, 1ll);
-    CHECK_EQ(c.kind[Ctx::kPassDraft].issued, 3ll);
+    CHECK_EQ(c.kind[Ctx::kPassContext].issued, 1ll);
+    CHECK_EQ(c.kind[Ctx::kPassBlockQuery].issued, 1ll);
+    CHECK_EQ(c.kind[Ctx::kPassDraft].issued, 2ll);
     CHECK_EQ(c.kind[Ctx::kPassTrunk].played, 0ll);
-    CHECK_EQ(c.kind[Ctx::kPassHistory].played, 0ll);
+    CHECK_EQ(c.kind[Ctx::kPassContext].played, 0ll);
+    CHECK_EQ(c.kind[Ctx::kPassBlockQuery].played, 0ll);
     CHECK_EQ(c.kind[Ctx::kPassDraft].played, 0ll);
     CHECK_EQ(c.played, 0ll);
 
     /* The whole set walked the issue path: the host backend holds no tape to play. */
     CHECK_EQ(c.issued_unkeyed, 5ll);
-    CHECK_EQ(c.issued_unkeyed, c.kind[Ctx::kPassTrunk].issued + c.kind[Ctx::kPassHistory].issued +
-                              c.kind[Ctx::kPassDraft].issued);
+    CHECK_EQ(c.issued_unkeyed, c.kind[Ctx::kPassTrunk].issued + c.kind[Ctx::kPassContext].issued +
+                              c.kind[Ctx::kPassBlockQuery].issued + c.kind[Ctx::kPassDraft].issued);
 
-    /* Coverage of a cache that never held a tape: a real run fills these, and `rerecorded` is what
-     * would justify a larger cache rather than a full one. */
+    /* Coverage of a cache that never held a tape: a real run fills these. `rerecorded` is an
+     * observation that under-counts past 32 evictions, not a verdict on the cache size. */
     CHECK_EQ(c.keys_live, 0ll);
     CHECK_EQ(c.keys_peak, 0ll);
     CHECK_EQ(c.evicted, 0ll);
     CHECK_EQ(c.rerecorded, 0ll);
+
+    /* `recorded` counts attempts, `recorded_ok` the attempts that produced a tape. A host backend
+     * records nothing, so neither moves -- and no success can outnumber an attempt. */
+    CHECK_EQ(c.recorded, 0ll);
+    CHECK_EQ(c.recorded_ok, 0ll);
+    for (int k = 0; k < Ctx::kPassKinds; ++k) {
+        CHECK(c.kind[k].recorded_ok <= c.kind[k].recorded);
+        CHECK_EQ(c.kind[k].recorded, 0ll);
+    }
+}
+
+/* The evicted-key ring remembers the last 32 evictions. A key evicted earlier is forgotten, so
+ * `rerecorded` under-counts instead of inventing evidence; a key it does remember is consumed by
+ * the first re-record, so one eviction is counted once. */
+TEST(the_evicted_ring_is_bounded_and_counts_a_re_record_once) {
+    Ctx::EvictedRing ring;
+
+    /* Forty evictions into 32 slots: the first eight are gone, the rest are recognised. */
+    for (uint64_t k = 1; k <= 40; ++k) ring.note(k);
+    for (uint64_t k = 1; k <= 8; ++k) CHECK(!ring.take(k));
+    for (uint64_t k = 9; k <= 40; ++k) CHECK(ring.take(k));
+
+    /* Consumed on the first take: a second record of the same key is not a second re-record. */
+    CHECK(!ring.take(9));
+    CHECK(!ring.take(40));
+
+    ring.note(7);
+    CHECK(ring.take(7));
+    CHECK(!ring.take(7));
+
+    /* A key that was never evicted is never a re-record. */
+    CHECK(!ring.take(12345));
 }
 
 RAD_TEST_MAIN()
