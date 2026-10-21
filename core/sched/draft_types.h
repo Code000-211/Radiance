@@ -396,10 +396,12 @@ inline bool draft_plan_bars_fill(const DraftPlan& p, int32_t i) {
 }
 
 /* The label for draft position j (0-based), if this cycle measured one: 1 when the position was
- * accepted, 0 at the first real rejection. False past `checked` -- an unreached position has no
- * label, and neither does one past a censor. */
+ * accepted, 0 at the first real rejection, and nothing past it. `checked` counts the positions
+ * with a label, so it always ends at the first rejection; a censor cuts the cycle earlier and the
+ * reason is recorded, not the position. */
 inline bool draft_label(const DraftSeqObservation& o, int j, float* label) {
     if (j < 0 || j >= (int)o.checked) return false;
+    if (j > (int)o.accepted) return false;   /* positions past the first rejection were not measured */
     if (label) *label = j < (int)o.accepted ? 1.0f : 0.0f;
     return true;
 }

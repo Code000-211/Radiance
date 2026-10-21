@@ -154,6 +154,18 @@ TEST(labels_stop_at_the_first_rejection_and_at_a_censor) {
     CHECK_EQ(label, 1.0f);
     CHECK(!draft_label(all, 3, &label));
 
+    /* The reviewer's repro: checked covers four positions but the first rejection is at 1. */
+    DraftSeqObservation long_tail;
+    long_tail.accepted = 1;
+    long_tail.checked = 4;
+    long_tail.verified = 6;
+    REQUIRE(draft_label(long_tail, 0, &label));
+    CHECK_EQ(label, 1.0f);
+    REQUIRE(draft_label(long_tail, 1, &label));
+    CHECK_EQ(label, 0.0f);
+    CHECK(!draft_label(long_tail, 2, &label));
+    CHECK(!draft_label(long_tail, 3, &label));
+
     DraftSeqObservation cut;
     cut.accepted = 1;
     cut.checked = 1;   /* an EOG cut after the committed prefix */

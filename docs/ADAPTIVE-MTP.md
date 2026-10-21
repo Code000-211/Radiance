@@ -45,8 +45,10 @@ prediction and sample.
   tokens, context class, history tokens and `N_j` (requests reaching round j), not just
   `(rows, max K)`. `DraftCostSample` carries the rounds and rows actually executed beside it.
 - **Labels only where measured.** `draft_label` returns a label for the accepted prefix (1) and
-  the first real rejection (0), and nothing past `checked`. EOG, `max_tokens`, cancellation and
-  the context end are `DraftCensor` reasons; they never become labels. Raw match length, commit
+  the first real rejection (0), and nothing after that: a position the target computed past the
+  first rejection was not measured, even when `checked` covers it. EOG, `max_tokens`, cancellation
+  and the context end are `DraftCensor` reasons: they cut `checked`, and the cut is what keeps the
+  censored tail out — the reason names why, it is not itself a position. Raw match length, commit
   length, and the censor reason are separate fields.
 - **Units are milliseconds or nothing.** An unmeasured shape is `valid = false` or
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
