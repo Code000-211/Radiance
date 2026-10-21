@@ -118,7 +118,6 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     plan->timing_valid = true;          /* a sample's bracket is taken as a real duration */
     plan->prefill_tokens = view.prefill_tokens;
 
-    int32_t eligible = 0;
     int32_t top = 0;
     for (int32_t i = 0; i < view.n_seq; ++i) {
         const DraftSeqView& v = view.seq[i];
@@ -130,7 +129,6 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         plan->history_tokens[i] = s->history_tokens;
         int k = 0;
         if (v.eligibility == DraftEligibility::Eligible) {
-            ++eligible;
             k = want < v.remaining ? want : v.remaining;
             if (k < want) plan->why[i] = DraftFallback::Resources;
         }
@@ -145,9 +143,12 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
     if (s->mode == Policy::Mode::Cost) {
         if (!costs.estimate) return RAD_E_UNSUPPORTED;   /* no model wired: say so */
         DraftVerifyShape shape;
-        shape.n_rows = eligible;
+        shape.n_rows = view.n_seq;   /* every row verifies its committed token, eligible or not */
         shape.verify_k = top;
         shape.ctx_class = 0;
+        /* The fake is a steady state: it prices and verifies the same window, so the plan's
+         * verify_k is the shape's. Reading max_k here would be the verify-K/max-K confusion. */
+        plan->verify_k = shape.verify_k;
         /* The loaded drafter, which is not who fills k[]: at K0 with the head loaded this stays
          * Serial, so the two K0 arms are distinct keys. */
         shape.drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;

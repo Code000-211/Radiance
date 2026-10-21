@@ -414,6 +414,31 @@ TEST(the_verify_shape_names_the_loaded_drafter_so_the_two_k0_arms_differ) {
     CHECK(model.last.drafter == DraftDrafter::None);
 }
 
+TEST(the_fake_prices_the_shape_the_plan_names) {
+    draft_fake::Fixture f;
+    f.add(0, 1);                                  /* eligible, drafts three */
+    f.add(1, 2, 64, DraftEligibility::Grammar);   /* ineligible: a plain decode row */
+    draft_fake::Policy policy;
+    policy.mode = draft_fake::Policy::Mode::Cost;
+    policy.legacy_k = 3;
+    draft_fake::CostModel model;
+    model.measured = true;
+    model.ms[3] = 9.0;
+
+    CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, {&model, draft_fake::estimate}, &f.plan),
+             RAD_OK);
+    /* The plan's verify_k is the shape's, not its max_k read twice. */
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK_EQ(f.plan.verify_k, 3);
+    CHECK_EQ(model.last.verify_k, f.plan.verify_k);
+    /* Both rows verify their committed token; only one of them drafts, so N_j and the token
+     * count agree: 2 rows, 2 + 3 tokens. */
+    CHECK_EQ(model.last.n_rows, 2);
+    CHECK_EQ(model.last.verify_tokens, 2 + 3);
+    CHECK_EQ(model.last.rows[1], 1);
+    CHECK(model.last.drafter == DraftDrafter::Serial);
+}
+
 TEST(a_cost_plan_without_a_cost_model_is_unsupported) {
     draft_fake::Fixture f;
     f.add(0, 1);
