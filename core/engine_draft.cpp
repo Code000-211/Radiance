@@ -6,6 +6,7 @@
  */
 #include "engine_priv.h"
 
+#include "../arch/common/rad_spechub_config.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
 
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -48,6 +50,46 @@ int Engine::step_state_init() {
     if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0]->device));
     slots_host_ = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
     if (!slots_host_) return RAD_E_NOMEM;
+
+    /* RADIANCE_MTP_COUPLED: the head's two planes, found by name in the program it declared, and
+     * the pinned staging the step path needs beside them. A program without them has no coupled
+     * path, so the flag's absence and its contradiction are told apart here: the flag is on and the
+     * head declared nothing means the architecture refused it (it returns RAD_E_UNSUPPORTED at its
+     * own declare), and a silent no-op would serve uncoupled drafts while the flag said otherwise. */
+    mtp_couple_ = mtp_coupled_enabled();
+    if (mtp_couple_) {
+        const Program& prog = ranks_[0]->program;
+        for (size_t i = 0; i < prog.buffers.size(); ++i) {
+            const std::string& name = prog.buffers[i].name;
+            auto ends = [&](const char* suffix) {
+                const size_t n = std::strlen(suffix);
+                return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+            };
+            if (ends("mtp_couple_draws")) couple_draws_buf_ = (rad_buf)i;
+            if (ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+        }
+        if (!couple_draws_buf_ || !couple_state_buf_) {
+            RAD_ERR("RADIANCE_MTP_COUPLED is set but the architecture declared no coupled MTP "
+                    "planes; the flag and the model disagree");
+            return RAD_E_STATE;
+        }
+        const RadBufDecl& sd = prog.buffers[couple_state_buf_].decl;
+        if (sd.rank != 3 || sd.shape[2] != (int64_t)RAD_MTP_COUPLE_STATE_WORDS) {
+            RAD_ERR("RADIANCE_MTP_COUPLED: 'mtp_couple_state' is not the [rounds, rows, %d]-word "
+                    "plane the coupling reads", (int)RAD_MTP_COUPLE_STATE_WORDS);
+            return RAD_E_STATE;
+        }
+        couple_rows_ = sd.shape[1];
+        couple_draw_stage_ = static_cast<RadMtpCoupleDraw*>(
+            rad_dev_alloc(n_slot * (int64_t)sizeof(RadMtpCoupleDraw), RAD_MEM_HOST_PINNED));
+        couple_readback_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
+            (int64_t)drafter_.depth * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
+            RAD_MEM_HOST_PINNED));
+        if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
+        RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, maximal "
+                 "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
+    }
+
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
@@ -62,6 +104,10 @@ void Engine::step_state_fini() {
     }
     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
     slots_host_ = nullptr;
+    if (couple_draw_stage_) rad_dev_free(couple_draw_stage_, RAD_MEM_HOST_PINNED);
+    if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
+    couple_draw_stage_ = nullptr;
+    couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
 }
@@ -142,6 +188,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
+    /* Before ANY serial pass reads a draw: the round-1 pass is the history pass below. */
+    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(n));
 
     /* RADIANCE_DEBUG_STAGE: running means of a draft pass's host time: batch + advance, greedy
      * sampler chain, barrier release and issue. They cost the step nothing until their sum exceeds
@@ -213,6 +261,16 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
      * history (Scheduler::serial_batch). */
     RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
     Rank& r0 = *ranks_[0];
+    if (mtp_couple_) {
+        /* Rounds 1..done of the drafting rows, in the SAME stream order as the slots below: the
+         * states come back behind the proposal that they were drawn beside. */
+        const void* state = r0.ctx.buf_ptr(couple_state_buf_);
+        if (!state || serial_done_ > (int)drafter_.depth) return RAD_E_STATE;
+        const int64_t pitch = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
+        RAD_TRY(rad_memcpy_2d_async(couple_readback_, pitch, state, pitch,
+                                    (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), serial_done_,
+                                    r0.ctx.stream()));
+    }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
     return RAD_OK;
@@ -253,8 +311,75 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         /* No draft for a request the sampler will not speculate on (a constraining grammar that
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
-        sched_.set_draft(serial_row_[(size_t)i].seq,
-                         &draft_out_[(size_t)i * (size_t)rounds], done);
+        const uint64_t seq = serial_row_[(size_t)i].seq;
+        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        if (!mtp_couple_) continue;
+        /* BOUND WHETHER OR NOT THE REQUEST SURVIVED. A truncated publication keeps a prefix, whose
+         * rows carry their own rounds' states; a request the scheduler refused binds nothing, and
+         * set_mtp_couple(…, 0) clears what an earlier step left. */
+        RAD_TRY(bind_couple(i, done, slots_host_[serial_row_[(size_t)i].card]));
+        for (auto& rk : ranks_) {
+            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, rc == RAD_OK ? done : 0);
+            if (st < 0 && st != RAD_E_NOTFOUND) return st;
+        }
+    }
+    return RAD_OK;
+}
+
+/* RADIANCE_MTP_COUPLED: the draw for every drafting row, before any serial pass reads it.
+ *
+ * The coordinate is the PRE-commit output size, which strictly grows between two steps that draft
+ * one request (each commits at least one token), so (base, round) never repeats a draft stream. The
+ * card is the slot the advance writes, and the plugin refuses a row whose staged draw names another
+ * -- which is what makes a stale draw a refusal here rather than a wrong token later. */
+int Engine::stage_couple_draws(int n) {
+    std::fill(couple_by_card_.begin(), couple_by_card_.end(), RadMtpCoupleDraw{});
+    for (const auto& e : sched_.plan().e)
+        if (e.req && e.card >= 0 && (size_t)e.card < couple_by_card_.size())
+            couple_by_card_[(size_t)e.card] = { e.req->sp.seed, (uint64_t)e.req->output.size(),
+                                                e.seq, e.card, e.req->sp.greedy() ? 0u : 1u };
+    for (int i = 0; i < n; ++i) {
+        const auto& row = serial_row_[(size_t)i];
+        if (row.card < 0 || (size_t)row.card >= couple_by_card_.size() ||
+            couple_by_card_[(size_t)row.card].seq != row.seq) {
+            RAD_ERR("MTP coupled: drafting row %d (sequence %llu, card %d) has no plan entry on its "
+                    "card", i, (unsigned long long)row.seq, (int)row.card);
+            return RAD_E_STATE;
+        }
+        couple_draw_stage_[i] = couple_by_card_[(size_t)row.card];
+    }
+    for (auto& rk : ranks_) {
+        void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
+        if (!dst) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
+                                 n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
+    }
+    return RAD_OK;
+}
+
+/* After commit: drafting row `row`'s rounds as rank 0's ops left them, checked against the draw
+ * staged for that row and the card's own slot (written through RadBatch::seq_ids, independently of
+ * the row index), then bound to the verify positions the next step samples: the committed output
+ * size is base + n_acc for every request still running.
+ *
+ * A STOCHASTIC ROW THAT DID NOT COME BACK SAMPLED, or whose x is not the card's draft, is a broken
+ * path and refuses the step: a status-0 bypass or a misattached Q must never pass for coupling. */
+int Engine::bind_couple(int row, int done, const StepSlot& S) {
+    const RadMtpCoupleDraw& d = couple_draw_stage_[row];
+    for (int rd = 1; rd <= done; ++rd) {
+        RadMtpCoupleState st = couple_readback_[(int64_t)(rd - 1) * couple_rows_ + row];
+        const bool sampled = d.mode == 1;
+        if (std::memcmp(&st.draw, &d, sizeof d) || st.round != rd || st.x != S.tok[rd] ||
+            st.status != (sampled ? 1 : 0) ||
+            (sampled && !rad_mtp_couple_state_valid(st, meta_.n_vocab))) {
+            RAD_ERR("MTP coupled: sequence %llu round %d returned status %d round %d x %d for card "
+                    "token %d (draw %s); refusing the step", (unsigned long long)d.seq, rd,
+                    st.status, st.round, st.x, S.tok[rd],
+                    std::memcmp(&st.draw, &d, sizeof d) ? "stale" : "current");
+            return RAD_E_STATE;
+        }
+        st.pos = d.base + (uint64_t)S.n_acc + (uint64_t)(rd - 1);
+        couple_bound_[rd - 1] = st;
     }
     return RAD_OK;
 }

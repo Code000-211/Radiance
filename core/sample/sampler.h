@@ -71,6 +71,7 @@
  */
 #pragma once
 #include "rad_sample.h"
+#include "rad_spechub.h"
 
 #include "../rad_core.h"
 #include "grammar.h"
@@ -160,6 +161,10 @@ public:
     /* Whether allows_speculation's answer can no longer change. It changes only when a grammar
      * whose backend cannot rewind starts to constrain (on a commit). */
     bool speculation_fixed(uint64_t req_id) const;
+    /* RADIANCE_MTP_COUPLED: bind the per-round states of the linear draft just published, `n` of
+     * them (0 clears). Each must name this request, the round it belongs to, and a `draw.mode` the
+     * row actually ran. RAD_E_NOTFOUND for a request already ended here. */
+    int set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n);
 
     /* ---------------------------------------------------------- step path */
 
@@ -218,6 +223,11 @@ private:
          * newly committed tokens only. Read only when the request carries a thinking budget. */
         ReasoningCount                  think;
         size_t                          think_seen = 0;
+        /* RADIANCE_MTP_COUPLED: the linear draft's per-round states for the window the scheduler
+         * published, bound by set_mtp_couple and consumed by build_step. `couple_n` is how many of
+         * `couple` are live; 0 for a request whose drafts carry no coupled proposal. */
+        RadMtpCoupleState couple[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+        int               couple_n = 0;
     };
 
     /* Mask staged row `row` to the reasoning block's close token, once the budget is spent
@@ -244,6 +254,7 @@ private:
     rad_op op_argmax_    = RAD_NULL_HANDLE;
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
+    rad_op op_couple_    = RAD_NULL_HANDLE;   /* RADIANCE_MTP_COUPLED only */
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 
@@ -259,6 +270,10 @@ private:
     rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
     rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
     rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
+    rad_buf buf_couple_  = RAD_NULL_HANDLE;   /* [rows, RAD_MTP_COUPLE_STATE_WORDS], flag only */
+    RadMtpCoupleState* couple_stage_ = nullptr;   /* pinned, one row per sampled position */
+    bool    couple_      = false;   /* RADIANCE_MTP_COUPLED */
+    bool    any_couple_  = false;   /* does any row this step carry a bound state? */
 
     /* Pinned staging, allocated once at declare. */
     DeviceSampleParams* params_stage_ = nullptr;

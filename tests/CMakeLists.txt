@@ -494,6 +494,9 @@ endif()
 # parameters). Cheap, so in the fast tier. libr4d.so is added when built; the script reports
 # "  SKIP " rather than passing when a plugin will not dump.
 set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
+if(TARGET spechub)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/spechub.so)
+endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
 endif()

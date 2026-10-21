@@ -305,6 +305,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_subdirectory(libavx)
 endif()
 add_subdirectory(arch)
+# spechub: the linear-MTP coupling kernels (RADIANCE_MTP_COUPLED), the one in-tree plugin directory
+# the experimental line owns. Built by default so the flag's kernels exist in the same tree that
+# enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
+add_subdirectory(plugin/spechub)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()
