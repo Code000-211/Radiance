@@ -982,13 +982,13 @@ void Ctx::tape_drop(PassTape& t) {
 int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     *out = PassTape{};
     out->key = key;
-    if (tape_begin() < 0) { arch_step_(this, b); return 0; }
+    if (tape_begin() < 0) { issue_live(b); return 0; }
     const int64_t i0 = n_issues_, c0 = ar_calls_.load(), y0 = ar_bytes_.load();
     rec_ = out;
     rec_mark_ = 0;
     haz_ops_.clear();
     haz_rng_.clear();
-    arch_step_(this, b);
+    issue_live(b);
     tape_cut();
     rec_ = nullptr;
     RadTape t = tape_end(step_status_ >= 0);
@@ -1237,14 +1237,15 @@ int Ctx::play_pass(PassTape& t) {
 /* Runs one pass: played from its tape, or issued live (and possibly recorded or audited). */
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
+    const int kind = pass_kind(*b);
     scratch_cur_[0] = scratch_cur_[1] = 0;
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
-    if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    if (!tape_on_ || staging_) { bump(pc_unkeyed_); issue_live(b); return RAD_OK; }
     const uint64_t key = pass_key(b);
-    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    if (key == 0) { bump(pc_unkeyed_); issue_live(b); return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
         bump(pc_refused_);
-        arch_step_(this, b);
+        issue_live(b);
         return RAD_OK;
     }
     PassTape* t = nullptr;
@@ -1252,6 +1253,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
     if (t && t->plays > 0 && t->plays % kAuditPlays != 0) {
         bump(pc_played_);
+        bump(pk_played_[kind]);
         pc_dispatched_.fetch_add(t->dispatches, std::memory_order_relaxed);
         pc_unordered_.fetch_add(t->unordered, std::memory_order_relaxed);
         return play_pass(*t);
@@ -1259,6 +1261,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
     if (t) {
         bump(pc_audited_);
+        bump(pk_audited_[kind]);
         /* Audit: issue the pass live, recording it, and compare. Runs before the first play and
          * then every kAuditPlays plays. */
         PassTape fresh;
@@ -1287,22 +1290,34 @@ int Ctx::run_pass(const RadBatch* b) {
      * bound crosses its bucket, so they are recorded on first sight. */
     if (b->phase != RAD_PHASE_DECODE && !tape_seen(key)) {
         bump(pc_first_);
-        arch_step_(this, b);
+        issue_live(b);
         return RAD_OK;
     }
 
     bump(pc_recorded_);
+    bump(pk_recorded_[kind]);
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
+    bump(pc_recorded_ok_);
+    bump(pk_recorded_ok_[kind]);
+    if (evicted_.take(key)) bump(pc_rerecorded_);
     nt.used = ++tape_clock_;
     if (tapes_.size() < kTapes) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];
         for (PassTape& x : tapes_) if (x.used < lru->used) lru = &x;
+        evicted_.note(lru->key);
+        bump(pc_evicted_);
         tape_drop(*lru);
         *lru = std::move(nt);
     }
+    const int64_t live = (int64_t)tapes_.size();
+    pc_keys_live_.store(live, std::memory_order_relaxed);
+    int64_t peak = pc_keys_peak_.load(std::memory_order_relaxed);
+    while (live > peak && !pc_keys_peak_.compare_exchange_weak(peak, live,
+                                                                std::memory_order_relaxed))
+        {}
     return RAD_OK;
 }
 
