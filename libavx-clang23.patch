@@ -1,0 +1,56 @@
+diff --git a/libavx/avx_attn.cpp b/libavx/avx_attn.cpp
+index 1441048..c6bd659 100644
+--- a/libavx/avx_attn.cpp
++++ b/libavx/avx_attn.cpp
+@@ -528,6 +528,18 @@ AVX_BF16_TARGET static inline void pv_rows(float* acc, int64_t D, const uint32_t
+         for (int v = 0; v < 4; ++v) _mm512_storeu_ps(acc + i * D + c0 + 16 * v, o[i][v]);
+ }
+ 
++/* P row (64 floats) to bf16 pairs. Kept out of attn_dense_bf16's OpenMP loop: clang's OpenMP
++ * outlining drops the enclosing function's target attribute, and a bf16 intrinsic in the
++ * outlined body then crashes the backend. The outlined function calls this, as it already calls
++ * qk_rows and pv_rows. */
++AVX_BF16_TARGET static inline void p_to_bf16_pairs(const float* sr, uint32_t* pr) {
++    _mm512_storeu_si512((void*)pr, (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16),
++                                                                 _mm512_loadu_ps(sr)));
++    _mm512_storeu_si512((void*)(pr + 16),
++                        (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 48),
++                                                     _mm512_loadu_ps(sr + 32)));
++}
++
+ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor* k,
+                                             const RadTensor* v, const RadTensor* cu,
+                                             const RadTensor* o, int64_t D, int64_t gqa,
+@@ -687,15 +699,7 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
+                 }
+             }
+             /* P to bf16, round to nearest even: a row's 64 values become its 32 key pairs. */
+-            for (int64_t r = 0; r < R; ++r) {
+-                const float* sr = S + r * KT;
+-                uint32_t* pr = ppack + r * 32;
+-                _mm512_storeu_si512((void*)pr, (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16),
+-                                                                             _mm512_loadu_ps(sr)));
+-                _mm512_storeu_si512((void*)(pr + 16),
+-                                    (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 48),
+-                                                                 _mm512_loadu_ps(sr + 32)));
+-            }
++            for (int64_t r = 0; r < R; ++r) p_to_bf16_pairs(S + r * KT, ppack + r * 32);
+             for (int64_t c0 = 0; c0 < D; c0 += 64) {
+                 int64_t r = 0;
+                 for (; r + 6 <= R; r += 6) pv_rows<6>(acc + r * D, D, ppack + r * 32, vpack, K2, c0);
+diff --git a/libavx/avx_gemm_tile.cpp b/libavx/avx_gemm_tile.cpp
+index e8a4bfa..4f9f09d 100644
+--- a/libavx/avx_gemm_tile.cpp
++++ b/libavx/avx_gemm_tile.cpp
+@@ -261,7 +261,10 @@ AVX_QB_TARGET static void qb_codes(const QbTab& q, const uint8_t* src, int64_t n
+  * of the j-th 32 codes. A code minus its zero lies in [-31, 31], exact in bf16: `t` holds bf16(i -
+  * 32) for i < 64, which one vpermt2w indexes by code - zero + 32. u5 codes are 40 bits for each
+  * eight, deposited into bytes by pdep (BMI2, which the caller checked). */
+-AVX_QB_TARGET __attribute__((target("bmi2"))) static void qb_codes_zp(
++/* One target list, not AVX_QB_TARGET plus a second attribute: clang keeps only the last target
++ * attribute on a declaration and would then compile this without the AVX-512 features its
++ * intrinsics need. GCC merges the two; the combined list is the form both accept. */
++__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16,bmi2"))) static void qb_codes_zp(
+         const uint8_t* row, int bits, int64_t n, int64_t npad, uint16_t* dst, const int32_t* zr,
+         const __m512i* t) {
+     for (int64_t i = 0; i < npad; i += 32) {
