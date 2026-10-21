@@ -528,6 +528,17 @@ AVX_BF16_TARGET static inline void pv_rows(float* acc, int64_t D, const uint32_t
         for (int v = 0; v < 4; ++v) _mm512_storeu_ps(acc + i * D + c0 + 16 * v, o[i][v]);
 }
 
+/* P row (64 floats) to bf16 pairs. Kept out of attn_dense_bf16's OpenMP loop: clang's OpenMP
+ * outlining drops the enclosing function's target attribute, and a bf16 intrinsic in the
+ * outlined body then crashes the backend. */
+AVX_BF16_TARGET static inline void p_to_bf16_pairs(const float* sr, uint32_t* pr) {
+    _mm512_storeu_si512((void*)pr, (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16),
+                                                                 _mm512_loadu_ps(sr)));
+    _mm512_storeu_si512((void*)(pr + 16),
+                        (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 48),
+                                                     _mm512_loadu_ps(sr + 32)));
+}
+
 AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor* k,
                                             const RadTensor* v, const RadTensor* cu,
                                             const RadTensor* o, int64_t D, int64_t gqa,
@@ -687,15 +698,7 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                 }
             }
             /* P to bf16, round to nearest even: a row's 64 values become its 32 key pairs. */
-            for (int64_t r = 0; r < R; ++r) {
-                const float* sr = S + r * KT;
-                uint32_t* pr = ppack + r * 32;
-                _mm512_storeu_si512((void*)pr, (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 16),
-                                                                             _mm512_loadu_ps(sr)));
-                _mm512_storeu_si512((void*)(pr + 16),
-                                    (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(sr + 48),
-                                                                 _mm512_loadu_ps(sr + 32)));
-            }
+            for (int64_t r = 0; r < R; ++r) p_to_bf16_pairs(S + r * KT, ppack + r * 32);
             for (int64_t c0 = 0; c0 < D; c0 += 64) {
                 int64_t r = 0;
                 for (; r + 6 <= R; r += 6) pv_rows<6>(acc + r * D, D, ppack + r * 32, vpack, K2, c0);
