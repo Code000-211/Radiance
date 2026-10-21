@@ -262,9 +262,10 @@ The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD cla
 llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
 Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
 `runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 236 checks over 15 cases), and the
-broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Each of the six failures fails
-identically on `cb5a69a` with the same compiler and configuration, so none of them is caused by
-P00:
+broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Five of the six failures fail
+identically on `cb5a69a` with the same compiler and configuration; the sixth, `glm5next_test`,
+passes there at 9.3 s and crosses its 10 s CPU budget only under the broad run's parallel load (it
+passes again in the 94-test fast tier). None of them is caused by P00:
 
 | Failure | Reason | Baseline `cb5a69a` |
 |---------|--------|--------------------|
