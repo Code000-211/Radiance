@@ -2038,11 +2038,12 @@ int Engine::export_draft_cost_profile() {
     p.fingerprint = draft_calib_runtime_.fingerprint;
     p.execution   = draft_calib_runtime_.execution;
     /* The fingerprint names the plan resolved at start. A bucket carrying kDraftSamplePlacement
-     * was measured while the mover was moving a unit (Scheduler::step_finished takes that from the
-     * rank's own move evidence), so its time is the cost of a residency this header does not
-     * name. The file has no field that could name the drifted residency, so those observations are
-     * left out -- only the affected ones: a clean cycle before the first move still measured the
-     * start plan and stays. */
+     * was measured while the placement was changing -- the mover moved a unit inside the bracket,
+     * or the step staged pooled experts for a prefill pass (Scheduler::step_finished takes both
+     * from the rank's own evidence) -- so its time is the cost of a residency this header does not
+     * name. The file has no field that could name that residency, so those observations are left
+     * out -- only the affected ones: a cycle before the change still measured the start plan and
+     * stays. */
     int32_t placement = 0;
     int32_t usable = 0;
     for (const DraftCostBucket& b : sched_.draft_costs().buckets()) {
@@ -2058,7 +2059,7 @@ int Engine::export_draft_cost_profile() {
         if (placement > 0)
             RAD_ERR("--draft-profile-out '%s': all %d measured bucket(s) were placement-affected, "
                     "so none describes the start residency the fingerprint names; a calibration "
-                    "needs cycles the mover did not disturb", cfg_.draft_profile_out.c_str(),
+                    "needs cycles without a placement change", cfg_.draft_profile_out.c_str(),
                     (int)placement);
         else
             RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
@@ -2088,8 +2089,9 @@ int Engine::export_draft_cost_profile() {
         RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
                  "their flag)", skipped);
     if (placement > 0)
-        RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) left out (a mover change "
-                 "inside the bracket; the fingerprint names the plan, not the drifted residency)",
+        RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) left out (a placement "
+                 "change inside the bracket: a mover move or a staged prefill pass; the "
+                 "fingerprint names the plan, not the residency the bracket ran under)",
                  (int)placement);
     RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
              cfg_.draft_profile_out.c_str(), p.buckets.size(),

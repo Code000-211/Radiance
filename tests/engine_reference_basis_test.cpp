@@ -528,7 +528,11 @@ TEST(an_admission_live_profile_keeps_the_strict_loan_match) {
  *
  * The identity check is the reference rule's own: both runs derive their fingerprint from the same
  * plan, so placement and arena agree; they differ only in basis/live_loan, which the no-loan
- * reference is exempt from (core/sched/draft_cost.cpp). */
+ * reference is exempt from (core/sched/draft_cost.cpp).
+ *
+ * The flag `kDraftSamplePlacement` also covers a bracket whose step staged pooled experts
+ * (`ev.staged`), which this freeze does not touch; the export case below keeps that exclusion as
+ * its counter-check and still expects a clean bucket beside it. */
 namespace {
 
 /* A unit the heat engine can promote on this run: movable, pooled, and still in the pool after
@@ -667,6 +671,7 @@ struct PlayedExport {
     int64_t          moves     = 0;       /* residency_moves() over the played cycles */
     int              export_rc = RAD_OK;
     int              played    = 0;       /* clean played cycles the exported file kept */
+    int              staged_samples = 0;  /* samples the table kept with kDraftSamplePlacement */
     bool             inited    = false;
 
     PlayedExport(int n_experts, bool reference)
@@ -745,7 +750,9 @@ struct PlayedExport {
         /* The played cycles, in the order the step loop plays them: plan, commit, publish the
          * head's rounds, the rank's heat and tiering dispatch, then the bracket's evidence. The
          * histogram is the one the freeze case shows would promote a pooled unit on an unfrozen
-         * mover. */
+         * mover. The last bracket is the stager's instead: the rank reports that the step armed
+         * pooled experts for a prefill chunk, which the freeze does not touch and the export must
+         * still leave out. */
         HeatEngine& heat  = EngineTestPeer::heat_of(eng, 0);
         Mover&      mover = EngineTestPeer::mover_of(eng, 0);
         /* The unit this plan lets the heat move: pooled after the start fill, as in the freeze
@@ -756,7 +763,7 @@ struct PlayedExport {
         counts[(size_t)rig.plan.units[(size_t)hot].expert] = 500;
         int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
         const int64_t base = EngineTestPeer::residency_moves(eng);
-        for (int step = 0; step < cycles; ++step) {
+        for (int step = 0; step <= cycles; ++step) {
             if (!s.step()) return RAD_E_STATE;
             const DraftPlan* dp = s.draft().plan();
             if (!dp || dp->n_seq != 1) return RAD_E_STATE;
@@ -775,6 +782,7 @@ struct PlayedExport {
             ev.replay_known     = true;
             ev.replay           = DraftReplay::None;
             ev.moves_since_bind = EngineTestPeer::residency_moves(eng) - base;
+            ev.staged           = (step == cycles);
             s.step_finished(ev);
         }
         moves = EngineTestPeer::residency_moves(eng) - base;
@@ -783,13 +791,19 @@ struct PlayedExport {
          * run that ends here would leave it) and writes the file. */
         export_rc = EngineTestPeer::export_calibration(eng);
         played    = clean_played(cfg.draft_profile_out);
+
+        /* The staged bracket is not folded into a clean one: once the flush has closed it, the
+         * table holds it with the placement flag, and the export has dropped it from the file
+         * while the played cycles stayed. */
+        for (const auto& b : s.draft_costs().buckets())
+            if (b.flags & kDraftSamplePlacement) staged_samples += b.n;
         return RAD_OK;
     }
 };
 
 TEST(a_reference_calibration_exports_the_cycles_the_run_played) {
     constexpr int kExperts = 48;   /* the freeze case's plan: a pooled unit the heat promotes */
-    constexpr int kCycles  = 10;   /* long enough for that promotion to land inside a bracket */
+    constexpr int kCycles  = 10;   /* clean played cycles; one staged bracket follows them */
 
     {
         PlayedExport ref(kExperts, /*reference*/ true);
@@ -797,7 +811,9 @@ TEST(a_reference_calibration_exports_the_cycles_the_run_played) {
         REQUIRE_EQ(ref.export_rc, RAD_OK);
         CHECK_EQ(ref.moves, (int64_t)0);   /* the freeze: the placement never moved */
         CHECK_EQ(ref.played, kCycles);
-
+        /* The stager's bracket is recorded with the flag and left out of the file: the freeze
+         * narrows which cycles are marked, it does not make every played cycle exportable. */
+        CHECK_EQ(ref.staged_samples, 1);
         std::ifstream in(ref.cfg.draft_profile_out, std::ios::binary);
         REQUIRE(in.good());
         nlohmann::json j;
@@ -815,9 +831,10 @@ TEST(a_reference_calibration_exports_the_cycles_the_run_played) {
         CHECK_EQ(fp["arena"].get<std::string>(), ref.rt.fingerprint.arena);
         CHECK_EQ(fp["arena"].get<std::string>(), std::string("none"));
 
-        /* Every played decode cycle is in the file, none carrying a placement flag: the samples
-         * fold by shape (the first cycle verified nothing, the following ones the window the cycle
-         * before published). */
+        /* Every clean played decode cycle is in the file, none carrying a placement flag: the
+         * samples fold by shape (the first cycle verified nothing, the following ones the window
+         * the cycle before published). The staged bracket is not here -- the table's copy is the
+         * CHECK above. */
         for (const auto& b : j["buckets"]) {
             if (b["shape"]["prefill_tokens"].get<int>() != 0) continue;
             CHECK(b["flags"].empty());
