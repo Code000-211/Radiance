@@ -197,6 +197,27 @@ struct Model {
 
 static Model g_model[MAX_RANKS];
 
+/* The sizing declare's own Model. A sizing declare (`RadBuildCtx::shape_probe`) runs after the
+ * real one and would otherwise reset and refill `g_model`, which `step()` reads for the whole
+ * run: the buffers, weights and per-layer handles the real declare resolved. It is thread-local
+ * since the engine declares every rank's level on its own thread, and each such thread owns the
+ * one Model its declares write. */
+#if QWEN35_MOE
+static thread_local Model g_probe;
+#endif
+
+/* Which Model a declare writes. Only the routed build answers a sizing declare (probe() below
+ * sets shape_probe_ok under QWEN35_MOE); the dense and int8 builds keep the real one, so their
+ * output is unchanged. */
+static Model& declare_target(const RadBuildCtx* ctx) {
+#if QWEN35_MOE
+    if (ctx->shape_probe) return g_probe;
+#else
+    (void)ctx;
+#endif
+    return g_model[ctx->rank];
+}
+
 /* Checks the container's statement of its format, since every mismatch is silent: a
  * `weight_block_size` of [64,64] against kernels that shift by 7 reads the right bytes with the
  * wrong gain, and e5m2 decoded as e4m3 gives merely implausible numbers. A container that states
@@ -429,7 +450,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = declare_target(ctx);
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1242,6 +1263,13 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+#if QWEN35_MOE
+    /* The routed build declares the same graph at any step size: declare() reads the step's rows
+     * from the build context alone and writes them into its own Model, which is what lets
+     * Engine::probe_arena_levels hold a sizing declare against the real one. plan_level still
+     * decides per level -- a buffer set or an extent that differs refuses it there, not here. */
+    out->shape_probe_ok = 1;
+#endif
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);

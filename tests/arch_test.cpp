@@ -6475,6 +6475,96 @@ TEST(qwen35moe_fp8_routes_every_expert_and_folds_the_shared_arm) {
     }
 }
 
+/* The routed build answers a sizing declare, which is what gives a profile its arena levels.
+ *
+ * Engine::probe_arena_levels declares the plugin again at a smaller step (RadBuildCtx::shape_probe)
+ * whenever probe() reports shape_probe_ok; plan_level() keeps the answer only if it names the same
+ * buffers and the same ops with no extent outside the row dimension growing. Until this plugin
+ * answered, every identity the tree wrote said `arena "none"`.
+ *
+ * This case pins the two things that make it true:
+ *   1. the sizing declare leaves the real declare's Model alone -- `step()` reads it all run;
+ *   2. it names the same buffers and the same ops, with only the rows smaller.
+ * The dense build keeps its own answer below: probe() reports no level plan there, so a dense
+ * qwen35 deployment gains nothing from this and its identity is unchanged. */
+TEST(the_routed_qwen35_declares_its_graph_at_a_smaller_step) {
+    MetaKV mk = q35moe_meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen35moe_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.shape_probe_ok, 1);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok  = 512;
+    c.max_seqs = 4;
+    c.max_spec = 2;
+    c.max_ctx  = 4096;
+    RadBuilder full;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&full, mk.meta(), &c), RAD_OK);
+
+    const qwen35moe_fp8::Model& m = qwen35moe_fp8::g_model[0];
+    const int64_t    real_tok    = m.g.max_tok;
+    const size_t     real_layers = m.layers.size();
+    const rad_buf    real_x      = m.b_x;
+    const rad_weight real_tok_w  = m.w_tok;
+    REQUIRE_EQ(real_tok, (int64_t)512);
+    CHECK(real_layers > 0);
+    const size_t real_ops = full.ops.size();
+
+    RadBuildCtx p = c;
+    p.max_tok     = 256;
+    p.shape_probe = 1;
+    RadBuilder small;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&small, mk.meta(), &p), RAD_OK);
+
+    /* 1. The step's state is still the real declare's: same rows, same handles. */
+    CHECK_EQ(m.g.max_tok, real_tok);
+    CHECK_EQ(m.layers.size(), real_layers);
+    CHECK_EQ(m.b_x, real_x);
+    CHECK_EQ(m.w_tok, real_tok_w);
+    CHECK_EQ(full.ops.size(), real_ops);
+
+    /* 2. The same graph and the same buffers, only rows smaller. */
+    REQUIRE_EQ(small.ops.size(), full.ops.size());
+    for (size_t i = 0; i < full.ops.size(); ++i) {
+        CHECK_EQ(small.ops[i].op, full.ops[i].op);
+        REQUIRE_EQ(small.ops[i].p.size(), full.ops[i].p.size());
+        for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
+            const RecParam& a = full.ops[i].p[k];
+            const RecParam& q = small.ops[i].p[k];
+            if (a.kind == RAD_P_RANGE) continue;   /* the step's rows, which plan_level checks */
+            if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval)
+                fprintf(stderr, "    op %zu '%s' param '%s' differs: %lld at 512, %lld at 256\n",
+                        i, full.ops[i].op.c_str(), a.key.c_str(), a.ival, q.ival);
+            CHECK_EQ(a.ival, q.ival);
+            CHECK_EQ(a.sval, q.sval);
+            CHECK_EQ(a.dval, q.dval);
+        }
+    }
+    REQUIRE_EQ(small.bufs.size(), full.bufs.size());
+    int shrank = 0;
+    for (size_t i = 0; i < full.bufs.size(); ++i) {
+        const RadBufDecl& f = full.bufs[i].d;
+        const RadBufDecl& q = small.bufs[i].d;
+        CHECK_EQ(small.bufs[i].name, full.bufs[i].name);
+        CHECK_EQ(q.kind, f.kind);
+        CHECK_EQ(q.domain, f.domain);
+        CHECK_EQ(q.dtype, f.dtype);
+        CHECK_EQ(q.rank, f.rank);
+        for (uint32_t d = 1; d < f.rank; ++d) CHECK_EQ(q.shape[d], f.shape[d]);
+        CHECK(q.shape[0] <= f.shape[0]);
+        shrank += q.shape[0] < f.shape[0];
+    }
+    CHECK(shrank > 0);
+}
+
+/* The dense build declares no level plan: its identity and its step stay as they were. */
+TEST(the_dense_qwen35_keeps_its_identity) {
+    MetaKV mk = q35fp8_meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.shape_probe_ok, 0);
+}
+
 /* The routed model's engine steps, its routed MTP head included, lint clean at one and two
  * ranks. */
 TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
