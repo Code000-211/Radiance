@@ -249,14 +249,20 @@ int price(void*, const DraftVerifyShape& s, DraftCostEstimate* out) {
 }
 
 /* Turn the cost policy on through the seam the engine will use: the scheduler passes its own
- * params, the test only adds what Config cannot express yet. */
-void use_cost_policy(Fixture& f, Predictions& pred) {
+ * params, the test only adds what Config cannot express yet. A test that needs depths the default
+ * tiers cannot name passes its own. */
+void use_cost_policy(Fixture& f, Predictions& pred, const int32_t* tiers = nullptr,
+                     int n_tiers = 0) {
     DraftController::Params dp = f.sch.draft().params();
     dp.policy.mode     = DraftPolicyMode::Cost;
     dp.policy.tiers[0] = 0;
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 6;
     dp.policy.n_tiers  = 3;
+    if (tiers) {
+        for (int i = 0; i < n_tiers; ++i) dp.policy.tiers[i] = tiers[i];
+        dp.policy.n_tiers = n_tiers;
+    }
     dp.policy.hold     = 0;      /* a single-cycle test must not wait 8 cycles for a move */
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
@@ -591,6 +597,96 @@ TEST(a_history_only_rows_watermark_needs_its_pass) {
     CHECK(f.sch.find(id)->n_computed > hist_end);
     f.sch.serial_end(0);
     CHECK_EQ(f.sch.draft_watermark(id), hist_end);
+}
+
+/* ================================================================== the rounds thin by depth */
+
+/* M2: a round runs only the rows that still have a draft at its depth, and the snapshot is
+ * ordered deepest first, so every round's rows are a prefix of the one before. The plan here is
+ * issued in an order the depths contradict (2, 1, 3 and one K0 row), so plan order alone would
+ * put the shallowest row in every round.
+ *
+ * Round 0 is the history pass and carries round 1 for the drafting rows (RadBatch::draft_out_ids);
+ * round 1 has no pass of its own. Rounds 2 and 3 are the driver's own count, not `round == K`. */
+TEST(a_round_runs_only_the_rows_that_still_have_a_draft) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t a = f.submit(160), b = f.submit(170), c = f.submit(180), d = f.submit(190);
+    pred.set(a, { 0.9f, 0.9f, 0.01f });                    /* two drafts pay */
+    pred.set(b, { 0.9f, 0.01f });                          /* one */
+    pred.set(c, { 0.9f, 0.9f, 0.9f, 0.01f });              /* three */
+    pred.set(d, { 0.01f });                               /* none: history only */
+    const int32_t tiers[4] = { 0, 1, 2, 3 };
+    use_cost_policy(f, pred, tiers, 4);
+
+    f.prefill(a);
+    f.prefill(b);
+    f.prefill(c);
+    f.prefill(d);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, a), 2);
+    CHECK_EQ(planned(f.sch, b), 1);
+    CHECK_EQ(planned(f.sch, c), 3);
+    CHECK_EQ(planned(f.sch, d), 0);
+    const StepEntry* ea = entry_of(f.sch, a);
+    const StepEntry* eb = entry_of(f.sch, b);
+    const StepEntry* ec = entry_of(f.sch, c);
+    const StepEntry* ed = entry_of(f.sch, d);
+    REQUIRE(ea && eb && ec && ed);
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    const int n = f.sch.serial_begin(&rounds, rows, 6);
+    CHECK_EQ(rounds, 3);                  /* the deepest row's depth, not the ceiling */
+    REQUIRE(n == 3);                      /* the K0 row drafts nothing */
+    CHECK_EQ(rows[0].seq, c);
+    CHECK_EQ(rows[1].seq, a);
+    CHECK_EQ(rows[2].seq, b);
+    for (int i = 0; i < n; ++i) {
+        const StepEntry* e = entry_of(f.sch, rows[i].seq);
+        REQUIRE(e != nullptr);
+        CHECK_EQ(rows[i].slot, e->slot);
+    }
+
+    /* Round 0: the three drafting rows in that order, then the K0 row's history. Each row's
+     * history starts at its own committed end, which identifies it. */
+    const RadBatch* r0 = f.sch.serial_batch(0, 1);
+    REQUIRE(r0 != nullptr);
+    CHECK_EQ(r0->n_seq, 4);
+    CHECK_EQ(r0->n_draft_out, 3);          /* round 1 for each drafting row */
+    CHECK_EQ(r0->ctx_lens[0], ec->ctx_len);
+    CHECK_EQ(r0->ctx_lens[1], ea->ctx_len);
+    CHECK_EQ(r0->ctx_lens[2], eb->ctx_len);
+    CHECK_EQ(r0->ctx_lens[3], ed->ctx_len);
+    CHECK(f.sch.serial_batch(1, 2) == nullptr);   /* carried by round 0 */
+
+    /* Round 2: the rows at K >= 2, still deepest first. */
+    const RadBatch* r2 = f.sch.serial_batch(2, 3);
+    REQUIRE(r2 != nullptr);
+    CHECK_EQ(r2->n_seq, 2);
+    CHECK_EQ(r2->ctx_lens[0], ec->ctx_len + 1);
+    CHECK_EQ(r2->ctx_lens[1], ea->ctx_len + 1);
+
+    /* Round 3: the single K=3 row. */
+    const RadBatch* r3 = f.sch.serial_batch(3, 4);
+    REQUIRE(r3 != nullptr);
+    CHECK_EQ(r3->n_seq, 1);
+    CHECK_EQ(r3->ctx_lens[0], ec->ctx_len + 2);
+
+    /* No row has a fourth draft, so round 4 builds nothing. */
+    CHECK(f.sch.serial_batch(4, 5) == nullptr);
+
+    f.commit_plain(11);
+    f.sch.serial_end(2);                  /* rounds 2 and 3 ran */
+    CHECK_EQ(f.sch.draft_watermark(c), f.sch.find(c)->n_computed);
+    CHECK_EQ(f.sch.draft_watermark(d), f.sch.find(d)->n_computed);   /* its history pass ran */
 }
 
 /* ================================================================== the real limits win */

@@ -2281,16 +2281,36 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.lead       = (int32_t)lead;
         m.base_pos   = head_max;
         m.draft_idx  = can_draft ? n_draft_rows : -1;
+        /* The rounds run to the deepest row; a shallower one stops after its own depth. A row the
+         * plan does not name keeps the snapshot's depth. */
+        const int32_t pk = planned_k(s);
+        m.k = can_draft ? (pk >= 0 && pk < *rounds ? pk : *rounds) : 0;
         serial_.push_back(m);
 
-        if (can_draft) {
-            out[n_draft_rows].seq  = m.seq;
-            out[n_draft_rows].slot = m.slot;
-            out[n_draft_rows].card = m.card;
-            ++n_draft_rows;
-        }
+        if (can_draft) ++n_draft_rows;
     }
-    return n_draft_rows;
+
+    /* A round runs only the rows that still have a draft at its depth, and the driver freezes each
+     * row's depth from the batches it saw. That needs the rows to be a prefix for every round, so
+     * the snapshot is ordered by depth, deepest first, plan order within a depth (draft_idx is
+     * still that order here). Only this snapshot's own draft order changes; the issued plan keeps
+     * its row order. */
+    std::sort(serial_.begin(), serial_.end(), [](const SerialSeq& a, const SerialSeq& b) {
+        const int32_t ka = a.draft_idx >= 0 ? a.k : -1;
+        const int32_t kb = b.draft_idx >= 0 ? b.k : -1;
+        if (ka != kb) return ka > kb;
+        return a.draft_idx < b.draft_idx;
+    });
+    int n = 0;
+    for (SerialSeq& m : serial_) {
+        if (m.draft_idx < 0) continue;
+        m.draft_idx = n;
+        out[n].seq  = m.seq;
+        out[n].slot = m.slot;
+        out[n].card = m.card;
+        ++n;
+    }
+    return n;
 }
 
 const RadBatch* Scheduler::serial_batch(int round, int step) {
@@ -2311,16 +2331,18 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     serial_plan_.tok_shift  = 1;           /* the head's own indexing; see StepPlan::tok_shift */
     serial_plan_.e.reserve(serial_.size());
 
-    /* Drafting sequences first, in draft order, then history-only ones. Every round's rows are
-     * the drafting sequences in that order, and at depth 1 the history pass is the group's last
-     * pass, so its first rows are where the advance that takes the last proposal (ADV_TAKE)
-     * reads them. */
+    /* Drafting sequences first, in draft order (deepest first, see serial_begin), then
+     * history-only ones. Every round's rows are the drafting sequences that have a draft left at
+     * that depth, so each round is a prefix of the one before, and at depth 1 the history pass is
+     * the group's last pass, so its first rows are where the advance that takes the last proposal
+     * (ADV_TAKE) reads them. */
     for (int part = 0; part < 2; ++part)
     for (size_t i = 0; i < serial_.size(); ++i) {
         const SerialSeq& m = serial_[i];
         if ((m.draft_idx >= 0) != (part == 0)) continue;
         if (round == 0 && m.hist_n <= 0) continue;      /* nothing owed for this sequence */
-        if (round > 0 && m.draft_idx < 0) continue;     /* history only: no token to propose */
+        if (round > 0 && (m.draft_idx < 0 || m.k < round))
+            continue;      /* history only, or this row's depth ended before this round */
         const Request* rq = serial_req(m);
         /* Unreachable while reap() defers on block_holds(); if it happens the round is skipped,
          * costing one step's draft. */

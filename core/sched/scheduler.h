@@ -306,9 +306,11 @@ public:
      *               Says which sequences may draft, reserves lookahead KV up to the furthest
      *               position acceptance could reach, and clamps `rounds` to the current depth.
      *   serial_batch   one batch per pass: 0 is the history, which also carries round 1 for the
-     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. Rows continuing
-     *               a sampled verify are device rows (advance.h): the card fills their positions
-     *               and tokens, so no pass waits on the host.
+     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. A round runs only
+     *               the rows whose frozen K reaches it, deepest first, so every round's rows are a
+     *               prefix of the snapshot and a row's depth is the last round it was in. Rows
+     *               continuing a sampled verify are device rows (advance.h): the card fills their
+     *               positions and tokens, so no pass waits on the host.
      *   serial_end     after commit(), with the rounds that ran: moves the history watermark.
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
      *               keeps n_draft 0 and the n-gram drafter fills in.
@@ -607,6 +609,9 @@ private:
         /* Its index among the drafting rows, or -1 for a row that only owes history (e.g. a
          * sequence mid-prompt, with hidden states but no token to draft from). */
         int32_t        draft_idx = -1;
+        /* The depth this cycle gave the row, fixed at serial_begin: draft round r > 1 runs only
+         * the rows with k >= r, and the driver freezes each row's depth from the rounds it saw. */
+        int32_t        k = 0;
         /* No Request* here, as for BlockSeq: serial_batch reads serial_ after the lock was
          * released and retaken. */
         /* The furthest position round 1 can write at: the verify step's last position, reached
