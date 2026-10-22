@@ -487,6 +487,7 @@ void DraftCostTable::clear() {
     ignored_ = 0;
     capacity_ = 0;
     active_ = false;
+    fallback_admitted_ = false;
 }
 
 int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRuntime& runtime,

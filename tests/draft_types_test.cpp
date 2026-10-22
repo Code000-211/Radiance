@@ -424,9 +424,11 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     rows[0].generated = 3; rows[0].published = 3; rows[0].verified = 3;
     rows[0].accepted = 2; rows[0].checked = 3; rows[0].raw_match = 2;
     rows[0].end = DraftSeqEnd::Rejected; rows[0].origin = DraftOrigin::Head;
+    rows[0].label_origin = DraftOrigin::Head; rows[0].label_generated = 3;
     rows[1].generated = 3; rows[1].published = 3; rows[1].verified = 3;
     rows[1].accepted = 1; rows[1].checked = 2; rows[1].raw_match = 1;
     rows[1].end = DraftSeqEnd::Rejected; rows[1].origin = DraftOrigin::Head;
+    rows[1].label_origin = DraftOrigin::Head; rows[1].label_generated = 3;
 
     DraftObservation obs;
     obs.cycle_id = f.view.cycle_id;
@@ -529,9 +531,11 @@ TEST(a_cycle_stays_deliverable_across_preemption_recycle_and_resume) {
     rows[0].generated = 2; rows[0].published = 2; rows[0].verified = 2;
     rows[0].accepted = 2; rows[0].checked = 2; rows[0].raw_match = 2;
     rows[0].end = DraftSeqEnd::AllAccepted; rows[0].origin = DraftOrigin::Head;
+    rows[0].label_origin = DraftOrigin::Head; rows[0].label_generated = 2;
     rows[1].generated = 1; rows[1].published = 1; rows[1].verified = 1;
     rows[1].accepted = 0; rows[1].checked = 1; rows[1].raw_match = 0;
     rows[1].end = DraftSeqEnd::Rejected; rows[1].origin = DraftOrigin::Head;
+    rows[1].label_origin = DraftOrigin::Head; rows[1].label_generated = 1;
 
     DraftObservation obs;
     obs.cycle_id = ring_plan.cycle_id;
@@ -590,6 +594,7 @@ TEST(a_plan_from_an_older_policy_stays_observable_while_it_is_alive) {
     row.generated = 2; row.published = 2; row.verified = 2;
     row.accepted = 1; row.checked = 2; row.raw_match = 1;
     row.end = DraftSeqEnd::Rejected; row.origin = DraftOrigin::Head;
+    row.label_origin = DraftOrigin::Head; row.label_generated = 2;
     DraftObservation obs;
     obs.cycle_id = f.plan.cycle_id;
     obs.policy_version = f.plan.policy_version;
@@ -648,6 +653,7 @@ TEST(a_rows_origin_is_the_plans_permission_not_a_side_list) {
         r.generated = 2; r.published = 2; r.verified = 2;
         r.accepted = 1; r.checked = 2; r.raw_match = 1;
         r.end = DraftSeqEnd::Rejected; r.origin = DraftOrigin::Head;
+        r.label_origin = DraftOrigin::Head; r.label_generated = 2;
     }
     CHECK(draft_origin_fits_plan(f.plan, 0, rows[0]));
     CHECK(draft_origin_fits_plan(f.plan, 1, rows[1]));
@@ -674,6 +680,7 @@ TEST(a_rows_origin_is_the_plans_permission_not_a_side_list) {
     rows[1].generated = 0; rows[1].published = 0; rows[1].verified = 0;
     rows[1].accepted = 0; rows[1].checked = 0; rows[1].raw_match = 0;
     rows[1].end = DraftSeqEnd::AllAccepted;
+    rows[1].label_origin = DraftOrigin::None; rows[1].label_generated = 0;
     CHECK(draft_origin_fits_plan(f.plan, 1, rows[1]));
     CHECK(draft_observation_deliverable(obs));
 
@@ -859,6 +866,7 @@ TEST(the_delivery_and_attribution_gates_refuse_a_plan_that_fails_its_own_check) 
     row.generated = 3; row.published = 3; row.verified = 3;
     row.accepted = 2; row.checked = 3; row.raw_match = 2;
     row.end = DraftSeqEnd::Rejected; row.origin = DraftOrigin::Head;
+    row.label_origin = DraftOrigin::Head; row.label_generated = 3;
     DraftObservation obs;
     obs.cycle_id = f.plan.cycle_id;
     obs.policy_version = f.plan.policy_version;
@@ -928,6 +936,81 @@ TEST(an_origin_is_bounded_by_the_draft_budget_it_claims) {
     row.generated = RAD_SCHED_MAX_SPEC + 1;
     row.published = RAD_SCHED_MAX_SPEC + 1;
     CHECK(!draft_seq_observation_valid(row));
+}
+
+TEST(the_labels_are_bounded_by_the_window_their_own_origin_verified) {
+    /* The bound is per row and per provenance, not per union of the two candidate windows: at
+     * depth > 0 the head's labels come from the frozen verify_k while the lookup fallback fills in
+     * the step that verifies it, so a union would admit a lookup row at the frozen window and a
+     * head row at the deepest row's K. */
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 3;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+    CHECK_EQ(f.plan.k[0], 3);
+
+    uint64_t req[1] = { 1 };
+    int32_t slot[1] = { 0 };
+    uint32_t gen[1] = { 1 };
+    DraftSeqObservation row;
+    row.generated = 3; row.published = 3; row.verified = 3;
+    row.accepted = 3; row.checked = 3; row.raw_match = 3;
+    row.end = DraftSeqEnd::AllAccepted; row.origin = DraftOrigin::Head;
+    row.label_origin = DraftOrigin::Head; row.label_generated = 3;
+    DraftObservation obs;
+    obs.cycle_id = f.plan.cycle_id;
+    obs.policy_version = f.plan.policy_version;
+    obs.n_seq = 1; obs.cap = 1;
+    obs.plan = &f.plan;
+    obs.req_id = req; obs.slot = slot; obs.slot_gen = gen;
+    obs.seq = &row; obs.complete = true;
+
+    /* Depth 0: the plan drafts and verifies the same K, so that is the head's window. */
+    CHECK(draft_observation_deliverable(obs));
+    row.verified = 4;
+    CHECK(!draft_observation_deliverable(obs));   /* one past the window it verified */
+    row.verified = 3;
+    row.label_generated = 4;
+    CHECK(!draft_observation_deliverable(obs));   /* labels from wider than that window */
+    row.label_generated = 3;
+
+    /* A row the verified window did not draft consumed no window at all, whatever its plan did. */
+    row.label_origin = DraftOrigin::None; row.label_generated = 0;
+    CHECK(!draft_observation_deliverable(obs));
+    row.verified = 0; row.checked = 0; row.accepted = 0; row.raw_match = 0;
+    row.end = DraftSeqEnd::Stopped;
+    CHECK(draft_observation_deliverable(obs));
+
+    /* Depth 1: the head's labels were verified by the paired step over the frozen verify_k, which
+     * an ahead plan may set apart from what it drafts. */
+    f.plan.pipeline_depth = 1;
+    f.plan.verify_k = 2;
+    row.label_origin = DraftOrigin::Head; row.label_generated = 2;
+    row.verified = 2; row.checked = 2; row.accepted = 2; row.raw_match = 2;
+    row.end = DraftSeqEnd::AllAccepted;
+    CHECK(draft_observation_deliverable(obs));
+    row.verified = 3; row.checked = 3; row.accepted = 3; row.raw_match = 3;
+    CHECK(!draft_observation_deliverable(obs));   /* past the frozen window, not past k[i] */
+
+    /* A deeper frozen window is legal ahead, and the head row follows it -- but no further. */
+    f.plan.verify_k = 5;
+    CHECK(draft_observation_deliverable(obs));
+    row.label_generated = 6;
+    CHECK(!draft_observation_deliverable(obs));
+
+    /* The lookup fallback is not published ahead: it fills in the step that verifies it, so its
+     * window stays k[i] even when the frozen verify_k is deeper. */
+    f.plan.fill[0] = DraftDrafter::Ngram;
+    row.origin = DraftOrigin::Lookup; row.label_origin = DraftOrigin::Lookup;
+    row.label_generated = 3;
+    CHECK(draft_observation_deliverable(obs));
+    row.verified = 4;
+    CHECK(!draft_observation_deliverable(obs));   /* the frozen window is not the lookup's */
+    f.plan.pipeline_depth = 0;
+    f.plan.verify_k = 3;
+    row.verified = 3;
+    CHECK(draft_observation_deliverable(obs));   /* depth 0: k[i] is the window either way */
 }
 
 TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {

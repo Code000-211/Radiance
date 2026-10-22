@@ -127,6 +127,9 @@ void activate_costs(Fixture& f) {
     rt.fingerprint = p.fingerprint;
     CHECK_OK(f.sch.draft_costs().configure(p, rt));
     REQUIRE(f.sch.draft_costs().active());
+    /* Matching is not admission: an empty profile has no price for any shape, so the deployment
+     * says in so many words that Cost may run on the policy's named baseline (scheduler.cpp). */
+    f.sch.draft_costs().admit_fallback();
 }
 
 /* The plan's scalars for one cycle, copied: the controller's storage moves with the next open. */
@@ -1696,6 +1699,67 @@ TEST(the_cost_policy_is_wired_through_config_and_observes_each_cycle_exactly_onc
     CHECK_EQ(st->n[3], 0);
 }
 
+/* An idle step loop opens no next cycle: without a delivery at that point, the last cycle a running
+ * server measured would wait for shutdown, and the slots its rows name may be recycled first. This
+ * drives exactly that path -- a fully measured cycle, the engine's idle call, then the request
+ * leaving -- and the second half shows a cycle no later open can finish is counted, not left in
+ * flight. */
+TEST(an_idle_engine_delivers_its_last_measured_cycle_before_the_slot_is_recycled) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);   /* measured, but no next open has delivered it */
+    const int64_t dropped0 = f.sch.draft_cycles_dropped();
+
+    f.sch.draft_ring_idle();
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
+
+    /* Before the slot is recycled: the request leaving after the delivery cannot retract it, and
+     * the retired record is not counted again. */
+    CHECK_OK(f.sch.cancel(id));
+    f.sch.draft_ring_idle();
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
+}
+
+TEST(an_idle_engine_counts_a_cycle_no_later_open_can_finish_as_discarded) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    const int64_t dropped0 = f.sch.draft_cycles_dropped();
+
+    /* Opened, but its verify never committed -- and no next open will come. */
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.draft_ring_idle();
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0 + 1);
+
+    f.sch.draft_ring_idle();   /* idempotent: the record is retired */
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0 + 1);
+}
+
 /* Preemption by recompute keeps the slot and its generation (only add() bumps it), so B's per-slot
  * estimate is the same request's after the resume. The cycle whose row left before its verify,
  * though, never completes: it is counted, not delivered with a hole. */
@@ -1913,6 +1977,37 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
     const std::string refused =
         stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
     CHECK(has(refused, "no admissible cost baseline"));
+
+    /* A matching profile with no measured bucket is the reader's proof that it found the runtime,
+     * not the deployment's admission that Cost may price nothing: the profile alone is refused by
+     * name, so a forgotten admission cannot look like a loaded baseline. */
+    {
+        DraftCostProfile p;
+        p.fingerprint.model     = "test";
+        p.fingerprint.quant     = "q";
+        p.fingerprint.tp_wire   = "w";
+        p.fingerprint.gpus      = "g";
+        p.fingerprint.kernels   = "k";
+        p.fingerprint.kv_format = "bf16";
+        p.fingerprint.placement = "all_vram";
+        p.fingerprint.tp        = 1;
+        DraftCostRuntime rt;
+        rt.fingerprint = p.fingerprint;
+        CHECK_OK(f.sch.draft_costs().configure(p, rt));
+        REQUIRE(f.sch.draft_costs().active());
+        REQUIRE(f.sch.draft_costs().buckets().empty());
+        CHECK(!f.sch.draft_costs().fallback_admitted());
+        const std::string empty =
+            stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+        CHECK(has(empty, "no measured bucket"));
+
+        /* clear() resets the admission with the rest of the table, so an earlier deployment's
+         * admission cannot reappear under a new profile. */
+        f.sch.draft_costs().admit_fallback();
+        CHECK(f.sch.draft_costs().fallback_admitted());
+        f.sch.draft_costs().clear();
+        CHECK(!f.sch.draft_costs().fallback_admitted());
+    }
 
     activate_costs(f);
     CHECK_OK(f.start());

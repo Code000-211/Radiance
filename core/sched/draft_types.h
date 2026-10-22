@@ -665,15 +665,25 @@ inline bool draft_observation_deliverable(const DraftObservation& o) {
         if (!draft_seq_observation_valid(s)) return false;
         if (!draft_origin_fits_plan(p, i, s)) return false;
         /* The two windows are per-row quantities, not a single K: this row's drafter may only
-         * produce what its own k[i] paid for, and it may only claim positions the paired verify
-         * step actually ran. That window is the frozen previous plan's (`verify_k`) OR, where the
-         * head published nothing and the step filled from the prompt lookup, this plan's own
-         * budget for the row -- the lookup fill is verified in the same step that made it, so a K
-         * raised above the frozen window is legitimate and a complete cycle must not be dropped
-         * for it. Which of the two it was is `label_origin`, not this bound. */
+         * produce what its own k[i] paid for, and it may only claim positions its own provenance's
+         * verify step actually ran. A union of the two candidate windows is not that check: it
+         * admits a head row at the deepest row's K and a lookup row at the frozen plan's window.
+         * The head publishes ahead, so with pipeline_depth > 0 its labels were verified by the
+         * paired step over the frozen `verify_k`, and at depth 0 by the same pass over this row's
+         * k[i] (draft_plan_valid binds verify_k == max_k there). The lookup fills in the step that
+         * verifies it, so its window is k[i]. A None row consumed no window at all. */
+        int32_t window;
+        switch (s.label_origin) {
+            case DraftOrigin::None:   window = 0; break;
+            case DraftOrigin::Head:   window = p.pipeline_depth > 0 ? p.verify_k : p.k[i]; break;
+            case DraftOrigin::Lookup: window = p.k[i]; break;
+            default: return false;
+        }
         if ((int32_t)s.generated > p.k[i]) return false;
-        const int32_t window = p.verify_k > p.k[i] ? p.verify_k : p.k[i];
         if ((int32_t)s.verified > window) return false;
+        /* The labels are what that same window produced, so a row cannot claim a measurement
+         * wider than the window it says it consumed. */
+        if ((int32_t)s.label_generated > window) return false;
         /* One row per request per cycle: two rows for the same request would apply one cycle's
          * gradient to the same state twice. `draft_plan_identifies` already ties row i to row i
          * of the plan, so this only has to catch a plan/view that names one request twice. */

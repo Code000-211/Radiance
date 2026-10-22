@@ -9,7 +9,8 @@ exist and are tested on the host: B's predictor and A's cost table are both fed 
 ring, and the cost policy is opt-in (`--draft-policy cost`; the default stays `legacy`). Cost is
 still inactive without a configured profile: `DraftCostTable::configure` is called by no
 deployment path yet, so `--draft-policy cost` is refused at `Scheduler::init` by name (the
-baseline lock) and every estimate takes its named fallback. The sample path only measures: it
+baseline lock: an active table **and** either a measured bucket or an explicit
+`admit_fallback()`) and every estimate takes its named fallback. The sample path only measures: it
 activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
 
 ## The seam
@@ -248,6 +249,11 @@ prediction and sample.
   `tape_begin`; on the host every pass is unkeyed, so a host regression can prove the step binding
   of the frozen snapshot and the placement bit, not a Play/Record/Audit transition. Those are
   covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly.
+- **The last cycle does not wait for shutdown.** A cycle is delivered at the next cycle's open,
+  and an idle engine opens none -- its slots may even be recycled first. `Engine::step_loop`'s idle
+  branch therefore calls `Scheduler::draft_ring_idle()`, which closes the open record under the
+  step lock: a fully reported cycle reaches the learner there instead of at `shutdown()`/`fini()`,
+  and a record no later open can finish is counted as dropped rather than left in flight.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.
@@ -284,15 +290,16 @@ fabricated success the contracts forbid.
 |------|--------|---------|-------|
 | `--num-speculative-tokens` | N / `auto` | `auto` | existing; 0 = no drafter process |
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
-| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and an active profile for this runtime's fingerprint (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
+| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | profile reader lands with A |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
-`cost` is accepted only with a serial drafter, a valid ceiling contract and an active profile for
-the runtime's fingerprint; unsupported combinations are refused by name, never silently mapped to
-`legacy`. Block drafters are unchanged.
+`cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
+fingerprint, an active profile that has a measured bucket or an explicitly admitted fallback
+baseline; unsupported combinations are refused by name, never silently mapped to `legacy`. Block
+drafters are unchanged.
 The K0 rules are in the plan: K0 with the drafter loaded stays a temporary operating state with
 weights, buffers and arena geometry unchanged (history for the MTP KV/QSA keeps being maintained),
 and it is measured separately from a process started with `--num-speculative-tokens 0` and no
@@ -350,16 +357,26 @@ refused by name, not reinterpreted under the current keys.
 ```
 
 - **Fingerprint.** A profile is valid only when model, quantisation, TP wire and rank count, GPUs,
-  kernel/build stamp and KV format/placement match. A mismatch disables the profile and the policy
-  falls back to the known fixed configuration, naming the mismatch in the log and in the plan.
+  kernel/build stamp and KV format/placement match. `configure()` does not fail on a mismatch: it
+  leaves the table inactive and names the first differing field in `reason()`. That is a visible
+  fallback on a running `legacy` deployment, not a start abort -- `Cost` was never admitted. With
+  `--draft-policy cost` the same mismatch is a start abort: `Scheduler::init` refuses by name (see
+  below), so a Cost deployment never runs on the fixed baseline because its profile silently did
+  not match.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
-  `draft_policy = Cost` unless the cost table is already `active()`, i.e. `configure()` matched a
-  profile to this runtime's fingerprint -- the drafter shape alone (a serial head, a positive
-  ceiling) is not a baseline and never was. A pre-configured table therefore survives `init`
-  instead of being cleared; only an inactive one is cleared. Configuring the table after `init` is
-  not a bootstrap: the policy the scheduler admitted was already chosen under a fallback. The
-  profile reader that fills the runtime fingerprint from the deployment is still the missing
-  production link.
+  `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
+  `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually
+  quote -- at least one measured bucket, or `DraftCostTable::admit_fallback()`. `active()` alone is
+  not the admission: a matching profile with no bucket proves the reader ran, not that anyone
+  accepted pricing every shape with the policy's named fixed baseline. The deployment must say so,
+  in so many words, before `init`; otherwise `init` returns `RAD_E_UNSUPPORTED` with
+  `no measured bucket` (or the profile's `reason()` when the table was never active), so a
+  forgotten admission cannot look like a loaded baseline. The drafter shape alone (a serial head, a
+  positive ceiling) is not a baseline and never was. A pre-configured table therefore survives
+  `init` instead of being cleared; only an inactive one is cleared, and `clear()` drops the
+  admission with the rest of the table. Configuring the table after `init` is not a bootstrap: the
+  policy the scheduler admitted was already chosen under a fallback. The profile reader that fills
+  the runtime fingerprint from the deployment is still the missing production link.
 - **`execution`.** `rectangular` (all N_j equal) and `shrinking` (E2: per-request caps, N_j falling
   with j) produce different kernels and times, so they are different profiles. Changing the
   execution invalidates the old file rather than rescaling it.

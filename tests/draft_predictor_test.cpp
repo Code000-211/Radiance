@@ -380,8 +380,13 @@ TEST(the_labels_teach_by_the_window_they_measured_not_by_the_plans_origin) {
     const float learned = r.state[0].a[0];
 
     /* Lookup -> Head: plan N's row is the head's, but the window it verified was the previous
-     * cycle's lookup fill, which never published. Nothing to learn, and the estimate is intact. */
-    r.arm(10, 6, 6);
+     * cycle's lookup fill, which never published. Nothing to learn, and the estimate is intact.
+     * A row whose label window drafted nothing has verified == 0 -- that is what the None label
+     * means (draft_observation_deliverable), not a window that computed positions it cannot
+     * name. */
+    r.arm(10, 6, 0, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 1,
+          (int)DraftSeqEnd::AllAccepted);
+    r.sobs[0].verified        = 0;
     r.sobs[0].label_origin    = DraftOrigin::None;
     r.sobs[0].label_generated = 0;
     CHECK_OK(r.model.observe(r.obs));
@@ -392,7 +397,9 @@ TEST(the_labels_teach_by_the_window_they_measured_not_by_the_plans_origin) {
 
     /* K0/changing K: a row whose label window drafted nothing teaches nothing, whatever this
      * plan's own K is; the next drafted window learns again, per position. */
-    r.arm(10, 3, 3);
+    r.arm(10, 3, 0, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 1,
+          (int)DraftSeqEnd::AllAccepted);
+    r.sobs[0].verified        = 0;
     r.sobs[0].label_origin    = DraftOrigin::None;
     r.sobs[0].label_generated = 0;
     CHECK_OK(r.model.observe(r.obs));

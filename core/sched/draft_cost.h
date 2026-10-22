@@ -174,6 +174,14 @@ public:
     /* No profile: every estimate is invalid. */
     void clear();
 
+    /* The deployment's explicit admission of an empty baseline: it accepts that Cost runs on the
+     * policy's named fixed baseline until a cycle has been measured. `active()` alone is not that
+     * admission -- a matching profile with no bucket proves the reader ran, not that anyone
+     * accepted pricing without measurements (docs/ADAPTIVE-MTP.md). Cleared by clear(), so a
+     * reset table cannot inherit an earlier deployment's admission. */
+    void admit_fallback() { fallback_admitted_ = true; }
+    bool fallback_admitted() const { return fallback_admitted_; }
+
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
     const std::vector<DraftCostBucket>& buckets() const { return buckets_; }
@@ -221,6 +229,7 @@ private:
     int64_t ignored_ = 0;
     int64_t inactive_ = 0;
     bool active_ = false;
+    bool fallback_admitted_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
                                   const int32_t* round_rows);
