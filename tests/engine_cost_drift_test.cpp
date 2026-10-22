@@ -163,6 +163,9 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     /* The loop ends itself on the latch; stop() only bounds the wait (a no-op once it has). */
     for (int i = 0; i < 30000 && !EngineTestPeer::sched(e).draft_cost_aborted(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const rad::DraftPlan* refused = EngineTestPeer::sched(e).draft().plan();
+    REQUIRE(refused != nullptr);
+    const uint64_t cycle_at_latch = refused->cycle_id;
     EngineTestPeer::stop(e);
     loop.join();
 
@@ -172,11 +175,14 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     CHECK_EQ(EngineTestPeer::sched(e).draft_costs().reason(),
              std::string("residency drifted from the fingerprint's start placement"));
     CHECK(!EngineTestPeer::sched(e).draft_costs().fallback_admitted());
-    /* The plan in force is the last one priced before the move; the refused open priced none,
-     * so the run never drafted at the ceiling (no Fallback plan). */
+    /* The refusal priced nothing: the plan in force when the latch was set is still the one in
+     * force, and nothing is queued, so it names no row. The seam is read asynchronously -- a store
+     * that lands after an iteration's top read lets that one open a further cycle -- so what this
+     * proves is "a cycle after the move was refused", not strictly "the immediately next one". */
     const rad::DraftPlan* p = EngineTestPeer::sched(e).draft().plan();
     REQUIRE(p != nullptr);
-    CHECK(p->source != rad::DraftPlanSource::Fallback);
+    CHECK_EQ(p->cycle_id, cycle_at_latch);
+    CHECK_EQ(p->n_seq, 0);
 }
 
 }  /* namespace */

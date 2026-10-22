@@ -2560,10 +2560,12 @@ TEST(a_promoted_step_after_a_between_brackets_move_is_refused) {
     f.prefill(id);
     f.sch.find(id)->speculation_fixed = true;
 
+    /* The engine's order: this step is built, the next one is issued ahead while it is still open,
+     * it commits, and only then does the promote make the ahead step current. */
     REQUIRE(f.sch.step() != nullptr);
-    f.commit_plain(11);
     f.sch.expect_draft(id, 6);
     REQUIRE(f.sch.step_next() != nullptr);    /* the step issued ahead, with its own plan */
+    f.commit_plain(11);
 
     const DraftPlan* p = f.sch.draft().plan();
     REQUIRE(p != nullptr);
@@ -2676,12 +2678,13 @@ TEST(a_publication_cut_below_the_executed_rounds_keeps_the_executed_extent) {
     /* Cycle A: the plan opens at six; its step verifies nothing (the prefill published nothing). */
     REQUIRE(f.sch.step() != nullptr);
     CHECK_EQ(planned(f.sch, id), 6);
-    f.commit_plain(11);
 
-    /* The step issued ahead is planned to verify three; the head executes six. The publication is
-     * cut to the planned count, and the six rounds it ran stay with the cycle. */
+    /* The step issued ahead is planned to verify three, while the current step is still open; the
+     * head then executes six. The publication is cut to the planned count, and the six rounds it
+     * ran stay with the cycle. */
     f.sch.expect_draft(id, 3);
     REQUIRE(f.sch.step_next() != nullptr);
+    f.commit_plain(11);
     CHECK_OK(f.sch.set_draft(id, six, 6));
     CHECK_EQ(f.sch.find(id)->n_draft, 3);
 

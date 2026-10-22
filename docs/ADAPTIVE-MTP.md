@@ -169,7 +169,9 @@ prediction and sample.
   its verify to the same three. The ring keeps both facts separately: `generated` is what the head
   executed for the row and `published` what the paired step will verify. `draft_cost_observe`
   derives `rounds`/`draft_round_rows[]` from `generated`, so a commit that cut a row's verify
-  below the window it drafted still prices the rounds the bracket timed. A row that executed past
+  below the window it drafted still prices the rounds the bracket timed: a step issued ahead for
+  three that the head ran for six prices six executed rounds, with three published and verified,
+  and the sample's `verify_k` is that three. A row that executed past
   its plan entry is refused by `executed_within_plan` (`RAD_E_INVAL`) and counted as a refusal --
   visibly unpriced, never priced at a window it did not run.
 - **A missing measurement is not zero.** `DraftVerifyShape::unknown` names an absent history,
@@ -275,8 +277,9 @@ prediction and sample.
   `step_finished`, so a move published there would otherwise be seen only by the cycle after the
   one it priced. Once the divergence is noted under `cost`, `draft_cost_cycle()` refuses to open a
   cycle at all: it sets a one-way latch (`draft_cost_aborted`), logs the deactivation reason, and
-  leaves the last plan in force. `step()` returns no plan and `promote_next()` leaves the step
-  issued ahead unexecuted; the engine then ends the run on its existing error path
+  leaves the last plan in force. `step()` returns no plan, and `promote_next()` does not make the
+  step issued ahead current: that work was already issued to the ranks but is never collected or
+  committed. The engine then ends the run on its existing error path
   (`Engine::fail_loop`), which stops the loop, aborts the barrier and calls `Scheduler::shutdown`
   for the work already in flight. It does **not** fall back to the ceiling: with the table inactive
   every price is "not priced", the planner's named fallback would draft at `cfg.n_spec`, and that
