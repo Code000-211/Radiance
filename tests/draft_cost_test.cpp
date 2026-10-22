@@ -256,6 +256,10 @@ DraftCostSample truncated(const DraftVerifyShape& s, int32_t rounds, double ms) 
 
 }  /* namespace */
 
+/* The bucket stores the set of origins its samples verified each row from, as a bit per
+ * DraftOrigin; the file writes it as a '+' join. */
+uint8_t ob(DraftOrigin o) { return (uint8_t)(1u << (unsigned)o); }
+
 TEST(the_reader_accepts_the_documented_profile) {
     /* The format example from docs/ADAPTIVE-MTP.md, verbatim, to check field handling. Its 43.0 ms
      * is the example's own value -- a format sample, not the measured C8 K3 figure; the documented
@@ -1145,9 +1149,8 @@ TEST(the_writer_round_trips_what_the_reader_understood) {
         CHECK_EQ(a.n, b.n);
         CHECK_EQ(a.mean_ms, b.mean_ms);
         CHECK_EQ(a.unc_ms, b.unc_ms);
-        CHECK(b.origins_known);
         for (int32_t j = 0; j < a.shape.n_rows; ++j) {
-            CHECK(a.origins[j] == b.origins[j]);
+            CHECK_EQ(a.origin_set[j], b.origin_set[j]);
             CHECK_EQ(a.shape.rows[j], b.shape.rows[j]);
             CHECK_EQ(a.shape.draft_rows[j], b.shape.draft_rows[j]);
         }
@@ -1168,7 +1171,7 @@ TEST(the_writer_refuses_a_bucket_with_no_captured_origins) {
     b.draft_rows_total = 8;
     b.mean_ms = 10.0;
     b.n = 3;
-    b.origins_known = false;
+    /* origin_set stays at zero: no sample captured one. */
     p.buckets.push_back(b);
 
     std::string text, err;
@@ -1190,8 +1193,7 @@ TEST(the_writer_counts_buckets_whose_flag_it_cannot_name) {
     good.draft_rows_total = 8;
     good.mean_ms = 10.0;
     good.n = 3;
-    good.origins_known = true;
-    for (int32_t j = 0; j < good.shape.n_rows; ++j) good.origins[j] = DraftOrigin::Head;
+    for (int32_t j = 0; j < good.shape.n_rows; ++j) good.origin_set[j] = ob(DraftOrigin::Head);
     p.buckets.push_back(good);
 
     DraftCostBucket truncated_bucket = good;
@@ -1229,8 +1231,7 @@ TEST(write_file_never_overwrites_an_existing_profile) {
     b.draft_rows_total = 4;
     b.mean_ms = 10.0;
     b.n = 3;
-    b.origins_known = true;
-    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origins[j] = DraftOrigin::Head;
+    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origin_set[j] = ob(DraftOrigin::Head);
     p.buckets.push_back(b);
     std::string err;
     const int rc = draft_cost_profile_write_file(path, p, nullptr, &err);
@@ -1276,8 +1277,7 @@ TEST(the_writer_refuses_a_profile_with_no_measured_bucket) {
     diag.draft_rows_total = 4;
     diag.mean_ms = 4.0;
     diag.n = 1;
-    diag.origins_known = true;
-    for (int32_t j = 0; j < diag.shape.n_rows; ++j) diag.origins[j] = DraftOrigin::Head;
+    for (int32_t j = 0; j < diag.shape.n_rows; ++j) diag.origin_set[j] = ob(DraftOrigin::Head);
     diag.flags = kDraftSampleShortened;   /* kept for diagnosis, no name in the file */
     p.buckets.push_back(diag);
     int32_t skipped = 0;
@@ -1301,11 +1301,10 @@ TEST(a_serial_bucket_may_carry_lookup_rows) {
     b.draft_rows_total = 4;
     b.mean_ms = 10.0;
     b.n = 2;
-    b.origins_known = true;
-    b.origins[0] = DraftOrigin::Head;
-    b.origins[1] = DraftOrigin::Lookup;
-    b.origins[2] = DraftOrigin::Lookup;
-    b.origins[3] = DraftOrigin::None;
+    b.origin_set[0] = ob(DraftOrigin::Head);
+    b.origin_set[1] = ob(DraftOrigin::Lookup);
+    b.origin_set[2] = ob(DraftOrigin::Lookup);
+    b.origin_set[3] = ob(DraftOrigin::None);
     p.buckets.push_back(b);
 
     std::string text, err;
@@ -1313,12 +1312,96 @@ TEST(a_serial_bucket_may_carry_lookup_rows) {
     DraftCostProfile q;
     CHECK_EQ(draft_cost_profile_parse(text, &q, &err), RAD_OK);
     CHECK_EQ((int)q.buckets.size(), 1);
-    CHECK(q.buckets[0].origins[1] == DraftOrigin::Lookup);
+    CHECK(q.buckets[0].origin_set[1] == ob(DraftOrigin::Lookup));
 
     /* A head row under an n-gram-only bucket is still refused: the head was not the drafter. */
     p.buckets[0].shape.drafter = DraftDrafter::Ngram;
     CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
     CHECK(err.find("origins do not fit") != std::string::npos);
+}
+
+/* Two cycles in one bucket need not agree on where a row's window came from: the head drops it in
+ * one and the lookup fallback fills it in the next, with the same executed distribution. A single
+ * value per row would either pick one sample's mix or throw the whole export away over a
+ * difference that is not part of the key. The set keeps both, and the file says so. */
+TEST(a_bucket_whose_samples_disagree_on_a_rows_origin_keeps_both) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket b;
+    b.shape = query(0, 4, 1, { 0, 4 });
+    b.rounds = 1;
+    b.draft_round_rows[1] = 4;
+    b.draft_rows_total = 4;
+    b.mean_ms = 10.0;
+    b.n = 2;
+    b.origin_set[0] = ob(DraftOrigin::Head) | ob(DraftOrigin::Lookup);
+    b.origin_set[1] = ob(DraftOrigin::Lookup);
+    b.origin_set[2] = ob(DraftOrigin::Head);
+    b.origin_set[3] = ob(DraftOrigin::None);
+    p.buckets.push_back(b);
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_OK);
+    CHECK(text.find("\"head+lookup\"") != std::string::npos);
+
+    DraftCostProfile q;
+    CHECK_EQ(draft_cost_profile_parse(text, &q, &err), RAD_OK);
+    REQUIRE(q.buckets.size() == 1);
+    CHECK_EQ((int)q.buckets[0].origin_set[0], (int)(ob(DraftOrigin::Head) | ob(DraftOrigin::Lookup)));
+    /* Read -> write round-trips the set, order and all. */
+    std::string again;
+    CHECK_EQ(draft_cost_profile_write(q, &again, nullptr, &err), RAD_OK);
+    CHECK_EQ(again, text);
+
+    /* The set still answers to the drafter: a head bit under an n-gram bucket is refused. */
+    p.buckets[0].shape.drafter = DraftDrafter::Ngram;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
+    CHECK(err.find("origins do not fit") != std::string::npos);
+
+    /* And an unnameable member is malformed, not a mix to guess at. */
+    json bad = json::parse(again);
+    bad["buckets"][0]["shape"]["origins"][0] = "head+speculative";
+    CHECK_EQ(draft_cost_profile_parse(bad.dump(), &q, &err), RAD_E_INVAL);
+    CHECK(has(err, "unknown origin"));
+}
+
+/* The same at the table's recording seam: two samples of one bucket naming different origins widen
+ * the set instead of dropping the bucket and costing the caller the whole profile. */
+TEST(the_table_widens_the_origin_set_instead_of_dropping_the_bucket) {
+    DraftCostTable t;
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    rt.execution = p.execution;
+    REQUIRE(t.configure(p, rt) == RAD_OK);
+
+    const DraftVerifyShape shape = query(0, 4, 1, { 0, 4 });
+    const PlanFixture pf = plan_for(shape);
+    DraftCostSample s = sample_of(shape, 10.0);
+    s.origins_valid = true;
+    for (int32_t i = 0; i < shape.n_rows; ++i) s.origins[i] = DraftOrigin::Head;
+
+    CHECK_EQ(t.observe(completed_cycle(pf), s), RAD_OK);
+    s.origins[1] = DraftOrigin::Lookup;   /* the fallback filled row 1 this cycle */
+    CHECK_EQ(t.observe(completed_cycle(pf), s), RAD_OK);
+
+    const std::vector<DraftCostBucket>& bs = t.buckets();
+    REQUIRE(bs.size() == 1);
+    CHECK_EQ(bs[0].n, 2);
+    CHECK_EQ((int)bs[0].origin_set[1], (int)(ob(DraftOrigin::Head) | ob(DraftOrigin::Lookup)));
+    CHECK_EQ((int)bs[0].origin_set[0], (int)ob(DraftOrigin::Head));
+
+    /* And that bucket writes: the export is not lost over the difference. */
+    DraftCostProfile out;
+    out.fingerprint = p.fingerprint;
+    out.execution = p.execution;
+    out.buckets = bs;
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(out, &text, nullptr, &err), RAD_OK);
+    CHECK(text.find("\"head+lookup\"") != std::string::npos);
 }
 
 /* The backend's round model, not this cycle's distribution: a uniform cycle on the serial backend
@@ -1330,8 +1413,7 @@ TEST(a_uniform_bucket_of_a_shrinking_backend_is_still_one_profile) {
     p.execution = DraftCostExecution::Shrinking;
     DraftCostBucket b;
     b.shape = query(0, 4, 2, { 0, 4, 4 });
-    b.origins_known = true;
-    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origins[j] = DraftOrigin::Head;
+    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origin_set[j] = ob(DraftOrigin::Head);
     b.rounds = 2;
     b.draft_round_rows[1] = 4;
     b.draft_round_rows[2] = 4;

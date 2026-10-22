@@ -120,7 +120,7 @@ struct DraftCostRuntime {
  * took, which the execution could not exceed and which therefore bounds it: the bucket's provenance
  * and its upper bound, so a query planning a deeper distribution does not match.
  *
- * The origin mix (`shape.origins` in the file) is validated against the bucket's own drafter and
+ * The origin set (`shape.origins` in the file) is validated against the bucket's own drafter and
  * kept as provenance, but it is not part of the key: DraftVerifyShape has no origins field, so a
  * query could not discriminate on it anyway. See the note on that interface request above.
  *
@@ -131,12 +131,14 @@ struct DraftCostBucket {
     DraftVerifyShape shape;
     uint16_t flags = 0;
     /* The per-row provenance of the verify window the shape describes, captured from the samples
-     * that built it (DraftCostSample::origins). Provenance only, never a key. `origins_known` is
-     * false when no sample captured one or two samples of the same bucket disagreed: no single mix
-     * describes the bucket then, and the writer refuses it rather than picking one. A bucket read
-     * from a file carries the file's mix, so read -> write round-trips it. */
-    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
-    bool        origins_known = false;
+     * that built it (DraftCostSample::origins). Provenance only, never a key. Each row holds the
+     * *set* of origins its window came from -- bit (int)DraftOrigin -- because the cycles behind
+     * one bucket need not agree: the head drops a row in one cycle and the lookup fallback fills
+     * it in the next. A single value per row would either pick one sample's mix or throw the whole
+     * export away over a difference the key does not even see, so the file carries the set
+     * ("lookup", "head+lookup"). A row with no bit at all came from no sample that could name it;
+     * the writer refuses that bucket rather than inventing one. */
+    uint8_t origin_set[RAD_SCHED_MAX_SPEC] = {};
     /* The executed extent. rounds = -1 means "unknown", which matches no query. */
     int32_t  rounds = -1;       /* deepest draft round that actually ran */
     int32_t  draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {};  /* actual N_j, index 0 unused */

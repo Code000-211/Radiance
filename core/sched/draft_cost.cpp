@@ -160,19 +160,20 @@ bool executed_within_plan(const DraftCostSample& s, const DraftPlan& p) {
     return true;
 }
 
-/* The origin mix the file records must fit the drafter the same bucket names. `drafter` is the
+/* The origin set the file records must fit the drafter the same bucket names. `drafter` is the
  * process loaded for the pass (the serial head), and the origins are whose window each verify
  * consumed: a head row needs the head loaded, but a lookup row does not need the lookup to be the
  * only drafter -- the fallback fills any row the head left empty, so a serial deployment's mixed
  * cycles carry both. Requiring the lookup to be the loaded drafter refused the whole export for
  * every such run. A row that produced nothing is None under every drafter. */
-bool origins_fit_drafter(const DraftOrigin* origins, int32_t n_rows, DraftDrafter drafter) {
+uint8_t origin_bit(DraftOrigin o) { return (uint8_t)(1u << (unsigned)o); }
+
+bool origins_fit_drafter(const uint8_t* set, int32_t n_rows, DraftDrafter drafter) {
     for (int32_t i = 0; i < n_rows; ++i) {
-        switch (origins[i]) {
-            case DraftOrigin::None:   break;
-            case DraftOrigin::Head:   if (drafter != DraftDrafter::Serial) return false; break;
-            case DraftOrigin::Lookup: break;
-        }
+        if ((set[i] & origin_bit(DraftOrigin::Head)) && drafter != DraftDrafter::Serial) return false;
+        if (set[i] & ~(origin_bit(DraftOrigin::None) | origin_bit(DraftOrigin::Head) |
+                       origin_bit(DraftOrigin::Lookup)))
+            return false;
     }
     return true;
 }
@@ -223,7 +224,7 @@ int parse_fingerprint(const json& j, DraftCostFingerprint* f, std::string* err) 
     return RAD_OK;
 }
 
-int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, DraftOrigin* origins,
+int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, uint8_t* origins,
                 std::string* err) {
     const std::string where = "buckets[" + std::to_string(idx) + "]: ";
     int32_t ctx = 0;
@@ -301,16 +302,29 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, DraftOrigin* or
     const auto orig = sh.find("origins");
     if (orig == sh.end() || !orig->is_array() || (int32_t)orig->size() != s->n_rows)
         return refuse(err, RAD_E_INVAL, where + "shape.origins: missing or not exactly n_rows long");
+    /* A row names the origin(s) its window came from, joined with '+' when the bucket's samples
+     * disagree. One name is the common case and reads as it always did. */
     static const char* const kOrigin[] = { "none", "head", "lookup" };
     for (int32_t i = 0; i < s->n_rows; ++i) {
         const json& o = (*orig)[(size_t)i];
         if (!o.is_string()) return refuse(err, RAD_E_INVAL, where + "shape.origins: not a string");
         const std::string name = o.get<std::string>();
-        int v = -1;
-        for (int k = 0; k < 3; ++k)
-            if (name == kOrigin[k]) { v = k; break; }
-        if (v < 0) return refuse(err, RAD_E_INVAL, where + "shape.origins: unknown origin \"" + name + "\"");
-        origins[i] = (DraftOrigin)v;
+        uint8_t set = 0;
+        size_t at = 0;
+        while (at <= name.size()) {
+            const size_t plus = name.find('+', at);
+            const std::string part = name.substr(at, plus == std::string::npos ? plus : plus - at);
+            int v = -1;
+            for (int k = 0; k < 3; ++k)
+                if (part == kOrigin[k]) { v = k; break; }
+            if (v < 0)
+                return refuse(err, RAD_E_INVAL,
+                              where + "shape.origins: unknown origin \"" + part + "\"");
+            set |= origin_bit((DraftOrigin)v);
+            if (plus == std::string::npos) break;
+            at = plus + 1;
+        }
+        origins[i] = set;
     }
     if (!origins_fit_drafter(origins, s->n_rows, s->drafter))
         return refuse(err, RAD_E_INVAL, where + "shape.origins: does not fit drafter \"" +
@@ -350,13 +364,12 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
     const std::string where = "buckets[" + std::to_string(idx) + "]: ";
     if (!b.is_object()) return refuse(err, RAD_E_INVAL, where + "not an object");
 
-    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
+    uint8_t origins[RAD_SCHED_MAX_SPEC] = {};
     int rc = parse_shape(b, idx, &out->shape, origins, err);
     if (rc < 0) return rc;
-    /* Kept, not only validated: the writer has to state the mix it read, and a head row does not
+    /* Kept, not only validated: the writer has to state the set it read, and a head row does not
      * price a lookup row. */
-    for (int32_t i = 0; i < out->shape.n_rows; ++i) out->origins[i] = origins[i];
-    out->origins_known = true;
+    for (int32_t i = 0; i < out->shape.n_rows; ++i) out->origin_set[i] = origins[i];
 
     rc = parse_flags(b, idx, &out->flags, err);
     if (rc < 0) return rc;
@@ -543,11 +556,7 @@ json rows_json(const int32_t* rows, int32_t len) {
 int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string* err) {
     const std::string where = "buckets[" + std::to_string(idx) + "]: ";
     const DraftVerifyShape& s = b.shape;
-    if (!b.origins_known)
-        return refuse(err, RAD_E_INVAL,
-                      where + "the samples behind it recorded no origin mix (or two of them "
-                              "disagreed); a writer does not invent provenance");
-    if (!origins_fit_drafter(b.origins, s.n_rows, s.drafter))
+    if (!origins_fit_drafter(b.origin_set, s.n_rows, s.drafter))
         return refuse(err, RAD_E_INVAL, where + "its origins do not fit its drafter");
     if (!draft_shape_priceable(s))
         return refuse(err, RAD_E_INVAL, where + "the shape is not a priceable key");
@@ -575,13 +584,20 @@ int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string
     sh["rows"]           = rows_json(s.rows, s.verify_k + 1);
     sh["draft_k"]        = s.draft_k;
     sh["draft_rows"]     = rows_json(s.draft_rows, s.draft_k + 1);
+    /* A row's set, joined with '+' in the reader's order. One name is the common case. */
     json origins = json::array();
     for (int32_t i = 0; i < s.n_rows; ++i) {
-        const int o = (int)b.origins[i];
-        if (o < 0 || o > 2)
+        const uint8_t set = b.origin_set[i];
+        if (set == 0 || (set & ~0x07u))
             return refuse(err, RAD_E_INVAL, where + "row " + std::to_string(i) +
                                                 " carries no known origin");
-        origins.push_back(kOriginNames[o]);
+        std::string name;
+        for (int k = 0; k < 3; ++k) {
+            if (!(set & origin_bit((DraftOrigin)k))) continue;
+            if (!name.empty()) name += '+';
+            name += kOriginNames[k];
+        }
+        origins.push_back(std::move(name));
     }
     sh["origins"]  = std::move(origins);
     sh["sampling"] = s.sampling == DraftSampling::Sampled ? "sampled" : "greedy";
@@ -889,7 +905,6 @@ DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uin
 void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
     DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_round_rows);
     if (!b) return;
-    const bool fresh = b->n == 0;
     const double x = s.total_ms;
     if (b->n == 0) {
         b->mean_ms = x;
@@ -899,19 +914,11 @@ void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
         b->mean_ms += d / (double)(b->n + 1);
         b->unc_ms = std::max(b->unc_ms, std::fabs(d));
     }
-    /* The origin mix is provenance for the writer, not a key: the first sample states it, and a
-     * later sample of the same bucket that names another mix leaves the bucket without one (the
-     * write refuses it then -- no single mix describes it). */
-    if (fresh) {
-        b->origins_known = s.origins_valid != 0;
-        if (b->origins_known)
-            for (int32_t i = 0; i < s.shape.n_rows; ++i) b->origins[i] = s.origins[i];
-    } else if (b->origins_known) {
-        bool same = s.origins_valid != 0;
-        for (int32_t i = 0; same && i < s.shape.n_rows; ++i)
-            if (b->origins[i] != s.origins[i]) same = false;
-        b->origins_known = same;
-    }
+    /* The origin set is provenance for the writer, not a key: each sample adds the origins its
+     * window came from, and a cycle that filled a row another way widens the row's set instead of
+     * costing the whole export. A sample that captured no origin adds nothing. */
+    if (s.origins_valid)
+        for (int32_t i = 0; i < s.shape.n_rows; ++i) b->origin_set[i] |= origin_bit(s.origins[i]);
     ++b->n;
     if (flags & kDraftSampleAhead) ++b->n_ahead;
     if (s.target_ms >= 0.0 && finite(s.target_ms)) b->target_ms = s.target_ms;

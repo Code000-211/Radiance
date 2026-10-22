@@ -430,12 +430,16 @@ regenerated, never rescaled.
   temporary in the same directory with `O_CREAT|O_EXCL`, fsynced, published with `link()` (so it
   appears whole or not at all and an existing file is never replaced) and its directory is
   synced. A run that measured no bucket is refused by the writer and never published: an empty
-  file would read as a calibration of nothing. A bucket whose origin mix was not captured, or
+  file would read as a calibration of nothing. A bucket whose origin set was not captured, or
   whose rows do not fit its drafter, is not written at all: the serializer refuses rather than
-  inventing `head`. The origin mix follows the drafter that filled each row -- the lookup fallback
+  inventing `head`. The origin set follows the drafter that filled each row -- the lookup fallback
   fills rows the serial head left empty, so a serial bucket may carry `lookup` rows; a `head` row
-  under a lookup-only bucket is still refused. Diagnostic buckets whose flags the file cannot name
-  (truncated and unpriced ones) are left out and counted in the log.
+  under a lookup-only bucket is still refused. A row holds the *set* of origins its window came
+  from, not one: two cycles of one bucket can disagree (the head drops a row in one, the fallback
+  fills it in the next) with the same executed distribution, and the file names both joined with
+  `+` (`head+lookup`) instead of picking a sample or discarding the export. Diagnostic buckets
+  whose flags the file cannot name (truncated and unpriced ones) are left out and counted in the
+  log.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually
@@ -473,8 +477,9 @@ regenerated, never rescaled.
   sampling class, replay state and the loaded drafter. The planned draft distribution
   (`draft_k`, `draft_rows`) and the pipeline depth are part of the key too: the same `rounds` and
   total rows can shrink differently, and an issued-ahead cycle prices a different pair of
-  distributions than a synchronous one. Origins name the mix of rows (`head`, `lookup`); a head
-  row does not price a lookup row. `T(B, maxK)` alone is not a key, and K0 with the head loaded is
+  distributions than a synchronous one. Origins name the mix of rows (`head`, `lookup`, or a
+  `+`-joined set when the bucket's cycles differed); a head row does not price a lookup row.
+  `T(B, maxK)` alone is not a key, and K0 with the head loaded is
   not the same bucket as K0 with no drafter process.
 - **`replay` is stored by name, never by enum number.** `DraftReplay` carries `Unknown` at 0 in
   front of `None`, so a reader that cast the file's index would read a measured `none` as no
