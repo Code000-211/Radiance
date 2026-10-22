@@ -642,6 +642,158 @@ TEST(a_second_serve_does_not_inherit_the_previous_runs_stop) {
     }
 }
 
+/* A stop raised between two serve runs is not swallowed by the next run's start.
+ *
+ * Run 1 ends without a signal -- the drifted ahead pass aborts the step loop and fail_loop stops
+ * the transport -- so the SIGTERM handler stays installed: SA_RESETHAND is spent only by a signal
+ * that actually runs the handler. The SIGTERM below therefore arrives between the runs and sets
+ * the process-global flag. The second run's watcher must consume it and stop; a start that
+ * cleared the flag would swallow the stop and serve a listener nothing can stop, and the bounded
+ * wait below ends this process as that failure. The driver is detached before run 2, so the
+ * serving seam submits nothing: the second run can only end through the carried stop. */
+TEST(a_stop_between_two_serve_runs_stops_the_second) {
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
+                  "(configure -DRAD_WITH_HIP=OFF)");
+    return;
+#endif
+    setenv("ROCR_VISIBLE_DEVICES", "99", 1);
+    setenv("RADIANCE_HOST_VRAM_MIB", "512", 1);
+
+    tiny::TempDir dir("engine_loop_between_runs");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+
+    const std::string profile_path = dir / "between-runs-profile.json";
+    FixtureScope fixture;
+
+    /* Run 1: the drifted ahead pass aborts the step loop, and fail_loop stops the transport. No
+     * signal is raised, so the handler this run installed stays installed after the engine is
+     * gone. The engine is scoped: the second run gets none of the failed run's state, so only the
+     * carried stop can end it. */
+    {
+        Argv argv({ "--model", dir.path,
+                    "--radiance-home", home(),
+                    "--kernels", "libref",
+                    "--debug-accept-reference-kernels",
+                    "--num-speculative-tokens", "6",
+                    "--draft-window", "fixed",
+                    "--draft-policy", "cost",
+                    "--draft-profile", profile_path,
+                    "--max-num-batched-tokens", "64",
+                    "--host", "127.0.0.1",
+                    "--port", "0" });
+        rad::Config cfg;
+        REQUIRE_EQ(rad::config_parse(argv.argc(), argv.argv.data(), &cfg), RAD_OK);
+        REQUIRE(rad::device_is_host());
+
+        Engine e(std::move(cfg));
+        REQUIRE_EQ(e.start(), RAD_OK);
+
+        /* The one legal bucket the cost policy loads, in no shape this fixture plans: the drift,
+         * not a price, is what this run needs. Same fixture as the ahead case. */
+        rad::DraftCostRuntime rt;
+        REQUIRE_EQ(EngineTestPeer::runtime(e, &rt), RAD_OK);
+        {
+            rad::DraftCostProfile prof;
+            prof.fingerprint = rt.fingerprint;
+            prof.execution   = rt.execution;
+            rad::DraftCostBucket b;
+            b.shape.n_rows         = 1;
+            b.shape.verify_k       = 1;
+            b.shape.rows[1]        = 1;
+            b.shape.verify_tokens  = 2;
+            b.shape.history_tokens = 1;
+            b.shape.pipeline_depth = 1;
+            b.shape.draft_k        = 0;
+            b.shape.sampling       = rad::DraftSampling::Greedy;
+            b.shape.replay         = rad::DraftReplay::None;
+            b.shape.drafter        = rad::DraftDrafter::Serial;
+            b.origin_set[0]        = (uint8_t)(1u << (unsigned)rad::DraftOrigin::Head);
+            b.rounds               = 0;
+            b.draft_rows_total     = 0;
+            b.draft_round_rows[0]  = 0;
+            b.mean_ms              = 1.0;
+            b.unc_ms               = 0.1;
+            b.n                    = 1;
+            prof.buckets.push_back(b);
+            int32_t skipped = 0;
+            std::string err;
+            REQUIRE_EQ(rad::draft_cost_profile_write_file(profile_path, prof, &skipped, &err),
+                       RAD_OK);
+            CHECK_EQ(skipped, 0);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_driver.mu);
+            g_driver.engine        = &e;
+            g_driver.req_id        = 1;
+            g_driver.withheld      = false;
+            g_driver.serving       = false;
+            g_driver.submit_rc     = RAD_OK;
+            g_driver.trace.clear();
+            g_driver.ev.clear();
+            g_driver.model_passes.clear();
+            g_driver.ahead_tripped = false;
+            g_driver.trip_ahead    = true;
+        }
+        g_ahead_moves.store(0, std::memory_order_release);
+
+        std::promise<int> first;
+        std::future<int>  first_done = first.get_future();
+        std::thread first_thread([&] { first.set_value(e.serve(nullptr)); });
+        if (first_done.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+            std::fprintf(stderr, "engine_loop_test (between runs): the first serve() did not "
+                                 "return within 60 s after the cost drift:\n%s\n",
+                         trace_text().c_str());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        first_thread.join();
+        CHECK_EQ(first_done.get(), RAD_E_STATE);
+
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine     = nullptr;
+        g_driver.trip_ahead = false;
+    }
+
+    /* Between the runs: the handler run 1 installed is still in place -- SA_RESETHAND is spent
+     * only by a signal that actually ran it -- so this SIGTERM sets the process-global flag. */
+    REQUIRE_EQ(::raise(SIGTERM), 0);
+
+    /* A fresh engine: nothing but the carried stop can end this serve. An entry that clears the
+     * flag swallows the stop, the listener runs, and the bounded wait reports it. */
+    Argv again({ "--model", dir.path,
+                 "--radiance-home", home(),
+                 "--kernels", "libref",
+                 "--debug-accept-reference-kernels",
+                 "--num-speculative-tokens", "3",
+                 "--draft-window", "fixed",
+                 "--max-num-batched-tokens", "64",
+                 "--host", "127.0.0.1",
+                 "--port", "0" });
+    rad::Config cfg2;
+    REQUIRE_EQ(rad::config_parse(again.argc(), again.argv.data(), &cfg2), RAD_OK);
+    Engine e2(std::move(cfg2));
+    REQUIRE_EQ(e2.start(), RAD_OK);
+
+    std::promise<int> second;
+    std::future<int>  second_done = second.get_future();
+    std::thread second_thread([&] { second.set_value(e2.serve(nullptr)); });
+    if (second_done.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+        std::fprintf(stderr, "engine_loop_test (between runs): the second serve() did not return "
+                             "within 60 s after the stop raised between the runs: the stop was "
+                             "swallowed at the run's start and the listener is waiting for "
+                             "another one:\n%s\n", trace_text().c_str());
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    second_thread.join();
+    CHECK_EQ(second_done.get(), RAD_OK);
+}
+
 /* Both endpoints of the history watermark, on one engine started for real.
  *
  * Prompt 192 tokens against 64 a step: two mid-prompt chunks (no logit row and, on this shared head,

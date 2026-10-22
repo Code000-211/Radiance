@@ -19,6 +19,12 @@
 #include <thread>
 #include <vector>
 
+/* The transport's last moment before httplib's accept loop: the socket is bound and the routes are
+ * registered, but is_running_ is not set yet. A stop requested here has no listener to close; the
+ * listener must consume it when it starts. The default is the production no-op; a test binary
+ * links a strong definition that stops exactly here. */
+extern "C" __attribute__((weak)) void rad_test_before_listen() {}
+
 namespace rad {
 namespace server {
 
@@ -377,10 +383,6 @@ private:
 struct HttpTransport::Impl {
     httplib::Server  svr;
     std::atomic<int> port{0};
-    /* A stop may arrive before httplib's accept loop exists (the engine's watcher can stop while
-     * the routes are still being registered), where svr.stop() is a no-op. Remember it here, so
-     * serve() can decline to listen and a later serve() does not inherit it. */
-    std::atomic<bool> stopped{false};
 };
 
 HttpTransport::HttpTransport() : impl_(new Impl) {}
@@ -388,12 +390,11 @@ HttpTransport::~HttpTransport() { stop(); }
 
 void HttpTransport::stop() {
     if (!impl_) return;
-    impl_->stopped.store(true, std::memory_order_release);
     impl_->svr.stop();
 }
 
-/* 0 until the accept loop runs: before that httplib's stop() is a no-op, and a caller that
- * stopped a server it believed up would wait forever. */
+/* 0 until the accept loop runs: a caller that stopped a server it believed up would otherwise
+ * wait on a port nothing is listening on. */
 int HttpTransport::port() const {
     return impl_ && impl_->svr.is_running() ? impl_->port.load() : 0;
 }
@@ -480,10 +481,6 @@ static bool is_socket_upgrade(const httplib::Request& q) {
 
 int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     auto& svr = impl_->svr;
-
-    /* A stop that came in before this call has nothing to stop; consume it here rather than
-     * registering a listener for it. */
-    if (impl_->stopped.exchange(false, std::memory_order_acq_rel)) return RAD_OK;
 
     /* A request line longer than CPPHTTPLIB_MAX_LINE_LENGTH is closed with no status: httplib's
      * line reader gives up before any handler, error handler or logger runs. The build sets
@@ -754,13 +751,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         return httplib::Server::HandlerResponse::Handled;
     });
 
-    /* A stop that arrived while the routes were registered: give up before binding, so no socket
-     * is left bound for a serve nobody will ever listen on. A stop that arrives after this point
-     * is the accept loop's to answer (httplib's stop() closes the listening socket). */
-    if (impl_->stopped.exchange(false, std::memory_order_acq_rel)) return RAD_OK;
-
     /* Bind once: binding a named port and then any port would leave the first socket bound and
-     * unused. */
+     * unused. A stop that arrived before this point is remembered by the listener and consumed
+     * when it starts (httplib's stop_requested_), so nothing here has to look for it. */
     const int port = o.port == 0 ? svr.bind_to_any_port(o.host.c_str())
                      : svr.bind_to_port(o.host.c_str(), o.port) ? o.port : -1;
     if (port <= 0) {
@@ -770,9 +763,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     impl_->port.store(port);
     RAD_INFO("server: listening on http://%s:%d (%d threads, up to %zu)", o.host.c_str(), port,
              nt, most);
+    rad_test_before_listen();
     const bool ok = svr.listen_after_bind();
-    /* This run's stop is spent; a reused transport starts the next serve without it. */
-    impl_->stopped.store(false, std::memory_order_release);
     return ok ? RAD_OK : RAD_E_IO;
 }
 

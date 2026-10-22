@@ -2375,10 +2375,10 @@ std::string request_overrides(const Config& c) {
  * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
  * IChatTemplate::apply. */
 int Engine::run_server() {
-    /* One serve is one stop lifetime. The handler below sets a process-global flag and a second
-     * serve() would otherwise read the previous run's stop before its own transport is listening:
-     * it would stop nothing, and then serve a listener nothing can stop. */
-    g_signalled.store(false, std::memory_order_relaxed);
+    /* A stop that arrived between the previous serve and this one is this run's to act on: the
+     * watcher below consumes g_signalled at the moment it stops the transport, and nothing here
+     * clears it. Clearing at entry would swallow a signal raised after the previous run's stop
+     * and leave this listener with no consumer. */
     /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
      * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
      * hold the session table the sessions view reads. */
@@ -3250,7 +3250,9 @@ int Engine::run_server() {
                 }
             }
 #endif
-            if (g_signalled.load(std::memory_order_relaxed)) {
+            /* This exchange is the flag's one reset point: the signal is cleared where it is
+             * acted on, so one raised between two serve runs reaches the next run's watcher. */
+            if (g_signalled.exchange(false, std::memory_order_acq_rel)) {
                 RAD_INFO("stopping: draining in-flight requests");
                 srv.stop();
                 return;

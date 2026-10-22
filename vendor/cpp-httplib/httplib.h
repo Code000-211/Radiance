@@ -1846,6 +1846,9 @@ private:
 
   std::atomic<bool> is_running_{false};
   std::atomic<bool> is_decommissioned{false};
+  /* A stop requested before is_running_ is set has no listener to close; listen_internal()
+   * consumes this as soon as it starts, so that stop is not dropped. */
+  std::atomic<bool> stop_requested_{false};
 
   struct MountPointEntry {
     std::string mount_point;
