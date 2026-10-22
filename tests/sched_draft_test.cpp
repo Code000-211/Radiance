@@ -135,6 +135,7 @@ struct Predictions {
 int predict(void* ctx, const DraftBatchView& view, DraftPredictions* out) {
     const Predictions& t = *static_cast<Predictions*>(ctx);
     out->n_seq = view.n_seq;
+    out->cycle_id = view.cycle_id;        /* the set describes this cycle, as the contract says */
     out->version = view.policy_version;   /* this view's, not a later one */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->req_id[i] = view.seq[i].req_id;

@@ -56,9 +56,9 @@ struct EngineTestPeer {
      * (core/engine.cpp:1641); fini() is what ~Engine does not do for a scheduler the test started. */
     static Scheduler& sched(Engine& e) { return e.sched_; }
     static int init_sched(Engine& e, Program& prog, const Config& cfg, IKVManager* kv,
-                          IPrefixCache* pc) {
+                          IPrefixCache* pc, RadStream stream = nullptr) {
         std::vector<BatchBuilder::RankIO> rio;
-        rio.push_back({ 0, nullptr, &prog });
+        rio.push_back({ 0, stream, &prog });
         return e.sched_.init(prog, cfg, kv, pc, rio);
     }
     static void fini_sched(Engine& e) { e.sched_.fini(); }

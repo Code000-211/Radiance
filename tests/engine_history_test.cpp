@@ -97,22 +97,32 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
     REQUIRE(!h.prog.drafter_shared_kv);
 
     Engine e(h.cfg);
-    REQUIRE_EQ(EngineTestPeer::init_sched(e, h.prog, h.cfg, &h.kv, &h.pc), RAD_OK);
+    /* The batch builder stages each step on the rank's stream, as the engine's rank threads do;
+     * this fixture has no rank thread, so it creates the one stream those would. */
+    RadStream stream = nullptr;
+    REQUIRE_EQ(rad_stream_create(&stream, 0), RAD_OK);
     /* The scheduler is this fixture's, not one the engine started, so ~Engine does not fini it.
-     * The guard runs that on every exit, including the `return` a REQUIRE takes. Declared after
-     * `e`, so it runs before ~Engine. */
+     * The guard runs that on every exit, including the `return` a REQUIRE takes, and destroys the
+     * stream after it. Declared after `e`, so it runs before ~Engine; `inited` keeps fini off a
+     * scheduler whose init failed and whose kv_ is therefore unset. */
     struct SchedGuard {
-        Engine& e;
-        ~SchedGuard() { EngineTestPeer::fini_sched(e); }
-    } sched_guard{e};
+        Engine&   e;
+        RadStream stream;
+        bool      inited = false;
+        ~SchedGuard() {
+            if (inited) EngineTestPeer::fini_sched(e);
+            if (stream) rad_stream_destroy(stream);
+        }
+    } sched_guard{e, stream};
+    REQUIRE_EQ(EngineTestPeer::init_sched(e, h.prog, h.cfg, &h.kv, &h.pc, stream), RAD_OK);
+    sched_guard.inited = true;
     EngineTestPeer::drafter(e, h.prog.drafter);
     EngineTestPeer::barrier(e, 1);
 
-    /* One end event for both chunks, as step_state_init leaves one for the engine's life: the step
-     * path records the same handle every step and step_state_fini frees it. A second
-     * rad_event_create would overwrite the live handle and leak the first. */
+    /* One end event for both chunks, created the way step_state_init creates it and freed by
+     * step_state_fini: one handle for the engine's life, never overwritten. */
     RadEvent ev = nullptr;
-    REQUIRE_EQ(rad_event_create(&ev), RAD_OK);
+    REQUIRE_EQ(rad_event_create_as(&ev, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT), RAD_OK);
     EngineTestPeer::step_end(e, ev);
 
     auto req = std::make_unique<rad::Request>();
@@ -159,13 +169,19 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
         CHECK(!EngineTestPeer::sched(e).serial_batch_failed());
         CHECK_EQ(hb->n_draft_out, 0);
         CHECK_EQ(hb->n_tok, to - from);
-        CHECK_EQ(hb->ctx_lens[0], from);     /* the pass covers this chunk's context. Not proof it
-                                             * started at the watermark: with ctx_len == from that
-                                             * holds either way, so the watermark check below is
-                                             * what carries the progression. */
+
+        /* What mark_step_end does on rank 0's stream, and the only rank here has no thread to do
+         * it: without the record, await_step_end() in collect_step would return over an event
+         * nothing enqueued behind, and the pass would not be ordered before the reads below. */
+        REQUIRE_EQ(rad_event_record(ev, stream), RAD_OK);
 
         CHECK_EQ(EngineTestPeer::collect(e, b, so), RAD_OK);
         CHECK(so.complete);                 /* the wait over the issued pass ran */
+        CHECK_EQ(hb->ctx_lens[0], from);     /* read after the wait: the batch's arrays live on the
+                                             * rank's slab, which the step's upload fills. Covers this
+                                             * chunk's context; not proof it started at the watermark:
+                                             * with ctx_len == from that holds either way, so the
+                                             * watermark check below carries the progression. */
 
         REQUIRE_EQ(EngineTestPeer::commit(e, 11), RAD_OK);
         CHECK_EQ(EngineTestPeer::sched(e).find(1)->n_computed, to);

@@ -74,6 +74,9 @@
 #include "device/device.h"
 #include "engine.h"
 #include "engine_test_peer.h"
+/* serve() takes the watch by value, so the call below destroys a temporary: the deleter needs
+ * the complete type, which engine.h only forward-declares. */
+#include "util/stallwatch.h"
 
 #include <nlohmann/json.hpp>
 

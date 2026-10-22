@@ -327,6 +327,10 @@ endif()
 # libref's reference kernels. Like engine_e2e_test it pays a real startup, so it is `e2e` too.
 if(TARGET engine_loop_test)
   add_dependencies(engine_loop_test gemma4_bf16 libref)
+  # The case starts a real engine, and its architecture plugin resolves the core's symbols from
+  # the executable at dlopen, as bin/radiance does. Without ENABLE_EXPORTS they are not in the
+  # dynamic symbol table and every plugin fails to load.
+  set_target_properties(engine_loop_test PROPERTIES ENABLE_EXPORTS ON)
   set_tests_properties(engine_loop_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
