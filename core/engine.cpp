@@ -57,6 +57,13 @@ extern "C" __attribute__((weak)) void rad_test_step_point(int step, int rows, bo
  * concurrent access. tests/engine_loop_test.cpp defines it strongly; the weak definition keeps
  * every other test build that compiles these units linkable. */
 extern "C" __attribute__((weak)) void rad_test_serving() {}
+
+/* The third seam: the server's running state, reported from run_server()'s watcher once
+ * Server::port() turns nonzero. That is the first moment a stop is one the transport accepts --
+ * before it, httplib's stop() closes nothing and the signal is dropped (core/server/http.cpp). A
+ * driver binds its one stop to this rather than to the signal handler's disposition, which is
+ * installed before run() and so says nothing about whether a stop would survive. */
+extern "C" __attribute__((weak)) void rad_test_serving_ready(int port) { (void)port; }
 #endif
 
 namespace rad {
@@ -2810,8 +2817,22 @@ int Engine::run_server() {
     sigaction(SIGTERM, &sa, nullptr);
 
     std::atomic<bool> watching{true};
+#ifdef RAD_TEST_HOOKS
+    /* Once, and from the state itself: Server::port() is 0 until the transport is inside its
+     * accept loop, which is where httplib's stop() starts closing the listening socket instead of
+     * dropping the stop. The loop test's stop is bound to this report. */
+    bool serving_reported = false;
+#endif
     std::thread watcher([&] {
         while (watching.load(std::memory_order_relaxed)) {
+#ifdef RAD_TEST_HOOKS
+            if (!serving_reported) {
+                if (const int port = srv.port(); port != 0) {
+                    serving_reported = true;
+                    rad_test_serving_ready(port);
+                }
+            }
+#endif
             if (g_signalled.load(std::memory_order_relaxed)) {
                 RAD_INFO("stopping: draining in-flight requests");
                 srv.stop();

@@ -12,6 +12,14 @@
  * the only one that defines the seam's strong hooks. Nothing listens beyond loopback:
  * `--host 127.0.0.1 --port 0`.
  *
+ * The stop this driver sends is bound to the transport's running state, not to the signal
+ * handler's disposition: the handler is installed before run(), so a stop raised between the two
+ * lands in httplib's stop(), which closes nothing while the server is not running and drops it.
+ * The engine's watcher reports Server::port() once it turns nonzero -- the state in which a stop is
+ * accepted -- and only then is one SIGTERM raised. A report that never comes (the server failed to
+ * start, or the deadline passes) ends this process as a failure rather than calling a possibly
+ * dropped stop a clean cleanup.
+ *
  * What it proves, and what it does not
  * ------------------------------------
  * finish_serial_drafter needs two facts before the history watermark may advance:
@@ -92,6 +100,7 @@ struct Driver {
     Engine*                 engine   = nullptr;
     uint64_t                req_id   = 1;
     bool                    withheld = false;
+    bool                    serving  = false;  /* the engine reported the transport running */
     int                     submit_rc = RAD_OK;
 
     size_t live_before(size_t end) const {
@@ -121,57 +130,34 @@ std::string trace_text() {
     return trace_text_locked();
 }
 
-/* Our SIGTERM handler, installed before the serve thread exists. It is not a stop path: the
- * engine installs its own handler inside run_server() with SA_RESETHAND, so a delivery after that
- * one takes the default disposition and kills the process. This handler exists so the driver has
- * a disposition it can tell apart from the engine's, and so the previous one can be restored when
- * the case ends. */
-void on_test_sigterm(int) {}
-
-struct SigTermGuard {
-    struct sigaction old {};
-    bool installed = false;
-    SigTermGuard() {
-        struct sigaction sa {};
-        sa.sa_handler = &on_test_sigterm;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;                 /* no SA_RESETHAND: this one stays in place */
-        installed = sigaction(SIGTERM, &sa, &old) == 0;
-    }
-    ~SigTermGuard() { if (installed) sigaction(SIGTERM, &old, nullptr); }
-};
-
-/* The readiness proof for the engine's handler: the disposition is *read*, never inferred from a
- * delivery. A counter in our own handler cannot serve here -- handler swap and signal delivery
- * race, and a raise that finds the default disposition kills the process, while an unraised signal
- * increments nothing either way, so "the count did not move" does not mean "the engine has it".
- * sigaction with a null act changes nothing and is not itself a signal. SIG_DFL or SIG_IGN is a
- * failure, not readiness: SA_RESETHAND leaves exactly that behind after a delivery, and no stop is
- * sent then. */
-bool engine_handler_installed(std::chrono::steady_clock::time_point deadline) {
+/* The readiness proof for the stop, replacing an earlier one built on the signal disposition: the
+ * engine reports Server::port() from its watcher once it is nonzero, which is exactly when the
+ * transport is inside its accept loop and httplib's stop() closes the listening socket instead of
+ * closing nothing. The disposition proves nothing here -- the handler is installed before run(), so
+ * a stop raised on it alone can still land in the window where it is dropped.
+ *
+ * Bounded both ways: serve() returning first means the server never ran (a start failure) and there
+ * is nothing to stop; the deadline bounds a server that never gets there. The case below ends this
+ * process as a failure on both, so a stop that may have been dropped is never reported as a clean
+ * cleanup. The report also implies the engine's handler is in place -- run_server() installs it
+ * before the watcher that reports exists -- so the one raise cannot meet the default disposition. */
+bool wait_serving(std::future<int>& done, std::chrono::steady_clock::time_point deadline) {
     for (;;) {
-        struct sigaction cur {};
-        if (sigaction(SIGTERM, nullptr, &cur) != 0) return false;
-        if (cur.sa_handler != &on_test_sigterm)
-            return cur.sa_handler != SIG_DFL && cur.sa_handler != SIG_IGN;
+        {
+            std::lock_guard<std::mutex> lk(g_driver.mu);
+            if (g_driver.serving) return true;
+        }
+        if (done.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) return false;
         if (std::chrono::steady_clock::now() >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 
-/* Exactly one stop, and none at all when the handler never appeared. No path here signals twice:
- * a second delivery under SA_RESETHAND would kill the process, so the fixed deadline in the case
- * below is the last safeguard instead. */
-bool deliver_stop(std::chrono::steady_clock::time_point deadline) {
-    if (!engine_handler_installed(deadline)) return false;
-    return ::raise(SIGTERM) == 0;
-}
-
 }  /* namespace */
 
-/* The seam's two strong definitions. The defaults in core/engine.cpp are weak and exist so every
- * other build of those units links; only this binary defines them. Both tolerate having no driver
- * attached (a null `engine`), and do nothing then. */
+/* The seam's three strong definitions. The defaults in core/engine.cpp are weak and exist so every
+ * other build of those units links; only this binary defines them. All three tolerate having no
+ * driver attached (a null `engine`), and do nothing then. */
 extern "C" void rad_test_step_point(int step, int rows, bool prior_complete, bool complete) {
     std::lock_guard<std::mutex> lk(g_driver.mu);
     if (!g_driver.engine) return;
@@ -210,6 +196,15 @@ extern "C" void rad_test_serving() {
     req->sp.temp    = 0.0f;
     req->sink       = nullptr;
     g_driver.submit_rc = EngineTestPeer::submit(*g_driver.engine, std::move(req));
+}
+
+/* The engine's readiness report, from its watcher thread: the transport's port is nonzero, so a
+ * stop is one the server accepts from here on. It records and nothing else -- the stop itself is
+ * raised by the case, once. wait_serving() polls the flag; the report is one write and the wait's
+ * slice is 5 ms, so there is no notification to lose. */
+extern "C" void rad_test_serving_ready(int port) {
+    std::lock_guard<std::mutex> lk(g_driver.mu);
+    if (port > 0) g_driver.serving = true;
 }
 
 namespace {
@@ -273,18 +268,25 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     CHECK_EQ(sp.value("kind", std::string()), std::string("serial"));
     CHECK_EQ(sp.value("depth", -1), 3);
 
-    /* The engine's own handler is installed inside run_server(), after the stepper starts. Until it
-     * is, this one is the disposition the driver can recognise, and the stop below waits for the
-     * engine's to replace it. */
-    SigTermGuard sig;
-    REQUIRE(sig.installed);
-
     std::promise<int> served;
     std::future<int>  done = served.get_future();
     std::thread serve_thread([&] {
         const int rc = e.serve(nullptr);
         served.set_value(rc);
     });
+
+    /* Nothing is signalled before the server is known to be running: a start failure (bind, model
+     * load in run_server) and a transport that never gets there both end this process here, as a
+     * failure, with no stop sent at all. */
+    if (!wait_serving(done, std::chrono::steady_clock::now() + std::chrono::seconds(60))) {
+        const bool returned =
+            done.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+        std::fprintf(stderr, "engine_loop_test: the server never reported a running transport%s, so "
+                             "no stop was sent and this run is not a clean one:\n%s\n",
+                     returned ? " (serve() returned first)" : " within 60 s", trace_text().c_str());
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
 
     /* Every wait below is bounded. `satisfied` asks for the three steps the comparison needs: the
      * withheld step, and two row-carrying steps after it (the second one's seam is where the first
@@ -309,17 +311,15 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     }
 
     /* One stop, one join, on every path from here -- including the ones that already failed. The
-     * readiness proof before the raise is the installed handler; there is a residual window after
-     * it, because run_server() does note_ready() and run() between installing the handler and
-     * accepting, and a stop landing there is stored in the engine's flag for a watcher whose
-     * srv.stop() is a no-op on a server that is not running yet. That window is why the deadline
-     * below exists: it ends the process after printing the trace instead of hanging, and nothing
-     * here ever signals a second time. A join that does not complete ends the process too: the
+     * raise is bound to the running state wait_serving() proved, and a running server leaves that
+     * state only by run() returning, so the ready check is exactly what keeps the raise inside it.
+     * Nothing here ever signals a second time: the engine's handler is SA_RESETHAND, so a second
+     * delivery kills the process. A join that does not complete ends the process too, since the
      * engine owns threads nothing else can join. */
     if (done.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
-        !deliver_stop(std::chrono::steady_clock::now() + std::chrono::seconds(30))) {
-        std::fprintf(stderr, "engine_loop_test: the engine's SIGTERM handler never appeared, so no "
-                             "stop was sent:\n%s\n", trace_text().c_str());
+        ::raise(SIGTERM) != 0) {
+        std::fprintf(stderr, "engine_loop_test: raise(SIGTERM) failed although the server reported "
+                             "itself running and accepts a stop:\n%s\n", trace_text().c_str());
         std::fflush(stderr);
         std::_Exit(1);
     }
