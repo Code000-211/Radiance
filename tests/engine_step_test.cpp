@@ -47,8 +47,11 @@ TEST(engine_step_nothing_owed_returns_before_any_wait) {
     CHECK(!so.complete);
 }
 
-/* A history pass that was issued is waited on. With one rank, step_end_ is the end event of the
- * only participating rank. The engine owns the event from here: step_state_fini destroys it. */
+/* A history pass that was issued is waited on and the wait succeeds. This engine has no ranks, so
+ * no rank took part: the wait covers step_end_ alone, the host event set below, and says nothing
+ * about any rank's completion. What the case shows is the branch -- an issued pass that is waited
+ * on sets the fact -- not a multi-rank step. The engine owns the event from here: step_state_fini
+ * destroys it. */
 TEST(engine_step_a_waited_history_pass_is_complete) {
     Engine e(rad::Config{});
     EngineTestPeer::StepOut so;
@@ -72,9 +75,11 @@ TEST(engine_step_a_failed_wait_stays_incomplete) {
     CHECK(!so.complete);
 }
 
-/* collect_step does not clear the previous step's `complete`. A second call that owes nothing
- * returns before any wait and leaves the old value readable, which is why the issue site resets
- * it and why a reader must know which step the fact belongs to. */
+/* collect_step does not clear the previous step's `complete`: a second call that owes nothing
+ * returns before any wait and leaves the old value readable. That is all this case shows -- that
+ * the branch does not reset the flag. It does not prove the reset at a real step change, which
+ * happens at the issue site (core/engine.cpp:496) and is only reachable from a started engine
+ * (see the open list at the top). */
 TEST(engine_step_does_not_clear_a_previous_completion) {
     Engine e(rad::Config{});
     EngineTestPeer::StepOut so;
