@@ -218,13 +218,17 @@ DraftObservation completed_cycle(const PlanFixture& f) {
     return o;
 }
 
-/* A sample for `s` as planned, at `ms`. */
+/* A sample for `s` as planned, at `ms`. The replay state is the one the shape carries -- what the
+ * executing path established for this cycle -- and is copied into the sample's own evidence field
+ * rather than defaulted: `Unknown` never becomes a bucket key here, and neither does a state the
+ * shape does not name. */
 DraftCostSample sample_of(const DraftVerifyShape& s, double ms,
                           uint16_t flags = kDraftSampleValid) {
     DraftCostSample c;
     c.cycle_id = 1;
     c.policy_version = 1;
     c.shape = s;
+    c.replay = s.replay;
     c.total_ms = ms;
     c.flags = flags;
     c.rounds = s.draft_k;
@@ -240,6 +244,7 @@ DraftCostSample sample_of(const DraftVerifyShape& s, double ms,
 DraftCostSample truncated(const DraftVerifyShape& s, int32_t rounds, double ms) {
     DraftCostSample c = sample_of(s, ms);
     c.rounds = rounds;
+    c.flags |= kDraftSampleShortened;   /* the shared contract's name for the same fact */
     for (int j = rounds + 1; j <= s.draft_k; ++j) c.draft_round_rows[j] = 0;
     c.draft_rows_total = 0;
     for (int j = 0; j <= rounds; ++j) c.draft_rows_total += c.draft_round_rows[j];
@@ -621,6 +626,39 @@ TEST(only_an_attributable_sample_updates_a_measured_bucket) {
     CHECK_EQ((int)t.buckets().size(), 2);
 }
 
+TEST(a_sample_without_replay_evidence_is_never_learned_from) {
+    /* The bucket key is the replay state the run established, so the sample has to carry one and it
+     * has to be the state its shape names. Neither case may fall through as "no replay" -- a None
+     * written for gate conformity would price a shape with a fact nobody measured. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    const PlanFixture p3 = plan_for(k3);
+
+    /* The executing path could not establish the state: the bracket exists, it is not evidence. */
+    DraftCostSample unknown = sample_of(k3, 40.0);
+    unknown.replay = DraftReplay::Unknown;
+    CHECK_EQ(t.observe(completed_cycle(p3), unknown), RAD_OK);
+    CHECK_EQ(t.ignored(), 1);
+    CHECK_EQ((int)t.buckets().size(), 0);
+
+    /* A sample that disagrees with the shape it files itself under is a broken record, not a
+     * measurement under another key: refused, and nothing is stored. */
+    DraftCostSample contradicted = sample_of(k3, 40.0);
+    contradicted.replay = DraftReplay::Record;
+    CHECK_EQ(t.observe(completed_cycle(p3), contradicted), RAD_E_INVAL);
+    CHECK_EQ((int)t.buckets().size(), 0);
+    CHECK_EQ(t.ignored(), 1);
+
+    /* The evidence the run did establish is learned from as before. */
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 41.0)), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 1);
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 41.0);
+}
+
 TEST(a_depth_change_under_overlap_lands_in_its_own_bucket) {
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
@@ -668,15 +706,15 @@ TEST(an_ahead_bucket_is_found_again_as_measured_through_its_plan) {
 
     /* The k6 verify window is another shape key and must not be priced by the k3 sample. It is
      * priced as the documented heuristic instead: the same executed distribution and the same
-     * history/prefill, scaled by the verify-token ratio 56/24 plus the named margin -- the one
+     * history/prefill, scaled by the verify-token ratio 56/32 plus the named margin -- the one
      * dimension the bound may scale, and a rule of thumb, not a measurement. */
     const DraftVerifyShape k6 = make_shape(0, 8, { 0, 8, 8, 8, 8, 8, 8 }, 0, 6,
                                            { 0, 8, 8, 8, 8, 8, 8 }, 6);
     CHECK_EQ(t.estimate(k6, &e), RAD_OK);
     CHECK(e.source == DraftCostSource::ConservativeFallback);
     CHECK_EQ(e.coverage, 0);
-    CHECK(std::fabs(e.ms - 40.0 * (56.0 / 24.0) * 1.25) < 1e-9);
-    CHECK(std::fabs(e.unc_ms - 40.0 * (56.0 / 24.0) * 0.25) < 1e-9);
+    CHECK(std::fabs(e.ms - 40.0 * (56.0 / 32.0) * 1.25) < 1e-9);
+    CHECK(std::fabs(e.unc_ms - 40.0 * (56.0 / 32.0) * 0.25) < 1e-9);
 }
 
 TEST(a_short_execution_is_not_the_price_of_a_short_plan) {
@@ -946,8 +984,9 @@ TEST(an_executed_distribution_that_could_not_have_run_is_refused) {
     /* One round cannot draft more rows than the plan asked of it: this plan commits 8 requests to
      * round 1 and only 5 to rounds 2 and 3, so an executed [0,8,8,8] is impossible even though it
      * is monotone, complete and sums to its own total. That is the plan's cap * max_k = 24 bound,
-     * per round rather than as one number. */
-    const DraftVerifyShape mixed = make_shape(0, 8, { 0, 8, 8, 8 }, 0, -1, { 0, 8, 5, 5 });
+     * per round rather than as one number. Under overlap, so the verify window is not the plan's
+     * own and the per-round rule is the one that fires. */
+    const DraftVerifyShape mixed = make_shape(0, 8, { 0, 8, 8, 8 }, 0, -1, { 0, 8, 5, 5 }, 1);
     const PlanFixture pm = plan_for(mixed);
     CHECK_EQ(pm.plan.rows[2], 5);
     DraftCostSample ran_deeper = sample_of(mixed, 40.0);

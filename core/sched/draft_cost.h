@@ -195,11 +195,13 @@ public:
      * identify the plan it names, a sample whose identity disagrees with the observation, a plan
      * that says its bracket is not valid (DraftPlan::timing_valid), a shape that is not the plan's
      * own distribution or that is not priceable (an unknown dimension is refused, never priced as
-     * zero), an executed distribution that could not have run or that exceeds the plan it took, and
-     * a non-finite or non-positive time. Only an attributable sample updates a measured bucket; the
-     * rest are kept as diagnostics, and a truncation -- the plan's deepest round never ran, so the
-     * bracket carries abort cost -- is stored with kDraftBucketUnpriced instead of seeding a
-     * measured bucket. */
+     * zero), a replay state that contradicts the shape it would be filed under, an executed
+     * distribution that could not have run or that exceeds the plan it took, and a non-finite or
+     * non-positive time. A sample whose replay state the run could not establish is not an error:
+     * it is a bracket with no evidence and is counted in ignored(). Only an attributable sample
+     * updates a measured bucket; the rest are kept as diagnostics, and a truncation -- the plan's
+     * deepest round never ran, so the bracket carries abort cost -- is stored with
+     * kDraftBucketUnpriced instead of seeding a measured bucket. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */

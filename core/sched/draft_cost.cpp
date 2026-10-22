@@ -31,10 +31,12 @@ using json = nlohmann::json;
  * its bracket, it only stays visible through n_ahead. kDraftBucketUnpriced is the online-only
  * record of a truncation -- the plan's deepest round never ran, so the bracket carries abort cost
  * (observe()) -- and is a diagnostic in the same sense: excluded from pricing and from anchoring
- * alike. */
+ * alike. kDraftSampleShortened is the shared contract's version of the same fact, including the
+ * cancelled row that leaves `rounds` at the plan's extent while timing less work; it is listed
+ * here so such a bracket is kept with its flag instead of being priced as a full run. */
 constexpr uint16_t kDisturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
                                  kDraftSampleAdmission | kDraftSamplePlacement |
-                                 kDraftBucketUnpriced;
+                                 kDraftSampleShortened | kDraftBucketUnpriced;
 
 int refuse(std::string* err, int code, const std::string& what) {
     if (err) *err = what;
@@ -247,11 +249,17 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.sampling: missing or unknown");
     s->sampling = (DraftSampling)sampling;
 
+    /* The file's four names are mapped one by one, not by index: the shared enum has `Unknown` in
+     * front of `None`, and a cast would file a measured "none" as "no evidence". A profile is a
+     * measurement, so it always established its replay state -- `Unknown` never comes from a
+     * file. */
     static const char* const kReplay[] = { "none", "play", "record", "audit" };
+    static const DraftReplay kReplayValue[] = { DraftReplay::None, DraftReplay::Play,
+                                                DraftReplay::Record, DraftReplay::Audit };
     int replay = 0;
     if (!get_enum(sh, "replay", kReplay, 4, &replay))
         return refuse(err, RAD_E_INVAL, where + "shape.replay: missing or unknown");
-    s->replay = (DraftReplay)replay;
+    s->replay = kReplayValue[replay];
 
     static const char* const kDrafter[] = { "none", "serial", "ngram" };
     int drafter = 0;
@@ -653,6 +661,15 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
      * dimension is not priced as zero, and one that could not be measured is not learned from. */
     if (!draft_shape_matches_plan(sample.shape, *plan)) return RAD_E_INVAL;
     if (!draft_shape_priceable(sample.shape)) return RAD_E_INVAL;
+
+    /* Replay state keys the bucket, so the sample and the shape it files itself under must name the
+     * same state. A sample whose state the run could not establish is not an error -- it is a
+     * bracket with no evidence and is counted in ignored() below -- but an established state that
+     * contradicts the key is a broken record: filing it would price one state's work under
+     * another's key, and defaulting both to None to pass the gate would price a fact nobody
+     * measured. */
+    if (sample.replay != DraftReplay::Unknown && sample.shape.replay != sample.replay)
+        return RAD_E_INVAL;
     if (!executed_consistent(sample.rounds, sample.draft_round_rows, sample.draft_rows_total,
                              sample.shape.n_rows))
         return RAD_E_INVAL;
