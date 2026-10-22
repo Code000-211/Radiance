@@ -5,8 +5,8 @@ This is strictly just a Development fork, every Credit goes to https://codeberg.
 Upstream is the project credited above and in [`NOTICE`](NOTICE) (Deadcode and the radiance
 contributors); this repository is a development fork of it. The upstream history in this tree, the
 [`LICENSE`](LICENSE) and the [`NOTICE`](NOTICE) are kept as they are. The changes below sit on top
-of the last commit in this history authored outside this fork (`cb5a69a`, 2026-10-17); everything
-else is the upstream tree.
+of [`cb5a69a`](https://codeberg.org/StillDeadcode/radiance/commit/cb5a69ac3f993560ed8dcb32fa524b3b9f987c62),
+the last upstream commit in this history; everything else is the upstream tree.
 
 Merged on `main`:
 
@@ -17,13 +17,14 @@ Merged on `main`:
   the coupling's verify kernel produces the FP64 masses cooperatively; the ordered sums and every
   arithmetic contract stay as they were.
 
-Experimental, **not merged and not approved**:
+Experimental, **not merged into `main` and not approved**:
 
 - [#14 — sched: the adaptive draft policy's contracts, fakes and profile/manifest formats (P00)](https://github.com/Code000-211/Radiance/pull/14):
   the contract basis for an adaptive draft scheduler (cycle views, immutable plans, observations,
   the four hooks, and the profile and manifest formats), still under review. The sched, runtime and
-  test PRs stacked on it (#15–#20) target that branch, not `main`. None of this is part of the
-  merged tree, and this fork makes no performance or correctness claim for it.
+  test PRs stacked on it (#15–#20) target that branch, not `main`; #17 and #19 are already merged
+  into it, while #15, #16, #18 and #20 are still open. None of it is on `main`, and this fork makes
+  no performance or correctness claim for it.
 
 # radiance
 
