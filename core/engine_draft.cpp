@@ -120,7 +120,16 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
  * history pass and every round, each round's proposal published into the slots behind its pass,
- * then the slots' readback. Nothing synchronises here; collect_step has the step's one wait. */
+ * then the slots' readback. Nothing synchronises here; collect_step has the step's one wait.
+ *
+ * The round bound is the scheduler's: `rounds` comes back as the deepest row that survived the
+ * context and KV rejections in serial_begin (never below 1, so round 0 is still asked). A round
+ * inside it therefore always has a row, which is what makes a null batch unambiguous:
+ *   - regular end: round 0 with no drafting row. Nothing owes a pass -- a drafting row always
+ *     owes its history, and a history-only row is in round 0 only because its hist_n is positive;
+ *   - failure: any other null inside the bound. Rows the open cycle owes got no batch: the build
+ *     failed, or a row left the snapshot under this hold. The step is refused; running on would
+ *     publish a round the card never ran and move the watermark over history never written. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -160,16 +169,11 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
         if (!db) {
-            /* A drafting row always owes its history and every round it was planned for, so while
-             * the cycle has rows nullptr is a build that failed (BatchBuilder::build, batch.cpp),
-             * not a pass nobody needed: running on would publish a round the card never ran and
-             * move the watermark over history it never wrote. */
-            if (n > 0) {
-                RAD_ERR("drafter '%s': no batch for draft pass %d of step %d with %d row(s) "
-                        "drafting; the scheduler's build failed", drafter_.name, rd, step, n);
-                return RAD_E_STATE;
-            }
-            continue;   /* nothing drafts: only the history pass could have been owed, and may not be */
+            /* The one regular null (see above): round 0 with nothing drafting. */
+            if (rd == 0 && n <= 0) continue;
+            RAD_ERR("drafter '%s': no batch for draft pass %d of step %d, which the open cycle "
+                    "still owes; the scheduler built nothing for it", drafter_.name, rd, step);
+            return RAD_E_STATE;
         }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
@@ -316,7 +320,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
-    if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;   /* only the history pass ran */
+    if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;   /* round 0 only: hold ends it, with history_ran */
 
     Rank& r0 = *ranks_[0];
     const int rounds = serial_rounds_;
