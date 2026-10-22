@@ -9,6 +9,13 @@
 #include <cstring>
 #include <cstdlib>
 
+/* Test seam for the shared bench, at global scope because it is C linkage: tests/sched_fakes.h
+ * defines it strongly and returns true once to make a single build fail, so the scheduler's "a pass
+ * was owed and could not be built" path is reachable from a test without a runtime fault-injection
+ * switch. A production binary links this weak default, which always says no -- there is nothing to
+ * set at run time. */
+extern "C" __attribute__((weak)) bool rad_test_fail_batch_build() { return false; }
+
 namespace rad {
 
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
@@ -798,6 +805,9 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
 /* ------------------------------------------------------------------ build */
 const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, int step) {
     if (plan.e.empty()) return nullptr;
+    /* After the empty-plan check: the bench fails a build that has work to do, which is the case
+     * the scheduler must not mistake for "nothing owed". */
+    if (rad_test_fail_batch_build()) return nullptr;
     if ((int64_t)plan.e.size() > max_seqs_ || plan.n_tok > max_tok_) {
         RAD_ERR("step plan of %d sequences / %lld tokens exceeds the pools sized at %lld / %lld",
                 (int)plan.e.size(), (long long)plan.n_tok,

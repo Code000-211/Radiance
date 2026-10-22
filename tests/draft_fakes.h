@@ -35,6 +35,7 @@ inline int predict(void* ctx, const DraftBatchView& view, DraftPredictions* out)
     ++s->calls;
     if (!out || !out->seq || !out->req_id || out->cap < view.n_seq) return RAD_E_INVAL;
     out->n_seq = view.n_seq;
+    out->cycle_id = view.cycle_id;        /* the set describes this cycle */
     out->version = view.policy_version;   /* the view it describes, not a constant */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->req_id[i] = view.seq[i].req_id;
@@ -142,6 +143,10 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         if (k > top) top = k;
     }
     plan->max_k = top;
+    /* The fake is a steady state at every pipeline depth: it verifies the window it drafts. At
+     * depth 0 the contract requires that (draft_plan_valid); at depth > 0 it is this fake's choice,
+     * not a rule -- a real ahead plan may verify a different K, which the tests exercise by hand. */
+    plan->verify_k = top;
 
     DraftVerifyShape priced;   /* the shape this choice was priced on, checked against the plan */
     if (s->mode == Policy::Mode::Cost) {
@@ -150,10 +155,9 @@ inline int choose(void* ctx, const DraftBatchView& view, const DraftPredictions&
         shape.n_rows = view.n_seq;   /* every row verifies its committed token, eligible or not */
         shape.verify_k = top;
         shape.ctx_class = 0;
-        /* The fake is a steady state: it prices and drafts the same window, so the plan's
-         * verify_k, max_k and the shape's distributions are the same. Reading one for the other
-         * is the confusion the contract keeps apart. */
-        plan->verify_k = shape.verify_k;
+        /* The plan's verify_k (set with max_k above) and the shape's are the same value here
+         * because the fake is a steady state; reading one for the other is the confusion the
+         * contract keeps apart. */
         /* The loaded drafter, which is not who fills k[]: at K0 with the head loaded this stays
          * Serial, so the two K0 arms are distinct keys. */
         shape.drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;

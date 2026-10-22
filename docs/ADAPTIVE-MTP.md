@@ -28,22 +28,62 @@ prediction and sample.
   owns, sized at `max_seqs` (requests) or `RAD_SCHED_MAX_SPEC` (draft positions). A whole hook call
   is allocation-free. Profile I/O and its buffers stay outside the step path.
 - **Arrays are bounded by `RAD_SCHED_MAX_SPEC` (64)**, libr4d's verify query-row band. K is
-  counted after the committed token; the first target is K = 0..6. `draft_plan_rows` and
-  `draft_plan_valid` refuse `n_seq > cap` before reading `k[]`, so a caller cannot make the
-  contract check read past the storage it sized.
+  counted after the committed token; the first target is K = 0..6. `draft_plan_rows`,
+  `draft_plan_valid` and `draft_plan_identifies` refuse `n_seq > cap` before they read `k[]` or the
+  identity arrays, so a caller cannot make a contract check read past the storage it sized -- the
+  identity check included, which is the one a delivery path calls on a plan it did not issue.
 - **A plan is immutable from issue until every pass it names is consumed.** `choose` writes it
   once; no other hook writes into it, and `observe` takes only const inputs. Historical plans stay
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles
   in advance, and a telemetry overflow drops and counts records rather than blocking the card.
-- **Lifecycle: Preempt → Recycle → Resume.** A plan and its observation live in the cycle ring,
-  keyed by identity, until the observation is delivered or abandoned. Preemption stops the work but
-  does not discard a cycle that already ran: its observation is delivered when `complete`.
-  Recycling a slot resets slot state but must not free or rewrite a plan or observation still in
-  flight; resume starts a new cycle with a new plan, and the old observation never merges into it.
-  Delivery is `draft_observation_deliverable`, which never consults the live slot — so a recycled
-  generation cannot drop a measured cycle — and refuses a row whose origin does not fit its plan.
-  The ring owns copies of `req_id`, `slot` and `slot_gen`; pointers into live slot state would
-  change identity under the observation.
+- **Lifecycle: Preempt → Recycle → Resume, as a predicate, not as storage.** P00 supplies the
+  *check*, `draft_observation_deliverable`, and the identity it applies; it does not supply a ring,
+  an owner, an allocation or a free. The cycle ring -- a plan and its observation kept alive until
+  the observation is delivered or abandoned, with copies of `req_id`, `slot` and `slot_gen` rather
+  than pointers into live slot state -- is **C's** to build and to prove. A copied `DraftPlan`
+  struct whose `req_id`/`slot`/`slot_gen` were copied but whose `k`, `fill`, `rows`, `ctx_class` and
+  `history_tokens` still point into the issuing caller's storage is not ownership of the plan: the
+  lifetime test does exactly that, so it exercises the predicate, and the doc claim stops here.
+  Preemption stops the work but does not discard a cycle that already ran: its observation is
+  delivered when `complete`. Recycling a slot resets slot state but must not free or rewrite a plan
+  or observation still in flight; resume starts a new cycle with a new plan, and the old observation
+  never merges into it. Delivery never consults the live slot -- so a recycled generation cannot
+  drop a measured cycle -- and refuses a row whose origin does not fit its plan, and a plan that
+  fails its own gate.
+- **History belongs to the request, the slot generation is only the binding.** A prediction state
+  (`a`, `n`, `ess`) survives preemption and resume with its `req_id`; a new slot generation for the
+  same `req_id` is adopted, not reset, and only a different `req_id` starts from the prior. An
+  observation row is matched by `req_id` for the same reason: waiting for the slot generation a
+  preempted request no longer occupies would wait for a generation that never comes back. The
+  scheduler copies the state out of the slot at preempt and back in at resume, or holds it
+  off-slot; B cannot, because the table belongs to the slot. A smaller `max_seqs` may not be
+  configured while an open cycle names a slot above it -- shrink is refused or applied after the
+  drain, never by dropping the cycle.
+- **Delivery and application are two acts, and application is all-or-nothing.** The observer
+  returns one `applied` bit: every row was learned, or none was. A cycle that could not bind a
+  request's state right now is delivered again later from its original plan and state -- never
+  partially applied, so re-delivery cannot learn a row twice -- and it does not expire on the
+  ring's end: the ring holds the state until the cycle applies, and at full capacity uses the
+  scheduler's existing drain/backpressure limit. A cycle already applied is an caller error to
+  deliver again; B keeps no queue and allocates nothing in the path.
+- **The per-row windows are quantities of the cycle, not of one K.** A row's `generated` is bounded
+  by its own `plan.k[i]`; its `verified` is bounded by `plan.verify_k`, which under
+  `pipeline_depth > 0` is deliberately the window of the plan the paired step verifies, so
+  `verified <= k[i]` would be wrong there. `draft_observation_deliverable` refuses two rows for the
+  same `req_id` in one cycle: one cycle's evidence is applied to a state once.
+- **Completion is evidence, not a rank count.** The rank handoff is a host barrier, which joins
+  each rank's *enqueue*, and `step_end_` is a card-local event recorded on rank 0: neither says
+  another rank's stream has finished. `Engine::await_step_end()` is therefore the step's one
+  completion point -- it waits on rank 0's event and on every other rank's own end event, all
+  recorded at the same place, before the step issued ahead. `collect_step` uses it wherever it
+  already waits and, on the no-rows path, waits whenever the step issued a history pass: a
+  row-less pass is enqueued but read back by nothing, so returning without that wait would leave
+  "no row to collect" indistinguishable from "the pass completed". A step that owes no pass keeps
+  its run-ahead. The outcome is one flag, `StepOut::complete` -- set only after the wait, cleared
+  when the next step is prepared, and never set when the wait fails -- so a driver reads
+  `history_ran = serial_hist_issued_ && so.complete` and never derives completion from `n_rows`, a
+  non-null batch, a single rank or an enqueue. A failed, rejected or history-only batch has a
+  distinct outcome from a completed one and never advances a water level.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
   handed came from the plan they name — the observation carries both the identity arrays and the
@@ -58,8 +98,10 @@ prediction and sample.
 - **Origin is part of the cycle, not a side list.** `DraftPlan::fill[]` is the permission (who may
   spend `k[]`); `DraftSeqObservation::origin` is the fact (who produced the row: `Head`, `Lookup`
   or `None`). `draft_origin_fits_plan` refuses a lookup row behind a head budget, a head row behind
-  a lookup budget, and any proposal on a K0 row the plan barred — the K0/fallback leak. An
-  observation with no origin is not priced as head.
+  a lookup budget, any proposal on a K0 row the plan barred -- the K0/fallback leak -- and the
+  amount: `Head`/`Lookup` require `0 < generated <= k[i]`, so a row reporting more proposals than
+  its budget is not this plan's work, and a row that produced nothing is `None` whatever its budget
+  was. An observation with no origin is not priced as head.
 - **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
 - **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
@@ -73,11 +115,15 @@ prediction and sample.
   `history_tokens > 0` is "policy K0 with history", not "no work".
 - **Verify distribution and planned draft distribution are separate keys.** `DraftVerifyShape`
   carries `rows[]` for the verify pass and `draft_rows[]`/`draft_k` for the draft rounds the plan
-  asks for; under `pipeline_depth > 0` they belong to different cycles. `rounds` plus one total
-  cannot tell two shrinking distributions apart, so `DraftCostSample` carries the executed
-  distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan` checks the planned
-  distribution against the plan's `k[]`; `draft_shape_priceable` requires both distributions to be
-  monotone and complete and `verify_tokens` to equal `n_rows + sum_j rows[j]`.
+  asks for; under `pipeline_depth > 0` they belong to different cycles and may name different K.
+  `rounds` plus one total cannot tell two shrinking distributions apart, so `DraftCostSample`
+  carries the executed distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan`
+  checks the planned distribution against the plan's `k[]`; at `pipeline_depth == 0` it also binds
+  `verify_k` and `rows[]` to the plan, because nothing is issued ahead and the plan verifies the
+  window it drafts (`draft_plan_valid` binds `verify_k == max_k` there). `draft_shape_priceable`
+  requires both distributions to be monotone and complete, `verify_tokens` to equal
+  `n_rows + sum_j rows[j]`, and the deepest round of each to be non-empty: `verify_k > 0` with
+  `rows[verify_k] == 0` is a missing shape, not a measured zero.
 - **A missing measurement is not zero.** `DraftVerifyShape::unknown` names an absent history,
   prefill, replay or plan distribution; `draft_shape_priceable` refuses the shape, and the caller
   takes its named fallback. A zero is only a zero when it was measured as one.
@@ -88,7 +134,22 @@ prediction and sample.
   `max_tokens`, cancellation and the context end remain the `DraftCensor` reason; a censor does not
   erase a rejection measured before it. Raw match length, commit length, and the censor reason are
   separate fields, which is what lets F assert a correctly hit but uncommitted EOG without
-  inventing a reject label.
+  inventing a reject label. `accepted` is the committed draft count, not the emitted token count:
+  the step emits those drafts plus the target's own token at the next position (`accepted + 1`
+  tokens), which is the EOG when the cut hits one. Reading `accepted` as an emitted length
+  understates every step by one and makes a hit EOG look like a lost token. The tally is still
+  bounded where it protects a label:
+  `draft_seq_observation_valid` requires `raw_match == accepted` for `Rejected` (otherwise the 0 at
+  `accepted` would deny a token the drafter got right) and for `AllAccepted` (the row claims all it
+  checked was committed), and `raw_match <= verified` always -- the paired verify window, not this
+  plan's `generated`: a plan issued ahead drafts and verifies different windows, and `raw_match` is
+  `accept_greedy`'s uncensored count taken before the end-of-generation cut, so the cut must not
+  shrink it. The two windows are never chained: `verified` is not bounded by `published`, because a
+  verify window above the draft window computes positions this plan did not publish and one below
+  it stops short of them. Only `accepted <= published` crosses them, since a committed draft is one
+  this plan published. `Stopped` carries no label at `accepted`, and the censor decides where
+  commitment stopped -- `DraftController::observe` takes the committed count from the card -- so a
+  taller tally is accepted there: refusing it would lose every real label in a censored cycle.
 - **The output budget includes the bonus token.** `remaining` counts the tokens the request may
   still emit, and the verify step always emits the target's bonus token after the accepted prefix.
   Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
@@ -98,10 +159,26 @@ prediction and sample.
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
 - **Only cleanly attributed samples update a measured play bucket** (`draft_sample_attributable`):
   the sample names the cycle and policy version the observation names, has a finite positive
-  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement flag. A
-  sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
+  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission, placement or shortened
+  flag. A sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
   total is not a duration. Real DMA cost is routed away by its flag, not discarded as an outlier.
-  An `ahead` sample stays flagged so the model can weigh it.
+  An `ahead` sample stays flagged so the model can weigh it. The observation overload also requires
+  a completed cycle over a plan that passes `draft_plan_valid`: an unfinished cycle has no bracket
+  to fold in, and a plan that fails its own gate names no shape the sample could have been measured
+  under.
+- **The sample reports the run, the plan reports the intention.** `DraftCostSample::replay` is what
+  the executing path did; `DraftPlan::replay` is what was decided at issue time and is never proof
+  that a replay ran. `DraftReplay::None` is a claim of a plain run and may only be written from
+  evidence -- a caller that cannot tell leaves `Unknown`, including across a mixed record/play
+  pass. `draft_sample_attributable` enforces both halves: a sample whose replay state is `Unknown`
+  fills no bucket, and the bucket's key must be the state the run established
+  (`sample.shape.replay == sample.replay`), so a plan's declared `None` cannot key a sample the
+  execution did not evidence. `kDraftSampleShortened` marks a cycle that ended before its planned
+  extent (fewer rounds than `plan.max_k`, or a cancelled row): its bracket times less work than the
+  shape it would be filed under, so it is stored, never folded into the bucket it would otherwise
+  name. The plan itself is not rewritten afterwards to make `timing_valid` true; that field says
+  the executing
+  path opened the bracket before the cycle's first work and closed it after its last.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.
@@ -226,6 +303,15 @@ refused by name, not reinterpreted under the current keys.
   distributions are the same execution, and a shape carrying an `unknown` dimension.
 - **`ctx_class`.** 0 = below 4K, 1 = 4K–32K, 2 = 32K–128K, 3 = 128K and above
   (`draft_ctx_class`). Profiles only carry the classes the configured capacity can reach.
+- **Finite table, exact keys.** The table has a fixed capacity and neither grows nor evicts: a shape
+  that finds no room is dropped and counted, which the policy sees as a missing bucket and prices
+  through the fallback, never as a fabricated number. Admission may be made stricter to protect
+  those finite slots from one-off shapes, but only by refusing to admit a shape -- never by
+  coarsening the key. `ctx_class` buckets the context length alone; `history_tokens` and
+  `prefill_tokens` are compared exactly, as `anchor_class_matches` now does (A, `2c1a01d`). Two
+  prompts carrying a different amount of history or prefill did a different amount of work, and
+  filing them as one bucket makes one of them a bound on another measurement. Prefill work is the
+  tokens actually processed, not the prompt's cap.
 - **Coverage and uncertainty.** Each bucket carries its sample count and uncertainty. A missing
   bucket is priced by one documented interpolation step (a neighbouring context class or the
   documented N_j scaling) with `DraftCostSource::Interpolated` and the propagated uncertainty;
@@ -292,13 +378,19 @@ that name their axes.
 
 ## Verifying P00 on the host
 
-**Compiler.** Every build and compiled test — P00 and strands A–F — uses the compiler the engine
-ships with, ROCm's clang at `${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++` (the compiler `hipcc`
-drives). A system compiler is not a substitute; if the toolchain is missing, the blocker is
-reported rather than worked around. The intended entry point names it: `./build.sh` passes both
-compiler paths itself and refuses to configure without them, and the `default` CMake preset sets
-the same pair. Name it explicitly, in a build directory of its own so a differently compiled tree
-cannot be mistaken for this one:
+**Compiler.** Every build and compiled test — P00 and strands A–F — uses ROCm's clang 23: C at
+`/opt/rocm/llvm/bin/clang`, C++ at `/opt/rocm/llvm/bin/clang++`, HIP through
+`${ROCM_PATH:-/opt/rocm}/bin/hipcc`, which drives the same clang. The two `llvm/bin` spellings are
+not two toolchains: on the delivered ROCm 10.0.0 image `/opt/rocm/llvm/bin/{clang,clang++}` and
+`/opt/rocm/lib/llvm/bin/{clang,clang++}` all resolve to
+`/opt/rocm/core-10.0/lib/llvm/bin/clang-23` (one inode, `2103776`; sha256
+`241bf4da7ec39bc00b68ed74f6be751516d9892ed990e8c7fa372bad18500247`), and `hipcc --version` names
+the same `AMD clang version 23.0.0git (8f497e0…)`. ROCm clang 23 is the mandate; no ROCm 10.1
+requirement follows from it. A system compiler is not a substitute; if the toolchain is missing,
+the blocker is reported rather than worked around. The entry points name it: `./build.sh` passes
+both compiler paths itself and refuses to configure without them, and the `default` CMake preset
+sets the same pair. Name it explicitly, in a build directory of its own so a differently compiled
+tree cannot be mistaken for this one:
 
 ```bash
 /opt/rocm/llvm/bin/clang++ --version   # the proof: path and version beside the result
@@ -307,36 +399,53 @@ cannot be mistaken for this one:
 ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
-The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD clang 23.0.0git, ROCm
+**Build prerequisite, separate from P00.** A whole-tree clang 23 build needs branch
+`build/clang23-libavx` (from `cb5a69a`), which P00 does not contain:
+
+| Commit | What |
+|--------|------|
+| `dcb4e6f` | libavx: a duplicated `target` attribute, and a bf16 intrinsic in an OpenMP-outlined loop |
+| `c04006e` | `-Wl,--build-id`: kbench names a plugin by its ELF build-id note, which clang does not add itself |
+| `1ef93d2` | `core/device/aql.cpp`: prefer ROCm's `kfd_ioctl.h` (1.16) over the host kernel's 1.11 |
+
+That branch is reconciled with the `eval-main` handoff, not a parallel repair variant:
+`git diff dcb4e6f <eval-main> -- libavx` is empty, so the two libavx commits carry exactly
+eval-main's `8d46163` and `0bdecad`, and `1ef93d2` is eval-main's `ce42e4e` verbatim. The aql change
+is visible only in a HIP build (`RAD_WITH_HIP=OFF` compiles the translation unit out), so the host
+results below do not exercise it.
+
+**Result (2026-10-22).** Measured with `/opt/rocm/llvm/bin/clang{,++}` (AMD clang 23.0.0git, ROCm
 llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
-Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
-`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 310 checks over 23 cases), and the
-broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Five of the six failures fail
-identically on `cb5a69a` with the same compiler and configuration; the sixth, `glm5next_test`,
-passes there at 9.3 s and crosses its 10 s CPU budget only under the broad run's parallel load (it
-passes again in the 94-test fast tier). None of them is caused by P00:
+Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the prerequisite above, and
+`cb5a69a` plus the same prerequisite:
 
-| Failure | Reason | Baseline `cb5a69a` |
-|---------|--------|--------------------|
-| `images_test` | 9 checks, HTTP 500: no FFmpeg on this host | same 500s |
-| `videos_test` | 8 checks, `encoding_failed` / 400: no FFmpeg | same |
-| `gbnf_test_shard3` | `json_schema_walks_write_only_valid_instances` (`gbnf_test.cpp:1857`) | same failure |
-| `gbnf_test_shard2` | CPU budget 31.5 s > 10 s, all 7 cases ok | 21.2 s > 10 s |
-| `tokenizer_test` | CPU budget 32.2 s > 20 s, all 23 cases ok | 25.7 s > 20 s |
-| `glm5next_test` | CPU budget 10.9 s > 10 s, all 16 cases ok | 9.3 s, passes |
+- The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
+  pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
+  CEST, last artifact of that run 02:17:52). `e0a053c`, `9bc94cd` and `8c91876`, and the
+  completion/bench change after them, add checks and are **unexecuted** -- the tree now carries
+  381/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
+  objects on the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the
+  older libavx objects are not part of these binaries.
+- The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
+  baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
+  five failures below fail on both.
+- The two further broad-run failures on P00, `glm5next_test` (10.49 s CPU) and `quant_ggml_test`
+  (25.84 s CPU), pass individually on the same tree (7.83 s and 6.01 s) and passed in the baseline
+  broad run: they cross a wall-clock budget under the eight-way parallel run, not a check.
 
-The last three are wall-clock budgets under an eight-way parallel run on this host, not check
-failures; `glm5next_test` is the one that moved across the line and needs headroom, not a fix.
-None of the six touches `core/sched/`.
+The five, each run alone (`ctest -R '^<name>$' -j1`) with the same invocation on both trees:
 
-The whole-tree clang build needs the `build/clang23-libavx` commit first (the two kernel-source
-incompatibilities noted below); the broad run above was made with that patch applied to the
-working tree only, and P00 itself contains no libavx change.
+| Failure | P00 + prerequisite | `cb5a69a` + prerequisite |
+|---------|--------------------|--------------------------|
+| `gbnf_test_shard2` | 41715 checks over 7 cases in 20.94 s; `FAIL the binary spent 20.94 s of CPU, over its budget of 10 s (RAD_TEST_CPU_BUDGET)` | 41715 checks, 22.30 s CPU, same budget failure |
+| `gbnf_test_shard3` | `FAIL json_schema_walks_write_only_valid_instances`, `tests/gbnf_test.cpp:1857: CHECK(ok)`, `seed 69 wrote {"n":\x0a 91,"s":"bion\xf0\x85\xaa\x8d","t":\x0a[] }`; 1 failure | identical failure, same seed and output |
+| `images_test` | 9 failures, all `500 server_error: the picture could not be encoded: this build has no media decoder … (RAD_WITH_FFMPEG)` | same 9 failures |
+| `tokenizer_test` | 907 checks over 23 cases in 25.98 s; `FAIL the binary spent 26.04 s of CPU, over its budget of 20 s` | 907 checks, 30.89 s CPU, same budget failure |
+| `videos_test` | 8 failures: `tests/videos_test.cpp:238` `status` `"failed"` vs `"completed"`, `:239` `seconds` `"auto"` vs `"0.12"` | same 8 failures |
+
+None of the five touches `core/sched/`; the budget overruns above and the two load cases are this
+host's speed, not a check result. The earlier 99/104 and 98/104 figures were taken with
+`CMAKE_BUILD_TYPE` unset (an unoptimised build) and are superseded by the RelWithDebInfo runs
+above.
 
 The test binary is picked up by the existing `*_test.cpp` glob; no CMake edit is needed.
-
-The linker now states `--build-id` explicitly, which Debian's GCC driver passed by itself and
-clang's does not, so rad-kbench keeps a plugin identity whichever compiler links. The two libavx
-incompatibilities clang 23 has with GCC-built kernel sources (a duplicated `target` attribute and a
-bf16 intrinsic inside an OpenMP-outlined loop) are **not** part of P00; they are on branch
-`build/clang23-libavx` (commit `dcb4e6f`, from `cb5a69a`) and must land for a whole-tree clang build.

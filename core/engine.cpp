@@ -491,6 +491,9 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+        /* StepOut outlives the step (it is the loop's), so last step's completion must not be
+         * readable as this one's before any wait has run. */
+        so.complete = false;
         if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
@@ -844,7 +847,23 @@ int Engine::collect_issue(StepOut& so) {
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
     else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(so));
-    return rad_event_record(step_end_, ranks_[0]->ctx.stream());
+    RAD_TRY(rad_event_record(step_end_, ranks_[0]->ctx.stream()));
+    /* Each other rank's own end, recorded here rather than in the rank thread: the join barrier
+     * above already proves every rank has enqueued this step, so a record enqueued now on its
+     * stream covers all of its work and none of the step issued ahead below. */
+    for (size_t i = 1; i < ranks_.size(); ++i)
+        RAD_TRY(rad_event_record(rank_end_[i], ranks_[i]->ctx.stream()));
+    return RAD_OK;
+}
+
+/* The step's completion, on every rank. step_end_ is card-local and the rank barrier joins
+ * enqueues, so it alone would let the host commit -- and advance a history water level -- while
+ * another rank's stream is still running. The extra waits cost nothing in the common case: the
+ * ranks were released together, so theirs are done when rank 0's fires. */
+int Engine::await_step_end() {
+    RAD_TRY(rad_event_sync(step_end_));
+    for (size_t i = 1; i < ranks_.size(); ++i) RAD_TRY(rad_event_sync(rank_end_[i]));
+    return RAD_OK;
 }
 
 /* Issue the copy of an embedding step's pooled rows (the first n_seq) into pinned memory on rank
@@ -870,7 +889,8 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 1);
     if (plan.e.empty()) return RAD_OK;
-    RAD_TRY(rad_event_sync(step_end_));
+    RAD_TRY(await_step_end());
+    so.complete = true;
     if ((int64_t)plan.e.size() != (int64_t)b->n_seq) {
         RAD_ERR("an embedding step planned %zu sequences and its batch carries %lld",
                 plan.e.size(), (long long)b->n_seq);
@@ -978,11 +998,22 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
-    if (so.n_rows <= 0) return RAD_OK;
+    /* A step with no sampled rows has nothing to read back, so the host does not wait for a readback
+     * here and can run ahead. That is not completion evidence, and a history-only or mid-prompt
+     * pass still has to be proven before anything advances on it -- so wait when the step actually
+     * issued one, and only then. A pure prefill step issues no draft pass and keeps running ahead.
+     * Either way the fact is `so.complete`, never the row count or the batch pointer. */
+    if (so.n_rows <= 0) {
+        if (!serial_hist_issued_) return RAD_OK;
+        RAD_TRY(await_step_end());
+        so.complete = true;
+        return RAD_OK;
+    }
 
     so.rows.resize((size_t)so.n_rows);
-    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
-    RAD_TRY(rad_event_sync(step_end_));
+    /* Wait on the step-end events, not the streams: a step issued ahead is queued behind them. */
+    RAD_TRY(await_step_end());
+    so.complete = true;
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());

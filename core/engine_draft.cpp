@@ -49,6 +49,9 @@ int Engine::step_state_init() {
     slots_host_ = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
     if (!slots_host_) return RAD_E_NOMEM;
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    rank_end_.assign(ranks_.size(), nullptr);
+    for (size_t i = 1; i < ranks_.size(); ++i)
+        RAD_TRY(rad_event_create_as(&rank_end_[i], RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
 
@@ -62,6 +65,9 @@ void Engine::step_state_fini() {
     }
     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
     slots_host_ = nullptr;
+    for (RadEvent& ev : rank_end_)
+        if (ev) rad_event_destroy(ev);
+    rank_end_.clear();
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
 }
@@ -122,6 +128,7 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
  * history pass and every round, then the final proposal into the slots and their readback.
  * Nothing synchronises here; collect_step has the step's one wait. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
+    serial_hist_issued_ = false;
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
@@ -156,6 +163,11 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
+        /* Round 0 is the history pass; a non-null batch here means one was built and is about to be
+         * enqueued on every rank. Recorded before the issue so a failure below does not leave the
+         * fact claiming a pass that never reached a stream -- and the pass still proves nothing
+         * until collect_step waits on this step's end events. */
+        if (rd == 0) serial_hist_issued_ = true;
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds

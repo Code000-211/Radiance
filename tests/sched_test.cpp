@@ -3046,6 +3046,50 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
     bb.fini();
 }
 
+/* The bench's one-shot build failure (tests/sched_fakes.h): a build that has work to do fails
+ * exactly once, an empty plan does not spend the shot, and the next real build recovers. This is
+ * the seam the C/E regressions drive -- the builder's own refusal path, so no fault-injection
+ * switch has to exist in production. */
+TEST(a_failing_build_is_one_shot_and_spares_an_empty_plan) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 80));
+    StepPlan p;
+    auto plan_one = [&] {
+        p.reset();
+        StepEntry e;
+        e.seq = 1;
+        e.card = 0;
+        e.n_tokens = 1;
+        e.ctx_len = (int32_t)f.kv.seqs[1].n - 1;
+        p.e.push_back(e);
+        p.n_tok = 1;
+    };
+
+    plan_one();
+    CHECK(bb.build(p, f.kv, 0) != nullptr);   /* unarmed: the real builder accepts it */
+    sched_fail_next_build();
+    p.reset();
+    CHECK(bb.build(p, f.kv, 0) == nullptr);    /* an empty plan is not work; the shot survives */
+    plan_one();
+    CHECK(bb.build(p, f.kv, 0) == nullptr);    /* the owed build fails, once */
+    CHECK(bb.build(p, f.kv, 0) != nullptr);    /* and the next one recovers */
+    bb.fini();
+}
+
 /* Two conv groups, each derivation reading its own window. With one shared slot array and window,
  * only the last-declared RAD_KV_CONV group would be filled and the other's row would stay -1.
  * (Today only `conv_state_index` reads these, and no architecture calls it; conv kernels use the
