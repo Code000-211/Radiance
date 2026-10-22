@@ -108,6 +108,13 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
+#ifdef RAD_TEST_HOOKS
+    /* Test-build-only: engine_step_test drives collect_step's completion branch on a
+     * default-constructed Engine, which needs no model and no started scheduler. The macro is
+     * defined only for the test copy of the engine translation units (tests/CMakeLists.txt), so
+     * rad_core and every translation unit it is linked with see this class without the friend. */
+    friend struct EngineTestPeer;
+#endif
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
