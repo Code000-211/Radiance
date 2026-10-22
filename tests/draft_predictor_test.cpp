@@ -429,6 +429,19 @@ TEST(a_recycled_slot_starts_over_and_an_unchanged_identity_keeps_the_estimate) {
     CHECK_OK(r.predict());
     CHECK_EQ(r.pseq[0].a[0], 0.8f);
     CHECK_EQ(r.pseq[0].n[0], 0);
+
+    /* Identity is the pair, not the request: a cycle of an older generation is deliverable after
+     * a preempt -> recycle -> resume, but it teaches nothing to the resumed generation. */
+    Rig p(6);
+    REQUIRE_EQ(predicted(p, 11, 0, 2).valid, 0u);
+    p.arm(11, 3, 3, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 2);
+    const DraftPrediction resumed = predicted(p, 11, 0, 4);
+    CHECK_EQ(resumed.valid, 0u);
+    CHECK_OK(p.model.observe(p.obs));
+    CHECK_EQ(p.state[0].req_id, 11u);
+    CHECK_EQ(p.state[0].slot_gen, 4u);
+    CHECK_EQ(p.state[0].n[0], 0);
+    CHECK_EQ(p.state[0].a[0], 0.8f);
 }
 
 TEST(uncertainty_is_computed_from_the_effective_sample_size) {
@@ -483,11 +496,11 @@ TEST(an_observation_must_name_a_complete_cycle_its_plan_and_a_known_slot) {
     r.plan_id[0] = 11;
     CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL);
 
-    /* A plan that holds fewer rows than the observation reads is refused before a row is read. */
+    /* An over-wide plan is refused by the shared issuance gate before a row is read. */
     r.arm(10, 3, 3);
     r.plan.cap = 0;
     const std::string oob = stderr_of([&] { CHECK_EQ(r.model.observe(r.obs), RAD_E_INVAL); });
-    CHECK(has(oob, "but its plan holds"));
+    CHECK(has(oob, "names a plan that is not valid"));
 
     /* A row that contradicts itself teaches nothing. */
     r.arm(10, 3, 3, DraftCensor::None, 4);   /* checked > verified */

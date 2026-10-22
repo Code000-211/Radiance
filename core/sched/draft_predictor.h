@@ -92,9 +92,9 @@ public:
     /* DraftObserveFn's B half, composed by the integrator after a cycle the caller declared
      * complete. The cycle must pass draft_observation_deliverable: it names its plan, its rows are
      * complete and valid, and each row's origin fits the plan's permission. Refuses a malformed
-     * observation, an unclassified cut, a plan row set outside the plan's cap, and a slot outside
-     * the caller's table. A row whose slot was recycled to another identity is skipped, not
-     * merged. */
+     * observation, an unclassified cut, a plan that fails the shared issuance gate
+     * (draft_plan_valid bounds its rows), and a slot outside the caller's table. A row whose slot
+     * was recycled to another identity is skipped, not merged. */
     int observe(const DraftObservation& obs) const;
 
 private:

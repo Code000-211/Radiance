@@ -172,11 +172,12 @@ int DraftPredictModel::observe(const DraftObservation& obs) const {
         RAD_ERR("draft predictor: no state table configured");
         return RAD_E_INVAL;
     }
-    /* draft_plan_identifies() reads the plan's [cap]. Check that before the shared gate, so a
-     * caller's oversized n_seq cannot walk off the plan's arrays. */
-    if (obs.plan && obs.n_seq > obs.plan->cap) {
-        RAD_ERR("draft predictor: cycle %llu has %d rows but its plan holds %d",
-                (unsigned long long)obs.cycle_id, (int)obs.n_seq, (int)obs.plan->cap);
+    /* The plan is the cycle's immutable record and passed the shared issuance gate, so validate it
+     * with that same gate before draft_plan_identifies() reads its rows: an over-wide n_seq would
+     * otherwise walk off the plan's arrays. No local bound stands in for the contract here. */
+    if (obs.plan && draft_plan_valid(*obs.plan) != RAD_OK) {
+        RAD_ERR("draft predictor: cycle %llu names a plan that is not valid",
+                (unsigned long long)obs.cycle_id);
         return RAD_E_INVAL;
     }
     /* The contract's one lifetime gate: complete, plan-identified, valid rows, origin fits the
