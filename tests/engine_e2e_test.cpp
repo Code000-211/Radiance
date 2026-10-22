@@ -1787,6 +1787,86 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
     CHECK_EQ(spec.stop(), 0);
 }
 
+/* --draft-profile-out end to end: a legacy serving run with a serial assistant head measures the
+ * draft cycles one real request runs, exports them on the orderly SIGTERM shutdown, and a fresh
+ * start of the same deployment -- which derives its own runtime identity -- binds the file and is
+ * admitted on it. Nothing here writes a bucket by hand: the reader, the writer and the recording
+ * ring have their own fixtures (engine_profile_test, sched_draft_test); this case proves that the
+ * numbers in the file came out of this run. Both runs name the same ceiling: the Cost policy
+ * validates its default tier ladder (up to 6) against it and refuses a shallower one rather than
+ * clamping. */
+TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_them) {
+    /* A calibration run needs its own checkpoint (the assistant head lives in draft/), and the
+     * shared World has none with a drafter. */
+    tiny::TempDir dir("profile_out");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "profile.json";
+
+    const std::vector<std::string> common = { "--num-speculative-tokens", "6",
+                                        "--draft-window", "fixed" };
+    Server calib;
+    {
+        std::vector<std::string> a = common;
+        a.insert(a.end(), { "--draft-policy", "legacy", "--draft-profile-out", out });
+        REQUIRE(calib.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json reply = post(calib.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the request failed: %s\n%s\n", why.c_str(),
+                tail(calib.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
+
+    /* SIGTERM is the orderly shutdown: the request drains, serve() returns RAD_OK and the export
+     * runs after the step threads joined. A run that cannot price a bucket from its own cycles
+     * fails the export here, with the reason in the log. */
+    const int calib_exit = calib.stop();
+    const std::string calib_log = calib.output();
+    if (calib_exit != 0)
+        fprintf(stderr, "    the calibration run exited %d:\n%s\n", calib_exit,
+                tail(calib_log).c_str());
+    REQUIRE_EQ(calib_exit, 0);
+    CHECK(calib_log.find("bucket(s), fingerprint") != std::string::npos);
+
+    const json profile = json::parse(tiny::read_text(out), nullptr, false);
+    REQUIRE(profile.is_object());
+    const json buckets = profile.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    REQUIRE(!buckets.empty());
+    /* One bucket the table may price from: no disturbing flag (ahead is not one) and a positive
+     * mean over at least one measurement -- the rule the export and estimate() share. */
+    bool usable = false;
+    for (const json& b : buckets) {
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        usable = usable || (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
+    }
+    CHECK(usable);
+
+    /* The reload. A fresh process derives the identity from the same deployment and must bind the
+     * file; its start is the assertion, since the Cost policy refuses an inactive table or one
+     * without a usable bucket, and the log names the match. */
+    Server cost;
+    {
+        std::vector<std::string> a = common;
+        a.insert(a.end(), { "--draft-policy", "cost", "--draft-profile", out });
+        REQUIRE(cost.start(dir.path, a));
+    }
+    const std::string cost_log = cost.output();
+    if (cost_log.find("buckets match this deployment") == std::string::npos)
+        fprintf(stderr, "    the second run did not bind the profile:\n%s\n", tail(cost_log).c_str());
+    CHECK(cost_log.find("buckets match this deployment") != std::string::npos);
+    CHECK(cost_log.find("is not used for this deployment") == std::string::npos);
+    CHECK_EQ(cost.stop(), 0);
+}
+
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones
  * over the whole prompt. Each decoded position's probabilities must be what a cold prefill of the
  * prompt and the tokens before it gives: exactly where both paths compute each row the same way
