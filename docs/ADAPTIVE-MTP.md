@@ -120,7 +120,9 @@ prediction and sample.
   carries the executed distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan`
   checks the planned distribution against the plan's `k[]`; at `pipeline_depth == 0` it also binds
   `verify_k` and `rows[]` to the plan, because nothing is issued ahead and the plan verifies the
-  window it drafts (`draft_plan_valid` binds `verify_k == max_k` there). `draft_shape_priceable`
+  window it drafts (`draft_plan_valid` binds `verify_k == max_k` there). A plan at K 0 is the same
+  separation at plan level: `max_k == 0` with `verify_k > 0` drafts nothing and verifies the window
+  a previous cycle published, which only `pipeline_depth > 0` admits. `draft_shape_priceable`
   requires both distributions to be monotone and complete, `verify_tokens` to equal
   `n_rows + sum_j rows[j]`, and the deepest round of each to be non-empty: `verify_k > 0` with
   `rows[verify_k] == 0` is a missing shape, not a measured zero.

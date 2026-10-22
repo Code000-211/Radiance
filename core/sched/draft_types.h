@@ -360,7 +360,12 @@ enum { RAD_DRAFT_MAX_FEATURES = 4 };
  * not published, published and not verified, verified and not checked (past the first rejection),
  * and checked and still censored before it is committed. `end` classifies the cut; `origin` says
  * who produced this row (the plan's fill[] is only the permission). Both are part of the
- * observation, so no caller keeps a side list that can drift from the cycle. */
+ * observation, so no caller keeps a side list that can drift from the cycle.
+ *
+ * The counts have two origins and neither orders the other: `generated` and `published` are this
+ * plan's drafting; `verified`, `checked`, `accepted` and `raw_match` are the paired verify, which
+ * under issue-ahead verifies a window a previous cycle published. See
+ * draft_seq_observation_valid for what is ordered inside each. */
 struct DraftSeqObservation {
     uint64_t raw_match = 0;  /* consecutive drafts that matched the target's own draw, uncensored:
                               * accept_greedy's count, before the end-of-generation cut */

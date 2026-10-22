@@ -1092,6 +1092,8 @@ TEST(an_ahead_plan_may_verify_a_different_k_than_it_drafts) {
 
     f.plan.verify_k = 1;   /* the previous cycle verified one draft per row, not two */
     CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+    f.plan.verify_k = 3;   /* or one deeper than this plan drafts */
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
 
     DraftVerifyShape s;
     s.n_rows = 2;
@@ -1104,6 +1106,47 @@ TEST(an_ahead_plan_may_verify_a_different_k_than_it_drafts) {
     CHECK(s.verify_k != s.draft_k);
     CHECK(draft_shape_priceable(s));
     CHECK(draft_shape_matches_plan(s, f.plan));
+
+    /* The other direction: a verify window deeper than this plan's own draft distribution. */
+    DraftVerifyShape deep = s;
+    deep.verify_k = 3;
+    deep.rows[2] = 2; deep.rows[3] = 1;
+    deep.verify_tokens = 2 + 2 + 2 + 1;
+    CHECK(draft_shape_priceable(deep));
+    CHECK(draft_shape_matches_plan(deep, f.plan));
+}
+
+TEST(a_current_k0_plan_still_carries_the_pending_verify_window) {
+    /* K 0 this cycle and the verify window still outstanding: the plan drafts nothing, the paired
+     * step verifies what a previously published plan produced. Both the gate and the shape keep
+     * the two apart, so neither zeroing verify_k to fit max_k nor refusing the plan is needed. */
+    draft_fake::Fixture f;
+    f.view.pipeline_depth = 1;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 0;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+    CHECK_EQ(f.plan.pipeline_depth, 1);
+    CHECK_EQ(f.plan.max_k, 0);
+    CHECK_EQ(f.plan.k[0], 0);
+    CHECK(f.plan.fill[0] == DraftDrafter::None);
+    f.plan.verify_k = 3;   /* the previous cycle published three drafts for this row */
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+
+    DraftVerifyShape s;
+    s.n_rows = 1;
+    s.verify_k = 3;
+    s.rows[1] = 1; s.rows[2] = 1; s.rows[3] = 1;
+    s.verify_tokens = 1 + 1 + 1 + 1;
+    s.draft_k = 0;
+    s.pipeline_depth = 1;
+    CHECK(draft_shape_priceable(s));
+    CHECK(draft_shape_matches_plan(s, f.plan));
+
+    /* At depth 0 nothing is pending and the plan verifies the window it drafts, so a K0 plan
+     * naming a verify window is not this gate's to accept. */
+    f.plan.pipeline_depth = 0;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()
