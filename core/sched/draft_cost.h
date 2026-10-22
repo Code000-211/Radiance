@@ -3,17 +3,21 @@
  * The policy (C) compares candidate plans by their expected batch time, so it asks the
  * DraftCostModel seam for a price in milliseconds for a DraftVerifyShape. This is that price: a
  * versioned profile of measured buckets (`rad-draft-profile/2`, docs/ADAPTIVE-MTP.md), keyed by
- * the whole shape -- verify tokens and N_j, the plan's own draft distribution, the pipeline
- * depth, context class, history and prefill tokens, sampling, replay state and the loaded
- * drafter -- never by (rows, max K) alone.
+ * the verify shape -- verify tokens and N_j, pipeline depth, context class, history and prefill
+ * tokens, sampling, replay state and the loaded drafter -- paired with the draft distribution that
+ * actually ran, never by (rows, max K) alone.
  *
- * Two distributions, deliberately separate. `shape.rows[]` is the verify window of the associated
- * cycle; `shape.draft_rows[]` is the distribution the plan asked its draft rounds to run. At
- * pipeline_depth 0 they are the same execution, and the reader requires them to agree; above 0 the
- * paired step verifies a window the previous cycle drafted, so they belong to different cycles and
- * are keyed separately. `rounds` plus one total cannot tell two shrinking distributions apart, so
- * the executed distribution travels per round: `shape.draft_rows[]` is what the plan asked for,
- * `DraftCostBucket::draft_round_rows[]` is what ran.
+ * The price is the cost of the executed distribution. `shape.rows[]` is the verify window the cycle
+ * paid for; the draft work it paid for is `rounds` and `DraftCostBucket::draft_round_rows[]`, what
+ * actually ran. A cycle may legally stop before its plan's deepest round, so its bracket times that
+ * shorter execution and not the plan it took. The lookup key is therefore the sample's shape with
+ * the executed distribution in place of the plan's: a query names in `shape.draft_k` /
+ * `draft_rows[]` the distribution it plans to execute, and that distribution is compared against
+ * the executed one. The plan's own distribution stays in the bucket's shape -- it is what the sample
+ * was attributed against (`draft_shape_matches_plan`, `executed_within_plan`) and the upper bound of
+ * the execution, so a bucket measured at a shorter run never matches a query that plans the deeper
+ * one. The bucket's `shape.draft_rows[]` is therefore provenance, not key: it is what the sample
+ * was attributed against, and no query is matched on it.
  *
  * A missing measurement is not a zero. A shape carrying an unknown dimension is refused by
  * draft_shape_priceable() and by the reader, never priced as if its zeros had been measured.
@@ -29,9 +33,16 @@
  * so telemetry overflow never blocks the card.
  *
  * Units are milliseconds or nothing. A shape with no bucket is priced by one documented
- * interpolation step (the neighbouring context class) or by a conservative bound scaled from the
- * nearest measured anchor; with no anchor at all the estimate is invalid and the caller uses its
- * named fixed baseline. A unitless prior is never reported as milliseconds.
+ * interpolation step (the neighbouring context class) or by a heuristic fallback: a measured
+ * anchor that ran the same executed draft distribution and the same history and prefill work,
+ * scaled by the verify-token ratio plus a fixed margin. History and prefill are part of the class
+ * because no measured scaling exists for them -- borrowing across a different amount of either
+ * would be a bound on another measurement. The fallback scales verify work only -- it never prices
+ * draft work it has not measured, so a query planning more draft rounds than any bucket ran gets no
+ * number and the caller's named baseline instead of a shallower run's cost. That margin is a rule
+ * of thumb for preferring a bound over nothing, not a proven upper bound, and the estimate carries
+ * it as uncertainty. With no anchor at all the estimate is invalid and the caller uses its named
+ * fixed baseline. A unitless prior is never reported as milliseconds.
  *
  * Only a sample draft_sample_attributable() accepts updates a measured bucket, and only when its
  * identity is known: a sample whose cycle_id or policy_version is 0 (unattributed) is refused, and
@@ -78,17 +89,24 @@ struct DraftCostRuntime {
     DraftCostExecution   execution = DraftCostExecution::Rectangular;
 };
 
-/* One measured bucket. `shape` plus the executed extent `rounds`/`draft_round_rows` is the lookup
- * key: two cycles that verified the same window but ran a different draft distribution are
- * different kernels and stay separate -- the same round count and the same total rows are not
- * enough, [3,1,1] and [2,2,1] are two measurements.
+/* One measured bucket. Its price is the cost of the executed distribution: the lookup key is the
+ * sample's shape -- verify window, pipeline depth, context class, history and prefill tokens,
+ * sampling, replay and the loaded drafter -- paired with `rounds` and `draft_round_rows[]`, what
+ * actually ran. Two cycles that verified the same window but ran a different draft distribution are
+ * different kernels and stay separate: the same round count and the same total rows are not enough,
+ * [3,1,1] and [2,2,1] are two measurements.
+ *
+ * `shape.draft_k` / `shape.draft_rows[]` are not part of that key. They keep the plan the samples
+ * took, which the execution could not exceed and which therefore bounds it: the bucket's provenance
+ * and its upper bound, so a query planning a deeper distribution does not match.
  *
  * The origin mix (`shape.origins` in the file) is validated against the bucket's own drafter, but
  * it is not stored here: DraftVerifyShape has no origins field, so a query could not discriminate
  * on it anyway. See the note on that interface request above.
  *
- * `flags` are the attribution flags of the samples it was built from; a bucket carrying a
- * disturbing flag is a diagnostic record and is never used to price a shape. */
+ * `flags` are the attribution flags of the samples it was built from; a bucket carrying a disturbing
+ * flag -- or the online-only kDraftBucketUnpriced -- is a diagnostic record and is never used to
+ * price a shape. */
 struct DraftCostBucket {
     DraftVerifyShape shape;
     uint16_t flags = 0;
@@ -127,8 +145,16 @@ enum { kDraftCostDefaultBuckets = 2048 };
 /* The per-context-class interpolation allowance: a bucket borrowed from the neighbouring class
  * is widened by this fraction of its mean, propagated into the estimate's uncertainty. */
 constexpr double kDraftCostCtxStep = 0.10;
-/* The conservative bound's margin over the anchor's verify-token scaling. */
+/* The heuristic fallback's margin over the anchor's verify-token scaling: a rule of thumb for
+ * preferring a bound over nothing, not a proven upper bound. It is reported through
+ * DraftCostEstimate::unc_ms, so the caller can see how much of the number is the rule. */
 constexpr double kDraftCostFallbackMargin = 0.25;
+
+/* Strand-A bucket flag, created online only: the sample was a truncation -- the plan's deepest
+ * round never ran -- so its bracket carries the cost of stopping early and prices no plan.
+ * observe() keeps it for diagnosis and never returns it by estimate(); a profile file has no name
+ * for it and it is never written. */
+enum : uint16_t { kDraftBucketUnpriced = 1u << 15 };
 
 /* The profile in memory, plus the online updates from completed cycles. configure() copies the
  * profile; the caller's DraftCostProfile and its storage are not referenced afterwards. */
@@ -154,20 +180,28 @@ public:
     int64_t dropped() const { return dropped_; }   /* buckets dropped at capacity */
     int64_t ignored() const { return ignored_; }   /* observations with no timing to learn from */
 
-    /* Prices one shape. The key is the whole shape -- both distributions, pipeline depth and the
-     * loaded drafter included; the executed extent the query asks for is the plan's own
-     * distribution, so a bucket measured at another extent is a different pipeline depth and does
-     * not price it. Measured from an exact bucket, Interpolated from the neighbouring context
-     * class, or a ConservativeFallback scaled from the nearest anchor. valid = false when there is
-     * no anchor at all. Allocation-free. */
+    /* Prices one shape. The key is the shape -- verify window, pipeline depth and the loaded
+     * drafter included -- against the executed draft distribution: the query's
+     * `draft_k`/`draft_rows[]` is the distribution it plans to execute, and only a bucket measured
+     * at exactly that distribution prices it. A query that plans more than was ever measured gets
+     * no measurement, however close the bucket's plan was; so does one with no anchor that ran its
+     * own distribution with the same history and prefill. Measured from an exact bucket,
+     * Interpolated from the neighbouring context class, or a heuristic fallback scaled from the
+     * nearest anchor that ran the same distribution, history and prefill. valid = false when there
+     * is no such anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
     /* Learns from one completed cycle. Refuses an incomplete observation, one that does not
-     * identify the plan it names, a sample whose identity disagrees with the observation, a shape
-     * that is not the plan's own distribution or that is not priceable (an unknown dimension is
-     * refused, never priced as zero), an executed distribution that could not have run or that
-     * exceeds the plan it took, and a non-finite or non-positive time. Only an attributable sample
-     * updates a measured bucket; the rest are kept as diagnostics. */
+     * identify the plan it names, a sample whose identity disagrees with the observation, a plan
+     * that says its bracket is not valid (DraftPlan::timing_valid), a shape that is not the plan's
+     * own distribution or that is not priceable (an unknown dimension is refused, never priced as
+     * zero), a replay state that contradicts the shape it would be filed under, an executed
+     * distribution that could not have run or that exceeds the plan it took, and a non-finite or
+     * non-positive time. A sample whose replay state the run could not establish is not an error:
+     * it is a bracket with no evidence and is counted in ignored(). Only an attributable sample
+     * updates a measured bucket; the rest are kept as diagnostics, and a truncation -- the plan's
+     * deepest round never ran, so the bracket carries abort cost -- is stored with
+     * kDraftBucketUnpriced instead of seeding a measured bucket. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */

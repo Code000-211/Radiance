@@ -28,9 +28,15 @@ using json = nlohmann::json;
 
 /* The flags that make a bucket a diagnostic record rather than a measurement of normal
  * operation. kDraftSampleAhead is not here: an ahead sample is usable when the caller checked
- * its bracket, it only stays visible through n_ahead. */
+ * its bracket, it only stays visible through n_ahead. kDraftBucketUnpriced is the online-only
+ * record of a truncation -- the plan's deepest round never ran, so the bracket carries abort cost
+ * (observe()) -- and is a diagnostic in the same sense: excluded from pricing and from anchoring
+ * alike. kDraftSampleShortened is the shared contract's version of the same fact, including the
+ * cancelled row that leaves `rounds` at the plan's extent while timing less work; it is listed
+ * here so such a bracket is kept with its flag instead of being priced as a full run. */
 constexpr uint16_t kDisturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
-                                 kDraftSampleAdmission | kDraftSamplePlacement;
+                                 kDraftSampleAdmission | kDraftSamplePlacement |
+                                 kDraftSampleShortened | kDraftBucketUnpriced;
 
 int refuse(std::string* err, int code, const std::string& what) {
     if (err) *err = what;
@@ -82,28 +88,29 @@ bool get_rows(const json& j, const char* key, int32_t len, int32_t cap, int32_t*
     return true;
 }
 
-/* Cheap half of the shape key; the N_j arrays are compared only when this matches. */
+/* Cheap half of the shape key; the verify N_j array is compared only when this matches. The plan's
+ * draft distribution is not here: the price is the cost of the executed distribution, which
+ * extent_same() compares. */
 bool shape_head_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.n_rows == b.n_rows && a.verify_k == b.verify_k &&
            a.verify_tokens == b.verify_tokens && a.ctx_class == b.ctx_class &&
            a.history_tokens == b.history_tokens && a.prefill_tokens == b.prefill_tokens &&
            a.sampling == b.sampling && a.replay == b.replay && a.drafter == b.drafter &&
-           a.pipeline_depth == b.pipeline_depth && a.draft_k == b.draft_k;
+           a.pipeline_depth == b.pipeline_depth;
 }
 
-/* Both distributions are part of the key: the verify N_j and the draft N_j the plan asked for. */
+/* The verify distribution is part of the key; the draft distribution it plans is not -- see
+ * shape_head_same(). */
 bool shape_same(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     if (!shape_head_same(a, b)) return false;
     for (int j = 0; j <= a.verify_k; ++j)
         if (a.rows[j] != b.rows[j]) return false;
-    for (int j = 0; j <= a.draft_k; ++j)
-        if (a.draft_rows[j] != b.draft_rows[j]) return false;
     return true;
 }
 
-/* Everything the shape has except the context class: the one documented interpolation step. Both
- * distributions, the pipeline depth and the drafter must match -- the same depths with a
- * different length distribution are another kernel. */
+/* Everything the shape has except the context class: the one documented interpolation step. The
+ * verify distribution, the pipeline depth and the drafter must match -- the same depth with a
+ * different verify window is another kernel. */
 bool shape_same_except_ctx(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     if (a.ctx_class == b.ctx_class) return false;
     DraftVerifyShape a2 = a, b2 = b;
@@ -179,11 +186,14 @@ bool bucket_usable(const DraftCostBucket& b) {
 uint16_t bucket_class(uint16_t flags) { return (uint16_t)(flags & kDisturbing); }
 
 /* The conservative fallback may only borrow from an anchor of the same context class, sampling,
- * replay, loaded drafter and pipeline depth: a bound scaled across a different drafter process or
- * another overlap structure would be a bound on another measurement. */
+ * replay, loaded drafter and pipeline depth -- and, since no measured scaling exists for them, of
+ * the same history and prefill work. A bound scaled across a different drafter process, another
+ * overlap structure or another amount of history/prefill is a bound on another measurement. The
+ * verify window is the one dimension left, and its scaling is explicitly heuristic (estimate()). */
 bool anchor_class_matches(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.ctx_class == b.ctx_class && a.sampling == b.sampling && a.replay == b.replay &&
-           a.drafter == b.drafter && a.pipeline_depth == b.pipeline_depth;
+           a.drafter == b.drafter && a.pipeline_depth == b.pipeline_depth &&
+           a.history_tokens == b.history_tokens && a.prefill_tokens == b.prefill_tokens;
 }
 
 bool finite(double x) { return std::isfinite(x); }
@@ -239,9 +249,10 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.sampling: missing or unknown");
     s->sampling = (DraftSampling)sampling;
 
-    /* By name, never by the file's index: `DraftReplay::Unknown` sits at 0, so a cast would read a
-     * measured `none` as "no evidence" and no live shape could ever match its bucket. A profile is
-     * a measurement, so `unknown` is not a file value at all (draft_types.h). */
+    /* The file's four names are mapped one by one, not by index: the shared enum has `Unknown` in
+     * front of `None`, and a cast would file a measured "none" as "no evidence". A profile is a
+     * measurement, so it always established its replay state -- `Unknown` never comes from a
+     * file. */
     static const char* const kReplay[] = { "none", "play", "record", "audit" };
     static const DraftReplay kReplayValue[] = { DraftReplay::None, DraftReplay::Play,
                                                 DraftReplay::Record, DraftReplay::Audit };
@@ -264,7 +275,9 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.draft_rows: missing, not exactly draft_k + 1 "
                                             "long, or outside 0..n_rows");
     /* draft_shape_priceable covers the monotonicity, the token sum, the deepest-round rule and the
-     * stale tails of both arrays. */
+     * stale tails of both arrays. The plan's distribution stays a validated part of the file even
+     * though the lookup key uses the executed extent: it is the sample's provenance and its upper
+     * bound, so a file that leaves it out could not be attributed. */
     if (!draft_shape_priceable(*s))
         return refuse(err, RAD_E_INVAL, where + "shape: not a priceable key (both distributions "
                                             "must be monotone and complete, verify_tokens must be "
@@ -508,9 +521,11 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     if (!draft_shape_priceable(s)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no profile: invalid estimate, the caller's named baseline */
 
-    /* The extent this shape would be executed at is its own draft distribution: a bucket measured
-     * with another distribution ran another kernel, whatever its round count and total.
-     * draft_shape_priceable already guarantees that distribution is complete and monotone. */
+    /* The key's draft half is the executed extent: a bucket measured with another executed
+     * distribution ran another kernel, whatever its round count and total. The query's
+     * draft_k/draft_rows[] is the distribution it plans to execute, so it is the extent it asks to
+     * be priced at. draft_shape_priceable already guarantees that distribution is complete and
+     * monotone. */
 
     /* 1. The shape itself. */
     for (const DraftCostBucket& b : buckets_) {
@@ -526,13 +541,13 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 2. The one documented interpolation step: the neighbouring context class, same shape
-     * otherwise -- both distributions, the pipeline depth and the drafter included. The result is
-     * a real measurement; only its uncertainty is widened, and ties go to the larger class (more
-     * context, higher cost). */
+     * otherwise -- the verify distribution, the pipeline depth and the drafter included -- and the
+     * same executed extent. The result is a real measurement; only its uncertainty is widened, and
+     * ties go to the larger class (more context, higher cost). */
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
-    if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
+        if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (std::abs(b.shape.ctx_class - s.ctx_class) != 1) continue;
         if (!near || b.shape.ctx_class > near->shape.ctx_class) near = &b;
     }
@@ -546,17 +561,24 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
         return RAD_OK;
     }
 
-    /* 3. No bucket at all for this shape: a bound scaled from the nearest measured anchor of the
-     * same class, preferring an anchor at the same pipeline depth. The ratio is never below 1, so
-     * the bound never prices a shape under a measured one, and the margin is reported as
-     * uncertainty rather than hidden. */
+    /* 3. No bucket at all for this shape: a heuristic bound scaled from the nearest measured anchor
+     * of the same class -- which includes history and prefill work, since no measured scaling
+     * exists for them and a borrowed bound across a different amount of either would be a bound on
+     * another measurement -- and the same executed draft distribution. The ratio scales verify
+     * work only; it is never allowed to stand in for draft work, because the draft part is not
+     * linear in the verify window and a scaling factor for it would be a slope A has not measured.
+     * A query that plans more draft rounds than any bucket ran therefore gets no number at all --
+     * the caller's named baseline -- instead of pricing the deeper plan at a shallower run's cost,
+     * which is what made the deepest tier win for free. The ratio is never below 1, so the bound
+     * never prices a shape under a measured one, and the margin is reported as uncertainty rather
+     * than hidden -- it is a rule of thumb, not a proven upper bound. */
     const DraftCostBucket* anchor = nullptr;
     int32_t anchor_rank = INT32_MAX;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
+        if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (b.shape.verify_tokens <= 0) continue;
-        const int32_t rank = (extent_same(b, s.draft_k, s.draft_rows) ? 0 : 1000) +
-                             std::abs(b.shape.verify_k - s.verify_k);
+        const int32_t rank = std::abs(b.shape.verify_k - s.verify_k);
         if (rank < anchor_rank) {
             anchor = &b;
             anchor_rank = rank;
@@ -628,15 +650,26 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     const DraftPlan* plan = observation.plan;
     if (!plan) return RAD_E_INVAL;
     if (!draft_plan_identifies(*plan, observation)) return RAD_E_INVAL;
+    /* A bracket the plan itself says does not cover it is no price for any shape it names. */
+    if (!plan->timing_valid) return RAD_E_INVAL;
     if (sample.cycle_id == 0 || sample.cycle_id != observation.cycle_id) return RAD_E_INVAL;
     if (sample.policy_version != observation.policy_version) return RAD_E_INVAL;
 
-    /* The shape must be the plan's own: both distributions, the depth and the row count. Under
-     * pipeline_depth > 0 the verify window belongs to the paired step, so a shape filled from the
-     * current plan would be self-consistent and false. A shape carrying an unknown dimension is
-     * not priced as zero, and one that could not be measured is not learned from. */
+    /* The shape must be the plan's own: the verify distribution it filled, the depth and the row
+     * count. Under pipeline_depth > 0 the verify window belongs to the paired step, so a shape
+     * filled from the current plan would be self-consistent and false. A shape carrying an unknown
+     * dimension is not priced as zero, and one that could not be measured is not learned from. */
     if (!draft_shape_matches_plan(sample.shape, *plan)) return RAD_E_INVAL;
     if (!draft_shape_priceable(sample.shape)) return RAD_E_INVAL;
+
+    /* Replay state keys the bucket, so the sample and the shape it files itself under must name the
+     * same state. A sample whose state the run could not establish is not an error -- it is a
+     * bracket with no evidence and is counted in ignored() below -- but an established state that
+     * contradicts the key is a broken record: filing it would price one state's work under
+     * another's key, and defaulting both to None to pass the gate would price a fact nobody
+     * measured. */
+    if (sample.replay != DraftReplay::Unknown && sample.shape.replay != sample.replay)
+        return RAD_E_INVAL;
     if (!executed_consistent(sample.rounds, sample.draft_round_rows, sample.draft_rows_total,
                              sample.shape.n_rows))
         return RAD_E_INVAL;
@@ -645,13 +678,26 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no usable profile: nothing to learn into */
 
+    if (draft_sample_storable(sample) && sample.rounds < plan->max_k) {
+        /* The plan's deepest round never ran: the bracket is a verify window plus a draft phase
+         * that was cut short, and a cut-short phase carries the cost of stopping -- drain, rows in
+         * flight, discarded slots -- that a plan deliberately drawn at that extent would not pay.
+         * That holds after some rounds exactly as after none: a two-of-six run is not the price of
+         * a two-round plan. A is not told which stop was natural and which was an abort, so it
+         * prices neither. Kept for diagnosis, never priced -- estimate() and the anchor search
+         * both reject it. */
+        record(sample, (uint16_t)(kDraftBucketUnpriced |
+                                  (sample.flags & (kDisturbing | kDraftSampleAhead))));
+        return RAD_OK;
+    }
     if (draft_sample_attributable(observation, sample)) {
         record(sample, (uint16_t)(sample.flags & kDraftSampleAhead));
         return RAD_OK;
     }
-    if (sample.flags & kDisturbing) {
+    if ((sample.flags & kDisturbing) && draft_sample_storable(sample)) {
         /* Stored apart with its flags: a recording, audit, warmup, admission or placement bracket
-         * is not a price of normal operation, but it is not an outlier to be discarded either. */
+         * is not a price of normal operation, but it is not an outlier to be discarded either. A
+         * flagged bracket that did not time the shape (not valid) is not storable at all. */
         record(sample, (uint16_t)(sample.flags & (kDisturbing | kDraftSampleAhead)));
         return RAD_OK;
     }
