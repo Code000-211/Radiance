@@ -2926,7 +2926,10 @@ TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
     const std::string other = dir.path + "/arena-none.json";
     REQUIRE(tiny::write_text(other, doctored.dump(2)));
     std::vector<std::string> mismatch = at_budget(512);
-    mismatch.insert(mismatch.end(), { "--draft-policy", "cost", "--draft-profile", other });
+    /* The legacy policy: under `cost` a refused table is a refused start by design
+     * (Scheduler::init), which would stop the process before the refusal could be read. The bind
+     * and its reason are the same code either way. */
+    mismatch.insert(mismatch.end(), { "--draft-profile", other });
     Server small;
     REQUIRE(small.start(dir.path, mismatch, device_env(32)));
     const std::string small_log = small.output();
@@ -2935,7 +2938,7 @@ TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
     if (small_log.find("is not used for this deployment") == std::string::npos)
         fprintf(stderr, "    the changed level set was not refused:\n%s\n", tail(small_log).c_str());
     CHECK(small_log.find("is not used for this deployment") != std::string::npos);
-    CHECK(small_log.find("arena profile=\"512,256\" runtime=\"none\"") != std::string::npos);
+    CHECK(small_log.find("arena profile=\"none\" runtime=\"512,256\"") != std::string::npos);
     CHECK(small_log.find("basis no-loan -- an optimisation basis") == std::string::npos);
     CHECK_EQ(small.stop(), 0);
 }
