@@ -305,9 +305,13 @@ prediction and sample.
   and the amount is a function of the plan and the lent slots. The loan that bounds it is settled
   before serving, and the fill is completed there: `Engine::serve` runs one `loan_tick` with the
   cache still empty and then `Engine::complete_start_fill`, which holds turnover -- the production
-  balance keeps those slots free and calls the loan settled that way -- and repeats the balance
-  until `Mover::fill_settled()`. Every wave stays at zero dispatches, so the reserve is
+  balance keeps those slots free and calls the loan settled that way -- runs the held balance at
+  least once even if `Mover::fill_settled()` already reads true, and repeats it until
+  `Mover::fill_settled()`. Every wave stays at zero dispatches, so the reserve is
   materialised as part of the start placement instead of being filled by heat in the first steps.
+  A fill that cannot settle, and any device, stream or mover error on the way, is `serve`'s error:
+  the run stops before the fingerprint, the loaded profile and the prices rather than measuring a
+  placement it never reached.
   The mover sizes one record per lent slot (`Mover::lend_from`), so the wave split is the reserve,
   or a wave a drain cut short, not record exhaustion. The fingerprint names the loan and the slots
   it covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A

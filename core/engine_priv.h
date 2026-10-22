@@ -97,8 +97,11 @@ struct Engine::Rank {
      * can bound `moved` to that step's window (arena reclaim runs on the scheduler thread). */
     int64_t  ev_moves_before = 0;
     /* initial_fill_promotions on this rank when the start placement resolved; a fill after that is
-     * a move (Engine::rank_fill_exempt). Atomic: the step loop freezes it while a rank thread may
-     * still be noting its own step. */
+     * a move (Engine::rank_fill_exempt). Atomic because a rank thread reports its own evidence
+     * while the loop may read it; the freeze itself runs between two brackets, after the second
+     * barrier and with every rank parked, so flag-before-freeze is safe at the current call sites
+     * (settle_start_placement) and not as a general pair -- a future read with ranks running needs
+     * freeze-before-flag with release/acquire. */
     std::atomic<int64_t> fill_exempt{0};
     void note_evidence(const Ctx::StepEvidence& e, uint8_t pass_tape, bool moved) {
         if (e.step < 0) return;

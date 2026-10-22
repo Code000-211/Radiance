@@ -209,6 +209,36 @@ struct EngineTestPeer {
      * exists so the branch can run, not to prove a rank-stream synchronization; that proof stays
      * open (a fixture would need a real stream on the rank). */
     static void add_rank(Engine& e) { e.ranks_.push_back(std::make_unique<Engine::Rank>()); }
+
+    /* --- the start fill (tests/engine_start_fill_test.cpp) ------------------------------------
+     * A rank with a real plan and a real mover while the deployment around it is a fixture: the
+     * plan comes from the Planner and the Mover is initialised over the fixture program, with a
+     * KV loan the test owns. Test-only injection under RAD_TEST_HOOKS; that the Planner chose
+     * this plan is not under test, only what the engine does with a plan it was given. The rank
+     * copies both, so the pointers the Mover keeps refer to the rank's own program and plan. */
+    static int inject_plan_rank(Engine& e, const Program& prog, const Plan& plan, int turnover,
+                                const std::vector<LoanStrip>& strips, RadStream compute) {
+        if (e.ranks_.empty()) e.ranks_.push_back(std::make_unique<Engine::Rank>());
+        Engine::Rank& rk = *e.ranks_[0];
+        rk.index   = 0;
+        rk.device  = 0;
+        rk.program = prog;
+        rk.plan    = plan;
+        MoverConfig mc;
+        mc.turnover_slots = turnover;
+        if (const int rc = rk.heat.init(rk.plan, HeatParams{}); rc < 0) return rc;
+        if (const int rc = rk.mover.init(rk.program, rk.plan, mc); rc < 0) return rc;
+        if (const int rc = rk.mover.bind_compute_stream(compute); rc < 0) return rc;
+        return rk.mover.lend_from(Mover::kLendKV, strips);
+    }
+    static Mover&      mover_of(Engine& e, int32_t rank) { return e.ranks_[(size_t)rank]->mover; }
+    static HeatEngine& heat_of(Engine& e, int32_t rank) { return e.ranks_[(size_t)rank]->heat; }
+    /* serve()'s startup completion and the fill it runs, as the engine calls them. */
+    static int  complete_start_fill(Engine& e) { return e.complete_start_fill(); }
+    static int  prepare_serving(Engine& e) { return e.prepare_serving(); }
+    static bool start_placement_settled(const Engine& e) { return e.start_placement_settled(); }
+    /* Whether serve()'s calibration check armed a profile (it must not run after a failed fill). */
+    static bool calibrating(const Engine& e) { return e.draft_calibrating_; }
     /* The stop serve() raises after its transport ends; a fixture that runs step_loop itself sets
      * it once the branch under test has run. */
     static void stop(Engine& e) { e.stopping_.store(true, std::memory_order_release); }

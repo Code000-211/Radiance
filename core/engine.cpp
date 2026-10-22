@@ -94,6 +94,11 @@ extern "C" __attribute__((weak)) int64_t rad_test_residency_moves() { return 0; 
  * Engine::start_placement_settled() alone, > 0 keeps it unresolved. tests/engine_cost_drift_test.cpp
  * defines it strongly. */
 extern "C" __attribute__((weak)) int rad_test_placement_unresolved() { return 0; }
+
+/* A start fill that fails, injected by a fixture whose real mover cannot be made to fail on the
+ * host: < 0 makes Engine::complete_start_fill return it before the first wave. 0 leaves the fill
+ * alone. tests/engine_start_fill_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_start_fill_error() { return RAD_OK; }
 #endif
 
 namespace rad {
@@ -489,34 +494,76 @@ void Engine::settle_start_placement() {
     sched_.draft_costs().hold_prices(false);
 }
 
-void Engine::complete_start_fill() {
+int Engine::complete_start_fill() {
     /* One idle tick is one wave. The production balance keeps the turnover slots free and calls
      * the loan settled that way, so with turnover held the same call fills the reserve; a wave a
      * drain cut short, or one whose records moves in flight still hold, repeats. Serve completes
      * that here, at zero dispatches and before the first observation, so every promotion is the
      * plan's own lent slot (HeatStats::initial_fill_promotions) and the residency the profile is
      * bound to is the materialised one. Left for a later step the reserve would be a heat decision
-     * and read as a move (Mover::balance). Bounded: a fill that still cannot settle is left to the
-     * loop's resolve, which keeps the prices held until it can. */
+     * and read as a move (Mover::balance).
+     *
+     * The first wave runs whatever fill_settled() answers: a mover with nothing lent yet, or one
+     * whose last balance kept turnover free, can answer "settled" without a balance that held the
+     * reserve. Completion is only proven after one, and a fill that cannot settle within the wave
+     * bound is an error -- serve reports it instead of measuring a placement it never reached. */
     constexpr int kWaves = 256;
+#ifdef RAD_TEST_HOOKS
+    if (const int injected = rad_test_start_fill_error(); injected < 0) return injected;
+#endif
     for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
+        const int ds = rad_dev_set(r->device);
+        if (ds < 0) return ds;
         r->mover.hold_turnover(true);
-        int wave = 0;
-        for (; wave < kWaves && !r->mover.fill_settled(); ++wave) {
-            (void)rad_stream_sync(r->mover.transfer_stream());
-            const int st = r->mover.idle_tick(&r->heat);
-            if (st < 0) {
-                RAD_WARN("rank %d: completing the start placement's fill: %s", r->index,
-                         rad_strerror(st));
-                break;
+        int st = RAD_OK;
+        for (int wave = 0; wave < kWaves; ++wave) {
+            if (RadStream ts = r->mover.transfer_stream()) {
+                st = rad_stream_sync(ts);
+                if (st < 0) return st;
             }
+            st = r->mover.idle_tick(&r->heat);
+            if (st < 0) return st;
+            if (r->mover.fill_settled()) break;
         }
-        if (!r->mover.fill_settled())
-            RAD_WARN("rank %d: the start placement's fill did not settle in %d waves; a cost run "
-                     "stays unpriced until it does", r->index, kWaves);
+        if (!r->mover.fill_settled()) {
+            RAD_ERR("rank %d: the start placement's fill did not settle in %d waves", r->index,
+                    kWaves);
+            return RAD_E_FULL;
+        }
     }
     if (!ranks_.empty()) (void)rad_dev_set(ranks_[0]->device);
+    return RAD_OK;
+}
+
+int Engine::prepare_serving() {
+    /* The start placement's loan, before anything is measured. With no request yet, the cache's
+     * spare is its whole carve minus one prefill chunk, so this offer is a function of the plan,
+     * the KV carve and max_tok -- not of request timing. Settling it now is what makes the fill
+     * that follows the plan's own free lent slots: it is issued here, before the first
+     * observation, so it orders by layer at zero heat instead of by what the run has routed. A
+     * first fill issued only after the first step would be a heat decision and never the start
+     * placement (Mover::fill, HeatStats::initial_fill_promotions), and the fingerprint below
+     * names this loan and the slots it covers -- the two facts that make the fill a function of
+     * the identity. */
+    loan_tick(/*idle=*/true);
+    /* Complete the fill before anything is measured. The identity derived below and the profile
+     * read against it name the residency this materialises; a wave left for later would land at
+     * heat, after the first observation, and be a move away from that identity. Only a run bound
+     * to an identity has that stake; a legacy run keeps its startup behaviour.
+     *
+     * The fill's own error is serve's: a start placement that did not materialise must not fall
+     * through to a fingerprint, a profile or a price. */
+    if (cfg_.draft_policy == DraftPolicyKind::Cost || !cfg_.draft_profile.empty() ||
+        !cfg_.draft_profile_out.empty()) {
+        const int st = complete_start_fill();
+        if (st < 0) {
+            RAD_ERR("serve: the start placement's fill did not complete: %s", rad_strerror(st));
+            return st;
+        }
+    }
+    /* Validated before any path starts serving: a calibration run that cannot export must say so
+     * now, not after a complete run. */
+    return begin_draft_calibration();
 }
 
 int Engine::prepare_release(const RadBatch* b) {
@@ -2119,26 +2166,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
-    /* The start placement's loan, before anything is measured. With no request yet, the cache's
-     * spare is its whole carve minus one prefill chunk, so this offer is a function of the plan,
-     * the KV carve and max_tok -- not of request timing. Settling it now is what makes the fill
-     * that follows the plan's own free lent slots: it is issued here, before the first
-     * observation, so it orders by layer at zero heat instead of by what the run has routed. A
-     * first fill issued only after the first step would be a heat decision and never the start
-     * placement (Mover::fill, HeatStats::initial_fill_promotions), and the fingerprint below
-     * names this loan and the slots it covers -- the two facts that make the fill a function of
-     * the identity. */
-    loan_tick(/*idle=*/true);
-    /* Complete the fill before anything is measured. The identity derived below and the profile
-     * read against it name the residency this materialises; a wave left for later would land at
-     * heat, after the first observation, and be a move away from that identity. Only a run bound
-     * to an identity has that stake; a legacy run keeps its startup behaviour. */
-    if (cfg_.draft_policy == DraftPolicyKind::Cost || !cfg_.draft_profile.empty() ||
-        !cfg_.draft_profile_out.empty())
-        complete_start_fill();
-    /* Validated before any path starts serving: a calibration run that cannot export must say so
-     * now, not after a complete run. */
-    RAD_TRY(begin_draft_calibration());
+    /* The start placement's loan, the fill that materialises it, and the calibration check that
+     * must refuse before a run rather than after one. Any error there is serve's: nothing below
+     * may measure, price or profile a placement that did not complete. */
+    RAD_TRY(prepare_serving());
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;

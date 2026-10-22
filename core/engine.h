@@ -399,8 +399,16 @@ private:
      * turnover slots free and calls the loan settled that way, so they are only filled while
      * turnover is held, and a wave cut short (a drain before the fill, records still held by moves
      * in flight) repeats. Every wave lands at zero dispatches, where each promotion is the plan's
-     * own lent slot, not a later heat decision. See serve()'s call. */
-    void complete_start_fill();
+     * own lent slot, not a later heat decision. The first wave runs even when fill_settled() reads
+     * true, so the reserve is proven by a balance that held it; RAD_E_FULL when it cannot settle
+     * in the wave bound, and the first device, stream or mover error otherwise. See
+     * prepare_serving(). */
+    int  complete_start_fill();
+    /* serve()'s startup before anything is measured: the start loan, the fill that materialises
+     * it, and the calibration check that must refuse before a run rather than after one. Returns
+     * the first error, and serve stops there -- no fingerprint, profile or price follows a start
+     * placement that did not complete. */
+    int  prepare_serving();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */
