@@ -302,16 +302,23 @@ prediction and sample.
 - **The initial fill is provably the plan's, not a heat decision.** `Mover::fill()` marks a
   promotion `initial` when it is issued before the first observation (`HeatStats::
   initial_fill_promotions`); at zero dispatches every heat is zero, so the units are taken by layer
-  and the amount is a function of the plan and the lent slots. The loan that bounds it is settled
-  before serving, and the fill is completed there: `Engine::serve` runs one `loan_tick` with the
-  cache still empty and then `Engine::complete_start_fill`, which holds turnover -- the production
+  and the amount is a function of the plan and the lent slots. On a run bound to an identity --
+  `--draft-policy cost` or either profile flag -- the loan that bounds it is settled before serving
+  and the fill is completed there: `Engine::serve` runs one `loan_tick` with the cache still empty
+  and then `Engine::complete_start_fill`, which holds turnover -- the production
   balance keeps those slots free and calls the loan settled that way -- runs the held balance at
   least once even if `Mover::fill_settled()` already reads true, and repeats it until
   `Mover::fill_settled()`. Every wave stays at zero dispatches, so the reserve is
   materialised as part of the start placement instead of being filled by heat in the first steps.
   A fill that cannot settle, and any device, stream or mover error on the way, is `serve`'s error:
   the run stops before the fingerprint, the loaded profile and the prices rather than measuring a
-  placement it never reached.
+  placement it never reached. The startup loan tick is on the same contract: a cache that refuses
+  the offer, a device the mover cannot select, a loan a mover rejects or a failed idle fill returns
+  from `prepare_serving` before the completion, instead of letting the fill materialise against a
+  loan that never moved. A legacy run without a profile runs no completion and keeps the runtime
+  tick's log-and-continue behaviour; it shares the predicate, though -- `Mover::fill_settled()` is
+  reserve-aware for every dynamic plan, so its resolve waits for the idle balance to fill the
+  turnover reserve as well, and nothing is priced there either way.
   The mover sizes one record per lent slot (`Mover::lend_from`), so the wave split is the reserve,
   or a wave a drain cut short, not record exhaustion. The fingerprint names the loan and the slots
   it covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A
@@ -324,6 +331,11 @@ prediction and sample.
   after the start placement: a loan that grows back after a shrink, a loan that follows freed KV
   blocks, and a donor a migration moved out of a lent slot -- the slot it freed is refilled by a
   later `Mover::fill`, whose promotions are no longer initial.
+  A recall is outside the start fill for the same reason: `complete_start_fill` syncs the mover's
+  transfer stream, while a recalled slot's quarantine is recorded on the compute stream, so a
+  recall issued before serving stays for the next dispatch and reads as the drift its demotions
+  are. The completion's stream sync is also unbounded -- a stream that never signals hangs serve;
+  there is no watchdog. Neither limit is an exemption: they bound what the start proof covers.
 - **Both abort gates distinguish a calibration.** In the online policy a divergence deactivates
   the loaded table (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's
   start placement"): it stops pricing and stops learning, and it does not `admit_fallback()` --

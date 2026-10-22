@@ -575,8 +575,11 @@ private:
      * cache already owns (KVManager, the loan block). Lives here, not in the scheduler, because
      * rank 0's cache sets the amount while every rank's mover fills or empties slots, and a mover
      * may only be driven while its rank thread is parked, which this thread knows. `idle` also
-     * runs each mover's own fill, which a busy engine gets from the step. */
-    void loan_tick(bool idle);
+     * runs each mover's own fill, which a busy engine gets from the step. Returns the first error
+     * (the cache refusing the offer, a device that cannot be selected, a mover that rejects its
+     * loan or a failed idle fill); the runtime callers keep their log-and-continue behaviour, and
+     * only serve's identity-bound start path turns it into an abort. */
+    int loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx

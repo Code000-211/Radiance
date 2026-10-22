@@ -5,20 +5,23 @@
  * installed on the rank through the peer (test hooks only, no production override, no runtime
  * option). Everything the engine does with it afterwards is production code:
  *
- *  - complete_start_fill() runs its held-turnover wave even when the mover already answers
- *    fill_settled() true at entry -- the loop would otherwise run zero times -- and only accepts
- *    the placement once the wave leaves `fill_settled()` true (Review 2, finding 1). The fixture
- *    drives the real mover into the state place_test pins: the idle balance filled everything the
- *    loan covers except the turnover reserve. The engine has to finish it, so the reserve is
- *    initial and the resolve has nothing to move.
- *  - The same call must not depend on fill_settled() at entry. A settled mover sends the old loop
- *    through zero iterations, so the reserve proof was whatever the predicate happened to say.
- *    The completion now runs its wave from that entry too: it holds turnover, finds nothing left
- *    (fill_settled() is reserve-aware since the predicate fix, so a settled mover has no free
- *    reserve), and leaves the proof unchanged (Review 2, finding 1).
+ *  - The completion is what proves the start placement, not the predicate. complete_start_fill()
+ *    runs its held-turnover wave unconditionally and only accepts the placement once the wave
+ *    leaves `fill_settled()` true (Review 2, finding 1). The fixture drives the real mover into the
+ *    state place_test pins: the idle balance filled everything the loan covers except the turnover
+ *    reserve, so `fill_settled()` is false at entry and the held wave fills the reserve. The reserve
+ *    is then initial and the resolve has nothing to move.
+ *  - A mover that answers `fill_settled()` true at entry is the zero-iteration case. After the
+ *    predicate fix it cannot be produced (a settled mover has no free reserve), so the test pins
+ *    that entry as idempotence only: the wave runs, finds nothing left, and the proof is unchanged.
  *  - A failing fill must reach serve. The completion returns the status and prepare_serving()
  *    returns it before begin_draft_calibration(), so the run never gets a fingerprint, a profile
- *    or a price for a placement it did not reach (Review 2, finding 2).
+ *    or a price for a placement it did not reach (Review 2, finding 2). The fixture arms a real
+ *    calibration (profile-out, serial head, ceiling), so "no calibration" discriminates: the same
+ *    prepare_serving() arms it once the fault is gone.
+ *  - The startup loan tick is serve's too, on the same bound path: a cache, device or mover error
+ *    there returns before the completion instead of pricing a placement the loan never bounded. A
+ *    legacy run without a profile keeps ignoring it, as it did at runtime.
  *
  * The deployment around the rank is a fixture (no model, no plugin, no card): the program, the KV
  * carve the loan comes from and the compute stream. The Mover, the loan bookkeeping, the heat
@@ -58,6 +61,9 @@ KernelRow g_host_row;
  * Engine::complete_start_fill before its first wave. The weak definition in core/engine.cpp
  * leaves every other engine test alone. */
 std::atomic<int> g_fill_error{0};
+/* The same for the startup loan tick: the fixture has no cache plan whose offer could be refused,
+ * so the first error Engine::loan_tick would return is injected here. */
+std::atomic<int> g_loan_error{0};
 
 struct Fixture {
     Program prog;
@@ -191,11 +197,23 @@ private:
 
 }  /* namespace */
 
-/* The test build's seam (core/engine.cpp, weak): a fill that fails. The real host mover has no
- * deterministic failure to drive, so the fault is injected at the one point serve's completion
- * would take it from -- the status the engine must propagate. */
+/* The serial head and ceiling begin_draft_calibration() requires; the profile names its rounds per
+ * row, which only that head has. */
+RadDrafterDecl serial_head(int depth) {
+    RadDrafterDecl d{};
+    d.kind  = RAD_DRAFT_SERIAL;
+    d.depth = depth;
+    return d;
+}
+
+/* The test build's seams (core/engine.cpp, weak): a fill that fails and a loan tick that fails. The
+ * real host mover has no deterministic failure to drive, so the fault is injected at the one point
+ * serve's startup would take it from -- the status the engine must propagate. */
 extern "C" int rad_test_start_fill_error() {
     return g_fill_error.load(std::memory_order_relaxed);
+}
+extern "C" int rad_test_loan_tick_error() {
+    return g_loan_error.load(std::memory_order_relaxed);
 }
 
 /* Review 2, finding 1: fill_settled() alone is not the completion proof. The idle balance leaves
@@ -240,11 +258,10 @@ TEST(complete_start_fill_fills_the_reserve_the_idle_balance_left_free) {
     CHECK_EQ(h.stats().moves((int64_t)h.stats().initial_fill_promotions), (int64_t)0);
 }
 
-/* The zero-iteration case: settled before the call, so the old loop condition (fill_settled())
- * never entered its body. The completion runs its held-turnover wave regardless -- it proves the
- * placement by balancing, it does not infer it from the predicate -- and on a settled mover that
- * wave finds nothing left. The proof and the accounting must be unchanged. */
-TEST(complete_start_fill_holds_turnover_from_an_already_settled_mover) {
+/* Idempotence, not the zero-iteration proof: calling the completion twice on a settled mover must
+ * change nothing. After the predicate fix a mover cannot answer "settled with a free reserve", so
+ * the pre-fix and post-fix code agree here -- the entry is pinned, the branch is not. */
+TEST(complete_start_fill_is_idempotent_on_an_already_settled_mover) {
     Rig r(/*n_expert*/ 24, /*strips*/ 8, /*turnover*/ 2);
     Engine e(r.cfg);
     REQUIRE_EQ(r.build(e), RAD_OK);
@@ -269,10 +286,14 @@ TEST(complete_start_fill_holds_turnover_from_an_already_settled_mover) {
 
 /* Review 2, finding 2: the completion's error is serve's. prepare_serving() runs the loan, the
  * fill and then the calibration check; the injected fill error comes back before the check, so no
- * calibration is armed and the placement stays unresolved (prices held). */
+ * calibration is armed and the placement stays unresolved (prices held). The profile-out below is
+ * live -- the same call arms it once the fault is gone -- so the check discriminates. */
 TEST(a_start_fill_error_stops_serving_before_the_profile) {
     Rig r(/*n_expert*/ 24, /*strips*/ 8, /*turnover*/ 2);
+    r.cfg.draft_profile_out = radtest::tmp_path("engine_start_fill_error_out.json");
+    r.cfg.n_spec            = 6;
     Engine e(r.cfg);
+    EngineTestPeer::drafter(e, serial_head(6));
     REQUIRE_EQ(r.build(e), RAD_OK);
     Mover& m = EngineTestPeer::mover_of(e, 0);
     CHECK_OK(m.set_loan(Mover::kLendKV, r.loan.all()));
@@ -287,10 +308,45 @@ TEST(a_start_fill_error_stops_serving_before_the_profile) {
     CHECK(!EngineTestPeer::start_placement_settled(e));
     CHECK(!EngineTestPeer::calibrating(e));
 
-    /* The same call without the fault completes the start fill and reaches the check. */
+    /* The same call without the fault completes the start fill and arms the calibration -- which
+     * is what makes the assertion above a discriminating one, not a restatement of "not armed". */
     CHECK_OK(EngineTestPeer::prepare_serving(e));
     CHECK(m.fill_settled());
     CHECK(EngineTestPeer::start_placement_settled(e));
+    CHECK(EngineTestPeer::calibrating(e));
+}
+
+/* A startup loan tick that fails is serve's on the same bound path: it returns before the
+ * completion, so no fill runs against a loan the cache or a mover never accepted. A legacy run
+ * without a profile keeps the runtime behaviour and ignores it -- the same injected error is
+ * RAD_OK there. */
+TEST(a_start_loan_error_stops_the_bound_start_but_not_a_legacy_one) {
+    {
+        Rig r(/*n_expert*/ 24, /*strips*/ 8, /*turnover*/ 2);
+        r.cfg.draft_profile_out = radtest::tmp_path("engine_start_loan_error_out.json");
+        r.cfg.n_spec            = 6;
+        Engine e(r.cfg);
+        EngineTestPeer::drafter(e, serial_head(6));
+        REQUIRE_EQ(r.build(e), RAD_OK);
+        Mover& m = EngineTestPeer::mover_of(e, 0);
+        CHECK_OK(m.set_loan(Mover::kLendKV, r.loan.all()));
+
+        g_loan_error.store(RAD_E_STATE, std::memory_order_relaxed);
+        CHECK_EQ(EngineTestPeer::prepare_serving(e), RAD_E_STATE);
+        g_loan_error.store(0, std::memory_order_relaxed);
+        CHECK(!m.fill_settled());
+        CHECK(!EngineTestPeer::calibrating(e));
+    }
+    {
+        Rig r(/*n_expert*/ 24, /*strips*/ 8, /*turnover*/ 2);
+        r.cfg.draft_policy = DraftPolicyKind::Legacy;
+        Engine e(r.cfg);
+        REQUIRE_EQ(r.build(e), RAD_OK);
+
+        g_loan_error.store(RAD_E_STATE, std::memory_order_relaxed);
+        CHECK_OK(EngineTestPeer::prepare_serving(e));
+        g_loan_error.store(0, std::memory_order_relaxed);
+    }
 }
 
 RAD_TEST_MAIN()

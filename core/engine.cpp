@@ -100,6 +100,11 @@ extern "C" __attribute__((weak)) int rad_test_placement_unresolved() { return 0;
  * alone. tests/engine_start_fill_test.cpp defines it strongly. */
 extern "C" __attribute__((weak)) int rad_test_start_fill_error() { return RAD_OK; }
 
+/* The startup loan tick's failure, injected for the same reason: the fixture has no cache plan a
+ * refused offer could come from. < 0 makes Engine::loan_tick return it before it moves anything;
+ * 0 leaves the tick alone. tests/engine_start_fill_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_loan_tick_error() { return RAD_OK; }
+
 /* The destructor's drain seam, called twice: stage 0 after the compute streams are drained and
  * before the buffers a pass may still read are freed, stage 1 after those frees. A driver asks
  * the device allocator whether each allocation is still live at both points, so the case observes
@@ -563,16 +568,24 @@ int Engine::prepare_serving() {
      * placement (Mover::fill, HeatStats::initial_fill_promotions), and the fingerprint below
      * names this loan and the slots it covers -- the two facts that make the fill a function of
      * the identity. */
-    loan_tick(/*idle=*/true);
+    const bool identity_bound = cfg_.draft_policy == DraftPolicyKind::Cost ||
+                                !cfg_.draft_profile.empty() || !cfg_.draft_profile_out.empty();
+    const int loan_st = loan_tick(/*idle=*/true);
+    if (identity_bound && loan_st < 0) {
+        RAD_ERR("serve: the start loan did not move: %s", rad_strerror(loan_st));
+        return loan_st;
+    }
     /* Complete the fill before anything is measured. The identity derived below and the profile
      * read against it name the residency this materialises; a wave left for later would land at
-     * heat, after the first observation, and be a move away from that identity. Only a run bound
-     * to an identity has that stake; a legacy run keeps its startup behaviour.
+     * heat, after the first observation, and be a move away from that identity. Only an
+     * identity-bound run takes that stake: a legacy run without a profile runs no completion and
+     * keeps its startup tick, so nothing is priced or profiled for it. The predicate it shares
+     * (`Mover::fill_settled`) is reserve-aware for every dynamic plan all the same, so a legacy
+     * run's resolve waits for the idle balance to fill the reserve too.
      *
      * The fill's own error is serve's: a start placement that did not materialise must not fall
      * through to a fingerprint, a profile or a price. */
-    if (cfg_.draft_policy == DraftPolicyKind::Cost || !cfg_.draft_profile.empty() ||
-        !cfg_.draft_profile_out.empty()) {
+    if (identity_bound) {
         const int st = complete_start_fill();
         if (st < 0) {
             RAD_ERR("serve: the start placement's fill did not complete: %s", rad_strerror(st));
@@ -734,7 +747,7 @@ int Engine::step_loop() {
             }
             tier_tick();
             expire_tick(rad_mono_ns());
-            loan_tick(/*idle=*/true);
+            (void)loan_tick(/*idle=*/true);
             /* The start placement is materialised once the fill has nothing left to issue and
              * every copy it issued has retired. Only here, where no bracket is open: a resolve
              * that flipped inside a bracket would stamp that bracket with a placement it ran
@@ -1106,7 +1119,7 @@ int Engine::step_loop() {
 #endif
         sched_.step_finished(ev);
         tier_tick();
-        loan_tick(/*idle=*/false);
+        (void)loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
@@ -1468,10 +1481,13 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
  *
  * A request that cannot wait for a shrink takes the blocks at once through a callback into every
  * slab (KVManager::set_reclaim, installed in start()). */
-void Engine::loan_tick(bool idle) {
-    if (!lending_) return;
+int Engine::loan_tick(bool idle) {
+#ifdef RAD_TEST_HOOKS
+    if (const int injected = rad_test_loan_tick_error(); injected < 0) return injected;
+#endif
+    if (!lending_) return RAD_OK;
     const uint64_t now = rad_mono_ns();
-    if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */
+    if (now - loan_last_ns_ < 100000000ull) return RAD_OK;    /* 100 ms */
     loan_last_ns_ = now;
 
     /* Under the scheduler's lock: the loan moves rank 0's live mark and free count, which an HTTP
@@ -1493,23 +1509,32 @@ void Engine::loan_tick(bool idle) {
 
     /* The cache moves first when the loan grows, the slabs first when it shrinks, so no block is
      * ever both a cache block and a slab slot. */
-    if (lead.kv.set_loan(std::max(offer, held)) < 0) {
+    if (const int st = lead.kv.set_loan(std::max(offer, held)); st < 0) {
         RAD_ERR("kv loan: the cache refused a loan of %lld tokens it said it could spare; lending "
                 "stops", (long long)std::max(offer, held));
         lending_ = false;
-        return;
+        return st;
     }
+    int first = RAD_OK;
     for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.follow(lead.kv);
     for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
-        (void)r->mover.set_loan(Mover::kLendKV, offer);
+        if (const int st = rad_dev_set(r->device); st < 0) {
+            if (first == RAD_OK) first = st;
+            continue;
+        }
+        if (const int st = r->mover.set_loan(Mover::kLendKV, offer); st < 0 && first == RAD_OK)
+            first = st;
         if (idle) {
             const int st = r->mover.idle_tick(&r->heat);
-            if (st < 0) RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
-                                 rad_strerror(st));
+            if (st < 0) {
+                RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
+                         rad_strerror(st));
+                if (first == RAD_OK) first = st;
+            }
         }
     }
     (void)rad_dev_set(ranks_[0]->device);
+    return first;
 }
 
 /* ------------------------------------------------------------------ the arena's level */
