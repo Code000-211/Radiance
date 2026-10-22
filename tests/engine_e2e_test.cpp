@@ -2069,11 +2069,12 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
 }
 
 /* The start path's lender registration, on a model that can lend at all. A model that can lend
- * needs conditional units: only MoE experts are RAD_ACCESS_CONDITIONAL, and only those the planner
- * tiers into the pinned host pool are movable -- that is what enables the heat engine and what
- * makes `Mover::lend_from` carve slots out of the KV cache. tests/tiny_moe.h adds that routed arm
- * to the dense Gemma4 trunk; the device is sized so that not every expert fits and --host-pool-mib
- * holds the rest, so the start has slots to offer.
+ * needs conditional units: only MoE experts are RAD_ACCESS_CONDITIONAL. Conditional units can also
+ * be resident and movable (core/place/planner.cpp sets `mu.movable` on the resident fill too), but
+ * for lending the pinned ones count here: `Mover::lend_from` carves slots only for HostPinned,
+ * movable units (core/place/mover.cpp). tests/tiny_moe.h adds that routed arm to the dense Gemma4
+ * trunk; the device is sized so that not every expert fits and --host-pool-mib holds the rest, so
+ * the start has slots to offer.
  *
  * Observed where it acts, not through the export and not through a loan a request holds: `/stats`
  * reports the mover's own count (experts.flex_capacity, Mover::count_flex) and the startup line
@@ -2086,7 +2087,7 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
  * block drafter at most (arch/common/rad_gemma4_dflash.h:628), and the plugin that carries the
  * serial assistant head refuses any checkpoint with experts
  * (arch/gemma4_bf16/gemma4_bf16.cpp:1632). An arch that is both routed and serial-drafted exists
- * (qwen35_fp8's MTP, qwen4exp_fp8, glm5next), but no tiny fixture writes one. The discriminating
+ * (qwen35moe_fp8's MTP, qwen4exp_fp8, glm5next), but no tiny fixture writes one. The discriminating
  * pair stays open until a deployment is both. */
 TEST(the_live_start_offers_its_experts_a_positive_loan) {
     tiny::TempDir dir("moe");
