@@ -144,6 +144,8 @@ private:
     int32_t last_k_ = 0;     /* the previous cycle's depth; 0 until one was chosen */
     int32_t held_   = 0;     /* cycles since it last moved */
     bool    chosen_ = false;
+    /* The explicit-ladder coverage gap was diagnosed; once per priced/unpriced transition. */
+    bool    gap_reported_ = false;
     /* The last issued plan's K per request: the window the paired step verifies. `fr_n_` counts the
      * entries in use; reset() forgets them without giving the storage back. */
     std::vector<uint64_t> fr_id_;

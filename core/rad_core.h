@@ -900,9 +900,11 @@ struct Config {
     /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
      * The default is the ladder the policy was tuned with. An explicit tier above the executable
      * head depth is refused by Scheduler::init, which is where that depth is known (auto resolves
-     * it), and so is a ladder whose top is below it: the named baseline runs at that depth, so a
-     * lower top would measure a depth the ladder never offers. The default ladder is trimmed to
-     * the depth instead, so a valid deployment is not refused for the ladder's deeper end. */
+     * it). A top below it is left as given: a profile that prices that top is a valid reload, so
+     * the list is not refused at init. Only a cycle whose top is unpriced while the named
+     * baseline would run deeper is refused, by the policy that can see the shape; nothing is
+     * learnt into a depth the ladder never offers (docs/ADAPTIVE-MTP.md). The default ladder is
+     * trimmed to the depth instead, so a valid deployment is not refused for its deeper end. */
     int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
     int     draft_n_tiers = 5;
     bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */

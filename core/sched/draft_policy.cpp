@@ -73,6 +73,7 @@ void DraftPlanner::reset() {
     last_k_ = 0;
     held_   = 0;
     chosen_ = false;
+    gap_reported_ = false;
     fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
 }
 
@@ -303,6 +304,32 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     }
 
     if (!best_p.valid) {
+        /* The deepest offered plan has no measurement. R's named baseline is evidence only when it
+         * runs the offered top's own shape: the default ladder (fallback_k == the deepest tier) or
+         * rows whose remaining budget clamps both to the same k. When the baseline would run at a
+         * deeper k -- an explicit ladder below exec_depth -- its bucket can never be queried by
+         * this ladder, so the run would stay in the fallback and never price the offered top.
+         * Diagnose that cycle and issue nothing: extending the ladder or moving the baseline is
+         * the operator's call, and a sample must not be learnt at a depth the ladder never offers. */
+        if (c_.fallback_k > deepest) {
+            bool deeper_row = false;
+            for (int32_t i = 0; i < view.n_seq; ++i)
+                if (cap_of(view.seq[i], c_.k_ceiling) > deepest) {
+                    deeper_row = true;
+                    break;
+                }
+            if (deeper_row) {
+                if (!gap_reported_) {
+                    RAD_ERR("draft policy: the deepest offered tier K%d is unpriced for this "
+                            "cycle's shape, and the named baseline would run at K%d; the ladder "
+                            "never offers that depth, so the cycle is refused and nothing is "
+                            "learned into it (end the ladder at K%d, or set the ceiling to K%d)",
+                            (int)deepest, (int)c_.fallback_k, (int)c_.fallback_k, (int)deepest);
+                    gap_reported_ = true;
+                }
+                return RAD_E_UNSUPPORTED;
+            }
+        }
         /* The deepest offered plan has no measurement: a named baseline, not an invented price --
          * and specifically not the price of a shallower plan this batch did not offer as deep. */
         for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -314,6 +341,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
             if (out->k[i] > top) top = out->k[i];
         return finish(view, top, DraftPlanSource::Fallback, DraftFallback::UnknownShape, out);
     }
+
+    gap_reported_ = false;   /* a priced cycle re-arms the one diagnosis */
 
     for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
         for (int32_t i = 0; i < view.n_seq; ++i) {

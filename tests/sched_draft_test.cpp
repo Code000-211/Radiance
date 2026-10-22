@@ -2211,11 +2211,13 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
     CHECK_OK(f.start());
 }
 
-/* --draft-depth-tiers under cost must end at the executable head depth. The named baseline runs
- * at that depth, so a ladder topping below it would measure a depth the ladder never offers and
- * leave the deepest offered tier permanently unpriced. The refusal is by name; the list is not
- * silently extended and the calibration depth is not moved to fit it. */
-TEST(an_explicit_ladder_below_the_executable_depth_is_refused_by_name) {
+/* An explicit ladder below the executable depth is a valid reload when the profile prices its
+ * top; only an unpriced top is a coverage gap. Then the named baseline would run at exec_depth --
+ * a depth the ladder never offers -- and its bucket could never be queried by this ladder, so the
+ * run would stay in the fallback. Init accepts the ladder; the cycle is diagnosed and refused, and
+ * nothing is learnt into the ladder. The list and the baseline are not changed behind the
+ * operator's back. */
+TEST(an_unpriced_explicit_ladder_below_the_executable_depth_is_diagnosed_and_not_learned) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
@@ -2226,12 +2228,17 @@ TEST(an_explicit_ladder_below_the_executable_depth_is_refused_by_name) {
     f.cfg.draft_n_tiers   = 2;
     f.cfg.draft_tiers[0]  = 0;
     f.cfg.draft_tiers[1]  = 2;
-    activate_costs(f);
+    activate_costs(f);                    /* live, empty, fallback admitted */
 
-    const std::string refused = stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
-    CHECK(has(refused, "explicit ladder"));
-    CHECK(has(refused, "ends at 2"));
-    CHECK(has(refused, "executable head depth 6"));
+    CHECK_OK(f.start(DraftReplay::None));  /* init accepts it; the cycle diagnoses the gap */
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    const std::string gap = stderr_of([&] { REQUIRE(f.sch.step() != nullptr); });
+    CHECK(has(gap, "deepest offered tier K2"));
+    CHECK(has(gap, "named baseline would run at K6"));
+    CHECK(f.sch.draft().plan() == nullptr);              /* no cost plan this cycle */
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), 0u);  /* nothing learnt at K6 */
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);              /* the refused cycle did not open */
 }
 
 /* The same ladder is admitted when the executable depth really is 2: the ceiling may be deeper,
