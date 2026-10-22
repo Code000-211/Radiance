@@ -2596,18 +2596,26 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
  * both a routed feed-forward and a serial drafter (tests/tiny_moe.h: write_qwen35_moe;
  * arch/qwen35moe_fp8 with its `mtp.` head).
  *
- * Live twin: the start-time lender carves slots out of the KV cache and offers them to the experts
- * ("N slots can be lent out of the KV cache ..."), and /stats reports that capacity. Reference
- * twin: the same checkpoint and flags plus the basis, so the run starts with both lenders off --
- * "nothing is lent: it is all the cache's" -- serves one request that records a draft cycle, and
- * writes a profile whose fingerprint names the basis and the arena identity it was measured on.
- * The file's export refuses a reference that lent anything (core/engine.cpp:1997), so a file that
- * exists is the proof the two starts really differed.
+ * Three starts on the same checkpoint, placement and batch flags:
+ *   live       the start-time lender carves slots out of the KV cache and offers them to the
+ *              experts ("N slots can be lent out of the KV cache ..."); /stats reports that
+ *              capacity. It runs the default (legacy) draft policy.
+ *   reference  adds `--draft-reference --draft-policy cost --draft-profile-out`: both lenders stay
+ *              off -- "nothing is lent: it is all the cache's" -- one real request records a draft
+ *              cycle, and the run writes the profile. The export refuses a reference that lent
+ *              anything (core/engine.cpp:2008-2022), so a file that exists is the proof the two
+ *              starts really differed.
+ *   cost       loads that file in normal operation (`--draft-policy cost --draft-profile`), the
+ *              way a serving deployment would: the run binds it, lends for real, and serves a
+ *              request. The bind is also the live placement comparison -- a table refuses any
+ *              fingerprint or execution difference -- so the log's no-loan binding line says the
+ *              file was measured on exactly this deployment.
  *
  * The plugin declares no level plan for the activation arena (`RadArchProbe::shape_probe_ok`), so
- * this path's arena identity is "none" -- the file's own name for a deployment with no level plan,
- * not a missing field. The KV lender is the one this fixture can exercise, and the fingerprint
- * still binds the run to it through `placement`. */
+ * `arena` is "none" in the file -- the file's own name for a deployment with no level plan, not a
+ * missing field, and not a statement about the KV loan. The loan is the separate `live_loan` field,
+ * which a no-loan reference omits by construction; `placement` names the plan it was derived
+ * under. */
 TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
     tiny::TempDir dir("qmoe_ref");
     REQUIRE(dir.ok());
@@ -2684,12 +2692,84 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
     REQUIRE(p.is_object());
     const json& fp = p["fingerprint"];
     CHECK_EQ(fp.value("basis", ""), std::string("no-loan"));
-    /* No level plan in this plugin: "none" is the identity the file records, and the live twin's
-     * start would have named the KV loan instead. */
-    CHECK_EQ(fp.value("arena", ""), std::string("none"));
+    /* The identity the file is bound to: the arch id the loader resolved, the deployment's
+     * parallelism and wire, the card, the kernel set, the KV format, and the resolved plan (not
+     * the flag -- `placement` is strategy, budgets and a digest of the residency). */
+    CHECK_EQ(fp.value("model", ""), std::string("qwen35moe"));
     CHECK_EQ(fp.value("quant", ""), std::string("fp8_e4m3"));
-    CHECK(fp.contains("placement") && !fp["placement"].get<std::string>().empty());
-    CHECK(!p["buckets"].empty());
+    CHECK_EQ(fp.value("tp", -1), 1);
+    CHECK_EQ(fp.value("tp_wire", ""), std::string("n/a"));
+    CHECK(!fp.value("gpus", "").empty());
+    CHECK(fp.value("kernels", "").find("qwen35moe") != std::string::npos);
+    CHECK_EQ(fp.value("kv_format", ""), std::string("bf16"));
+    const std::string placement = fp.value("placement", "");
+    CHECK(placement.rfind("expert_tiered ", 0) == 0);
+    CHECK(placement.find("dyn=1") != std::string::npos);
+    /* No level plan in this plugin: "none" is the identity the file records. It is not the loan --
+     * that is `live_loan`, which a no-loan reference omits by construction. */
+    CHECK_EQ(fp.value("arena", ""), std::string("none"));
+    CHECK(!fp.contains("live_loan"));
+    /* A serial head runs one dependent pass a token, so every cycle is a shrinking round. */
+    CHECK_EQ(p.value("execution", ""), std::string("shrinking"));
+
+    /* The buckets the reload can price from: a clean measurement (nothing disturbing; `ahead` is
+     * not), and the start cycle the first plan asks for -- verify_k 0, one token of history, at
+     * the executable depth the cost fallback runs (num-speculative-tokens, the ladder's top). */
+    const json buckets = p.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    REQUIRE(!buckets.empty());
+    bool usable = false, start_cycle = false;
+    for (const json& b : buckets) {
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        usable = usable || (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0) continue;
+        start_cycle = true;
+        CHECK_EQ(shape.value("verify_tokens", -1), 1);
+        CHECK_EQ(shape.value("history_tokens", -1), 1);
+        CHECK_EQ(shape.value("draft_k", -1), 2);
+        CHECK_EQ(shape.value("drafter", ""), std::string("serial"));
+    }
+    CHECK(usable);
+    CHECK(start_cycle);
+
+    /* ---- the cost twin: normal operation, the exported file bound, a real request ---- */
+    std::vector<std::string> cost = common;
+    cost.insert(cost.end(), { "--draft-policy", "cost", "--draft-profile", profile });
+    Server run;
+    REQUIRE(run.start(dir.path, cost, device_env(32)));
+    const std::string run_log = run.output();
+    /* The no-loan file loading on a serving run that lends: the engine's own comparison of the
+     * fingerprint and the execution. The other branch is the refusal. */
+    if (run_log.find("basis no-loan -- an optimisation basis") == std::string::npos)
+        fprintf(stderr, "    the cost run did not bind the profile:\n%s\n", tail(run_log).c_str());
+    CHECK(run_log.find("basis no-loan -- an optimisation basis") != std::string::npos);
+    CHECK(run_log.find("is not used for this deployment") == std::string::npos);
+    CHECK(run_log.find("slots can be lent out of the KV cache") != std::string::npos);
+    CHECK(run_log.find("nothing is lent: it is all the cache's") == std::string::npos);
+
+    const json served =
+        post(run.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (tokens_of(served).empty())
+        fprintf(stderr, "    the cost run's request answered status %d (%s): %s\n", status,
+                why.c_str(), served.dump().c_str());
+    CHECK(!tokens_of(served).empty());
+
+    /* Real borrowing, not the offer: `flex_bytes` is what the lent slots hold, `flex_capacity`
+     * what the loan offers. The start placement's fill runs before the first step and leaves only
+     * the working reserve and turnover slots free, so a positive `flex_bytes` is the plan's own
+     * residency living in memory borrowed from the KV cache. */
+    const json rst = stats(run.port);
+    const int run_exit = run.stop();
+    CHECK_EQ(run_exit, 0);
+    REQUIRE(rst.is_object() && rst.contains("experts"));
+    if (!(rst["experts"].value("flex_bytes", 0.0) > 0.0))
+        fprintf(stderr, "    the cost run lent nothing (experts: %s)\n",
+                rst["experts"].dump().c_str());
+    CHECK(rst["experts"].value("flex_bytes", 0.0) > 0.0);
+    CHECK(rst["experts"].value("flex_capacity", 0.0) >= rst["experts"].value("flex_bytes", 0.0));
 }
 
 RAD_TEST_MAIN()
