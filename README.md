@@ -1,3 +1,10 @@
+This is strictly just a Development fork every Credit goes to StillDeadCode on Codeberg.
+
+For the People on Launch80 that want to try out some of the stuff that i work on.
+
+
+
+
 # radiance
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
