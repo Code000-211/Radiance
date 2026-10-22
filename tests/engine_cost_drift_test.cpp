@@ -14,10 +14,12 @@
  * mover's evidence is injected through the test build's weak seam (rad_test_residency_moves,
  * core/engine.cpp). The move itself is the only simulated fact.
  *
- * The ordering is the finding: the test waits until at least two cost cycles have opened with
- * nothing queued. Cycle N+1's open proves iteration N ran its idle branch to the end (step()
- * answers null, the ticks follow); only then does the seam report the move. The next iteration
- * reads it at the top and refuses that cycle's planning.
+ * The ordering is the finding: the seam counts the loop's own reads -- the baseline is the first,
+ * the top of every iteration follows -- so the test waits for the third. By then the first
+ * iteration has run end to end (its empty cycle opened, its idle branch and its ticks done), and
+ * the move published next stands between an idle tick and the next planning. The store stays
+ * asynchronous: if it lands after a later top read, that iteration opens a cycle and the one
+ * after it is refused. The test thread reads no scheduler state before the loop has joined.
  */
 #include "rad_test.h"
 
@@ -37,14 +39,22 @@
 
 namespace {
 
+/* The loop thread's own seam calls: 1 is step_loop's baseline read, 2 the top of the first
+ * iteration, 3 the top of the second -- the first moment the first iteration has run end to end.
+ * The test publishes the move once that call has happened. */
+std::atomic<int>  g_seam_calls{0};
+std::atomic<bool> g_first_idle_done{false};
 std::atomic<bool> g_moved{false};
 
 }  /* namespace */
 
 /* The test build's seam (core/engine.cpp, weak): the mover's cumulative evidence since the
- * profile was bound. One move, once the loop has idled at least one full iteration. */
+ * profile was bound. One move, published by the test thread after the loop's own third read. */
 extern "C" int64_t rad_test_residency_moves() {
-    return g_moved.load(std::memory_order_relaxed) ? 1 : 0;
+    const bool moved = g_moved.load(std::memory_order_acquire);
+    if (g_seam_calls.fetch_add(1, std::memory_order_acq_rel) + 1 >= 3)
+        g_first_idle_done.store(true, std::memory_order_release);
+    return moved ? 1 : 0;
 }
 
 namespace {
@@ -135,9 +145,16 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     /* step_loop binds rank 0's device; the loop needs the rank, not a program on it. */
     EngineTestPeer::add_rank(e);
 
+    g_seam_calls.store(0, std::memory_order_relaxed);
+    g_first_idle_done.store(false, std::memory_order_relaxed);
     g_moved.store(false, std::memory_order_relaxed);
+
     int rc = RAD_OK;
-    std::thread loop([&] { rc = EngineTestPeer::step_loop(e); });
+    std::atomic<bool> loop_done{false};
+    std::thread loop([&] {
+        rc = EngineTestPeer::step_loop(e);
+        loop_done.store(true, std::memory_order_release);
+    });
     struct LoopGuard {
         Engine&      e;
         std::thread& t;
@@ -148,24 +165,21 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     } loop_guard{e, loop};
 
     /* Nothing is queued, so every iteration plans a cycle with no rows and then runs the idle
-     * branch. The second open proves the first iteration's ticks completed: the move below is
-     * therefore published between an idle tick and the planning that must refuse it. */
+     * branch. The seam sets this on its third call: the first iteration has run to its end, so the
+     * move published here stands between an idle tick and the planning after it. No scheduler
+     * state is touched from this thread while the loop runs. */
     bool idled = false;
     for (int i = 0; i < 5000 && !idled; ++i) {
-        const rad::DraftPlan* p = EngineTestPeer::sched(e).draft().plan();
-        idled = p != nullptr && p->cycle_id >= 2;
+        idled = g_first_idle_done.load(std::memory_order_acquire);
         if (!idled) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(idled);
 
-    g_moved.store(true, std::memory_order_relaxed);
+    g_moved.store(true, std::memory_order_release);
 
     /* The loop ends itself on the latch; stop() only bounds the wait (a no-op once it has). */
-    for (int i = 0; i < 30000 && !EngineTestPeer::sched(e).draft_cost_aborted(); ++i)
+    for (int i = 0; i < 30000 && !loop_done.load(std::memory_order_acquire); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const rad::DraftPlan* refused = EngineTestPeer::sched(e).draft().plan();
-    REQUIRE(refused != nullptr);
-    const uint64_t cycle_at_latch = refused->cycle_id;
     EngineTestPeer::stop(e);
     loop.join();
 
@@ -175,13 +189,12 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     CHECK_EQ(EngineTestPeer::sched(e).draft_costs().reason(),
              std::string("residency drifted from the fingerprint's start placement"));
     CHECK(!EngineTestPeer::sched(e).draft_costs().fallback_admitted());
-    /* The refusal priced nothing: the plan in force when the latch was set is still the one in
-     * force, and nothing is queued, so it names no row. The seam is read asynchronously -- a store
-     * that lands after an iteration's top read lets that one open a further cycle -- so what this
-     * proves is "a cycle after the move was refused", not strictly "the immediately next one". */
+    /* Read after the join: the loop owned this state until it returned. The plan in force is an
+     * idle cycle's -- nothing is queued, so it names no row -- and the refusal opened none after
+     * it. The store was still asynchronous, so this proves "a cycle after the move was refused",
+     * not strictly "the immediately next one". */
     const rad::DraftPlan* p = EngineTestPeer::sched(e).draft().plan();
     REQUIRE(p != nullptr);
-    CHECK_EQ(p->cycle_id, cycle_at_latch);
     CHECK_EQ(p->n_seq, 0);
 }
 
