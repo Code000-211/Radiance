@@ -2592,4 +2592,104 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
     CHECK(direct.png == conv.png);
 }
 
+/* The reference basis end to end, on the only plugin a tiny checkpoint can reach that declares
+ * both a routed feed-forward and a serial drafter (tests/tiny_moe.h: write_qwen35_moe;
+ * arch/qwen35moe_fp8 with its `mtp.` head).
+ *
+ * Live twin: the start-time lender carves slots out of the KV cache and offers them to the experts
+ * ("N slots can be lent out of the KV cache ..."), and /stats reports that capacity. Reference
+ * twin: the same checkpoint and flags plus the basis, so the run starts with both lenders off --
+ * "nothing is lent: it is all the cache's" -- serves one request that records a draft cycle, and
+ * writes a profile whose fingerprint names the basis and the arena identity it was measured on.
+ * The file's export refuses a reference that lent anything (core/engine.cpp:1997), so a file that
+ * exists is the proof the two starts really differed.
+ *
+ * The plugin declares no level plan for the activation arena (`RadArchProbe::shape_probe_ok`), so
+ * this path's arena identity is "none" -- the file's own name for a deployment with no level plan,
+ * not a missing field. The KV lender is the one this fixture can exercise, and the fingerprint
+ * still binds the run to it through `placement`. */
+TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
+    tiny::TempDir dir("qmoe_ref");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    /* A whole 128-column block per head: without the GPU's fused `gate_quant_fp8` the fp8 gated
+     * attention falls back to sigmoid + mul + the activation quantiser, and the block declares
+     * that fallback only where a head is whole 128-blocks wide
+     * (arch/common/rad_block_attn_gated_fp8.h: gate_pair). */
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    /* A card that cannot hold the expert plane beside the cache: the tiered placement keeps the
+     * routed units in the pinned host pool, which is exactly the state the KV lender serves. A
+     * card the whole plane fits on lends nothing, so the size is part of the case. 64 batched
+     * tokens is the chunk this geometry's gdn_conv_prep needs. */
+    const std::vector<std::string> common = { "--num-speculative-tokens", "2",
+                                              "--placement", "expert_tiered",
+                                              "--host-pool-mib", "96",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+
+    /* ---- the live twin: the cache lends what no request holds ---- */
+    Server live;
+    REQUIRE(live.start(dir.path, common, device_env(32)));
+    const json st = stats(live.port);
+    const int live_exit = live.stop();
+    const std::string live_log = live.output();
+    CHECK_EQ(live_exit, 0);
+    CHECK(live_log.find("slots can be lent out of the KV cache") != std::string::npos);
+    CHECK(live_log.find("is lent to the experts while no request holds it") != std::string::npos);
+    CHECK(live_log.find("nothing is lent: it is all the cache's") == std::string::npos);
+    REQUIRE(st.is_object() && st.contains("experts"));
+    CHECK(st["experts"].value("flex_capacity", -1.0) > 0.0);
+
+    /* ---- the reference twin: both lenders off, one request, the profile written ---- */
+    const std::string profile = dir.path + "/reference.json";
+    std::vector<std::string> ref = common;
+    ref.insert(ref.end(), { "--draft-reference", "--draft-policy", "cost", "--draft-profile-out",
+                            profile });
+    Server basis;
+    REQUIRE(basis.start(dir.path, ref, device_env(32)));
+    int status = 0;
+    std::string why;
+    const json reply =
+        post(basis.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (tokens_of(reply).empty())
+        fprintf(stderr, "    the reference run's request answered status %d (%s): %s\n", status,
+                why.c_str(), reply.dump().c_str());
+    CHECK(!tokens_of(reply).empty());
+    const int ref_exit = basis.stop();
+    const std::string ref_log = basis.output();
+    CHECK_EQ(ref_exit, 0);
+    CHECK(ref_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const std::string body = tiny::read_text(profile);
+    REQUIRE(!body.empty());
+    const json p = json::parse(body, nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", ""), std::string("no-loan"));
+    /* No level plan in this plugin: "none" is the identity the file records, and the live twin's
+     * start would have named the KV loan instead. */
+    CHECK_EQ(fp.value("arena", ""), std::string("none"));
+    CHECK_EQ(fp.value("quant", ""), std::string("fp8_e4m3"));
+    CHECK(fp.contains("placement") && !fp["placement"].get<std::string>().empty());
+    CHECK(!p["buckets"].empty());
+}
+
 RAD_TEST_MAIN()
