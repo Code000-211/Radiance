@@ -107,6 +107,37 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_state_valid(const RadMtpCoupleS
     return has_x && (sum - 1) <= 1e-12 && (1 - sum) <= 1e-12;
 }
 
+/* THE VERIFY POSITION OF A COUPLED ROUND, and the one coordinate the engine's bind and the
+ * sampler's row check must agree on.
+ *
+ * The sampler stages row k of a request at output position `n_out + k`, where `n_out` is that
+ * request's committed output length WHEN THE STEP IS BUILT. A coupled round r (1-based) is the
+ * draft verified at row k = r - 1, so its state carries `pos = n_out + (r - 1)`. The acceptance
+ * and residual uniforms are drawn at exactly this position (KEY_ACCEPT / KEY_RESID), which is what
+ * makes the verify's draw the draw the propose's law describes.
+ *
+ * `n_out` is the length the verify step will actually see -- read from the request after the
+ * drafting step's commit, never reconstructed from a pre-commit base plus a slot counter: those
+ * two drift apart whenever the commit emits fewer tokens than the card accepted (a max_tokens or
+ * context cut) or a request's step is carried. `base` stays the DRAFT's coordinate, which is a
+ * different number and must not be reused here. */
+static inline RAD_SPECHUB_HD uint64_t rad_mtp_couple_verify_pos(uint64_t n_out, int round) {
+    return n_out + (round > 0 ? (uint64_t)(round - 1) : 0);
+}
+
+/* Would the verify row for draft index `k` (0-based) of a request with committed output length
+ * `n_out` take `c` as its coupled state? Same request and seed, the round this row's draft came
+ * from, the position it samples, the very token it proposes, and a state the proposer could have
+ * written. Anything else is a stale state from another step, and coupling against it would apply a
+ * law this step never drew. Both the sampler's step build and Engine::bind_couple ask this. */
+static inline RAD_SPECHUB_HD bool rad_mtp_couple_binds(const RadMtpCoupleState& c, uint64_t seq,
+                                                       uint64_t seed, uint64_t n_out, int k,
+                                                       int32_t draft_x, int64_t vocab) {
+    return c.status == 1 && c.draw.seq == seq && c.draw.seed == seed && c.round == k + 1 &&
+           c.pos == rad_mtp_couple_verify_pos(n_out, k + 1) && c.x == draft_x &&
+           rad_mtp_couple_state_valid(c, vocab);
+}
+
 /* Build the stored Q from a shortlist of eight (id, score) slots.
  *
  * Holes (id < 0) and -inf scores carry no mass. An entry whose FP64 weight or normalized q

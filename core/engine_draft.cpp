@@ -335,8 +335,16 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         if (!mtp_couple_) continue;
         /* BOUND WHETHER OR NOT THE REQUEST SURVIVED. A truncated publication keeps a prefix, whose
          * rows carry their own rounds' states; a request the scheduler refused binds nothing, and
-         * set_mtp_couple(…, 0) clears what an earlier step left. */
-        RAD_TRY(bind_couple(i, done, slots_host_[serial_row_[(size_t)i].card]));
+         * set_mtp_couple(…, 0) clears what an earlier step left.
+         *
+         * The position coordinate is the request's committed output length AFTER this commit -- the
+         * value the next build_step reads as its n_out. A request no longer in the plan is gone
+         * from the sampler too (set_mtp_couple returns RAD_E_NOTFOUND), so its bound positions are
+         * never consumed; they stay at the draw's pre-commit base. */
+        uint64_t n_out = couple_draw_stage_[(size_t)i].base;
+        for (const StepEntry& e : plan.e)
+            if (e.req && e.seq == seq) { n_out = (uint64_t)e.req->output.size(); break; }
+        RAD_TRY(bind_couple(i, done, slots_host_[serial_row_[(size_t)i].card], n_out));
         for (auto& rk : ranks_) {
             const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, rc == RAD_OK ? done : 0);
             if (st < 0 && st != RAD_E_NOTFOUND) return st;
@@ -373,12 +381,19 @@ int Engine::stage_couple_draws(int n) {
 
 /* After commit: drafting row `row`'s rounds as rank 0's ops left them, checked against the draw
  * staged for that row and the card's own slot (written through RadBatch::seq_ids, independently of
- * the row index), then bound to the verify positions the next step samples: the committed output
- * size is base + n_acc for every request still running.
+ * the row index), then bound to the verify positions the next step samples.
+ *
+ * THE POSITION CONTRACT (rad_mtp_couple_verify_pos, abi/rad_spechub.h): the next build stages row k
+ * at `n_out + k`, where `n_out` is the request's committed output length AT THAT BUILD. `n_out` is
+ * therefore read from the request as it stands after this step's commit -- the same value the next
+ * build will see -- and round rd lands at `n_out + (rd - 1)`. It is deliberately NOT rebuilt from
+ * the draw's pre-commit `base` plus the slot's `n_acc`: the commit can emit fewer tokens than the
+ * card accepted (a max_tokens or context cut, a carried step), and the two then disagree by
+ * exactly the tokens that were not emitted.
  *
  * A STOCHASTIC ROW THAT DID NOT COME BACK SAMPLED, or whose x is not the card's draft, is a broken
  * path and refuses the step: a status-0 bypass or a misattached Q must never pass for coupling. */
-int Engine::bind_couple(int row, int done, const StepSlot& S) {
+int Engine::bind_couple(int row, int done, const StepSlot& S, uint64_t n_out) {
     const RadMtpCoupleDraw& d = couple_draw_stage_[row];
     for (int rd = 1; rd <= done; ++rd) {
         RadMtpCoupleState st = couple_readback_[(int64_t)(rd - 1) * couple_rows_ + row];
@@ -392,7 +407,7 @@ int Engine::bind_couple(int row, int done, const StepSlot& S) {
                     std::memcmp(&st.draw, &d, sizeof d) ? "stale" : "current");
             return RAD_E_STATE;
         }
-        st.pos = d.base + (uint64_t)S.n_acc + (uint64_t)(rd - 1);
+        st.pos = rad_mtp_couple_verify_pos(n_out, rd);
         couple_bound_[rd - 1] = st;
     }
     return RAD_OK;

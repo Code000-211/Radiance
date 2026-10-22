@@ -116,4 +116,164 @@ TEST(a_row_whose_card_names_another_sequence_is_refused) {
           std::string::npos);
 }
 
+/* ================================================== THE VERIFY POSITION CONTRACT
+ *
+ * The sampler stages row k of a request at `n_out + k`, `n_out` being that request's committed
+ * output length when the step is built. Round rd is verified at row k = rd - 1, so the state bound
+ * after the drafting step must carry `n_out + (rd - 1)` for the `n_out` the NEXT step will see.
+ *
+ * These tests walk successive steps through the REAL staging function and the REAL binding rule
+ * (rad_mtp_couple_binds), with the request's output growing the way a commit grows it. The engine
+ * used to rebuild the coordinate as `pre-commit base + slot n_acc`, which is the same number only
+ * while the commit emits exactly what the card accepted. A max_tokens/context cut or a carried step
+ * emits fewer, and every bound position then sat one past the row it was meant for: no row bound,
+ * no verify ran, and the coupling was silently inert. */
+
+namespace {
+
+/* A sampled state as the propose kernel would leave it for `draw`, at round `rd` and position
+ * `pos`: one Q token, x drawn from it, status 1. */
+RadMtpCoupleState sampled(const RadMtpCoupleDraw& draw, int rd, uint64_t pos) {
+    RadMtpCoupleState s{};
+    s.draw   = draw;
+    s.round  = rd;
+    s.status = 1;
+    s.count  = 1;
+    s.x      = 100 + rd;
+    for (int i = 0; i < 8; ++i) s.ids[i] = -1;   /* the proposer's padding */
+    s.ids[0] = s.x;
+    s.q[0]   = 1.0;
+    s.pos    = pos;
+    return s;
+}
+
+/* One step's staging through mtp_couple_plan_stage, for request `r` on `card`. */
+RadMtpCoupleDraw stage_one(Request* r, uint64_t seq, int32_t card, std::string* why) {
+    StepPlan plan;
+    plan.e.push_back(entry(r, seq, card, r->output.size(), false));
+    const Scheduler::SerialRow rows[] = { row(seq, card) };
+    std::vector<RadMtpCoupleDraw> by_card(8);
+    RadMtpCoupleDraw stage[1];
+    if (mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, why) != RAD_OK) return {};
+    return stage[0];
+}
+
+}  /* namespace */
+
+/* VARYING n_acc, SEVERAL ROUNDS, AND A CUT COMMIT. Every round bound with the request's committed
+ * length is taken by the next build; the same rounds bound the old way are not, as soon as one
+ * commit emits fewer tokens than the card accepted. */
+TEST(the_bound_position_is_the_verify_rows_sampling_position) {
+    const int kRounds = 3;
+    /* accepted by the card / actually appended to output, per step. Step 3 is the cut: the card
+     * accepted 3, the budget let 2 through, which is where the old arithmetic drifted. */
+    const int card_acc[] = { 1, 3, 4, 3, 1 };
+    const int emitted[]  = { 1, 3, 3, 4, 1 };
+    const int steps = (int)(sizeof card_acc / sizeof card_acc[0]);
+
+    Request r;
+    r.id = 7;
+    r.sp = SamplingParams{};
+    r.sp.seed = 4242;
+    r.sp.temp = 1.0f;
+
+    std::vector<RadMtpCoupleState> bound;   /* the states bound after the previous step */
+    uint64_t prev_base = 0;                 /* the previous draw's pre-commit coordinate */
+    for (int step = 0; step < steps; ++step) {
+        std::string why;
+        const RadMtpCoupleDraw draw = stage_one(&r, r.id, 2, &why);
+        REQUIRE_EQ(why, std::string());
+        /* The draw's base is the PRE-commit length: the draft's own coordinate, not the verify's. */
+        CHECK_EQ(draw.base, (uint64_t)r.output.size());
+
+        /* The build of THIS step runs over the states bound at the previous one, at the length the
+         * commit left. Every round lands on its row. */
+        if (!bound.empty()) {
+            for (int k = 0; k < kRounds; ++k) {
+                const uint64_t n_out = (uint64_t)r.output.size();
+                CHECK(rad_mtp_couple_binds(bound[(size_t)k], r.id, r.sp.seed, n_out, k,
+                                           bound[(size_t)k].x, 1 << 20));
+                /* THE REGRESSION: the same state under the old pre-commit base + n_acc coordinate
+                 * lands one past the row on the cut step, and would bind nothing. */
+                const uint64_t old_pos = prev_base + (uint64_t)card_acc[step - 1] + (uint64_t)k;
+                CHECK_EQ(old_pos == n_out + (uint64_t)k, emitted[step - 1] == card_acc[step - 1]);
+            }
+        }
+
+        /* The commit. */
+        for (int j = 0; j < emitted[step]; ++j) r.output.push_back(0);
+        prev_base = draw.base;
+
+        /* The bind, after the commit: the length the NEXT build reads. */
+        bound.clear();
+        for (int rd = 1; rd <= kRounds; ++rd)
+            bound.push_back(sampled(draw, rd, rad_mtp_couple_verify_pos((uint64_t)r.output.size(),
+                                                                       rd)));
+    }
+}
+
+/* STALE STATES ARE REJECTED. A round from another step, a round whose position is off by one, and
+ * a token the row does not propose all fail the rule -- the coupling never applies a law this step
+ * did not draw. */
+TEST(a_state_from_another_step_is_refused) {
+    Request r;
+    r.id = 11;
+    r.sp = SamplingParams{};
+    r.sp.seed = 9;
+    r.sp.temp = 1.0f;
+    std::string why;
+    const RadMtpCoupleDraw d = stage_one(&r, r.id, 3, &why);
+    REQUIRE_EQ(why, std::string());
+
+    const uint64_t n_out = 5;
+    const RadMtpCoupleState good = sampled(d, 1, rad_mtp_couple_verify_pos(n_out, 1));
+    CHECK(rad_mtp_couple_binds(good, r.id, r.sp.seed, n_out, 0, good.x, 1 << 20));
+
+    /* One position ahead: the old arithmetic's answer. */
+    CHECK(!rad_mtp_couple_binds(sampled(d, 1, rad_mtp_couple_verify_pos(n_out, 1) + 1), r.id,
+                                r.sp.seed, n_out, 0, good.x, 1 << 20));
+    /* Another step's round. */
+    CHECK(!rad_mtp_couple_binds(sampled(d, 2, rad_mtp_couple_verify_pos(n_out, 2)), r.id,
+                                r.sp.seed, n_out, 0, good.x, 1 << 20));
+    /* Another seed, another sequence. */
+    CHECK(!rad_mtp_couple_binds(good, r.id, r.sp.seed + 1, n_out, 0, good.x, 1 << 20));
+    CHECK(!rad_mtp_couple_binds(good, r.id + 1, r.sp.seed, n_out, 0, good.x, 1 << 20));
+    /* The row proposes a token this state did not draw, and a state with no Q at all. */
+    CHECK(!rad_mtp_couple_binds(good, r.id, r.sp.seed, n_out, 0, good.x + 1, 1 << 20));
+    RadMtpCoupleState greedy = good;
+    greedy.status = 0;
+    greedy.draw.mode = 0;
+    CHECK(!rad_mtp_couple_binds(greedy, r.id, r.sp.seed, n_out, 0, good.x, 1 << 20));
+}
+
+/* REQUEST AND SLOT REUSE. Two requests take turns on the same card, so each step's staged draw
+ * names the sequence currently on it. The previous request's rounds are not accepted by the new
+ * one's rows, whichever position they carry. */
+TEST(a_reused_card_serves_the_sequence_that_is_on_it) {
+    Request a, b;
+    a.id = 21;
+    b.id = 22;
+    a.sp = SamplingParams{};
+    b.sp = SamplingParams{};
+    a.sp.seed = 1;
+    b.sp.seed = 2;
+    a.output.assign(4, 0);
+    b.output.assign(9, 0);
+
+    std::string why;
+    const RadMtpCoupleDraw da = stage_one(&a, a.id, 5, &why);
+    REQUIRE_EQ(why, std::string());
+    const RadMtpCoupleDraw db = stage_one(&b, b.id, 5, &why);
+    REQUIRE_EQ(why, std::string());
+    CHECK_EQ(da.seq, (uint64_t)21);
+    CHECK_EQ(db.seq, (uint64_t)22);
+
+    /* a's rounds, at a's length, do not bind a row of b -- not even at b's position. */
+    const RadMtpCoupleState sa = sampled(da, 1, rad_mtp_couple_verify_pos((uint64_t)b.output.size(), 1));
+    CHECK(!rad_mtp_couple_binds(sa, b.id, b.sp.seed, (uint64_t)b.output.size(), 0, sa.x, 1 << 20));
+    /* b's own state does. */
+    const RadMtpCoupleState sb = sampled(db, 1, rad_mtp_couple_verify_pos((uint64_t)b.output.size(), 1));
+    CHECK(rad_mtp_couple_binds(sb, b.id, b.sp.seed, (uint64_t)b.output.size(), 0, sb.x, 1 << 20));
+}
+
 RAD_TEST_MAIN()

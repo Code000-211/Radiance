@@ -408,7 +408,7 @@ private:
     std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
     RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
     int  stage_couple_draws(int n);
-    int  bind_couple(int row, int done, const StepSlot& S);
+    int  bind_couple(int row, int done, const StepSlot& S, uint64_t n_out);
 
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
      * The nine phases sum to the whole step, including the readback, commit and drafter after the

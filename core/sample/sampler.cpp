@@ -739,12 +739,10 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                     /* BIND TO THIS ROW: same request and seed, the round this row's draft came
                      * from, the position it samples, and the very token it proposes. Anything else
                      * is a stale state from another step, and coupling against it would apply a law
-                     * this step never drew. */
-                    if (c.status == 1 && c.draw.seq == r->id && c.draw.seed == sp.seed &&
-                        c.round == k + 1 &&
-                        c.pos == (uint64_t)r->output.size() + (uint64_t)k &&
-                        (!r->draft || c.x == r->draft[k]) &&
-                        rad_mtp_couple_state_valid(c, cfg_.n_vocab)) {
+                     * this step never drew. The rule is rad_mtp_couple_binds (abi/rad_spechub.h),
+                     * the same one Engine::bind_couple writes the position by. */
+                    if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k,
+                                             r->draft ? r->draft[k] : -1, cfg_.n_vocab)) {
                         couple_stage_[row] = c;
                         any_couple_ = true;
                     }
