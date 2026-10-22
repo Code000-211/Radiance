@@ -30,9 +30,9 @@
  * version is provenance, not a reset.
  *
  * Evidence: a[j] is the EMA over at most the last (2 - alpha)/alpha labels, so the label count
- * stops being the evidence after the running-mean phase. DraftPrediction.n reports the effective
- * sample size (prior pseudo-labels excluded), and unc[] is computed from it: a policy can price a
- * position by how much it actually knows, not by how long the slot has lived.
+ * stops being the evidence after the running-mean phase. DraftPrediction.n is the contract's raw
+ * observation count; the effective sample size is internal and only unc[] is computed from it: a
+ * policy can price a position by how much it actually knows, not by how long the slot has lived.
  *
  * Memory: DraftPredictState is one per request slot, owned by the scheduler, and nothing here
  * allocates. A slot whose (req_id, slot_gen) differs from its state is recycled and starts at the
@@ -56,7 +56,7 @@ namespace rad {
 /* One request's estimate. Identity is the view's (req_id, slot_gen); `a[j]` is the chance position
  * j+1 is accepted given that 1..j were. `n[j]` is the raw label count that drives the EMA step
  * (the controller's schedule); `ess[j]` is the effective sample size, prior pseudo-labels
- * included, that predict() reports and unc_at() uses. */
+ * included, that unc_at() uses. */
 struct DraftPredictState {
     uint64_t req_id = 0;
     uint32_t slot_gen = 0;

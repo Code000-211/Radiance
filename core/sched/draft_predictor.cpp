@@ -101,9 +101,8 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
                 (unsigned)view.policy_version, (unsigned)p_.version);
         return RAD_E_INVAL;
     }
-    out->n_seq = view.n_seq;
-    out->version = p_.version;
-    const int D = p_.max_depth;
+    /* Validate every row before anything moves: a view refused at its last row must not have reset
+     * a live slot on the way there -- that would make an older cycle unobservable. */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         const DraftSeqView& v = view.seq[i];
         if (v.slot < 0 || v.slot >= cap_) {
@@ -111,6 +110,12 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
                     (unsigned long long)v.req_id, (int)v.slot, (int)cap_ - 1);
             return RAD_E_INVAL;
         }
+    }
+    out->n_seq = view.n_seq;
+    out->version = p_.version;
+    const int D = p_.max_depth;
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        const DraftSeqView& v = view.seq[i];
         DraftPredictState& s = states_[v.slot];
         if (s.req_id != v.req_id || s.slot_gen != v.slot_gen) start(s, v.req_id, v.slot_gen);
 
@@ -121,10 +126,9 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
             const bool in = j < D;
             pr.a[j] = in ? s.a[j] : 0.0f;
             pr.unc[j] = in ? unc_at(s, j) : 0.0f;
-            double data = in ? (double)s.ess[j] - (double)p_.prior_weight : 0.0;
-            if (data < 0.0) data = 0.0;
-            const long count = std::lround(data);
-            pr.n[j] = (uint16_t)(count > 65535 ? 65535 : count);
+            /* The contract's n counts real observations; the effective sample size is this
+             * model's own and only shapes unc[] above. */
+            pr.n[j] = in ? s.n[j] : (uint16_t)0;
             if (in && s.n[j] > 0) valid |= 1ull << j;
         }
         pr.valid = valid;

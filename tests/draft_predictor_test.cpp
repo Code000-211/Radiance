@@ -457,10 +457,9 @@ TEST(uncertainty_is_computed_from_the_effective_sample_size) {
         previous = p.unc[0];
     }
     CHECK_NEAR(r.state[0].a[0], 1.0, 0.05);
-    CHECK_EQ(r.state[0].n[0], 32);          /* the EMA's own count keeps growing ... */
+    CHECK_EQ(r.state[0].n[0], 32);         /* the EMA's own count keeps growing ... */
     const DraftPrediction saturated = predicted(r, 10, 0);
-    CHECK(saturated.n[0] <= 43);            /* ... the reported evidence does not: (2-a)/a - prior */
-    CHECK(saturated.n[0] >= 20);
+    CHECK_EQ(saturated.n[0], 32);          /* ... and n reports it raw, not the EMA's reach */
 
     /* 1400 alternating labels: the estimate still rests on ~42 effective labels, so the reported
      * uncertainty stays near 2*sqrt(.25/47) instead of collapsing with the cycle count. */
@@ -468,7 +467,7 @@ TEST(uncertainty_is_computed_from_the_effective_sample_size) {
         CHECK_OK(r.observe(10, 6, i % 2 == 0 ? 6 : 0));
     const DraftPrediction p = predicted(r, 10, 0);
     CHECK_EQ(r.state[0].n[0], 1432);
-    CHECK(p.n[0] <= 43);
+    CHECK_EQ(p.n[0], 1432);                /* raw count; the ~42 effective labels shape unc only */
     CHECK(p.unc[0] > 0.12f);
     CHECK(p.unc[0] < 0.18f);
     CHECK(p.unc[0] >= 0.0f && p.unc[0] <= 1.0f);
@@ -675,6 +674,24 @@ TEST(predict_refuses_a_batch_it_cannot_fill) {
     bad.prior = 0.8f;
     bad.half_life = -1.0f;
     CHECK_EQ(r.model.configure(bad, r.state, kCap), RAD_E_INVAL);
+}
+
+TEST(a_refused_view_does_not_reset_a_live_slot_on_its_way_to_the_bad_row) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    CHECK_OK(r.observe(10, 3, 3));
+    const float learned = r.state[0].a[0];
+    CHECK_EQ(r.state[0].n[0], 1);
+
+    /* A new identity in row 0 would reset the slot; row 1 is outside the table. The view is
+     * refused as a whole, so the reset must not have happened on the way. */
+    r.add(0, 12, 0, 2);
+    r.add(1, 13, kCap, 3);
+    CHECK_EQ(r.model.predict(r.view, &r.pred), RAD_E_INVAL);
+    CHECK_EQ(r.state[0].req_id, 10u);
+    CHECK_EQ(r.state[0].slot_gen, 1u);
+    CHECK_EQ(r.state[0].n[0], 1);
+    CHECK_NEAR(r.state[0].a[0], learned, 0.0);
 }
 
 RAD_TEST_MAIN()
