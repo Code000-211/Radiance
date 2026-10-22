@@ -135,7 +135,13 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     }
 
     cfg_ = cfg;
-    if (!mtp_coupled_config_valid()) return RAD_E_INVAL;
+    /* A value other than unset/0/1 is refused, not read as off: a deployment that asked for the
+     * coupling and got a typo must not be served the uncoupled path while believing otherwise. */
+    if (!mtp_coupled_config_valid()) {
+        RAD_ERR("RADIANCE_MTP_COUPLED accepts 0|1 (or unset); refusing the start rather than "
+                "serving the uncoupled path");
+        return RAD_E_INVAL;
+    }
     couple_ = mtp_coupled_enabled();
     if (cfg_.n_vocab_local <= 0) cfg_.n_vocab_local = cfg_.n_vocab / cfg_.world_size;
 

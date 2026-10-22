@@ -2465,7 +2465,16 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
 
 `mtp_couple_propose` and `mtp_couple_verify` are the linear-MTP coupling (`RADIANCE_MTP_COUPLED=1`),
-and nothing else in the engine knows about coupling. `mtp_couple_propose` runs on a draft round's
+and nothing else in the engine knows about coupling. The switch takes `1`, `0` or nothing; any other
+value refuses the start rather than serving the uncoupled path. Turning coupling on requires the
+linear serial draft chain: a block drafter (`RAD_DRAFT_BLOCK`) or no drafter at all is refused at
+bringup, because neither has a per-round draw to couple. The `spechub` plugin ships both rows and
+their host oracle in one library and marks them per row, so the device rows count as production
+kernels while the oracle is what the reference gate knows about — on a machine with no card only
+the oracle is left, and the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
+if it is set, it must name `spechub` or the coupled ops are not loaded at all.
+
+`mtp_couple_propose` runs on a draft round's
 final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
 scores at temperature 1; it writes `x` into column 0 of `idx` and one state row per round. A row
 whose `seq_ids` does not name the card its draw was staged for, or whose shortlist is malformed,

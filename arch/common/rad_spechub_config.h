@@ -14,19 +14,25 @@ namespace rad {
 
 /* RADIANCE_MTP_COUPLED=1: the linear builtin MTP drafter samples x~Q each round and the target
  * sampler applies the maximal coupling (docs/OPS.md, `mtp_couple_propose`/`mtp_couple_verify`).
- * Unset or "0" is the ordinary path. Exclusive with RADIANCE_NO_DRAFT: a deployment that has
- * turned drafting off cannot couple to a draft that is never made. */
+ * Unset or "0" is the ordinary path.
+ *
+ * Nothing here enumerates the drafter configurations the coupling cannot serve. Drafting is
+ * switched off by asking for no speculative window (`--num-speculative-tokens 0`), which leaves
+ * `RadDrafterDecl::kind == RAD_DRAFT_NONE`; a block drafter declares RAD_DRAFT_BLOCK. Both are
+ * read from the declaration by the engine (Engine::step_state_init), which is where they are
+ * known. An environment variable that no other code reads cannot enforce either. */
 inline bool mtp_coupled_enabled() {
     const char* value = std::getenv("RADIANCE_MTP_COUPLED");
     return value && !std::strcmp(value, "1");
 }
 
-/* A typo is OFF, never something else -- and a flag that is on while drafting is off is a
- * contradiction the deployment is told about rather than served through. */
+/* A value other than unset/0/1 is REFUSED, not read as off: a deployment that asked for coupling
+ * and got a typo must not be served the uncoupled path while believing otherwise. The refusal is
+ * RAD_E_INVAL out of Sampler::declare (and out of the architecture's own check where it makes one),
+ * both before the first request. */
 inline bool mtp_coupled_config_valid() {
     const char* value = std::getenv("RADIANCE_MTP_COUPLED");
-    return (!value || !std::strcmp(value, "0") || !std::strcmp(value, "1")) &&
-           !(mtp_coupled_enabled() && std::getenv("RADIANCE_NO_DRAFT"));
+    return !value || !std::strcmp(value, "0") || !std::strcmp(value, "1");
 }
 
 }  // namespace rad
