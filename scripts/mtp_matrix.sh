@@ -214,8 +214,9 @@ EOF
   chk "c: row unusable"               "$(awk 'NR == 2 {print $22}' "$rows")" 0
 
   # F: the same good run, but every answer is legal JSON with different spacing, the top-level keys
-  # in the other order, and a quoted key inside the escaped content. The client reads bytes, so it
-  # must neither mistake that content for the "text" key nor lose the chunk: the counts stay 600.
+  # in the other order, and quoted keys ("text", "completion_tokens") inside the escaped content.
+  # The client reads bytes, so neither the chunk count nor the usage may come from that content:
+  # 600 chunks and a whole-stream usage of 600 are the real stream's numbers, not the text's 7.
   MOCK_JSON=spaced MOCK_CHUNKS=300 MOCK_GAP_MS=20 RADIANCE="$HERE/mtp_mock_server.py" PORT=8130 \
     WIN=1 RAMP=20 SETTLE=1 "$SELF" "$d/manifest.json" > "$d/f.log" 2>&1
   chk "f: exit status"                "$?" 0
@@ -525,8 +526,9 @@ stream_one() {   # $1 payload, $2 out file
         body=${line#data: }
         # Not a JSON parser: it finds the key anywhere in the chunk and reads up to the next
         # quote. That covers the two facts needed here -- a content arrival, a usage count.
-        # Limit: text carrying an escaped quote is truncated (only emptiness is decided); a
-        # server that stops sending a non-empty "text" per chunk needs a real parser.
+        # Limit: text carrying an escaped quote is truncated (only emptiness is decided), and an
+        # escaped key inside it does not match, because a backslash follows the name, not a quote.
+        # A server that stops sending a non-empty "text" per chunk needs a real parser.
         case $body in *'"completion_tokens"'*)
           rest=${body#*'"completion_tokens"'}
           rest=${rest#*:}
