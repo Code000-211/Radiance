@@ -2069,6 +2069,237 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
 }
 
+/* ================================================================== what a shared step is made of */
+/* Issue #8 asks whether a prompt's chunks should be served overlapping, and beside the decode of
+ * another request. Before either is believed or dismissed the engine has to be able to say what it
+ * already does: which rows rode together, how much prefill ran inside a step that also decoded,
+ * and whether that step was big enough for the prefill stager to arm for. Counters, not a new
+ * policy: docs/PREFILL-OVERLAP.md.
+ */
+
+/* The ordering a mixed step's recurrent state depends on: every decode row before the split, every
+ * chunk after it (RadBatch::n_seq_decode). The scheduler's sort produces it and the batch builder
+ * refuses a plan that does not hold it, so state is written by one path per sequence per step. */
+TEST(a_mixed_step_leaves_no_doubt_about_which_half_a_row_is_in) {
+    Fixture f;
+    share_fixture(f, /*auto=*/-1);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);                 /* d's prompt: it decodes from the next step */
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);   /* walked first: it outranks d */
+    CHECK(f.sch.step() != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.phase, RAD_PHASE_MIXED);
+    CHECK(pl.split_ordered());
+    int64_t dec = 0, pf = 0, pf_tok = 0;
+    for (const StepEntry& e : pl.e) { if (e.is_prefill) { ++pf; pf_tok += e.n_tokens; } else ++dec; }
+    CHECK_EQ(pl.n_seq_decode, dec);
+    CHECK(dec >= 1 && pf >= 1);
+    for (size_t i = 0; i < pl.e.size(); ++i)
+        CHECK_EQ((int)((int64_t)i < pl.n_seq_decode), (int)!pl.e[(size_t)i].is_prefill);
+    /* the decode half is the decoder, and only it; the prefill half is the prompt */
+    for (int64_t i = 0; i < pl.n_seq_decode; ++i) {
+        CHECK(!pl.e[(size_t)i].is_prefill);
+        CHECK_EQ(pl.e[(size_t)i].seq, d);
+    }
+    for (int64_t i = pl.n_seq_decode; i < (int64_t)pl.e.size(); ++i) {
+        CHECK(pl.e[(size_t)i].is_prefill);
+        CHECK_EQ(pl.e[(size_t)i].seq, p);
+    }
+    /* one chunk and one decoder: mixed, but not chunk against chunk */
+    CHECK_EQ(f.sch.metrics().steps_multi_prefill, 0);
+    CHECK_EQ(f.sch.metrics().decode_rows_mixed, dec);
+    CHECK_EQ(f.sch.metrics().prefill_rows_mixed, pf);
+    /* not charged until the step commits, since a step that never ran computed nothing */
+    CHECK_EQ(f.sch.metrics().prefill_tok_mixed, 0);
+    f.commit_plain(12);
+    CHECK_EQ(f.sch.metrics().prefill_tok_mixed, pf_tok);
+}
+
+/* The control: with --busy-prefill-chunk off a chunk takes every token the step has left, so
+ * nothing shares with it and every mixed-step counter stays at zero. A counter that counts in the
+ * control arm is counting something else. (What `off` does NOT claim is that a decode row already
+ * ahead of the chunk in the walk is left out: it is the chunk that gives room up, not the row.) */
+TEST(off_carries_no_row_in_a_mixed_step) {
+    Fixture f;
+    share_fixture(f, /*off=*/0);
+    CHECK_OK(f.start());
+    const uint64_t p = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    f.submit(100, 64);                  /* arrives after the chunk owns the step: kept out */
+    for (int k = 0; k < 4; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.plan().e.size(), 1);
+        CHECK_EQ(f.sch.plan().e[0].seq, p);
+        CHECK(f.sch.plan().e[0].is_prefill);
+        f.commit_plain();
+    }
+    CHECK_EQ(f.sch.metrics().steps_mixed, 0);
+    CHECK_EQ(f.sch.metrics().decode_rows_mixed, 0);
+    CHECK_EQ(f.sch.metrics().prefill_rows_mixed, 0);
+    CHECK_EQ(f.sch.metrics().prefill_tok_mixed, 0);
+    CHECK_EQ(f.sch.metrics().steps_multi_prefill, 0);
+    CHECK_EQ(f.sch.metrics().prefill_rows_unstaged, 0);
+}
+
+/* Chunk against chunk: the direction the issue names. Two prompts of one interval as the whole
+ * budget share the step under auto -- each leaves the other a share -- and neither starves. A step
+ * of chunks only is PREFILL-shaped, so steps_multi_prefill is the counter that says it happened.
+ */
+TEST(two_prompts_prefill_in_one_step) {
+    Fixture f;
+    share_fixture(f, /*auto=*/-1);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3500, 64);
+    const uint64_t b = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.phase, RAD_PHASE_PREFILL);          /* no decode row rode along */
+    CHECK(pl.split_ordered());
+    CHECK_EQ((int)pl.e.size(), 2);
+    bool saw_a = false, saw_b = false;
+    for (const StepEntry& e : pl.e) {
+        if (e.seq == a) saw_a = true;
+        if (e.seq == b) saw_b = true;
+        /* each chunk is a quantum multiple: neither was squeezed under one */
+        CHECK(e.n_tokens >= 64 && e.n_tokens % 64 == 0);
+    }
+    CHECK(saw_a && saw_b);
+    CHECK_EQ(f.sch.metrics().steps_multi_prefill, 1);
+    CHECK_EQ(f.sch.metrics().prefill_rows_mixed, 0);
+    f.commit_plain();
+    /* and both keep advancing: neither is left out of the following steps */
+    for (int k = 0; k < 3; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        int rows = 0;
+        for (const StepEntry& e : f.sch.plan().e) if (e.is_prefill) ++rows;
+        CHECK(rows >= 1);
+        CHECK(f.sch.find(a) != nullptr && f.sch.find(b) != nullptr);
+        f.commit_plain();
+    }
+}
+
+/* The cost a shared chunk can pay: the prefill stager arms on the whole step's rows
+ * (PrefillStager::begin_pass), so a chunk held under its smallest pass reads every routed layer's
+ * pooled experts across the link inside the GEMMs. An explicit --busy-prefill-chunk N has no
+ * floor -- set_stage_rows warns about it at startup -- and this is the number that says what that
+ * trade cost. With no stager armed the counter stays at zero: nothing was given up.
+ */
+TEST(a_chunk_in_a_step_under_the_stagers_floor_is_counted_unstaged) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 256;                 /* an explicit ceiling, under the floor */
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);
+    f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().n_tok, 2048);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().prefill_rows_unstaged, 0);   /* alone: the whole step, staged */
+    f.submit(100, 64);                                     /* wants in: the chunk is held back */
+    CHECK(f.sch.step() != nullptr);
+    int64_t rows = 0, pf = 0;
+    for (const StepEntry& e : f.sch.plan().e) { ++rows; if (e.is_prefill) ++pf; }
+    CHECK_EQ(rows, 2);
+    CHECK(f.sch.plan().n_tok < 1025);
+    CHECK_EQ(f.sch.metrics().prefill_rows_unstaged, pf);
+    CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 1);
+}
+
+/* The rule itself, apart from the scheduler that satisfies it: a draft pass leaves the split zero
+ * and is all decode rows, so the phase is what decides for it, and only a MIXED plan can be
+ * mis-ordered.
+ */
+TEST(split_ordered_judges_only_a_plan_that_carries_a_split) {
+    StepPlan p;
+    StepEntry dec, pre;
+    dec.is_prefill = false;
+    pre.is_prefill = true;
+
+    /* A draft pass: DECODE, n_seq_decode left at reset()'s zero, rows are all decode. */
+    p.reset();
+    p.phase = RAD_PHASE_DECODE;
+    p.e = { dec, dec };
+    CHECK(p.split_ordered());
+
+    /* A mixed plan in order, and the same plan with a chunk ahead of a decode row. */
+    int64_t bad = -1;
+    p.phase = RAD_PHASE_MIXED;
+    p.n_seq_decode = 1;
+    p.e = { dec, pre };
+    CHECK(p.split_ordered(&bad));
+    p.e = { pre, dec };
+    CHECK(!p.split_ordered(&bad));
+    CHECK_EQ(bad, 0);
+    /* An in-order vector and a split that does not match it is the same hazard: the row the split
+     * puts in the wrong half takes the other path. The index names the row the refusal is about.
+     */
+    p.e = { dec, dec, pre };
+    p.n_seq_decode = 1;
+    CHECK(!p.split_ordered(&bad));
+    CHECK_EQ(bad, 1);
+    p.n_seq_decode = 2;
+    CHECK(p.split_ordered(&bad));
+}
+
+/* The builder refuses what the rule forbids, rather than issuing it: the halves become device
+ * arrays there (cu_seqlens + n_seq_decode, state_index + n_seq_decode * pitch), and a row on the
+ * wrong side of the split is wrong in a way the batch shape hides. Driven directly, because the
+ * scheduler's sort never produces the shape -- a later caller of build() can.
+ */
+TEST(the_batch_builder_refuses_a_mixed_plan_whose_split_disagrees_with_its_entries) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 64));
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 64));
+
+    StepPlan p;
+    auto plan = [&](bool chunk_first) {
+        p.reset();
+        p.phase = RAD_PHASE_MIXED;
+        p.n_seq_decode = 1;
+        StepEntry dec, pre;
+        dec.seq = 1; dec.card = 0; dec.n_tokens = 1; dec.ctx_len = 8; dec.is_prefill = false;
+        pre.seq = 2; pre.card = 1; pre.n_tokens = 8; pre.ctx_len = 0; pre.is_prefill = true;
+        p.e = chunk_first ? std::vector<StepEntry>{ pre, dec } : std::vector<StepEntry>{ dec, pre };
+        p.n_tok = dec.n_tokens + pre.n_tokens;
+        return p;
+    };
+
+    const RadBatch* ok = bb.build(plan(false), f.kv, 0);
+    CHECK(ok != nullptr);
+    int64_t bad = -1;
+    CHECK(!plan(true).split_ordered(&bad));
+    CHECK_EQ(bad, 0);                      /* the chunk, sitting in the decode half */
+    CHECK(bb.build(plan(true), f.kv, 0) == nullptr);
+    /* and the same entries in a plan with no split at all are the builder's business as before */
+    p.reset();
+    p.phase = RAD_PHASE_PREFILL;
+    StepEntry pre;
+    pre.seq = 2; pre.card = 0; pre.n_tokens = 8; pre.ctx_len = 0; pre.is_prefill = true;
+    p.e = { pre };
+    p.n_tok = 8;
+    CHECK(bb.build(p, f.kv, 0) != nullptr);
+    bb.fini();
+}
+
 /* The share left for a request that then does not start (its media is not encoded yet) goes back
  * to the chunk that made room for it: the step is planned as if nothing had waited. */
 TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
