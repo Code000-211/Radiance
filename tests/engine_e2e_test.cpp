@@ -2615,7 +2615,12 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
  * `arena` is "none" in the file -- the file's own name for a deployment with no level plan, not a
  * missing field, and not a statement about the KV loan. The loan is the separate `live_loan` field,
  * which a no-loan reference omits by construction; `placement` names the plan it was derived
- * under. */
+ * under.
+ *
+ * The depth the reload chooses is not proof of the profile decision here: the loan moves experts
+ * inside the request, the calibration leaves every cycle after such a move out, and the fallback
+ * runs at the same ceiling anyway. The case after this one makes that decision observable on a
+ * plan with nothing movable. */
 TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
     tiny::TempDir dir("qmoe_ref");
     REQUIRE(dir.ok());
@@ -2677,10 +2682,11 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
     std::string why;
     const json reply =
         post(basis.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
-    if (tokens_of(reply).empty())
+    if (status != 200 || tokens_of(reply).size() != 24)
         fprintf(stderr, "    the reference run's request answered status %d (%s): %s\n", status,
                 why.c_str(), reply.dump().c_str());
-    CHECK(!tokens_of(reply).empty());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
     const int ref_exit = basis.stop();
     const std::string ref_log = basis.output();
     CHECK_EQ(ref_exit, 0);
@@ -2712,28 +2718,34 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
     /* A serial head runs one dependent pass a token, so every cycle is a shrinking round. */
     CHECK_EQ(p.value("execution", ""), std::string("shrinking"));
 
-    /* The buckets the reload can price from: a clean measurement (nothing disturbing; `ahead` is
-     * not), and the start cycle the first plan asks for -- verify_k 0, one token of history, at
-     * the executable depth the cost fallback runs (num-speculative-tokens, the ladder's top). */
+    /* The bucket the reload's first plan prices: the exact start shape -- verify_k 0, one token of
+     * verify and history, at the depth the calibration runs (the ceiling, K2) -- and it has to be
+     * usable by the rule estimate() shares with the export: no disturbing flag (`ahead` is not
+     * one), a positive mean and at least one measurement. A verify_k = 0 row is also an ordinary
+     * decode step that drafted nothing, so the shape is matched field by field; a bucket that is
+     * not this start is not failed here, it is simply not the one the policy looks up. */
     const json buckets = p.value("buckets", json::array());
     REQUIRE(buckets.is_array());
     REQUIRE(!buckets.empty());
-    bool usable = false, start_cycle = false;
+    bool start_priced = false;
     for (const json& b : buckets) {
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0 || shape.value("verify_tokens", -1) != 1 ||
+            shape.value("history_tokens", -1) != 1 || shape.value("draft_k", -1) != 2 ||
+            shape.value("drafter", std::string()) != std::string("serial"))
+            continue;
         bool clean = true;
         for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
         const json t = b.value("time_ms", json::object());
-        usable = usable || (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
-        const json shape = b.value("shape", json::object());
-        if (shape.value("verify_k", -1) != 0) continue;
-        start_cycle = true;
-        CHECK_EQ(shape.value("verify_tokens", -1), 1);
-        CHECK_EQ(shape.value("history_tokens", -1), 1);
-        CHECK_EQ(shape.value("draft_k", -1), 2);
-        CHECK_EQ(shape.value("drafter", ""), std::string("serial"));
+        const bool usable = clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1;
+        if (!usable)
+            fprintf(stderr, "    the start bucket is not usable: %s\n", b.dump().c_str());
+        start_priced = start_priced || usable;
     }
-    CHECK(usable);
-    CHECK(start_cycle);
+    if (!start_priced)
+        fprintf(stderr, "    the exported profile holds no usable start bucket:\n%s\n",
+                buckets.dump().c_str());
+    CHECK(start_priced);
 
     /* ---- the cost twin: normal operation, the exported file bound, a real request ---- */
     std::vector<std::string> cost = common;
@@ -2752,15 +2764,21 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
 
     const json served =
         post(run.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
-    if (tokens_of(served).empty())
+    if (status != 200 || tokens_of(served).size() != 24)
         fprintf(stderr, "    the cost run's request answered status %d (%s): %s\n", status,
                 why.c_str(), served.dump().c_str());
-    CHECK(!tokens_of(served).empty());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
 
     /* Real borrowing, not the offer: `flex_bytes` is what the lent slots hold, `flex_capacity`
      * what the loan offers. The start placement's fill runs before the first step and leaves only
      * the working reserve and turnover slots free, so a positive `flex_bytes` is the plan's own
-     * residency living in memory borrowed from the KV cache. */
+     * residency living in memory borrowed from the KV cache.
+     *
+     * Only the held bytes are asserted. `flex_capacity` is the *current* offer (target minus
+     * first), while `flex_bytes` counts every held slot from its first index, and
+     * SlotPool::set_target keeps held slots alive when a target shrinks: a correct lend can hold
+     * more than it currently offers, so `flex_capacity >= flex_bytes` is not an invariant. */
     const json rst = stats(run.port);
     const int run_exit = run.stop();
     CHECK_EQ(run_exit, 0);
@@ -2769,7 +2787,165 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
         fprintf(stderr, "    the cost run lent nothing (experts: %s)\n",
                 rst["experts"].dump().c_str());
     CHECK(rst["experts"].value("flex_bytes", 0.0) > 0.0);
-    CHECK(rst["experts"].value("flex_capacity", 0.0) >= rst["experts"].value("flex_bytes", 0.0));
+}
+
+/* The depth decision, told apart from the fallback: a reload whose head can execute six positions
+ * and whose ladder ends at two.
+ *
+ * The case above cannot carry this proof. Its tiered plan moves experts during the request, and
+ * the calibration marks every cycle after a move `placed` and leaves it out (Scheduler::
+ * draft_drift_note, core/sched/scheduler.cpp:2802-2827), so the exported file keeps the start
+ * cycle and the reload could not price a second one. Here nothing is movable: `all_vram` gives
+ * every unit `movable = false` (core/place/planner.cpp:523-531), HeatStats disables itself and the
+ * mover never runs (core/place/heat.cpp:126-138), so the same reference measures every shape the
+ * request executes and nothing drifts.
+ *
+ * The runs share the checkpoint, placement and batch flags; only the ceiling and the ladder
+ * differ, and neither is part of the fingerprint. The first calibration runs the named baseline at
+ * the head's own depth (K2) and writes it. The second runs it at six, so the fallback depth is an
+ * alternative this deployment really executes -- not a CLI number above the one it uses. The
+ * reload's head can execute K6 and its ladder offers only K2; a cycle the loaded profile cannot
+ * price is refused rather than drafted at K6 (core/sched/draft_policy.cpp:316-335). So a served
+ * 24-token answer that drafted two positions is the profile's decision: the same request drafts
+ * six when the baseline names that depth. */
+TEST(a_loaded_reference_decides_the_draft_depth_instead_of_the_fallback) {
+    tiny::TempDir dir("qmoe_depth");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;     /* the checkpoint the case above builds */
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    const std::string profile = dir.path + "/reference.json";
+    /* A card the whole plane fits on: nothing is pinned in the host pool, so there is no slot to
+     * lend and no heat move to invalidate the start placement. */
+    const std::vector<std::string> common = { "--placement", "all_vram",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+
+    std::vector<std::string> calib = common;
+    calib.insert(calib.end(), { "--num-speculative-tokens", "2", "--draft-reference",
+                                "--draft-policy", "cost", "--draft-profile-out", profile });
+    Server writer;
+    REQUIRE(writer.start(dir.path, calib, device_env(128)));
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt_ids(7, 24), 24), &status,
+                            &why);
+    if (status != 200 || tokens_of(wrote).size() != 24)
+        fprintf(stderr, "    the depth calibration's request answered status %d (%s): %s\n", status,
+                why.c_str(), wrote.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    const std::string writer_log = writer.output();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the depth calibration exited %d:\n%s\n", writer_exit,
+                tail(writer_log).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+    CHECK(writer_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const json p = json::parse(tiny::read_text(profile), nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", std::string()), std::string("no-loan"));
+    CHECK(fp.value("placement", std::string()).rfind("all_vram ", 0) == 0);
+    /* The whole request is in the file: the start shape (verify_k 0) and the shape every later
+     * cycle verifies (verify_k 2), both at the depth the calibration ran. This is the coverage the
+     * lending case's file cannot hold. */
+    const json buckets = p.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    bool start = false, decode = false;
+    for (const json& b : buckets) {
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        if (!clean || !(t.value("mean", 0.0) > 0.0) || t.value("n", 0) < 1) continue;
+        const json shape = b.value("shape", json::object());
+        if (shape.value("drafter", std::string()) != std::string("serial")) continue;
+        const int verify_k = shape.value("verify_k", -1);
+        start = start || (verify_k == 0 && shape.value("verify_tokens", -1) == 1 &&
+                          shape.value("history_tokens", -1) == 1 &&
+                          shape.value("draft_k", -1) == 2);
+        decode = decode || (verify_k == 2 && shape.value("draft_k", -1) == 2);
+    }
+    if (!start || !decode)
+        fprintf(stderr, "    the reference does not cover the request (start %d, K2 %d):\n%s\n",
+                (int)start, (int)decode, buckets.dump().c_str());
+    CHECK(start);
+    CHECK(decode);
+
+    /* The alternative the reload does not take, run: the same checkpoint, request and deployment
+     * at the head's own depth. Six positions execute here, so the reload's two are the profile's
+     * price and not the head's limit. */
+    std::vector<std::string> baseline = common;
+    baseline.insert(baseline.end(), { "--num-speculative-tokens", "6", "--draft-reference",
+                                      "--draft-policy", "cost", "--draft-profile-out",
+                                      dir.path + "/baseline6.json" });
+    Server six;
+    REQUIRE(six.start(dir.path, baseline, device_env(128)));
+    const json alt = post(six.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(alt).size() != 24)
+        fprintf(stderr, "    the K6 baseline's request answered status %d (%s): %s\n", status,
+                why.c_str(), alt.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(alt).size(), (size_t)24);
+    const int alt_positions = draft_positions(six.port);
+    if (alt_positions != 6)
+        fprintf(stderr, "    the K6 baseline drafted %d positions, not six:\n%s\n", alt_positions,
+                tail(six.output()).c_str());
+    CHECK_EQ(alt_positions, 6);
+    CHECK_EQ(six.stop(), 0);
+
+    /* The reload. Six is the head's executable depth and the named baseline; two is the only tier
+     * the ladder offers, and what the profile prices. One tier, not 0,2: with a shallower plan in
+     * the search, the ladder could decide on its own evidence instead of the file's depth. */
+    std::vector<std::string> reload = common;
+    reload.insert(reload.end(), { "--num-speculative-tokens", "6", "--draft-depth-tiers", "2",
+                                  "--draft-policy", "cost", "--draft-profile", profile });
+    Server reader;
+    REQUIRE(reader.start(dir.path, reload, device_env(128)));
+    const std::string bind = reader.output();
+    if (bind.find("buckets match this deployment") == std::string::npos)
+        fprintf(stderr, "    the reload did not bind the profile:\n%s\n", tail(bind).c_str());
+    CHECK(bind.find("buckets match this deployment") != std::string::npos);
+    CHECK(bind.find("is not used for this deployment") == std::string::npos);
+    CHECK(bind.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const json served =
+        post(reader.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(served).size() != 24)
+        fprintf(stderr, "    the reload's request answered status %d (%s): %s\n%s\n", status,
+                why.c_str(), served.dump().c_str(), tail(reader.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+
+    /* /metrics exports one `draft_position_reached_total` line per position the run drafted to:
+     * the deepest verify window it executed. Two is the priced depth; six would be the named
+     * baseline, and a cycle the file could not price would have been refused before reaching
+     * either. */
+    const int positions = draft_positions(reader.port);
+    if (positions != 2)
+        fprintf(stderr, "    the reload drafted %d positions, not the priced depth 2 "
+                        "(6 positions = the fallback ceiling):\n%s\n",
+                positions, tail(reader.output()).c_str());
+    CHECK_EQ(positions, 2);
+    CHECK_EQ(reader.stop(), 0);
 }
 
 RAD_TEST_MAIN()
