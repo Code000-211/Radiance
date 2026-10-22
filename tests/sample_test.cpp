@@ -3322,8 +3322,10 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
         CHECK_EQ(ch.s.staged_couple(k).round, k + 1);
         CHECK_EQ(ch.s.staged_couple(k).x, draft[k]);
         CHECK_EQ(ch.s.staged_couple(k).pos, rad_mtp_couple_verify_pos(n_out, k + 1));
-        /* The row is sampled at the position its state names. */
+        /* The row is sampled at the position its state names -- asserted against the row itself,
+         * not through the formula, so a drifted formula cannot move both sides together. */
         CHECK_EQ(p[k].pos, n_out + (uint64_t)k);
+        CHECK_EQ(ch.s.staged_couple(k).pos, p[k].pos);
     }
     CHECK_EQ(ch.s.staged_couple(3).round, 0);   /* the bonus row carries no law */
 
