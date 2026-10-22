@@ -436,8 +436,11 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
   `draft_types_test` reports 364 checks over 29 cases, built at 02:14:06 and run at 02:14:28, after a
   first 364/29 run of the same change at 02:13:09 and under ASan at 02:13:32. The working tree
   committed at 02:18:02 as `e0a053c` was built at 02:17:12 and executed at 02:17:27
-  (`draft_types_test`: 367/29) and at 02:17:53-59 (the other four suites); whether that commit is
-  byte-identical to the built tree can only be shown by a rebuild. `9bc94cd`, `8c91876`, `93d8797`,
+  (`draft_types_test`: 367/29) and at 02:17:53-59 (the other four suites). Those runs happened on a
+  tree that was still uncommitted, before `e0a053c` existed; the times sit close together but no
+  timing argument proves the tree the binary was built from equals the commit. They are therefore
+  reported as runs on an unverified working tree, neither as "`e0a053c` built" nor as "that exact
+  commit checked" — only a rebuild of the commit itself would show that. `9bc94cd`, `8c91876`, `93d8797`,
   `28cb9da` and `f77f93a` add checks to `draft_types_test` and `sched_test` and are **unexecuted**.
   Every run here started after the 02:01:24 CEST pause order; nothing has run since 02:17:59. No
   test target here depends on `libavx` (`ninja -t inputs`), so the older libavx objects are not part
