@@ -4,9 +4,17 @@
  * The rows themselves, their schemas and their argument readers are in spechub.cpp; the launches are
  * spechub.hip (device) and ref_spechub.cpp (host).
  *
- * `rad_plugin_reference` is 1: this library's rows have a host reference beside them and are checked
- * against it, so the loader must rank it as a reference rather than let it win a selection by load
- * order. The flag, not the loader, is what puts a coupled row into serving.
+ * REFERENCE IS PER ROW HERE, not per library. This library carries a real device kernel AND the
+ * host oracle beside it; `rad_plugin_reference` is a whole-library answer, so returning 1 would
+ * mark the device rows as reference too and the engine's reference gate would refuse to serve the
+ * coupled path at all (RAD_E_NOKERNEL before the first request). The device rows therefore report
+ * 0 and the host rows 1 through `rad_kernel_reference`, and `rad_plugin_reference` stays 0 so the
+ * library is not ranked below the kernel libraries it belongs with. On a machine with no card only
+ * the two reference rows exist, and the gate then correctly refuses the coupling: there is no
+ * device kernel to serve it.
+ *
+ * What puts a coupled row into serving is the architecture declaring the op, which it only does
+ * with RADIANCE_MTP_COUPLED=1; the plugin and the loader never read that switch.
  */
 #include "spechub.h"
 
@@ -30,7 +38,20 @@ const RadPluginInfo kInfo = {
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
-extern "C" int rad_plugin_reference(void) { return 1; }
+/* Mixed library: 0, and the per-row answer below does the classifying. */
+extern "C" int rad_plugin_reference(void) { return 0; }
+
+/* Row layout is [device 0, device 1, ref 0, ref 1] with a card, [ref 0, ref 1] without. The
+ * device rows are the production kernels; the host rows are the oracle rad-kbench checks them
+ * against and the only thing a card-less machine can run. */
+extern "C" int rad_kernel_reference(int i) {
+#ifdef RAD_SPECHUB_WITH_DEVICE
+    return (i == 0 || i == 1) ? 0 : 1;
+#else
+    (void)i;
+    return 1;
+#endif
+}
 
 extern "C" int rad_kernel_schema_count(void) { return rad_spechub_schema_count(); }
 extern "C" const RadOpSchema* rad_kernel_schema_at(int i) { return rad_spechub_schema_at(i); }
