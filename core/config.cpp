@@ -42,6 +42,15 @@ static const std::string g_draft_window_help =
                 "                                    measured step cost (a serial draft head only). Default ") +
     draft_window_name(kDraftWindowDefault);
 
+static const std::string g_draft_policy_help =
+    std::string("legacy | cost: what decides each cycle's draft window. legacy uses the\n"
+                "                                    fixed depth, or --draft-window adaptive's per-sequence\n"
+                "                                    stop; cost runs the adaptive-MTP policy, which prices the\n"
+                "                                    batch shape and chooses each request's K per cycle. A\n"
+                "                                    deployment without a measured profile falls back to the\n"
+                "                                    configured depth. Default ") +
+    draft_policy_name(kDraftPolicyDefault);
+
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
                                         "Hugging Face repo id (owner/name), fetched before startup" },
@@ -155,6 +164,7 @@ static const Flag g_flags[] = {
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
+    { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -637,6 +647,15 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-policy")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "legacy")) c->draft_policy = DraftPolicyKind::Legacy;
+            else if (!std::strcmp(v, "cost"))   c->draft_policy = DraftPolicyKind::Cost;
+            else {
+                RAD_ERR("--draft-policy takes legacy or cost, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1060,6 +1079,7 @@ const ShowRow kShow[] = {
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
+    { "--draft-policy",       [](const Config& c) { return std::string(draft_policy_name(c.draft_policy)); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

@@ -435,6 +435,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
+        { "--draft-policy", { "cost" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -728,6 +729,24 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* --draft-policy takes exactly two names. Whether the deployment can run the cost policy (a serial
+ * drafter, a positive ceiling) is decided by the scheduler with the program in hand. */
+TEST(the_draft_policy_is_legacy_or_cost) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.draft_policy == kDraftPolicyDefault);
+    Config c;
+    CHECK_EQ(parse({ "--draft-policy", "cost" }, &c), RAD_OK);
+    CHECK(c.draft_policy == DraftPolicyKind::Cost);
+    CHECK_EQ(parse({ "--draft-policy", "legacy" }, &c), RAD_OK);
+    CHECK(c.draft_policy == DraftPolicyKind::Legacy);
+    for (const char* bad : { "Cost", "auto", "adaptive", "1", "" })
+        CHECK_EQ(parse({ "--draft-policy", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
+    CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
+    CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
 }
 
 /* An unknown policy name is refused; falling through to the default would make a comparison

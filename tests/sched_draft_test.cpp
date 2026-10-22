@@ -55,18 +55,19 @@ struct Fixture {
     }
 
     uint64_t next_id = 1;
-    uint64_t add_prompt(std::vector<int32_t> tokens, int max_tokens = 64) {
+    uint64_t add_prompt(std::vector<int32_t> tokens, int max_tokens = 64, int priority = 0) {
         auto r = std::make_unique<Request>();
         r->id = next_id++;
         r->max_tokens = max_tokens;
+        r->priority = priority;
         r->prompt = std::move(tokens);
         const uint64_t id = r->id;
         return sch.add(std::move(r)) < 0 ? 0 : id;
     }
-    uint64_t submit(int n_prompt, int max_tokens = 64) {
+    uint64_t submit(int n_prompt, int max_tokens = 64, int priority = 0) {
         std::vector<int32_t> t((size_t)n_prompt);
         for (int i = 0; i < n_prompt; ++i) t[(size_t)i] = 1000 + i;
-        return add_prompt(std::move(t), max_tokens);
+        return add_prompt(std::move(t), max_tokens, priority);
     }
     /* A prompt whose tail repeats its head, so prompt lookup has something to extend. */
     uint64_t submit_pattern(int repeats = 2) {
@@ -1334,5 +1335,170 @@ TEST(the_real_profile_needs_the_replay_dimension_the_planner_cannot_observe) {
     CHECK_OK(table.estimate(shape, &est));
     CHECK(est.valid);
     CHECK(est.source == DraftCostSource::Measured);
+}
+
+/* ================================================================== the production wiring */
+/* The policy is turned on by Config alone -- no seam call -- so this is the path a deployment
+ * takes: --draft-policy cost wires B's predictor and A's (empty) table into the controller, and
+ * the cycle the scheduler issues is the plan the step reads.
+ *
+ * The observation is applied exactly once per completed cycle, and it carries the two windows the
+ * contract names: the verify of the step paired with the plan (the frozen previous window) and the
+ * drafting published under the plan (which the next step verifies). */
+TEST(the_cost_policy_is_wired_through_config_and_observes_each_cycle_exactly_once) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+
+    /* Cycle A: nothing can be priced without a profile, so the named fallback is issued at the
+     * configured depth -- and the predictor ran to price it. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* pa = f.sch.draft().plan();
+    REQUIRE(pa != nullptr);
+    CHECK(pa->source == DraftPlanSource::Fallback);
+    CHECK_EQ(planned(f.sch, id), 6);
+    const int32_t slot = entry_of(f.sch, id)->slot;
+    const DraftPredictState* st = f.sch.draft_predict_state(slot);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, id);          /* predict() started this slot for this request */
+    CHECK_EQ(st->n[0], 0);             /* predicted, nothing learned yet */
+
+    /* The step paired with A verifies nothing (A is the first cycle), and its commit is A's verify
+     * half. The publication that follows is A's drafting half. */
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);   /* published is not yet a completed cycle */
+
+    /* Cycle B: opening it delivers A -- once -- and the step verifies the six A published. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    CHECK_EQ(entry_of(f.sch, id)->n_spec, 6);
+    CHECK_EQ(f.sch.draft_predict_state(slot)->n[0], 0);  /* A measured no positions */
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return 2; }));   /* 2 of 6 accepted */
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);   /* B's verify alone is not a completed cycle */
+
+    /* Cycle C: opening it delivers B, whose labels are the three positions the verify produced
+     * (two accepted, then the first rejection). */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 2);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    st = f.sch.draft_predict_state(slot);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->n[0], 1);
+    CHECK_EQ(st->n[1], 1);
+    CHECK_EQ(st->n[2], 1);
+    CHECK_EQ(st->n[3], 0);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return 2; }));
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+    /* Cycle D: one more delivery, one more label per position -- never two for one cycle. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 3);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    st = f.sch.draft_predict_state(slot);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->n[0], 2);
+    CHECK_EQ(st->n[1], 2);
+    CHECK_EQ(st->n[2], 2);
+    CHECK_EQ(st->n[3], 0);
+}
+
+/* Preemption by recompute keeps the slot and its generation (only add() bumps it), so B's per-slot
+ * estimate is the same request's after the resume. The cycle whose row left before its verify,
+ * though, never completes: it is counted, not delivered with a hole. */
+TEST(a_preempted_slot_keeps_its_history_and_its_cycle_is_dropped) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(64, 512, /*priority=*/0);
+    const uint64_t b = f.submit(64, 512, /*priority=*/5);
+    REQUIRE(a && b);
+
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    int32_t slot = -1;
+    uint32_t slot_gen = 0;
+    uint16_t n_before[RAD_SCHED_MAX_SPEC] = {};
+    int64_t dropped_before = 0;
+    bool preempted = false;
+
+    /* Decode until the pool is exhausted. Every step accepts the whole window, so the estimate
+     * accumulates one label per position per delivered cycle -- and every few steps a new block
+     * is needed, until `a` (the lower priority) is the victim. */
+    for (int i = 0; i < 200 && !preempted; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry* ea = entry_of(f.sch, a);
+        if (ea) slot = ea->slot;
+        const DraftPredictState* st =
+            slot < 0 ? nullptr : f.sch.draft_predict_state(slot);
+        /* The slot is started by the first cycle that has this row as a decode row; a prefill
+         * step plans no row and predicts nothing. */
+        if (st && st->req_id == a) {
+            if (slot_gen == 0) slot_gen = st->slot_gen;
+            CHECK_EQ(st->slot_gen, slot_gen);
+            for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) n_before[j] = st->n[j];
+        }
+        dropped_before = f.sch.draft_cycles_dropped();
+
+        CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+        for (uint64_t id : { a, b })
+            if (f.sch.find(id)->state == ReqState::Running)
+                CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+        preempted = f.sch.metrics().preemptions > 0;
+        if (preempted) {
+            const DraftPredictState* after =
+                slot < 0 ? nullptr : f.sch.draft_predict_state(slot);
+            REQUIRE(after != nullptr);
+            CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+            CHECK_EQ(after->req_id, a);
+            CHECK_EQ(after->slot_gen, slot_gen);
+            bool learned = false;
+            for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
+                CHECK_EQ(after->n[j], n_before[j]);
+                learned = learned || n_before[j] > 0;
+            }
+            CHECK(learned);   /* the history that survived is a real one, not an empty table */
+
+            /* The interrupted cycle is retired at the next open as incomplete. */
+            REQUIRE(f.sch.step() != nullptr);
+            CHECK_EQ(f.sch.draft_cycles_dropped(), dropped_before + 1);
+        }
+    }
+    CHECK(preempted);
+}
+
+/* docs/ADAPTIVE-MTP.md: cost is serial-only and needs a ceiling. The refusal is by name, at init,
+ * where the container's drafter is known -- never a silent fall back to legacy. */
+TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_BLOCK;   /* a block drafter proposes in one pass */
+    f.prog.drafter.depth = 6;
+    CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+
+    f.prog.drafter.kind = RAD_DRAFT_SERIAL;
+    f.cfg.n_spec = 0;                          /* no speculation, nothing to choose */
+    CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+
+    f.cfg.n_spec = 6;
+    CHECK_OK(f.start());
 }
 RAD_TEST_MAIN()

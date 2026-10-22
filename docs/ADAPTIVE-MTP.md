@@ -226,7 +226,7 @@ fabricated success the contracts forbid.
 |------|--------|---------|-------|
 | `--num-speculative-tokens` | N / `auto` | `auto` | existing; 0 = no drafter process |
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
-| `--draft-policy` | `legacy` / `cost` | `legacy` | `cost` refused with `RAD_E_UNSUPPORTED` until A+C land |
+| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head and a positive ceiling (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | profile reader lands with A |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |

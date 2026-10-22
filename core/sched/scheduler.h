@@ -14,6 +14,8 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "draft_cost.h"
+#include "draft_predictor.h"
 #include "metrics.h"
 
 #include <chrono>
@@ -389,6 +391,15 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    /* The observation path's counters, and one request's learned state: what a test (or a
+     * deployment's diagnostics) reads to see the hooks are called, not merely configured. The
+     * state is meaningful only while the slot holds that (req_id, slot_gen). */
+    int64_t draft_cycles_done() const { return draft_cycles_done_; }
+    int64_t draft_cycles_dropped() const { return draft_cycles_dropped_; }
+    const DraftPredictState* draft_predict_state(int32_t slot) const {
+        if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;
+        return &draft_predict_state_[(size_t)slot];
+    }
     SchedMetrics         metrics() const;
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
@@ -540,6 +551,59 @@ private:
     uint64_t                     draft_cycle_id_ = 0;
     uint32_t                     slot_gen_ = 0;
     bool                         draft_cost_failed_ = false;
+
+    /* The cost policy's two hooks, owned here: A's table and B's per-request predictor. The
+     * predictor keeps one state per request slot; `slot` is the request's for its whole life
+     * (preemption keeps it, only a new request bumps the generation), so an estimate survives a
+     * preempt/resume without the scheduler copying anything.
+     *
+     * A's table starts empty: no profile is loaded yet, so every estimate is invalid and the
+     * policy issues its named fallback. The sample path that would feed it is not wired --
+     * DraftCostTable::observe needs a per-cycle total_ms and the cycle's executed replay state,
+     * and the scheduler has neither today (DraftController::step_time measures a decode step for
+     * the adaptive window only). Named, not faked. */
+    DraftCostTable                 draft_costs_;
+    DraftPredictModel              draft_predict_;
+    std::vector<DraftPredictState> draft_predict_state_;
+
+    /* The cycle ring: a plan stays alive from the cycle that issued it until the step that
+     * verifies its drafts has committed, so the observation names the same plan its rows came
+     * from. Fixed capacity, storage reserved at init: the step path allocates nothing. A record
+     * whose slot is reused is dropped and counted -- a cycle that never completed is not
+     * evidence (draft_observation_deliverable), so it is discarded rather than delivered. */
+    struct DraftCycleRecord {
+        DraftPlan plan;                          /* the copy the observer is handed */
+        std::vector<uint64_t>     id;
+        std::vector<int32_t>      slot;
+        std::vector<uint32_t>     gen;
+        std::vector<int32_t>      k;
+        std::vector<DraftDrafter> fill;
+        std::vector<int32_t>      ctx_class;
+        std::vector<int32_t>      history_tokens;
+        std::vector<DraftSeqObservation> seq;    /* one per plan row, accumulated */
+        std::vector<uint8_t>      state;         /* row i: 0 pending, 1 reported, 2 dropped */
+        int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
+        int32_t  n_seq = 0;
+        uint64_t cycle_id = 0;
+        bool     active = false;
+    };
+    /* Capacity in cycles, not in steps: a record is delivered at the next cycle's open, so one is
+     * in flight; the rest is a backstop for a cycle that never got another open. */
+    enum { kDraftRing = 4 };
+    DraftCycleRecord draft_ring_[kDraftRing];
+    /* The record this cycle's verify and publications belong to, 0 when the open failed. */
+    uint64_t         draft_ring_cur_ = 0;
+    int64_t          draft_cycles_done_ = 0;      /* observations the predictor accepted */
+    int64_t          draft_cycles_dropped_ = 0;   /* incomplete, evicted or refused */
+    bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
+
+    void draft_ring_open(const DraftPlan& plan);
+    DraftCycleRecord* draft_ring_cycle(uint64_t cycle_id);
+    void draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin origin);
+    void draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
+                           uint64_t raw_match);
+    void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);
+    void draft_ring_close(uint64_t cycle_id);
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern

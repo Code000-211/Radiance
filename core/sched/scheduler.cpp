@@ -123,10 +123,65 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "row a drafting sequence, every round at the committed position%s",
                  serial_rot_shift_ ? " (rotated one past it)" : "");
 
+    /* docs/ADAPTIVE-MTP.md: `cost` is accepted only with a serial draft head and a usable ceiling.
+     * Refused by name here, where both facts are known, rather than silently mapped to legacy. */
+    if (cfg.draft_policy == DraftPolicyKind::Cost &&
+        (prog.drafter.kind != RAD_DRAFT_SERIAL || prog.drafter.depth <= 0 || cfg.n_spec <= 0)) {
+        RAD_ERR("--draft-policy cost: needs a serial draft head and a positive ceiling (drafter "
+                "kind %d, depth %d, ceiling %d)", (int)prog.drafter.kind,
+                (int)prog.drafter.depth, cfg.n_spec);
+        return RAD_E_UNSUPPORTED;
+    }
+
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
     /* The plan's caller-provided arrays are sized at max_seqs (draft_types.h). */
     dp.max_seqs = cfg.max_seqs;
+    /* The cost policy's two hooks: B's predictor and A's table. Wired here, owned by the
+     * scheduler, and read by DraftController::open_cycle every cycle -- not a module that exists
+     * beside the step path. `max_seqs` is the slot count both the prediction table and the plan
+     * arrays are sized at. */
+    dp.policy.mode = cfg.draft_policy == DraftPolicyKind::Cost ? DraftPolicyMode::Cost
+                                                           : DraftPolicyMode::Legacy;
+    /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
+     * depth is the configured one, or a cost deployment would draft nothing at all. */
+    dp.policy.fallback_k = cfg.n_spec;
+    if (cfg.max_seqs > 0) {
+        draft_predict_state_.assign((size_t)cfg.max_seqs, DraftPredictState{});
+        DraftPredictModel::Params pp;
+        pp.max_depth = cfg.n_spec;
+        pp.version   = RAD_DRAFT_POLICY_VERSION;
+        RAD_TRY(draft_predict_.configure(pp, draft_predict_state_.data(),
+                                         (int32_t)draft_predict_state_.size()));
+        dp.predictor = DraftPredictor{ &draft_predict_, &DraftPredictModel::predict_hook };
+    }
+    /* No profile is loaded, so every price is invalid and the policy issues its named fallback;
+     * the table is still the handle open_cycle prices through. */
+    draft_costs_.clear();
+    dp.costs = draft_costs_.handle();
+    /* The ring's storage: fixed at init so a cycle never allocates one. */
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i) {
+        DraftCycleRecord& r = draft_ring_[i];
+        r.id.assign((size_t)cfg.max_seqs, 0);
+        r.slot.assign((size_t)cfg.max_seqs, -1);
+        r.gen.assign((size_t)cfg.max_seqs, 0);
+        r.k.assign((size_t)cfg.max_seqs, 0);
+        r.fill.assign((size_t)cfg.max_seqs, DraftDrafter::None);
+        r.ctx_class.assign((size_t)cfg.max_seqs, 0);
+        r.history_tokens.assign((size_t)cfg.max_seqs, 0);
+        r.seq.assign((size_t)cfg.max_seqs, DraftSeqObservation{});
+        r.state.assign((size_t)cfg.max_seqs, 0);
+        r.plan.cap      = cfg.max_seqs;
+        r.plan.req_id   = r.id.data();
+        r.plan.slot     = r.slot.data();
+        r.plan.slot_gen = r.gen.data();
+        r.plan.k        = r.k.data();
+        r.plan.why      = nullptr;   /* not part of the observation's plan */
+        r.plan.rows     = r.rows;
+        r.plan.ctx_class      = r.ctx_class.data();
+        r.plan.history_tokens = r.history_tokens.data();
+        r.plan.fill           = r.fill.data();
+    }
     /* The adaptive window (draft.h) prices a draft by the measured cost of the step it adds to.
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
@@ -344,6 +399,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
         s.n_draft = n;
         s.req->n_draft = n;
         s.req->draft = n ? s.draft : nullptr;
+        draft_ring_publish(s, n, DraftOrigin::Head);
         return RAD_OK;
     }
 
@@ -362,6 +418,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
+    draft_ring_publish(s, n, DraftOrigin::Head);
     return RAD_OK;
 }
 
@@ -460,6 +517,10 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (!defer_free) drop_card(s);
     s.running = false;
     s.req->state = st;
+    /* A cycle this request was still part of can never complete: the step that would verify its
+     * proposals no longer runs for it. Dropped, so the pending record is retired instead of
+     * holding a slot until the ring evicts it. */
+    draft_ring_drop_row(s.req->id, s.slot, s.gen);
     if (s.req->finish_reason.empty() && reason) s.req->finish_reason = reason;
     queue_erase(running_, s.slot);
     queue_erase(waiting_, s.slot);
@@ -911,6 +972,10 @@ void Scheduler::preempt_back() {
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.drafter_reset();
+    /* The slot keeps this request's identity (preemption does not bump the generation), so B's
+     * per-slot estimate survives the recompute; the cycles still waiting on its drafts do not,
+     * because the step that would verify them no longer includes it. */
+    draft_ring_drop_row(r.id, s.slot, s.gen);
     /* Also clear the request's own window. The sampler stages 1 + Request::n_draft rows
      * (Sampler::build_step), and a drafter may have set it for the step this preemption removed;
      * left standing, the recompute's first sampled step stages rows its batch lacks and every
@@ -1299,6 +1364,10 @@ const RadBatch* Scheduler::step() {
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
+            /* A lookup fill is deliberately not published to the cycle record: the plan's fill[]
+             * never names Ngram, so the row may not claim these proposals
+             * (draft_origin_fits_plan). The step still verifies them and the observation carries
+             * that verify with no drafting -- so B learns nothing from a lookup row. */
             /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
              * rotary row or block-table column. commit() finishes a sequence before it reaches
              * the limit, so the one token itself always fits. */
@@ -1686,6 +1755,11 @@ void Scheduler::draft_cycle() {
  * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
 void Scheduler::draft_cost_cycle() {
     if (!draft_.cost_policy()) return;
+    /* Everything the last plan's rows will ever carry is in by now -- its verify at the paired
+     * step's commit, its drafting from the publications after it -- and B should hold those labels
+     * before it predicts this cycle. */
+    draft_ring_close(draft_ring_cur_);
+    draft_ring_cur_ = 0;
     int32_t n = 0;
     for (int32_t slot : running_) {
         SchedReq& s = *reqs_[(size_t)slot];
@@ -1757,7 +1831,199 @@ void Scheduler::draft_cost_cycle() {
         draft_cost_failed_ = true;
     } else {
         draft_cost_failed_ = false;
+        /* The plan the next step's verify and this cycle's publications belong to; copied now,
+         * because the controller reuses its two plan slots. */
+        draft_ring_cur_ = draft_.plan()->cycle_id;
+        draft_ring_open(*draft_.plan());
     }
+}
+
+/* ------------------------------------------------------------------ the observation ring
+ *
+ * A cost plan is issued at the open and read row by row while the step is planned; `pipeline_depth`
+ * 1 means the plan is chosen one step ahead of the step that spends its k[]. So a cycle's rows
+ * carry two windows, exactly as DraftSeqObservation documents them:
+ *
+ *   - its drafting: what was published under this plan -- the head's proposals after this step's
+ *     commit, which the next step verifies;
+ *   - its paired verify: the step of this cycle, which verifies the frozen previous plan's window.
+ *
+ * B's predictor must be shown exactly one observation per completed cycle, and it must name the
+ * plan the rows came from -- the controller hands out its plan storage again, so the record owns a
+ * copy of the plan and its rows.
+ *
+ * Lifecycle: open at issuance, report the verify at the paired step's commit, publish the drafting
+ * while the proposals are made, deliver at the next open. By then nothing can touch the record
+ * again, and the labels reach the predictor before it predicts the cycle that follows. A row whose
+ * request left first (preempted, cancelled) never reports, so the cycle is incomplete and is
+ * counted rather than delivered (draft_observation_deliverable's `complete`). Delivery at the next
+ * open also bounds a record's life to one cycle; the ring's eviction is only the backstop for a
+ * cycle that never got another open.
+ */
+void Scheduler::draft_ring_open(const DraftPlan& p) {
+    if (p.n_seq <= 0 || !p.req_id || p.n_seq > p.cap) return;
+    DraftCycleRecord* r = nullptr;
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
+        if (!draft_ring_[i].active) { r = &draft_ring_[i]; break; }
+    if (!r) {
+        r = &draft_ring_[0];
+        for (int32_t i = 1; i < (int32_t)kDraftRing; ++i)
+            if (draft_ring_[i].cycle_id < r->cycle_id) r = &draft_ring_[i];
+        ++draft_cycles_dropped_;
+    }
+    r->active   = true;
+    r->cycle_id = p.cycle_id;
+    r->n_seq    = p.n_seq;
+    /* Scalars first; the arrays below are the record's own storage and never move after init. */
+    r->plan.cycle_id       = p.cycle_id;
+    r->plan.policy_version = p.policy_version;
+    r->plan.n_seq          = p.n_seq;
+    r->plan.cap            = p.cap;
+    r->plan.k_ceiling      = p.k_ceiling;
+    r->plan.max_k          = p.max_k;
+    r->plan.verify_k       = p.verify_k;
+    r->plan.pipeline_depth = p.pipeline_depth;
+    r->plan.source         = p.source;
+    r->plan.fallback       = p.fallback;
+    r->plan.probe          = p.probe;
+    r->plan.replay         = p.replay;
+    r->plan.timing_valid   = p.timing_valid;
+    r->plan.prefill_tokens = p.prefill_tokens;
+    for (int32_t i = 0; i < p.n_seq; ++i) {
+        r->id[i]             = p.req_id[i];
+        r->slot[i]           = p.slot[i];
+        r->gen[i]            = p.slot_gen[i];
+        r->k[i]              = p.k[i];
+        r->fill[i]           = p.fill[i];
+        r->ctx_class[i]      = p.ctx_class[i];
+        r->history_tokens[i] = p.history_tokens[i];
+        r->seq[i]            = DraftSeqObservation{};
+        r->state[i]          = 0;
+    }
+    for (int32_t j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) r->rows[j] = p.rows[j];
+}
+
+Scheduler::DraftCycleRecord* Scheduler::draft_ring_cycle(uint64_t cycle_id) {
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
+        if (draft_ring_[i].active && draft_ring_[i].cycle_id == cycle_id) return &draft_ring_[i];
+    return nullptr;
+}
+
+/* The head's proposals for the step this plan governs, published after the step's commit. The
+ * lookup fill is not published (see the n-gram site in step()): its verify still counts --
+ * `verified` is not chained to `published` -- and B does not learn from a row with no drafting. */
+void Scheduler::draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin origin) {
+    if (!draft_.cost_policy() || !s.req) return;
+    const DraftPlan* p = draft_.plan();
+    if (!p) return;
+    DraftCycleRecord* r = draft_ring_cycle(p->cycle_id);
+    if (!r) return;
+    if (n < 0) n = 0;
+    if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
+    for (int32_t j = 0; j < r->n_seq; ++j) {
+        if (r->id[j] != s.req->id || r->slot[j] != s.slot || r->gen[j] != s.gen) continue;
+        /* No `state` gate: the row's own verify was reported at this step's commit, and the
+         * drafting is published after it -- both halves land in the same record. `state` answers
+         * only whether the verify is in, which is what delivery waits for. */
+        r->seq[j].generated = (uint8_t)n;
+        r->seq[j].published = (uint8_t)n;
+        r->seq[j].origin    = n > 0 ? origin : DraftOrigin::None;
+        break;
+    }
+}
+
+void Scheduler::draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
+                                  uint64_t raw_match) {
+    if (!draft_.cost_policy() || !e.req) return;
+    int32_t v = e.n_spec;
+    if (v < 0) v = 0;
+    if (accepted < 0) accepted = 0;
+    if (accepted > v) accepted = v;
+    if (raw_match < (uint64_t)accepted) raw_match = (uint64_t)accepted;
+    if (raw_match > (uint64_t)v) raw_match = (uint64_t)v;
+    /* The verify paired with this cycle's plan: step n verifies the frozen window of plan n-1, and
+     * its commits are plan n's `accepted` (DraftSeqObservation). */
+    DraftCycleRecord* r = draft_ring_cycle(draft_ring_cur_);
+    if (!r) return;
+    for (int32_t j = 0; j < r->n_seq; ++j) {
+        if (r->id[j] != e.req->id || r->slot[j] != s.slot || r->gen[j] != s.gen) continue;
+        if (r->state[j] != 0) break;
+        DraftSeqObservation& o = r->seq[j];
+        o.verified  = (uint8_t)v;
+        o.accepted  = (uint8_t)accepted;
+        o.raw_match = raw_match;
+        /* The labels the verify actually produced: the accepted prefix plus the first rejection.
+         * A raw tally above the commits is a matched-but-uncommitted stop, which the tally rule
+         * leaves uncensored (DraftSeqEnd::Stopped) rather than reading as a rejection. */
+        if (raw_match == (uint64_t)accepted) {
+            o.checked = (uint8_t)(accepted == v ? accepted : accepted + 1);
+            o.end = accepted == v ? DraftSeqEnd::AllAccepted : DraftSeqEnd::Rejected;
+        } else {
+            o.checked = (uint8_t)accepted;
+            o.end = DraftSeqEnd::Stopped;
+        }
+        r->state[j] = 1;
+        return;
+    }
+}
+
+/* A row that will never report: the request left the running set (preempted, cancelled, failed)
+ * before the step paired with its cycle committed. The cycle it was in is no longer complete, so
+ * it is dropped at the next open rather than delivered with a row nobody measured. */
+void Scheduler::draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen) {
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i) {
+        DraftCycleRecord& r = draft_ring_[i];
+        if (!r.active) continue;
+        for (int32_t j = 0; j < r.n_seq; ++j) {
+            if (r.id[j] != req_id || r.slot[j] != slot || r.gen[j] != gen) continue;
+            if (r.state[j] == 0) r.state[j] = 2;
+            break;
+        }
+    }
+}
+
+/* The cycle is over: every row has reported or will never. Delivered at most once, and only when
+ * every row of the plan is in the record -- a cycle missing a row is not a smaller observation, it
+ * is a different one. The record is retired whatever the predictor answers: a refused observation
+ * is a dropped cycle, not a retried one. */
+void Scheduler::draft_ring_close(uint64_t cycle_id) {
+    DraftCycleRecord* rp = draft_ring_cycle(cycle_id);
+    if (!rp) return;
+    DraftCycleRecord& r = *rp;
+    bool complete = r.n_seq > 0;
+    for (int32_t j = 0; j < r.n_seq && complete; ++j)
+        if (r.state[j] != 1) complete = false;
+    if (complete) {
+        DraftObservation o;
+        o.cycle_id       = r.cycle_id;
+        o.policy_version = r.plan.policy_version;
+        o.n_seq          = r.n_seq;
+        o.cap            = r.plan.cap;
+        o.plan           = &r.plan;
+        o.req_id         = r.id.data();
+        o.slot           = r.slot.data();
+        o.slot_gen       = r.gen.data();
+        o.seq            = r.seq.data();
+        o.complete       = true;
+        const int rc = draft_predict_.observe(o);
+        if (rc < 0) {
+            /* Once, not once per cycle: a wiring gap (e.g. a plan whose fill[] cannot name the
+             * drafter that really filled a row) would otherwise log on every step. The counter
+             * carries the rest. */
+            if (!draft_predict_refused_) {
+                draft_predict_refused_ = true;
+                RAD_WARN("draft predictor: cycle %llu refused (%s); further refusals are counted "
+                         "only", (unsigned long long)r.cycle_id, rad_strerror(rc));
+            }
+            ++draft_cycles_dropped_;
+        } else {
+            ++draft_cycles_done_;
+        }
+    } else {
+        ++draft_cycles_dropped_;
+    }
+    r.active = false;
+    r.n_seq  = 0;
 }
 
 /* ------------------------------------------------------------------ the next step */
@@ -1979,6 +2245,8 @@ int Scheduler::commit(const StepResult& res) {
             int32_t raw = res.n_raw ? res.n_raw[i] : a;
             if (raw < a) raw = a;
             if (raw > e.n_spec) raw = e.n_spec;
+            /* The verify half of the cycle whose proposals this step ran. */
+            draft_ring_report(s, e, a, (uint64_t)raw);
             /* A row issued ahead was staged at the furthest reachable context; it really
              * continued from the committed end. */
             const int64_t ctx0 = e.dev ? r.n_computed : (int64_t)e.ctx_len;

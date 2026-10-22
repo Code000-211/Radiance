@@ -148,6 +148,21 @@ constexpr DraftWindow kDraftWindowDefault = DraftWindow::Fixed;
 inline const char* draft_window_name(DraftWindow w) {
     return w == DraftWindow::Adaptive ? "adaptive" : "fixed";
 }
+
+/* --draft-policy: what decides each cycle's draft window.
+ *   Legacy  the fixed depth above, or --draft-window adaptive's per-sequence stop.
+ *   Cost    the adaptive-MTP cost policy (core/sched/draft_policy.h): B's predictor supplies
+ *           each request's per-position acceptance, A's cost model prices the batch shape, and
+ *           the plan it chooses is what every proposal site reads for the cycle. Without a
+ *           measured profile the model has no anchor, so the policy issues its named fallback at
+ *           the configured depth rather than inventing a price.
+ * The default is kDraftPolicyDefault, read by the help text and the startup line.
+ * `Kind`, not `DraftPolicy`: that name is the seam's choose hook (core/sched/draft_types.h). */
+enum class DraftPolicyKind { Legacy = 0, Cost = 1 };
+constexpr DraftPolicyKind kDraftPolicyDefault = DraftPolicyKind::Legacy;
+inline const char* draft_policy_name(DraftPolicyKind p) {
+    return p == DraftPolicyKind::Cost ? "cost" : "legacy";
+}
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
@@ -878,6 +893,7 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *
