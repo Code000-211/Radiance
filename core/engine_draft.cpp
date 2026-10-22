@@ -135,7 +135,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
-    serial_hist_ran_ = false;
+    serial_hist_issued_ = false;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -239,11 +239,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             serial_k_[(size_t)i] = rd == 0 ? 1 : rd;
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
-        /* Round 0 is the history pass. Two things make the claim: only rank 0's stream can be
-         * fenced, so a second rank leaves the word false; and the step's wait has to have covered
-         * the passes -- collect_step returns before its wait on a step with no logit rows, which
-         * is exactly the history-only case, so finish takes that wait itself. */
-        if (rd == 0) serial_hist_ran_ = ranks_.size() == 1;
+        /* Round 0 was enqueued; whether it ran is a different word, and finish reads that one. */
+        if (rd == 0) serial_hist_issued_ = true;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
@@ -307,13 +304,16 @@ struct BlockHold {
  * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
-    /* collect_step returns before its wait on a step with no logit rows (engine.cpp), so on such
-     * a step nothing has yet fenced the passes this claim is about -- and a row-less prefill chunk
-     * is exactly the history-only case. step_end_ was recorded on rank 0's stream after them, so
-     * wait on it here: a failed pass surfaces as this error, and the word never moves the
-     * watermark over it. */
-    if (serial_hist_ran_ && so.n_rows <= 0) RAD_TRY(rad_event_sync(step_end_));
-    SerialHold hold(sched_, serial_hist_ran_);
+    /* The history watermark may move only on proof that round 0 ran on every participating rank.
+     * An enqueue is not proof, and neither is a rank count. Two proofs exist: the step path's
+     * completion word, which covers every rank, and -- for a step that has logit rows -- the wait
+     * collect_step already took on step_end_, which mark_step_end recorded after the passes; that
+     * one fences rank 0 only, so it counts for a single rank. A step without rows (a mid-prompt
+     * chunk, the history-only case) returns before that wait, so it needs the first proof. No
+     * proof, no watermark: the pass is repeated instead. */
+    const bool hist_ran = serial_hist_issued_ &&
+                          (step_complete_ || (ranks_.size() == 1 && so.n_rows > 0));
+    SerialHold hold(sched_, hist_ran);
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
