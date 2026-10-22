@@ -34,7 +34,10 @@
  * (see accept.h).
  */
 #pragma once
+#include "draft_policy.h"
 #include "draft_types.h"
+
+#include <vector>
 
 namespace rad {
 
@@ -57,6 +60,14 @@ public:
         /* The adaptive policy: `--draft-window adaptive` with a serial drafter, decided by
          * Scheduler::init. Off, the depth is max_depth. */
         bool adapt = false;
+        /* The cost policy (--draft-policy cost, Welle 2). Off, nothing here changes. */
+        DraftPolicyConfig policy;
+        /* Requests a plan's caller-provided arrays hold: cfg.max_seqs. */
+        int max_seqs = 0;
+        /* A/B's hooks. The cost policy refuses to run without both (RAD_E_UNSUPPORTED): the
+         * choice is their output, and neither a prediction nor a price is invented here. */
+        DraftPredictor  predictor;
+        DraftCostModel  costs;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -159,6 +170,27 @@ public:
         return (d >= 0 && d <= RAD_SCHED_MAX_SPEC) ? by_depth_[d] : 0;
     }
 
+    /* ---------------------------------------------------------- the cost policy
+     *
+     * One plan per cycle, written once by open_cycle() and read by every site that caps a
+     * proposal. It is replaced only when the next cycle opens, so a proposal drafted and a step
+     * verified inside a cycle read the same plan. A plan whose identity names another cycle is
+     * not this cycle's; the scheduler falls back to next_depth() instead of acting on it. */
+    bool cost_policy() const { return planner_.config().mode == DraftPolicyMode::Cost; }
+    /* Fill `preds` through the predictor and choose the cycle's plan. Returns RAD_OK, or the
+     * failing hook's error; on any error no plan is in force and the cycle runs legacy. */
+    int  open_cycle(const DraftBatchView& view, DraftPredictions* preds);
+    /* The plan in force, or null. A plan is written once when its cycle opens and is not touched
+     * again until the same storage comes round: the next cycle writes the other of two sets, so a
+     * pointer handed out here keeps its rows across one further open_cycle(). A reader that must
+     * survive two cycles (an issued-ahead pass and its observation) copies it. */
+    const DraftPlan* plan() const { return plan_cur_ >= 0 ? &plan_slots_[plan_cur_].plan : nullptr; }
+    /* This cycle's K for the request, or -1 when the plan does not cover it. Identity, never an
+     * index: a recycled slot with another generation is another request. */
+    int  planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const;
+    DraftPlanner&      planner() { return planner_; }
+    const DraftPlanner& planner() const { return planner_; }
+
     /* One verify's outcome: `drafted` proposed, a prefix of `accepted` taken, `raw_match` the
      * uncensored match tally behind it (the end-of-generation cut shortens the commitment, not the
      * tally). `raw_match` defaults to `accepted` for callers without the raw count. Metrics only. */
@@ -207,6 +239,26 @@ private:
     /* T(d, class): the mean step time of each key, and the steps behind it. */
     double  cost_ms_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
     int64_t cost_n_ [RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
+
+    /* The cost policy's plan and its storage (reserved at configure, outside the step path). Two
+     * sets: the caller reads one while the next cycle fills the other. */
+    struct PlanSlot {
+        DraftPlan plan;
+        std::vector<uint64_t>      id;
+        std::vector<int32_t>       slot;
+        std::vector<uint32_t>      gen;
+        std::vector<int32_t>       k;
+        std::vector<DraftFallback> why;
+        std::vector<int32_t>       rows;
+        std::vector<int32_t>       ctx_class;
+        std::vector<int32_t>       history_tokens;
+        std::vector<DraftDrafter>  fill;
+    };
+    DraftPlanner planner_;
+    PlanSlot     plan_slots_[2];
+    int          plan_cur_ = -1;   /* the slot plan() returns; -1 = no plan this cycle */
+    int          plan_cur_prev_ = 0;   /* the slot the last opened cycle wrote */
+    bool cost_failed_ = false;   /* the open_cycle error was logged */
 
     /* Fill a sequence's estimate from the prior and set its first stop. */
     void    start(DraftAdapt& s) const;

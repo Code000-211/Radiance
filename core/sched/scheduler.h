@@ -29,6 +29,10 @@ struct SchedReq {
     std::unique_ptr<Request> req;
     uint64_t arrival = 0;        /* monotonic; the tiebreak below priority. A preempted request
                                   * keeps it, so it re-enters ahead of later arrivals */
+    /* The slot's generation: bumped every time this SchedReq is handed to another request. A
+     * cost plan names (req_id, slot, gen) so a recycled slot is never read as the request the
+     * plan was written for (core/sched/draft_types.h). */
+    uint32_t gen = 0;
     int32_t  slot = -1;
     /* The card's index for this sequence: the StepSlot the advance reads and writes (advance.h),
      * and the sequence identity a batch carries. Not `slot`, which is taken on arrival and can
@@ -161,6 +165,10 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* The serial head's valid-history end for a sequence (`SchedReq::draft_filled`), or -1 when the
+     * id is not live. The watermark is otherwise only visible through the next history pass, which
+     * for a history-only row starts where the watermark already is. */
+    int64_t  draft_watermark(uint64_t id) const;
 
     /* Requests that reached a terminal state since the last call, oldest first, swapped into
      * `out` under the lock (old contents discarded). Only the engine consumes it, to drop
@@ -297,12 +305,18 @@ public:
      *
      *   serial_begin   before commit(), right after the step is issued, while plan() describes it.
      *               Says which sequences may draft, reserves lookahead KV up to the furthest
-     *               position acceptance could reach, and clamps `rounds` to the current depth.
+     *               position acceptance could reach, and clamps `rounds` to the current depth and
+     *               then to the deepest row that still drafts. What it writes is the whole set of
+     *               passes to run: a round past it has no row, and none may be asked for.
      *   serial_batch   one batch per pass: 0 is the history, which also carries round 1 for the
-     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. Rows continuing
-     *               a sampled verify are device rows (advance.h): the card fills their positions
-     *               and tokens, so no pass waits on the host.
-     *   serial_end     after commit(), with the rounds that ran: moves the history watermark.
+     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. A round runs only
+     *               the rows whose frozen K reaches it, deepest first, so every round's rows are a
+     *               prefix of the snapshot and a row's depth is the last round it was in. Rows
+     *               continuing a sampled verify are device rows (advance.h): the card fills their
+     *               positions and tokens, so no pass waits on the host. A null return alone does not
+     *               say why; read serial_batch_failed() with it.
+     *   serial_end     after commit(), with the rounds that ran and whether the history pass did:
+     *               moves the history watermark.
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
      *               keeps n_draft 0 and the n-gram drafter fills in.
      */
@@ -314,8 +328,23 @@ public:
     int serial_begin(int* rounds, SerialRow* out, int max);
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
-     * round 0 carries it. Call serial_end() once the step has committed. */
-    void serial_end(int rounds_done);
+     * round 0 carries it. Call serial_end() once the step has committed.
+     *
+     * `history_ran` is the driver's word that the round-0 pass it built actually executed: a built
+     * batch is not a run pass (the cycle may be rejected, the build may come back null, the host
+     * pass may fail), and only the driver sees which. It defaults to false so a caller that cannot
+     * report the outcome repeats the history pass instead of claiming a watermark it did not earn. */
+    void serial_end(int rounds_done, bool history_ran = false);
+
+    /* Did the last serial_batch() fail to build a pass it owed? A null return alone conflates that
+     * with "nothing owed" (empty snapshot, round 1, a round no row reaches), and with a round-0
+     * history pass that no drafting row survives into. Not derivable from `n == 0`: the history a
+     * K0-only snapshot still owes is exactly what a row count cannot see. Set only where a pass
+     * was owed and no batch came back, so the driver can fail the cycle instead of reading the
+     * error as idleness. Cleared by serial_begin() and at every serial_batch() entry, so it speaks
+     * for the last call only. Orthogonal to `history_ran`: this is "could it be built", that is
+     * "did it run". */
+    bool serial_batch_failed() const;
 
     /* ----------------------------------------------------- the block drafter (spec §10)
      *
@@ -452,11 +481,40 @@ private:
     }
 
     /* The window a sequence may draft into: the configured depth, or under the adaptive window
-     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use).
-     * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
-     * rounds in serial_begin(). With the policy off it is next_depth(). */
+     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use), or
+     * under the cost policy what this cycle's frozen plan assigns it. Every site that caps a
+     * proposal applies it: step(), set_draft(), expect_draft() and the rounds in serial_begin().
+     * With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
+        if (draft_.cost_policy()) {
+            const int k = planned_k(s);
+            if (k >= 0) return k;
+            /* A plan is in force but does not name this row: it was admitted after the cycle
+             * opened and was not priced, so it drafts nothing this cycle. Only a cycle whose
+             * plan failed outright runs legacy. */
+            return draft_.plan() ? 0 : draft_.next_depth();
+        }
         return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+    }
+
+    /* Whether the plan bars the n-gram fallback from this row (draft_plan_bars_fill). A row the
+     * plan does not name is barred too while a plan is in force: k[] is the budget for every
+     * drafter, and an unpriced row has none. */
+    bool bars_fill(const SchedReq& s) const {
+        const DraftPlan* p = draft_.plan();
+        if (!p) return false;
+        if (!s.req) return true;
+        for (int32_t i = 0; i < p->n_seq; ++i)
+            if (p->req_id[i] == s.req->id && p->slot[i] == s.slot && p->slot_gen[i] == s.gen)
+                return draft_plan_bars_fill(*p, i);
+        return true;
+    }
+
+    /* This cycle's planned K for the request, or -1 when the cost policy is off or its plan
+     * does not name it. A planned 0 is a decision: the n-gram fallback must not fill it. */
+    int planned_k(const SchedReq& s) const {
+        if (!draft_.cost_policy() || !s.req) return -1;
+        return draft_.planned_k(s.req->id, s.slot, s.gen);
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
@@ -469,6 +527,19 @@ private:
      * allocate. */
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
+
+    /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
+     * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
+     * the step path does not allocate. */
+    void    draft_cost_cycle();
+    std::vector<DraftSeqView>    draft_view_seq_;
+    std::vector<DraftPrediction> draft_pred_seq_;
+    std::vector<uint64_t>        draft_pred_id_;
+    DraftBatchView               draft_view_;
+    DraftPredictions             draft_preds_;
+    uint64_t                     draft_cycle_id_ = 0;
+    uint32_t                     slot_gen_ = 0;
+    bool                         draft_cost_failed_ = false;
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
@@ -558,6 +629,9 @@ private:
         /* Its index among the drafting rows, or -1 for a row that only owes history (e.g. a
          * sequence mid-prompt, with hidden states but no token to draft from). */
         int32_t        draft_idx = -1;
+        /* The depth this cycle gave the row, fixed at serial_begin: draft round r > 1 runs only
+         * the rows with k >= r, and the driver freezes each row's depth from the rounds it saw. */
+        int32_t        k = 0;
         /* No Request* here, as for BlockSeq: serial_batch reads serial_ after the lock was
          * released and retaken. */
         /* The furthest position round 1 can write at: the verify step's last position, reached
@@ -566,6 +640,8 @@ private:
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
+    /* The last serial_batch() owed a pass and built none; see serial_batch_failed(). */
+    bool                serial_failed_ = false;
 
     /* The block drafter's rows, valid between block_begin() and block_end(): one per entry of the
      * trunk step just run, in order, with `ctx_len`/`n_tokens` mirroring it. The drafter reads
