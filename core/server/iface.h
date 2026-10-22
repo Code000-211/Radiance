@@ -121,6 +121,13 @@ struct SchedMetrics {
     int64_t prefill_chunks_capped = 0; /* held back for other work in the step (--busy-prefill-chunk) */
     int64_t steps_held = 0;           /* decode-only steps --prefill-interleave inserted */
     int64_t decode_rows_unspeculated = 0;
+    /* What the mixed steps are made of, for a chunked-prefill A/B (docs/PREFILL-OVERLAP.md);
+     * rad::SchedMetrics names what each one counts. */
+    int64_t steps_multi_prefill = 0;  /* steps carrying two or more prefill chunks */
+    int64_t decode_rows_mixed = 0;    /* decode rows that rode in a mixed step */
+    int64_t prefill_rows_mixed = 0;   /* prefill chunks that rode in a mixed step */
+    int64_t prefill_tok_mixed = 0;    /* prompt tokens computed inside a mixed step */
+    int64_t prefill_rows_unstaged = 0;/* chunks in a step the prefill stager did not arm */
     /* Cumulative nanoseconds inside steps, all shapes and decode-only. Wall clock over a step
      * count is not a step time: the engine idles between turns, and a prefill chunk costs an
      * order of magnitude more than a decode step. `step_ns_decode / steps_decode` is the cost of
