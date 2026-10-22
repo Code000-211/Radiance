@@ -73,6 +73,8 @@
 #include "rad_block_hc.h"
 #include "rad_block_moe_fp8.h"
 #include "rad_block_mtp_fp8.h"     /* mtp_draft_head_q2(): one reading of the 2-bit head */
+#include "rad_spechub.h"           /* RAD_MTP_COUPLE_*: the coupling wire */
+#include "rad_spechub_config.h"    /* RADIANCE_MTP_COUPLED */
 #include "rad_qsa.h"
 #include "rad_block_vit.h"
 
@@ -108,6 +110,9 @@ struct MtpHcBlock {
         /* Vocab-parallel pairs, declared only when the head is sharded: (int32 id, f32 value)
          * pairs stored as f32, this rank's top-R and the all-gathered world * R. */
         rad_buf dpair = 0, dgath = 0;
+        /* RADIANCE_MTP_COUPLED: [max_seqs] draws and [depth, max_seqs] states, both PERSIST across
+         * the serial passes (round 1 resets the logical stream, not the plane). */
+        rad_buf couple_draws = 0, couple_state = 0;
         AttnGatedFP8::Wire attn{};
         MoeFP8::Wire       mlp{};
         QsaIndexer::Wire   qsa{};
@@ -158,6 +163,9 @@ struct MtpHcBlock {
     rad_op op_dsel = 0, op_dback = 0;
     rad_op op_logits = 0, op_dquant = 0, op_dlogits = 0, op_dtopk = 0, op_drerank = 0;
     rad_op op_dgather = 0, op_dmerge = 0;
+    /* RADIANCE_MTP_COUPLED: one op a round. The ABI freezes `round` as a parameter, so a round
+     * cannot be an operand and each gets its own declared op. */
+    rad_op op_couple[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
 
     /* rad_arch.h's vocab-head rule, asked through the block by whoever sizes `dlog` and the pair
      * planes. */
@@ -422,6 +430,27 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
             if (!op_dgather || !op_dmerge) return RAD_E_INVAL;
         }
         if (!op_dquant || !op_dlogits || !op_dtopk) return RAD_E_INVAL;
+        /* THE LINEAR COUPLED PROPOSAL: one op a round (the ABI freezes `round` as a parameter, so a
+         * round cannot be an operand), after the final rerank/merge, on the shortlist that would
+         * otherwise give column 0.
+         *
+         * LINEAR CHAIN ONLY. A coupled row's Q is the head's own top-8 at temperature 1, and x is a
+         * TOKEN; a tree takes column 0 as a parent index, so coupling and branching cannot share a
+         * pass. The engine refuses that combination before this runs; the test here keeps a
+         * declaration that disagrees with it from silently proposing tokens into a tree plane. */
+        if (mtp_coupled_enabled()) {
+            if (!w.couple_draws || !w.couple_state || depth < 1 ||
+                depth > RAD_MTP_COUPLE_MAX_ROUNDS || !op_drerank || (g.world > 1 && !op_dmerge))
+                return RAD_E_UNSUPPORTED;
+            for (int round = 1; round <= depth; ++round) {
+                op_couple[round - 1] = rw(b, RAD_OP(b, "mtp_couple_propose",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab),
+                               RAD_INT("round", round), RAD_INT("max_rounds", depth)),
+                    RAD_NOWEIGHTS),
+                    { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state });
+                if (!op_couple[round - 1]) return RAD_E_INVAL;
+            }
+        }
     }
     /* Keep the carry `hin` live through the head's last op: it is written before the mixer and
      * lm_head run, and the planner could otherwise give its bytes to them (silently lowering
@@ -429,6 +458,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     {
         rad_op last = op_logits;
         if (q2) last = op_dmerge ? op_dmerge : op_drerank ? op_drerank : op_dtopk;
+        if (op_couple[0]) last = op_couple[depth - 1];
         if (rad_op_reads(b, last, &w.hin, 1) < 0) return RAD_E_INVAL;
     }
     return RAD_OK;
@@ -523,6 +553,19 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
             if (op_drerank)
                 RAD_ISSUE_N(c, op_drerank, L, brows(w.hout, L), RAD_W(w_lm), brows(w.didx, L),
                             brows(w.didx, L), brows(w.dval, L), RAD_NONE);
+        }
+        /* THE COUPLED PROPOSAL, after the FINAL reranked shortlist: column 0 is what ADV_TAKE reads,
+         * and a sampled row replaces it with its own x. Round 1 is carried by the history pass
+         * (r < 0), every later round by its own pass, exactly as the carry above is. */
+        if (op_couple[0]) {
+            const int round = r < 0 ? 1 : r;
+            if (round < 1 || round > depth) {
+                rad_step_fail(c, "MTP coupled round exceeds the declared draft depth");
+                return;
+            }
+            RAD_ISSUE_N(c, op_couple[round - 1], L, brows(w.didx, L), brows(w.dval, L),
+                        praw(batch->seq_ids, RAD_I32, batch->n_seq),
+                        brows(w.couple_draws, L), RAD_B(w.couple_state));
         }
     } else {
         RAD_ISSUE_N(c, op_logits, L, brows(w.hout, L), RAD_W(w_lm), brows(w.logits, L));

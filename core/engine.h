@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
 #include "cvec.h"
 #include <map>
 #include <set>
@@ -395,6 +396,19 @@ private:
     int  step_state_init();
     void step_state_fini();
     StepSlot*            slots_host_ = nullptr;
+
+    /* RADIANCE_MTP_COUPLED (engine_draft.cpp). The head declares `mtp_couple_draws` and
+     * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
+     * reads the states back once, then binds each to the verify row it will be coupled at. */
+    bool     mtp_couple_ = false;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
+    RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
+    RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
+    std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
+    RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    int  stage_couple_draws(int n);
+    int  bind_couple(int row, int done, const StepSlot& S);
 
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
      * The nine phases sum to the whole step, including the readback, commit and drafter after the
