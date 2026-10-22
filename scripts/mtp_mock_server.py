@@ -14,6 +14,8 @@ Environment:
   MOCK_CHUNKS     content chunks per request (default 20)
   MOCK_GAP_MS     milliseconds between chunks (default 50)
   MOCK_FAIL       the N-th request answers 500 instead of streaming (default 0, never)
+  MOCK_JSON       "compact" (default) or "spaced": legal JSON with different spacing. Keys are
+                  deliberately in an order the runner does not assume.
   MOCK_PIDFILE    write this process's PID here once it is listening
   MOCK_BODY_LOG   append every request body here, one per line
 """
@@ -27,8 +29,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CHUNKS = int(os.environ.get("MOCK_CHUNKS", "20"))
 GAP = float(os.environ.get("MOCK_GAP_MS", "50")) / 1000.0
 FAIL_AT = int(os.environ.get("MOCK_FAIL", "0"))
+SPACED = os.environ.get("MOCK_JSON", "compact") == "spaced"
 PIDFILE = os.environ.get("MOCK_PIDFILE", "")
 BODY_LOG = os.environ.get("MOCK_BODY_LOG", "")
+
+
+def dumps(obj):
+    if not SPACED:
+        return json.dumps(obj, separators=(",", ":"))
+    # A different legal rendering: spaces, and the top-level keys in the other order.
+    return json.dumps({k: obj[k] for k in reversed(list(obj))}, separators=(", ", ": "))
+
 
 lock = threading.Lock()
 seen = {"active": 0, "requests": 0, "decode": 0, "steps": 0, "draft": 0, "acc": 0, "prefill": 0}
@@ -95,13 +106,12 @@ class Handler(BaseHTTPRequestHandler):
                     seen["steps"] += 1
                     seen["draft"] += 1
                     seen["acc"] += 1
-                self.chunk("data: " + json.dumps(
-                    {"choices": [{"text": "x", "index": 0}]}, separators=(",", ":")) + "\n\n")
+                self.chunk("data: " + dumps(
+                    {"choices": [{"index": 0, "text": "x"}]}) + "\n\n")
                 time.sleep(GAP)
             # The usage line comes at the stream's end, after the window has closed.
-            self.chunk("data: " + json.dumps(
-                {"choices": [], "usage": {"completion_tokens": CHUNKS}},
-                separators=(",", ":")) + "\n\n")
+            self.chunk("data: " + dumps(
+                {"usage": {"completion_tokens": CHUNKS}, "choices": []}) + "\n\n")
             self.chunk("data: [DONE]\n\n")
             self.chunk("")
         finally:

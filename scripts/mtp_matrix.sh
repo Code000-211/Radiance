@@ -159,9 +159,10 @@ fi
 
 # ------------------------------------------------------------------ mock regression cases
 # These exercise the runner's own plumbing against a local stand-in server -- the row write, the
-# prompt text in the payload, the complete stream capture, client errors, both C edges, the held
-# lock and the wrapper's signal cleanup. They need the shared lock free and a card is not needed;
-# scripts/mtp_mock_server.py is not a model and measures nothing.
+# prompt text in the payload, the complete stream capture, a differently formatted (but legal) JSON
+# answer, client errors, both C edges, the held lock and the wrapper's signal cleanup. They need the
+# shared lock free and a card is not needed; scripts/mtp_mock_server.py is not a model and measures
+# nothing.
 mocktest() {
   local d; d=$(mktemp -d) || return 1
   local bad=0
@@ -211,6 +212,15 @@ EOF
     WIN=1 RAMP=6 SETTLE=1 "$SELF" "$d/manifest.json" > "$d/c.log" 2>&1
   chk "c: exit status is a failure"   "$?" 1
   chk "c: row unusable"               "$(awk 'NR == 2 {print $22}' "$rows")" 0
+
+  # F: the same good run, but every answer is legal JSON with different spacing and key order.
+  # The parser must not depend on how this mock happens to print.
+  MOCK_JSON=spaced MOCK_CHUNKS=300 MOCK_GAP_MS=20 RADIANCE="$HERE/mtp_mock_server.py" PORT=8130 \
+    WIN=1 RAMP=20 SETTLE=1 "$SELF" "$d/manifest.json" > "$d/f.log" 2>&1
+  chk "f: exit status"                "$?" 0
+  chk "f: whole stream captured"      "$(awk 'NR == 2 {print $13}' "$rows")" 600
+  chk "f: usage of the whole stream"  "$(awk 'NR == 2 {print $15}' "$rows")" 600
+  chk "f: row usable"                 "$(awk 'NR == 2 {print $22}' "$rows")" 1
 
   # D: a held lock is refused at once, not waited out. The holder execs its sleep, so killing the
   # PID this case recorded also releases the lock.
@@ -506,17 +516,26 @@ json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # is always complete by the time it is read.
 stream_one() {   # $1 payload, $2 out file
   printf 'send\t%s\n' "$(now_us)" > "$2"
-  local body
+  local body rest v      # no process per chunk: this runs on the measured path
   while IFS= read -r line; do
     case $line in
       'data: '*)
         body=${line#data: }
-        case $body in
-          *'"completion_tokens":'*)
-            printf 'usage\t%s\n' \
-              "$(printf '%s' "$body" | sed 's/.*"completion_tokens":\([0-9]*\).*/\1/')" >> "$2" ;;
-          *'"text":""'*) ;;                                  # an empty delta is not an arrival
-          *'"text":"'*) printf '%s\n' "$(now_us)" >> "$2" ;;
+        # JSON spacing and key order are the server's choice, so nothing matches a fixed
+        # substring beyond the key itself; only the value between the quotes is read.
+        case $body in *'"completion_tokens"'*)
+          rest=${body#*'"completion_tokens"'}
+          rest=${rest#*:}
+          v=${rest#"${rest%%[0-9]*}"}      # from the first digit ...
+          v=${v%%[!0-9]*}                 # ... to the first non-digit
+          [ -n "$v" ] && printf 'usage\t%s\n' "$v" >> "$2" ;;
+        esac
+        case $body in *'"text"'*)
+          rest=${body#*'"text"'}
+          v=${rest#*'"'}                  # past the opening quote of the value
+          if [ "$v" = "$rest" ]; then v=  # no string value at all
+          else v=${v%%'"'*}; fi           # up to its closing quote
+          [ -n "$v" ] && printf '%s\n' "$(now_us)" >> "$2" ;;  # empty delta: no arrival
         esac
         ;;
     esac

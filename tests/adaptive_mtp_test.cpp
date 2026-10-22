@@ -11,18 +11,21 @@
  *     -- or past a censor -- carries a label.
  *   - the end classification. A draft that matched the target's stopping token is compared but not
  *     committed: `end == Stopped`, `checked == accepted`, and the stop position itself gets no
- *     label. Giving it a 0 would teach the head that a correct stop was wrong. The target drawing
- *     the stop token instead of the draft is a real 0, even though the cycle then censors. A row
+ *     label. Giving it a 0 would teach the head that a correct stop was wrong. A stop the head
+ *     predicted and the target did not draw is the mirror image: a real 0 at that position. The
+ *     target drawing the stop token instead of a draft is a real 0 too, even though the cycle then
+ *     censors. A stop at the bonus position cuts no draft prefix, so the censor stays None. A row
  *     that reached verification with `end == Unset` is refused, not guessed.
  *   - the bonus token. The verify step emits the target's own token after the accepted prefix
  *     whether or not a draft was accepted, so the drafts are bounded by `remaining - 1`; a cycle
- *     never emits past `remaining`.
+ *     never emits past `remaining`, and `remaining == 0` emits nothing at all.
  *   - raw match, commit length and the censor reason are three separate numbers.
  *   - above temperature 0 acceptance is equality with the target's own draw. A draft that is the
  *     mode is rejected when the target drew something else, and a draft that is not the mode is
  *     accepted when the target drew it; that is neither argmax acceptance nor min(1, p/q).
- *   - a K0 row in a mixed batch publishes no label, and a plan from an earlier cycle still holds
- *     its own values after the next cycle is chosen (one storage set per live cycle).
+ *   - a K0 row in a mixed batch publishes no label but a valid empty observation (nothing
+ *     generated, nothing rejected), and a plan from an earlier cycle still holds its own values
+ *     after the next cycle is chosen (one storage set per live cycle).
  *
  * What is deliberately not here: state parity (KV bounds, GDN anchors, conv cursor, QSA tails,
  * MTP-history watermark) and the concurrency matrix. Both need a running engine, and a text
@@ -71,8 +74,10 @@ Row run_one(const Seq& s) {
     Row r;
     if (s.eligibility != DraftEligibility::Eligible) return r;
     if (s.draft.empty()) {
-        /* K0: a plain decode row. It emits one token and has no label to give. */
-        r.emitted = 1;
+        /* K0: a plain decode row. It emits the target's own token, bounded by what is left, and
+         * publishes a valid empty observation: nothing generated, nothing rejected. */
+        r.o.end = DraftSeqEnd::AllAccepted;
+        r.emitted = s.remaining > 0 ? 1 : 0;
         return r;
     }
 
@@ -86,20 +91,17 @@ Row run_one(const Seq& s) {
     int32_t acc = 0;
     CHECK_OK(accept_greedy(s.draft.data(), k, s.target.data(), out, &acc));
 
-    /* `acc` is the uncensored match length. A stopping token ends the commit wherever it appears:
-     * predicted and matched, it is compared but not committed (Stopped); produced by the target
-     * instead of the draft, it is a real rejection (Rejected) that then censors. */
-    int32_t eog = -1;
-    for (int32_t j = 0; j <= acc; ++j)
-        if (is_eog(out[j])) { eog = j; break; }
+    /* The engine's own cut (sample/accept.h): a stopping token ends the emission wherever it
+     * appears among the accepted prefix and the token past it. `acc` stays the uncensored match
+     * length, which is what the cost model is trained on. */
+    const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
 
-    const int32_t cut = eog >= 0 && eog < acc ? eog : acc;   /* drafts committed */
     r.o.raw_match = (uint64_t)acc;
     r.o.accepted = (uint8_t)cut;
     r.committed = cut;
     r.emitted = cut + 1;                                    /* the bonus token is always emitted */
 
-    if (eog >= 0 && eog < acc) {
+    if (cut < acc) {
         /* The draft agreed on the stop token. It is emitted but not committed, so `checked` ends
          * at `accepted` and that position carries no label. */
         r.o.end = DraftSeqEnd::Stopped;
@@ -108,7 +110,10 @@ Row run_one(const Seq& s) {
     } else {
         r.o.end = acc < k ? DraftSeqEnd::Rejected : DraftSeqEnd::AllAccepted;
         r.o.checked = (uint8_t)(r.o.end == DraftSeqEnd::Rejected ? acc + 1 : acc);
-        if (eog >= 0) r.o.censor = DraftCensor::Eog;         /* the correction was the stop token */
+        /* The censor says which *draft prefix* was cut. A stop token the target drew at a
+         * rejected draft position is the correction there, so the cycle censors. A stop token at
+         * the bonus position cut no draft at all: the run ends, the censor stays None. */
+        if (acc < k && is_eog(out[acc])) r.o.censor = DraftCensor::Eog;
         else if (s.remaining > 0 && r.emitted >= s.remaining) r.o.censor = DraftCensor::MaxTokens;
     }
     return r;
@@ -221,6 +226,43 @@ TEST(a_stop_token_the_target_chooses_after_a_rejection_is_a_real_zero) {
     CHECK_EQ(labels(r.o), std::string("1110...."));
 }
 
+TEST(a_stop_token_at_the_bonus_position_cuts_no_draft_so_it_censors_nothing) {
+    /* Every draft matched and the target's own token past the prefix is the stop. The run ends
+     * there, but no draft position was cut: `end` stays AllAccepted and the censor stays None. */
+    Seq s = agreeing(1, 3);
+    s.target[3] = kEog;                    /* the bonus position, past the last draft */
+
+    const Row r = run_one(s);
+    CHECK_EQ((int)r.o.raw_match, 3);
+    CHECK_EQ((int)r.o.accepted, 3);
+    CHECK_EQ((int)r.o.checked, 3);
+    CHECK_EQ(r.emitted, 4);
+    CHECK(r.o.end == DraftSeqEnd::AllAccepted);
+    CHECK(r.o.censor == DraftCensor::None);
+    CHECK(draft_seq_observation_valid(r.o));
+    CHECK_EQ(labels(r.o), std::string("111....."));
+}
+
+TEST(a_stop_the_head_predicted_but_the_target_did_not_is_a_real_reject) {
+    /* The mirror of the stopped case: the head proposes the stop token and the target draws
+     * something else at that position. The draft was wrong, so the position is a measured 0 --
+     * not a Stopped row with no label. The target's token is not the stop, so nothing censors. */
+    Seq s;
+    s.req_id = 1;
+    s.draft  = { 1, kEog, 3 };
+    s.target = { 1, 9, 3, 5 };
+
+    const Row r = run_one(s);
+    CHECK_EQ((int)r.o.raw_match, 1);
+    CHECK_EQ((int)r.o.accepted, 1);
+    CHECK_EQ((int)r.o.checked, 2);
+    CHECK_EQ(r.emitted, 2);
+    CHECK(r.o.end == DraftSeqEnd::Rejected);
+    CHECK(r.o.censor == DraftCensor::None);
+    CHECK(draft_seq_observation_valid(r.o));
+    CHECK_EQ(labels(r.o), std::string("10......"));
+}
+
 TEST(output_budget_censors_the_cycle_and_exhaustion_is_not_a_rejection) {
     /* remaining = 4 with k = 3: the commit emits four tokens and the run ends. Positions the
      * budget already used up carry no label, and the end is still AllAccepted -- the budget ran
@@ -287,6 +329,33 @@ TEST(the_bonus_token_is_never_spent_on_a_draft) {
     for (int i = 0; i < 4; ++i) CHECK_EQ(f.plan.k[i], want_k[i]);
     CHECK(f.plan.fill[3] == DraftDrafter::None);
     CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+}
+
+TEST(the_last_token_of_the_budget_is_emitted_once_and_zero_emits_nothing) {
+    /* remaining 1: the verify step's own token is all that is left, so K0 and exactly one emitted
+     * token. remaining 0: nothing is left and nothing is emitted, not even the bonus token. */
+    CHECK_EQ(draft_budget_k(1, 6), 0);   /* one token left is K0, not a draft of zero width */
+    CHECK_EQ(draft_budget_k(0, 6), 0);
+
+    Seq one;
+    one.req_id = 1;
+    one.remaining = 1;
+    const Row r = run_one(one);
+    CHECK_EQ(r.emitted, 1);
+    CHECK_EQ(r.emitted, one.remaining);
+    CHECK_EQ((int)r.o.accepted, 0);
+    CHECK(r.o.end == DraftSeqEnd::AllAccepted);
+    CHECK(draft_seq_observation_valid(r.o));
+
+    Seq zero;
+    zero.req_id = 2;
+    zero.remaining = 0;
+    const Row z = run_one(zero);
+    CHECK_EQ(z.emitted, 0);
+    CHECK_EQ(z.emitted, zero.remaining);
+    CHECK_EQ((int)z.o.accepted, 0);
+    CHECK(z.o.end == DraftSeqEnd::AllAccepted);
+    CHECK(draft_seq_observation_valid(z.o));
 }
 
 TEST(cancelled_preempted_and_grammar_capped_requests_publish_no_labels) {
@@ -424,10 +493,17 @@ TEST(a_mixed_batch_counts_the_rows_that_reach_each_round) {
     for (int j = 0; j <= 6; ++j) CHECK_EQ(f.plan.rows[j], want[j]);
     CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
 
-    /* The K0 row publishes no label: the empty sequence is not a run of rejections. */
+    /* The K0 row publishes no label -- the empty sequence is not a run of rejections -- and its
+     * observation is still valid: nothing generated, nothing rejected. */
     Seq k0;
     k0.req_id = 25;
-    CHECK_EQ(labels(run_one(k0).o), std::string("........"));
+    const Row k0r = run_one(k0);
+    CHECK_EQ(labels(k0r.o), std::string("........"));
+    CHECK_EQ((int)k0r.o.generated, 0);
+    CHECK_EQ((int)k0r.o.accepted, 0);
+    CHECK(k0r.o.end == DraftSeqEnd::AllAccepted);
+    CHECK(k0r.o.origin == DraftOrigin::None);   /* a row that produced nothing is None */
+    CHECK(draft_seq_observation_valid(k0r.o));
 }
 
 TEST(a_k0_row_in_a_batch_still_has_a_plan_of_its_own) {
