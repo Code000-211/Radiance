@@ -165,6 +165,9 @@ static const Flag g_flags[] = {
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
+    { "--draft-depth-tiers",  "LIST",   "the K values the cost policy chooses between, ascending\n"
+    "                                    and unique, e.g. 0,2,3,4,6; each must be <= the ceiling.\n"
+    "                                    Default 0,2,3,4,6" },
     { "--draft-profile",      "PATH",   "a rad-draft-profile/3 file measured on this deployment,\n"
     "                                    read before the scheduler starts; a fingerprint or\n"
     "                                    execution mismatch disables it and is named in the log.\n"
@@ -172,9 +175,10 @@ static const Flag g_flags[] = {
     { "--draft-profile-out",  "PATH",   "write the cost profile this run measured to PATH when the\n"
     "                                    engine exits, with this deployment's fingerprint and\n"
     "                                    execution; refused if PATH exists or nothing was measured.\n"
-    "                                    Records under --draft-policy legacy or adaptive, not cost;\n"
-    "                                    needs a serial draft head. Not accepted on a generator or\n"
-    "                                    embedding model" },
+    "                                    Under --draft-policy cost the table is record-only: the run\n"
+    "                                    issues the fallback baseline and prices nothing from what\n"
+    "                                    it records. Needs a serial draft head. Not accepted on a\n"
+    "                                    generator or embedding model" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -666,6 +670,32 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-depth-tiers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Ascending and unique here; the ceiling is not known until auto resolves it, so
+             * "<= ceiling" is DraftPlanner::configure's check, at startup. */
+            const std::string all = v;
+            size_t at = 0;
+            int n = 0;
+            while (at <= all.size()) {
+                const size_t end = std::min(all.find(',', at), all.size());
+                const std::string one = all.substr(at, end - at);
+                int64_t t = 0;
+                if (!parse_int(a.c_str(), one.c_str(), 0, INT32_MAX, &t)) return RAD_E_INVAL;
+                if (n >= kDraftMaxTiers) {
+                    RAD_ERR("--draft-depth-tiers takes at most %d K values", kDraftMaxTiers);
+                    return RAD_E_INVAL;
+                }
+                if (n > 0 && (int)t <= c->draft_tiers[n - 1]) {
+                    RAD_ERR("--draft-depth-tiers must be ascending and unique (%lld after %d)",
+                            (long long)t, c->draft_tiers[n - 1]);
+                    return RAD_E_INVAL;
+                }
+                c->draft_tiers[n++] = (int)t;
+                at = end + 1;
+            }
+            c->draft_n_tiers = n;
+        }
         else if (S("--draft-profile")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             c->draft_profile = v;
@@ -1098,6 +1128,11 @@ const ShowRow kShow[] = {
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-policy",       [](const Config& c) { return std::string(draft_policy_name(c.draft_policy)); } },
+    { "--draft-depth-tiers",  [](const Config& c) {
+        std::string s;
+        for (int i = 0; i < c.draft_n_tiers; ++i) s += (i ? "," : "") + num(c.draft_tiers[i]);
+        return s;
+    } },
     { "--draft-profile",      [](const Config& c) { return or_none(c.draft_profile, "none"); } },
     { "--draft-profile-out",  [](const Config& c) { return or_none(c.draft_profile_out, "none"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },

@@ -244,7 +244,8 @@ prediction and sample.
   the whole deployment (`Ctx::records_passes()` false) and the cycle is priced against the buckets
   that runtime measured. That is necessary, not sufficient: a cycle whose shape the file does not
   hold still falls back -- a request's first cycle verifies nothing, so it is keyed `verify_k = 0`,
-  and a legacy calibration files only cycles that verify the window it already published. A
+  and a legacy calibration files only cycles that verify the window it already published; a `cost`
+  calibration (record-only) files the start cycle itself. A
   recording
   deployment stays `Unknown`, because which of play, record and audit a pass does exists only once
   that pass runs, after its plan was issued; the shape is then unpriceable and the named fallback
@@ -359,9 +360,10 @@ patch. New sources are picked up by the existing `CONFIGURE_DEPENDS` globs, and 
 
 ## CLI names
 
-The first two exist today and keep their meaning. The rest are **defined here but not accepted
-yet**: Welle 2 adds them when they have an effect. A flag that parses and does nothing would be the
-fabricated success the contracts forbid.
+The window, policy and profile flags exist today and keep their meaning. `--draft-depth-tiers` is
+accepted now that the cost choice reads it. `--draft-policy-shadow` and `--draft-explore-rate` are
+**defined here but not accepted yet**: Welle 2 adds them when they have an effect. A flag that
+parses and does nothing would be the fabricated success the contracts forbid.
 
 | Flag | Values | Default | State |
 |------|--------|---------|-------|
@@ -370,7 +372,7 @@ fabricated success the contracts forbid.
 | `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; with a matched profile A's table prices the shapes, otherwise every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | accepted; read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
-| `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |
+| `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. Each must be ≤ the ceiling (auto resolves it, so the range check is `DraftPlanner::configure`'s) and a list is never silently trimmed. A cost deployment whose ceiling is below a tier is refused by name |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
 `cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
@@ -464,13 +466,20 @@ regenerated, never rescaled.
   reader derives it and the `--draft-profile-out` writer derives it from the same function, so
   read and write cannot drift. A `rectangular`-stamped profile for a serial deployment is refused
   by name and must be recalibrated, not restamped.
-- **Writing a profile (`--draft-profile-out`).** A calibration run decodes under `legacy` or
-  `adaptive` with the recording armed in place of the cost policy: the same decode rows and the
-  same observation ring, but the controller's plan is never set, so `draft_cap()`/`bars_fill()`
-  and the rest of the run are exactly what they are without the flag, and `cost` stays refused
-  rather than weakened. Each cycle's record names the depth the step really caps each row at
-  (the head's own depth, the adaptive window, 0 for a row that may not speculate), so a bucket
-  describes a shape the run could execute. A cycle with more decode rows than
+- **Writing a profile (`--draft-profile-out`).** A calibration run decodes under whichever policy
+  the deployment really runs -- `legacy`, `adaptive` or `cost` -- with the recording armed. Under
+  legacy/adaptive the controller's plan is never set, so `draft_cap()`/`bars_fill()` and the rest of
+  the run are exactly what they are without the flag. Under `cost` the table is put in record-only
+  mode: the run opens the same cycles any cost deployment opens -- the start cycle included, which
+  is the one no legacy run can execute, because it verifies a window it did not draft -- issues the
+  admitted fallback baseline, and prices nothing from the buckets it is still filling. That is the
+  mode that measures the shape a later cost deployment prices first (`verify_k = 0`); without it a
+  reload can price no request's first cycle. The depth a calibration measures is its ceiling, so a
+  calibration below the default ladder passes the tiers it fits (`--draft-depth-tiers 0,2` at a
+  ceiling of 2); the reload may then run a deeper ceiling and choose the measured tier by its price.
+  Each cycle's record names the depth the step really
+  caps each row at (the head's own depth, the adaptive window, 0 for a row that may not speculate),
+  so a bucket describes a shape the run could execute. A cycle with more decode rows than
   `RAD_SCHED_MAX_SPEC` (64) is not recorded at all: naming a prefix would describe a shape shorter
   than the bracket `step_finished()` times. It is counted (`Scheduler::draft_cycles_dropped()`)
   and warned once, and the table learns nothing from it. When the engine exits -- and only when the

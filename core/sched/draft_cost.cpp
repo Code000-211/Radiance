@@ -773,6 +773,7 @@ void DraftCostTable::clear() {
     capacity_ = 0;
     active_ = false;
     fallback_admitted_ = false;
+    record_only_ = false;
 }
 
 int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRuntime& runtime,
@@ -812,6 +813,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     *out = DraftCostEstimate{};
     if (!draft_shape_priceable(s)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no profile: invalid estimate, the caller's named baseline */
+    if (record_only_) return RAD_OK;   /* a calibration measures; it does not price */
 
     /* The key's draft half is the executed extent: a bucket measured with another executed
      * distribution ran another kernel, whatever its round count and total. The query's

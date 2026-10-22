@@ -1683,10 +1683,15 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
 }
 
 /* --draft-profile-out: the calibration mode. Refused, not ignored, when it cannot produce an
- * honest profile: the two flags together would read and write the same identity, Cost would price
- * with the numbers it is recording, an existing path would be replaced, and only the serial head
- * can be recorded. All of them are checked here, at startup, so a run that cannot export says so
- * before serving instead of after. */
+ * honest profile: the two flags together would read and write the same identity, an existing path
+ * would be replaced, and only the serial head can be recorded. All of them are checked here, at
+ * startup, so a run that cannot export says so before serving instead of after.
+ *
+ * Both policies calibrate. Under legacy the run never verifies a window it did not just draft, so
+ * the shape a cost deployment prices first -- a cycle whose paired step verified nothing, before
+ * any plan published -- cannot arise. A cost run executes exactly that start cycle, and the table
+ * is put in record-only mode for it: the run measures the fallback baseline it really runs and
+ * prices nothing from the buckets it is still filling. */
 int Engine::begin_draft_calibration() {
     if (cfg_.draft_profile_out.empty()) return RAD_OK;
     if (!cfg_.draft_profile.empty()) {
@@ -1694,11 +1699,7 @@ int Engine::begin_draft_calibration() {
                 "profile and does not read one; pass only one of the two");
         return RAD_E_INVAL;
     }
-    if (cfg_.draft_policy == DraftPolicyKind::Cost) {
-        RAD_ERR("--draft-profile-out: calibrate under --draft-policy legacy. Under cost the table "
-                "prices with the numbers the run is recording");
-        return RAD_E_INVAL;
-    }
+    const bool cost = cfg_.draft_policy == DraftPolicyKind::Cost;
     if (cfg_.kld()) {
         RAD_ERR("--draft-profile-out: the KL mode scores the trunk and drafts nothing, so it "
                 "measures no draft cycle to export");
@@ -1729,8 +1730,9 @@ int Engine::begin_draft_calibration() {
     }
     /* The identity is derived here, before the scheduler starts: an incomplete one must fail
      * before the run, not at export, and the profile is then written with the fingerprint this run
-     * was bound to. The table is admitted with no buckets -- it is the recording's target, and
-     * with Cost refused above nothing can ever be priced from it. */
+     * was bound to. The table is the recording's target with no buckets of its own: under legacy
+     * nothing can be priced from it, and a cost calibration admits the fallback baseline it
+     * measures and never prices at all (record_only). */
     RAD_TRY(draft_cost_runtime(&draft_calib_runtime_));
     DraftCostProfile empty;
     empty.fingerprint = draft_calib_runtime_.fingerprint;
@@ -1740,6 +1742,12 @@ int Engine::begin_draft_calibration() {
         RAD_ERR("--draft-profile-out: the recording table refused this runtime: %s",
                 sched_.draft_costs().reason().c_str());
         return RAD_E_STATE;
+    }
+    if (cost) {
+        /* The run executes the named baseline until a cycle is measured, and it is that baseline
+         * -- including the start cycle nothing precedes -- that the file records. */
+        sched_.draft_costs().admit_fallback();
+        sched_.draft_costs().record_only();
     }
     draft_calibrating_ = true;
     return RAD_OK;

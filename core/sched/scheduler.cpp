@@ -162,10 +162,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     /* The calibration's recording (--draft-profile-out): the same ring the cost policy uses, opened
      * under whatever policy this deployment really runs. It never sets the controller's plan, so
-     * draft_cap()/bars_fill() and the Cost lock are exactly what they are without it. `cost` is
-     * refused together with the flag (engine.cpp), so the two never arm at once. The file can name
-     * only the serial head, so a deployment without one cannot be recorded (refused by name there);
-     * the depth is the deepest round the head can publish. */
+     * draft_cap()/bars_fill() and the Cost lock are exactly what they are without it. A cost
+     * calibration runs with a record-only table (engine.cpp), so it opens the same cycles as any
+     * cost deployment -- including the start cycle -- but issues the fallback baseline and prices
+     * nothing. The file can name only the serial head, so a deployment without one cannot be
+     * recorded (refused by name there); the depth is the deepest round the head can publish. */
     draft_record_ = !cfg.draft_profile_out.empty();
     draft_head_depth_ = 0;
     draft_record_prev_k_ = -1;
@@ -182,6 +183,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * arrays are sized at. */
     dp.policy.mode = cfg.draft_policy == DraftPolicyKind::Cost ? DraftPolicyMode::Cost
                                                            : DraftPolicyMode::Legacy;
+    /* --draft-depth-tiers: what the cost choice weighs. A tier above the ceiling is refused by
+     * DraftPlanner::configure below, by name. */
+    dp.policy.n_tiers = cfg.draft_n_tiers < (int)RAD_DRAFT_MAX_TIERS ? cfg.draft_n_tiers
+                                                                    : (int)RAD_DRAFT_MAX_TIERS;
+    for (int i = 0; i < dp.policy.n_tiers; ++i) dp.policy.tiers[i] = cfg.draft_tiers[i];
     /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
      * depth is the configured one, or a cost deployment would draft nothing at all. */
     dp.policy.fallback_k = cfg.n_spec;

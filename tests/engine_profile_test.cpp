@@ -131,12 +131,18 @@ TEST(a_calibration_refuses_both_profile_flags_at_once) {
     CHECK(!EngineTestPeer::sched(e).draft_costs().active());
 }
 
-TEST(a_calibration_refuses_the_cost_policy) {
+/* Cost calibrates like legacy does -- the policy is what makes a start cycle measurable, not a
+ * reason to refuse the file. With no rank planned the identity cannot be derived, so the refusal
+ * comes from the deployment, exactly as for the legacy case above. */
+TEST(a_calibration_under_cost_reaches_the_identity_derivation) {
     Config cfg;
     cfg.draft_profile_out = radtest::tmp_path("engine_calib_cost.json");
     cfg.draft_policy      = rad::DraftPolicyKind::Cost;
+    cfg.n_spec            = 6;
     Engine e(std::move(cfg));
-    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+    EngineTestPeer::drafter(e, serial_head(6));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_STATE);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
 }
 
 TEST(a_calibration_refuses_the_kl_mode) {

@@ -435,7 +435,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
-        { "--draft-policy", { "cost" } }, { "--draft-profile", { "/p.json" } },
+        { "--draft-policy", { "cost" } }, { "--draft-depth-tiers", { "0,2" } },
+        { "--draft-profile", { "/p.json" } },
         { "--draft-profile-out", { "/out.json" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
@@ -748,6 +749,27 @@ TEST(the_draft_policy_is_legacy_or_cost) {
     CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
+}
+
+/* --draft-depth-tiers is the cost policy's ladder: ascending, unique, at most kDraftMaxTiers.
+ * "<= ceiling" needs the ceiling, which auto resolves after the container is open, so that check
+ * stays with the planner. */
+TEST(the_draft_depth_tiers_are_an_ascending_unique_list) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_n_tiers, 5);
+    CHECK_EQ(d.draft_tiers[0], 0);
+    CHECK_EQ(d.draft_tiers[4], 6);
+    Config c;
+    CHECK_EQ(parse({ "--draft-depth-tiers", "0,2" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_n_tiers, 2);
+    CHECK_EQ(c.draft_tiers[1], 2);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "1,3,3" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "4,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "0,,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "-1,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "high" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers" }, &c), RAD_E_INVAL);
 }
 
 /* --draft-profile is a path, read by the engine once the deployment is up. Nothing parses the file

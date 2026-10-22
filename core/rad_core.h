@@ -163,6 +163,9 @@ constexpr DraftPolicyKind kDraftPolicyDefault = DraftPolicyKind::Legacy;
 inline const char* draft_policy_name(DraftPolicyKind p) {
     return p == DraftPolicyKind::Cost ? "cost" : "legacy";
 }
+/* The most K values --draft-depth-tiers carries; sizes Config::draft_tiers and the planner's
+ * ladder (RAD_DRAFT_MAX_TIERS, core/sched/draft_policy.h). */
+constexpr int kDraftMaxTiers = 8;
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
@@ -894,6 +897,12 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
+    /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
+     * The default is the ladder the policy was tuned with. A tier above the ceiling is refused by
+     * DraftPlanner::configure, which is where the ceiling is known (auto resolves it); a list is
+     * never silently trimmed. */
+    int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
+    int     draft_n_tiers = 5;
     /* --draft-profile: a rad-draft-profile/3 file measured on this deployment. Read once before
      * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
      * inactive and names the difference, and Cost is then refused by Scheduler::init. An older
@@ -903,7 +912,8 @@ struct Config {
      * same fingerprint and execution the reader derives at startup. The observation ring records
      * under legacy/adaptive; written once at the end of serve(), after the ring is flushed, and
      * only when the run measured at least one bucket; never over an existing file. Under cost the
-     * table would be pricing with the same numbers it records, so that combination is refused. */
+     * table is record-only: the run issues the admitted fallback at its ceiling -- the start cycle
+     * included, which legacy drafting never executes -- and prices nothing from what it records. */
     std::string draft_profile_out;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------

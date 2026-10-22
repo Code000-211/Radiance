@@ -641,6 +641,34 @@ TEST(only_an_attributable_sample_updates_a_measured_bucket) {
     CHECK_EQ((int)t.buckets().size(), 2);
 }
 
+/* A calibration measures and never prices: the table files what the run executes, and no estimate
+ * comes out of it -- not even from a bucket it has just recorded. Otherwise the run's second cycle
+ * would decide with the first cycle's measurement and the file would describe a steered run. */
+TEST(a_record_only_table_learns_without_pricing_anything) {
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    t.record_only();
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    const PlanFixture p3 = plan_for(k3);
+
+    /* The recording still works: a clean sample becomes a bucket the export may write. */
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 40.0)), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 1);
+    CHECK(t.has_usable_bucket());
+
+    /* And nothing is priced, not even the shape just measured. */
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(!e.valid);
+
+    /* A cleared table does not inherit the mode. */
+    t.clear();
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    CHECK_EQ(t.observe(completed_cycle(p3), sample_of(k3, 40.0)), RAD_OK);
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(e.valid);
+}
+
 TEST(a_sample_without_replay_evidence_is_never_learned_from) {
     /* The bucket key is the replay state the run established, so the sample has to carry one and it
      * has to be the state its shape names. Neither case may fall through as "no replay" -- a None

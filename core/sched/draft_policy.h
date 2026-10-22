@@ -57,7 +57,7 @@ namespace rad {
  * silently mapped to `legacy` (docs/ADAPTIVE-MTP.md). */
 enum class DraftPolicyMode : uint8_t { Legacy = 0, Cost = 1 };
 
-enum { RAD_DRAFT_MAX_TIERS = 8 };
+enum { RAD_DRAFT_MAX_TIERS = kDraftMaxTiers };
 /* The plan's version, stamped into every plan so a reader can tell which policy chose it. The
  * integrator's DraftHooks::version wins when it is wired; this is the default. */
 enum { RAD_DRAFT_POLICY_VERSION = 1 };

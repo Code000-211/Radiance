@@ -240,6 +240,13 @@ public:
     void admit_fallback() { fallback_admitted_ = true; }
     bool fallback_admitted() const { return fallback_admitted_; }
 
+    /* A calibration measures, it never prices: observe() files the cycles the run executes, while
+     * estimate() reports no price at all. A cost run measuring its own profile would otherwise
+     * decide with the buckets it is still filling -- the first cycle's measurement feeding the
+     * second cycle's plan -- and the exported numbers would describe a run that was steered by
+     * them. The fallback baseline is what such a run executes, and exactly what it measures. */
+    void record_only() { record_only_ = true; }
+
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
     /* Stops pricing and learning, naming why, while keeping the loaded buckets visible: the run's
@@ -298,6 +305,7 @@ private:
     int64_t inactive_ = 0;
     bool active_ = false;
     bool fallback_admitted_ = false;
+    bool record_only_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
                                   const int32_t* round_rows);
