@@ -1503,11 +1503,14 @@ struct HostChain {
     }
 
     HostChain(int64_t n_vocab, int64_t max_seqs, int max_spec, const VocabView* vocab = nullptr,
-              int64_t max_candidates = 8)
+              int64_t max_candidates = 8, const char* second_plugin = nullptr)
         : nv(n_vocab) {
         /* libref alone: it is the implementation under test, and a directory scan would also
          * pick up whatever else was built beside it. */
         if (reg.load_plugin(home() + "/kernels/libref.so", 0) < 0) return;
+        /* A second library by name, for an op libref does not carry (the coupling's verify op is
+         * the spechub plugin's, host row included). */
+        if (second_plugin && reg.load_plugin(home() + "/kernels/" + second_plugin, 0) < 0) return;
         RadModelMeta meta{};
         meta.arch_id = "sampler_chain";
         meta.name    = "sampler_chain";
@@ -3251,6 +3254,98 @@ TEST(a_dry_row_with_breakers_has_its_raw_logprob) {
     TokenLogprobs lp;
     CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
     CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
+}
+
+/* ================================================== the coupled verify row */
+
+/* THE COUPLED STATE AT THE SAMPLER'S OWN BUILD.
+ *
+ * The engine binds a round's state at `n_out + (round - 1)` (core/sched/mtp_couple_bind.h, through
+ * rad_mtp_couple_verify_pos), and build_step stages row k of the request at `n_out + k`, taking the
+ * state only when it names that exact row (rad_mtp_couple_binds). This drives the REAL build_step
+ * with the coupling on: the bound rounds become the draft rows' states, the bonus row stays
+ * unbound, and a state one position ahead -- what the engine's old `base + n_acc` formula produced
+ * once a commit came up short -- is refused. A refused row is deliberately silent in production;
+ * here it is the assertion.
+ *
+ * The verify op is declared by the spechub plugin, whose host row (ref_mtp_couple_verify) is what
+ * makes the declaration succeed here; build_step alone is driven, so the op never runs. */
+TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
+    setenv("RADIANCE_MTP_COUPLED", "1", 1);
+    HostChain ch(64, 2, 3, nullptr, 8, "spechub.so");
+    unsetenv("RADIANCE_MTP_COUPLED");
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    const int32_t draft[3] = { 21, 22, 23 };
+    Request r = make_req(7, { 1, 2, 3 }, sp);
+    r.draft = draft;
+    r.n_draft = 3;
+    std::string err;
+    CHECK_OK(ch.s.begin_request(r.id, r.sp, &err));
+
+    /* The states the engine binds after a live commit, at the positions it writes them. */
+    const uint64_t n_out = r.output.size();
+    auto states_at = [&](uint64_t first_pos, RadMtpCoupleState* out) {
+        for (int rd = 1; rd <= 3; ++rd) {
+            RadMtpCoupleState& c = out[rd - 1];
+            c = RadMtpCoupleState{};
+            c.draw.seq  = r.id;
+            c.draw.seed = r.sp.seed;
+            c.draw.mode = 1;
+            c.round     = rd;
+            c.status    = 1;
+            c.count     = 1;
+            c.x         = draft[rd - 1];
+            for (int i = 0; i < 8; ++i) c.ids[i] = -1;
+            c.ids[0]    = c.x;
+            c.q[0]      = 1.0;
+            c.pos       = first_pos + (uint64_t)(rd - 1);
+        }
+    };
+    RadMtpCoupleState bound[3];
+    states_at(rad_mtp_couple_verify_pos(n_out, 1), bound);
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3));
+
+    std::vector<Request*> reqs = { &r };
+    CHECK_OK(ch.s.build_step(reqs));
+    int64_t n = 0;
+    const DeviceSampleParams* p = ch.s.staged_params(&n);
+    CHECK_EQ(n, 4);                       /* three draft rows and the bonus row */
+    CHECK(ch.s.staged_any_couple());
+    for (int k = 0; k < 3; ++k) {
+        CHECK_EQ(ch.s.staged_couple(k).round, k + 1);
+        CHECK_EQ(ch.s.staged_couple(k).x, draft[k]);
+        CHECK_EQ(ch.s.staged_couple(k).pos, rad_mtp_couple_verify_pos(n_out, k + 1));
+        /* The row is sampled at the position its state names. */
+        CHECK_EQ(p[k].pos, n_out + (uint64_t)k);
+    }
+    CHECK_EQ(ch.s.staged_couple(3).round, 0);   /* the bonus row carries no law */
+
+    /* THE OLD FORMULA'S POSITION: one ahead of the row. Every row is refused, so the batch issues
+     * no verify at all -- an inert coupling, which is what the engine's own formula used to
+     * produce. */
+    RadMtpCoupleState ahead[3];
+    states_at(rad_mtp_couple_verify_pos(n_out, 1) + 1, ahead);
+    CHECK_OK(ch.s.set_mtp_couple(r.id, ahead, 3));
+    CHECK_OK(ch.s.build_step(reqs));
+    CHECK(!ch.s.staged_any_couple());
+    for (int k = 0; k < 4; ++k) CHECK_EQ(ch.s.staged_couple(k).round, 0);
+
+    /* REUSE: an ended request's binding is gone, and a new one starts unbound. */
+    ch.s.end_request(r.id);
+    CHECK_EQ(ch.s.set_mtp_couple(r.id, bound, 3), RAD_E_NOTFOUND);
+    Request r2 = make_req(8, { 1, 2, 3 }, sp);
+    r2.draft = draft;
+    r2.n_draft = 3;
+    CHECK_OK(ch.s.begin_request(r2.id, r2.sp, &err));
+    CHECK_OK(ch.s.build_step({ &r2 }));
+    CHECK(!ch.s.staged_any_couple());
 }
 
 RAD_TEST_MAIN()

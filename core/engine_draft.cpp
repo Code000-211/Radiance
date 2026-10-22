@@ -7,6 +7,7 @@
 #include "engine_priv.h"
 
 #include "../arch/common/rad_spechub_config.h"
+#include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
@@ -333,24 +334,61 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         const uint64_t seq = serial_row_[(size_t)i].seq;
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (!mtp_couple_) continue;
-        /* BOUND WHETHER OR NOT THE REQUEST SURVIVED. A truncated publication keeps a prefix, whose
-         * rows carry their own rounds' states; a request the scheduler refused binds nothing, and
-         * set_mtp_couple(…, 0) clears what an earlier step left.
+        /* BOUND ONLY FOR A REQUEST STILL RUNNING. A truncated publication keeps a prefix, whose
+         * rows carry their own rounds' states; a request this commit finished (a max_tokens or
+         * context cut), or one the scheduler refused, binds nothing -- its rows are carried
+         * terminal work and will never sample again. set_mtp_couple(…, 0) clears what an earlier
+         * step left, and for a request already gone from the sampler it is RAD_E_NOTFOUND.
          *
          * The position coordinate is the request's committed output length AFTER this commit -- the
-         * value the next build_step reads as its n_out. A request no longer in the plan is gone
-         * from the sampler too (set_mtp_couple returns RAD_E_NOTFOUND), so its bound positions are
-         * never consumed; they stay at the draw's pre-commit base. */
-        uint64_t n_out = couple_draw_stage_[(size_t)i].base;
-        for (const StepEntry& e : plan.e)
-            if (e.req && e.seq == seq) { n_out = (uint64_t)e.req->output.size(); break; }
-        RAD_TRY(bind_couple(i, done, slots_host_[serial_row_[(size_t)i].card], n_out));
+         * value the next build_step reads as its n_out. The rule is mtp_couple_bind_rounds
+         * (sched/mtp_couple_bind.h), where it is driven against a real commit without an Engine. */
+        const MtpCoupleBindPoint bp = mtp_couple_bind_point(plan, seq);
+        int n_bound = 0;
+        std::string why;
+        const int bs = mtp_couple_bind_rounds(
+            bp, couple_draw_stage_[(size_t)i], &couple_readback_[(size_t)i], (int)couple_rows_,
+            done, slots_host_[serial_row_[(size_t)i].card], meta_.n_vocab, couple_bound_,
+            &n_bound, &why);
+        if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
         for (auto& rk : ranks_) {
-            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, rc == RAD_OK ? done : 0);
+            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_,
+                                                      rc == RAD_OK ? n_bound : 0);
             if (st < 0 && st != RAD_E_NOTFOUND) return st;
         }
     }
     return RAD_OK;
+}
+
+/* One line, once, at the first coupled verify that completed on the device. What makes it
+ * evidence is where it reads: the sampler's staged rows AFTER collect_step's wait, so the op it
+ * names was built with bound rows and its batch returned -- an executed verify, not an enqueue, a
+ * LIVE flag or a terminal row bound for a request that will never sample again (those are skipped
+ * at bind, sched/mtp_couple_bind.h). Request numbers and the kernel name only: no tokens, no keys,
+ * no logits. */
+void Engine::couple_verify_evidence(int step) {
+    if (!mtp_couple_ || couple_evidence_) return;
+    Sampler& smp = ranks_[0]->sampler;
+    if (!smp.staged_any_couple()) return;
+    int64_t n = 0;
+    smp.staged_params(&n);
+    std::vector<uint64_t> seqs;
+    int64_t rows = 0;
+    for (int64_t r = 0; r < n; ++r) {
+        const RadMtpCoupleState& c = smp.staged_couple(r);
+        if (c.round <= 0) continue;
+        ++rows;
+        if (std::find(seqs.begin(), seqs.end(), c.draw.seq) == seqs.end())
+            seqs.push_back(c.draw.seq);
+    }
+    if (rows <= 0) return;
+    std::string ids;
+    for (size_t i = 0; i < seqs.size(); ++i)
+        ids += fmt("%s%llu", i ? "," : "", (unsigned long long)seqs[i]);
+    couple_evidence_ = true;
+    RAD_INFO("MTP coupled verify completed: step %d, %lld bound row(s) over request(s) [%s], "
+             "kernel %s", step, (long long)rows, ids.c_str(),
+             ranks_[0]->ctx.ip_kernel_name(smp.staged_couple_op()));
 }
 
 /* RADIANCE_MTP_COUPLED: the draw for every drafting row, before any serial pass reads it.
@@ -375,40 +413,6 @@ int Engine::stage_couple_draws(int n) {
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
-    }
-    return RAD_OK;
-}
-
-/* After commit: drafting row `row`'s rounds as rank 0's ops left them, checked against the draw
- * staged for that row and the card's own slot (written through RadBatch::seq_ids, independently of
- * the row index), then bound to the verify positions the next step samples.
- *
- * THE POSITION CONTRACT (rad_mtp_couple_verify_pos, abi/rad_spechub.h): the next build stages row k
- * at `n_out + k`, where `n_out` is the request's committed output length AT THAT BUILD. `n_out` is
- * therefore read from the request as it stands after this step's commit -- the same value the next
- * build will see -- and round rd lands at `n_out + (rd - 1)`. It is deliberately NOT rebuilt from
- * the draw's pre-commit `base` plus the slot's `n_acc`: the commit can emit fewer tokens than the
- * card accepted (a max_tokens or context cut, a carried step), and the two then disagree by
- * exactly the tokens that were not emitted.
- *
- * A STOCHASTIC ROW THAT DID NOT COME BACK SAMPLED, or whose x is not the card's draft, is a broken
- * path and refuses the step: a status-0 bypass or a misattached Q must never pass for coupling. */
-int Engine::bind_couple(int row, int done, const StepSlot& S, uint64_t n_out) {
-    const RadMtpCoupleDraw& d = couple_draw_stage_[row];
-    for (int rd = 1; rd <= done; ++rd) {
-        RadMtpCoupleState st = couple_readback_[(int64_t)(rd - 1) * couple_rows_ + row];
-        const bool sampled = d.mode == 1;
-        if (std::memcmp(&st.draw, &d, sizeof d) || st.round != rd || st.x != S.tok[rd] ||
-            st.status != (sampled ? 1 : 0) ||
-            (sampled && !rad_mtp_couple_state_valid(st, meta_.n_vocab))) {
-            RAD_ERR("MTP coupled: sequence %llu round %d returned status %d round %d x %d for card "
-                    "token %d (draw %s); refusing the step", (unsigned long long)d.seq, rd,
-                    st.status, st.round, st.x, S.tok[rd],
-                    std::memcmp(&st.draw, &d, sizeof d) ? "stale" : "current");
-            return RAD_E_STATE;
-        }
-        st.pos = rad_mtp_couple_verify_pos(n_out, rd);
-        couple_bound_[rd - 1] = st;
     }
     return RAD_OK;
 }

@@ -251,6 +251,9 @@ if(TARGET spechub)
     target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
   endif()
   add_dependencies(spechub_wiring_test spechub)
+  # sample_test's coupling case declares a Sampler with RADIANCE_MTP_COUPLED and needs the verify
+  # op the spechub plugin carries (its host row); it skips when the library is absent.
+  add_dependencies(sample_test spechub)
 endif()
 
 # ================================================================== whole models on the CPU

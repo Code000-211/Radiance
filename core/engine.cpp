@@ -717,6 +717,9 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* The step's sampler chain, verify op included, has returned: one line at the first
+         * coupled verify that actually completed. */
+        couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
             if (st < 0) return fail_loop(st);

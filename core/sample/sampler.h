@@ -205,6 +205,14 @@ public:
      * meaningful only where the row carries RAD_SP_MASK. */
     const uint32_t* staged_mask(int64_t row) const { return mask_stage_ + row * mask_words_; }
     int64_t         mask_words() const { return mask_words_; }
+    /* Staged row `row`'s bound coupled state, as `run` uploads it: all-zero where the row carries
+     * none (bonus row, greedy row, uncoupled step). Lets a build be checked without a device. */
+    const RadMtpCoupleState& staged_couple(int64_t row) const { return couple_stage_[row]; }
+    /* Whether any row of the last build carries a bound state, i.e. whether `run` issues the
+     * verify op at all. */
+    bool staged_any_couple() const { return any_couple_; }
+    /* The verify op the last build resolved, for naming its kernel in a log line. */
+    rad_op staged_couple_op() const { return op_couple_; }
 
 private:
     /* Whether the vocabulary is split, judged by this rank's logit width rather than the rank

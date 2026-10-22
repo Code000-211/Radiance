@@ -129,7 +129,11 @@ static inline RAD_SPECHUB_HD uint64_t rad_mtp_couple_verify_pos(uint64_t n_out, 
  * `n_out` take `c` as its coupled state? Same request and seed, the round this row's draft came
  * from, the position it samples, the very token it proposes, and a state the proposer could have
  * written. Anything else is a stale state from another step, and coupling against it would apply a
- * law this step never drew. Both the sampler's step build and Engine::bind_couple ask this. */
+ * law this step never drew.
+ *
+ * Asked by the sampler's step build, against the state the engine bound. The engine's own bind
+ * does not call it: it checks the readback against the card (draw, round, x, status) and writes
+ * the position with rad_mtp_couple_verify_pos, the formula here that both sides must agree on. */
 static inline RAD_SPECHUB_HD bool rad_mtp_couple_binds(const RadMtpCoupleState& c, uint64_t seq,
                                                        uint64_t seed, uint64_t n_out, int k,
                                                        int32_t draft_x, int64_t vocab) {

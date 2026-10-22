@@ -407,8 +407,13 @@ private:
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
     std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
     RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     int  stage_couple_draws(int n);
-    int  bind_couple(int row, int done, const StepSlot& S, uint64_t n_out);
+    /* One INFO line at the first coupled verify that completed on the device: the step, the
+     * requests whose rows actually carried a bound state, and the kernel the verify op resolved
+     * to. Read off the sampler's staged rows after collect_step's wait, so it reports an executed,
+     * finished verify -- not an enqueue and not a LIVE flag. */
+    void couple_verify_evidence(int step);
 
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
      * The nine phases sum to the whole step, including the readback, commit and drafter after the

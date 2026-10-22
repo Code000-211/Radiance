@@ -733,16 +733,17 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             if (couple_) {
                 couple_stage_[row] = RadMtpCoupleState{};
                 const auto sit = seqs_.find(r->id);
-                if (sit != seqs_.end() && !sp.greedy() && k + 1 < n_pos &&
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
                     k < sit->second.couple_n) {
                     const RadMtpCoupleState& c = sit->second.couple[k];
                     /* BIND TO THIS ROW: same request and seed, the round this row's draft came
                      * from, the position it samples, and the very token it proposes. Anything else
                      * is a stale state from another step, and coupling against it would apply a law
-                     * this step never drew. The rule is rad_mtp_couple_binds (abi/rad_spechub.h),
-                     * the same one Engine::bind_couple writes the position by. */
-                    if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k,
-                                             r->draft ? r->draft[k] : -1, cfg_.n_vocab)) {
+                     * this step never drew. The rule is rad_mtp_couple_binds (abi/rad_spechub.h);
+                     * its position term is rad_mtp_couple_verify_pos, the formula the engine binds
+                     * by (core/sched/mtp_couple_bind.h). */
+                    if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k, r->draft[k],
+                                             cfg_.n_vocab)) {
                         couple_stage_[row] = c;
                         any_couple_ = true;
                     }

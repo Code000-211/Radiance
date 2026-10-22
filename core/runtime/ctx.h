@@ -546,6 +546,9 @@ public:
     /* Backs rad_step_fail(): stops the step like an operand rejection, with the caller's
      * message. */
     int  step_fail(const char* what);
+    /* The device kernel `h` resolved to on this rank ("?" if it resolved none). For log
+     * attribution only. */
+    const char* ip_kernel_name(rad_op h) const;
 private:
     [[noreturn]] void fatal_issue(rad_op h, int64_t n, const char* why) const;
 
@@ -572,7 +575,6 @@ private:
      * byte-compares the two results, finding kernels that are not a function of their inputs,
      * which a host-vs-device comparison cannot detect. */
     void  oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd);
-    const char* ip_kernel_name(rad_op h) const;
     /* The reference library's host plan for (op, band): the band's own host plan when a reference
      * library won it, else one resolved from `registry_` on first use. Null when none exists. */
     const IssuePlan* oracle_reference(rad_op h, int band);
