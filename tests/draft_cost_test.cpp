@@ -4,9 +4,11 @@
  * What is checked is what the policy may rely on: a profile is refused by name when it is not
  * this format or not this deployment, an exact bucket is Measured, a missing shape is one
  * documented interpolation or a named conservative bound -- never a unitless prior labelled
- * milliseconds -- and only an attributable sample moves a measured bucket. The key is the whole
- * shape: both distributions, the pipeline depth and the loaded drafter, so the same round count
- * and the same row total with a different shrinking distribution are two buckets.
+ * milliseconds -- and only an attributable sample moves a measured bucket. The key is the verify
+ * shape -- the verify distribution, the pipeline depth and the loaded drafter -- paired with the
+ * draft distribution that actually ran, so the same round count and the same row total with a
+ * different shrinking distribution are two buckets, and a plan's original distribution never makes
+ * its own truncated run unreachable.
  */
 #include "rad_test.h"
 
@@ -230,6 +232,17 @@ DraftCostSample sample_of(const DraftVerifyShape& s, double ms,
         c.draft_round_rows[j] = s.draft_rows[j];
         c.draft_rows_total += s.draft_rows[j];
     }
+    return c;
+}
+
+/* A sample of `s` whose cycle stopped after `rounds` of the planned rounds and kept the full verify
+ * window: the pass verifies the planned window, only the drafting stopped. */
+DraftCostSample truncated(const DraftVerifyShape& s, int32_t rounds, double ms) {
+    DraftCostSample c = sample_of(s, ms);
+    c.rounds = rounds;
+    for (int j = rounds + 1; j <= s.draft_k; ++j) c.draft_round_rows[j] = 0;
+    c.draft_rows_total = 0;
+    for (int j = 0; j <= rounds; ++j) c.draft_rows_total += c.draft_round_rows[j];
     return c;
 }
 
@@ -666,12 +679,123 @@ TEST(a_short_execution_does_not_price_the_full_plan) {
     CHECK_EQ(t.observe(completed_cycle(p), stopped), RAD_OK);
     CHECK_EQ((int)t.buckets().size(), 1);
     CHECK_EQ(t.buckets()[0].rounds, 2);
+    CHECK_EQ(t.buckets()[0].shape.draft_k, 4);   /* the plan stays as provenance and upper bound */
 
     DraftCostEstimate e;
     CHECK_EQ(t.estimate(full, &e), RAD_OK);
     CHECK(e.valid);
     CHECK(e.source == DraftCostSource::ConservativeFallback);   /* a bound, not this run */
     CHECK_EQ(e.coverage, 0);
+    CHECK_EQ(e.ms, 22.5);   /* 18.0 x (1 + 25 %): the heuristic margin, not a measurement */
+
+    /* The other half of the finding: the run is not unreachable either. A query that plans the
+     * executed distribution -- the same verify window, two rounds of 8,8 -- is priced by its own
+     * measurement, not kept out by the plan the bucket was attributed against. */
+    const DraftVerifyShape short_plan = make_shape(0, 8, { 0, 8, 8, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
+    CHECK_EQ(t.estimate(short_plan, &e), RAD_OK);
+    CHECK(e.valid);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 18.0);
+    CHECK_EQ(e.coverage, 1);
+}
+
+TEST(a_truncated_or_shrinking_run_prices_the_query_that_plans_it) {
+    /* Q2-Q4 of the review. One planned K3 shape, two completed cycles: one stopped after two full
+     * rounds (31.0 ms), one ran all three rounds shrinking 8,5,2 (38.0 ms). Each is reachable by a
+     * query planning exactly what it ran, the plan's own deeper distribution is not, and the two
+     * are never averaged. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape full = make_shape(0, 8, { 0, 8, 8, 8 }, 0, -1, {}, 0);
+    const PlanFixture p = plan_for(full);
+
+    /* Q2: two of three rounds, both full. */
+    CHECK_EQ(t.observe(completed_cycle(p), truncated(full, 2, 31.0)), RAD_OK);
+
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(full, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::ConservativeFallback);   /* Q2's 38.75 */
+    CHECK_EQ(e.coverage, 0);
+    CHECK_EQ(e.ms, 31.0 * 1.25);   /* heuristic fallback over this very measurement */
+
+    /* Q3/Q4: the same shape, a third cycle that shrank 8,5,2 in three rounds. */
+    DraftCostSample shrinking = sample_of(full, 38.0);
+    shrinking.cycle_id = 2;
+    shrinking.draft_round_rows[2] = 5;
+    shrinking.draft_round_rows[3] = 2;
+    shrinking.draft_rows_total = 15;
+    const PlanFixture p2 = plan_for(full, 2);
+    CHECK_EQ(t.observe(completed_cycle(p2), shrinking), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 2);   /* two executions, neither folded into the other */
+
+    const DraftVerifyShape two_rounds = make_shape(0, 8, { 0, 8, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
+    const DraftVerifyShape shrunk = make_shape(0, 8, { 0, 8, 8, 8 }, 0, 3, { 0, 8, 5, 2 }, 0);
+    CHECK_EQ(t.estimate(two_rounds, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 31.0);
+    CHECK_EQ(t.estimate(shrunk, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 38.0);
+    CHECK_EQ(t.estimate(full, &e), RAD_OK);
+    CHECK(e.source != DraftCostSource::Measured);   /* nobody measured the full plan */
+}
+
+TEST(a_shorter_verify_window_is_not_sold_the_longer_runs_bracket) {
+    /* The limit of the executed-distribution key: the draft half is comparable, the verify half is
+     * not. A query that drafts the same two rounds but verifies only [0,8,8] -- one window fewer --
+     * pays less verify work, so the stored bracket is neither its measurement nor its bound. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape full = make_shape(0, 8, { 0, 8, 8, 8 }, 0, -1, {}, 0);
+    const PlanFixture p = plan_for(full);
+    CHECK_EQ(t.observe(completed_cycle(p), truncated(full, 2, 31.0)), RAD_OK);
+
+    DraftCostEstimate e;
+    const DraftVerifyShape cheap = make_shape(0, 8, { 0, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
+    CHECK_EQ(t.estimate(cheap, &e), RAD_OK);
+    CHECK(e.source != DraftCostSource::Measured);
+    CHECK_EQ(e.coverage, 0);
+    CHECK(e.ms >= 31.0);   /* the heuristic bound never prices under the measurement it scales */
+}
+
+TEST(a_truncation_no_query_can_express_is_kept_as_a_diagnostic) {
+    /* Drafts were planned and none ran: the bracket is a verify window plus an abandoned draft
+     * phase. A K0 query plans no draft work, so recording this as a measured K0 bucket would
+     * overprice it; the sample is kept flagged and prices nothing. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    const PlanFixture p3 = plan_for(k3);
+    CHECK_EQ(t.observe(completed_cycle(p3), truncated(k3, 0, 20.0)), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 1);
+    CHECK((t.buckets()[0].flags & kDraftBucketUnpriced) != 0);
+
+    DraftCostEstimate e;
+    const DraftVerifyShape k0 = make_shape(0, 8, { 0 }, 0, 0, {}, 0);
+    CHECK_EQ(t.estimate(k0, &e), RAD_OK);
+    CHECK(!e.valid);   /* a diagnostic is not a price, and it is not an anchor either */
+
+    /* A genuine K0 cycle (nothing planned, nothing drafted) is still measurable. */
+    const PlanFixture p0 = plan_for(k0, 2);
+    DraftCostSample idle = sample_of(k0, 12.0);
+    idle.cycle_id = 2;
+    CHECK_EQ(t.observe(completed_cycle(p0), idle), RAD_OK);
+    CHECK_EQ((int)t.buckets().size(), 2);
+    CHECK_EQ(t.estimate(k0, &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    CHECK_EQ(e.ms, 12.0);
+}
+
+TEST(a_plan_that_disowns_its_bracket_teaches_nothing) {
+    /* DraftPlan::timing_valid is the plan's own statement that total_ms brackets it. A sample of a
+     * plan that says it does not is no price for any shape the plan names. */
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    PlanFixture p = plan_for(k3);
+    p.plan.timing_valid = false;
+    CHECK_EQ(t.observe(completed_cycle(p), sample_of(k3, 40.0)), RAD_E_INVAL);
+    CHECK(t.buckets().empty());
 }
 
 TEST(an_incomplete_or_inconsistent_observation_is_refused) {
