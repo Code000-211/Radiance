@@ -934,6 +934,16 @@ decoders keep their cadence. A lone prefill is not held, nor is the step after a
 chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
 inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
+**Chunks overlap the gap between them.** A chunk is queued while the chunk before it still runs, and
+the stager uses that: at the first op past its last routed layer it gives back the ring places that
+read is behind and puts the next chunk's first three layers on the link, paced on this chunk's last
+layers as if the two were one pass, so those bytes cross while the card has the tail of the previous
+chunk to run (`core/place/stager.h`). `--no-prefill-overlap` leaves every chunk to stage its own
+first layers at its own first op, which is the control arm for measuring the overlap on a box with a
+card in it; it changes no numbers, only when the copies go out. What it does not cross is a step
+between two chunks that carries no prompt -- `--prefill-interleave`, or another sequence decoding --
+because that step runs at an arena level that lends the staging region to the expert slab.
+
 **A prefill alone in its step can carry several intervals** (`--prefill-span N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
 With
@@ -1569,6 +1579,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
+| `--no-prefill-overlap` | on | do not let the chunk before a prefill chunk stage its first experts; the control arm of the overlap (§4.5) |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |

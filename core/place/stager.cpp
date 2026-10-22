@@ -131,6 +131,7 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
         rebase_ = true;
     }
     first_op_ = true;
+    wrapped_ = false;
     next_ = 0;
     first_li_ = -1;
     for (int32_t& g : gate_li_) g = -1;
@@ -162,7 +163,8 @@ int PrefillStager::recycle_front() {
     Place& p = place_[i];
     if (p.free_rec) RAD_TRY(rad_event_wait(mover_->transfer_stream(), p.free));
     p.li = -1;
-    p.free_rec = p.read = p.retired = false;
+    p.free_rec = p.read = p.retired = p.early = false;
+    p.free_on = nullptr;
     ring_order_.pop_front();
     spare_.push_back(i);
     return RAD_OK;
@@ -216,9 +218,10 @@ int PrefillStager::take(int64_t want, bool partial, int32_t* out) {
 
 /* Stage one layer into the ring, behind `gate` when not null. The layer the run reaches next
  * (`now`) takes whatever room there is up to its need; any other goes only whole and within half
- * the ring, so the next layer always has at least half the ring. *got is kStaged, kNone when
- * nothing of the layer is pooled, or kLater when the ring has no room yet. */
-int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
+ * the ring, so the next layer always has at least half the ring. `early` is a layer staged for the
+ * next trunk pass, which end_pass leaves published. *got is kStaged, kNone when nothing of the
+ * layer is pooled, or kLater when the ring has no room yet. */
+int PrefillStager::stage_layer(int32_t li, bool now, bool early, RadEvent gate, int* got) {
     *got = kLater;
     const Layer& L = layers_[(size_t)li];
     int64_t unit = 0;
@@ -233,6 +236,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     if (i < 0) return RAD_OK;
     Place& p = place_[i];
     p.li = li;
+    p.early = early;
     if (gate) RAD_TRY(rad_event_wait(mover_->transfer_stream(), gate));
     /* A wrapping place continues at the region's start. */
     const int64_t off = p.beg % ring_, len = p.end - p.beg;
@@ -241,6 +245,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     RAD_TRY(mover_->stage_units(L.units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
     if (p.staged.empty()) {
         p.li = -1;
+        p.early = false;
         spare_.push_back(i);
         *got = kNone;
         return RAD_OK;
@@ -263,7 +268,7 @@ int PrefillStager::stage_ahead(int32_t cur, bool* resync) {
             gate = gate_[g % kGates];
         }
         int got = kLater;
-        RAD_TRY(stage_layer(next_, next_ <= cur + 1, gate, &got));
+        RAD_TRY(stage_layer(next_, next_ <= cur + 1, /*early=*/false, gate, &got));
         if (got == kLater) break;
         *resync = *resync || got == kStaged;
         ++next_;
@@ -293,6 +298,12 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
             RAD_TRY(stage_ahead(first_li_ - 1, resync));
         }
     }
+
+    /* The first op past this pass's last routed layer is the earliest point that proves the chunk
+     * has read everything the ring holds, so the next chunk's first layers go out here rather than
+     * at the pass's end (stager.h). */
+    if (next_prefill_ && !wrapped_ && (int32_t)h > layers_.back().last_op)
+        RAD_TRY(wrap_early(s, resync));
 
     if ((size_t)h >= first_of_.size()) return RAD_OK;
     const int32_t li = first_of_[(size_t)h];
@@ -333,36 +344,68 @@ int PrefillStager::after_op(rad_op h, RadStream s) {
         RAD_TRY(rad_event_record(p.free, s));
         p.free_rec = true;
         p.read = true;
+        p.free_on = s;
     }
     return RAD_OK;
 }
 
-/* Retire everything this pass staged. Then, when the next step continues a prompt, stage its
- * trunk pass's first layers, layer k paced on this pass's layer n - kLead + k, as if the two
- * passes were one. */
+/* The wrap (see stager.h). The op about to be issued is, by stream order, behind every op issued on
+ * this stream before it, so a place whose last read was recorded here is behind that read: give it
+ * back now, so a copy that laps it waits on the read and not on the end of the pass, and so the
+ * next chunk's bytes start crossing while this pass still has its tail to run. A place last read on
+ * another lane stays published: only the join before end_pass says what is behind it. */
+int PrefillStager::wrap_early(RadStream s, bool* resync) {
+    wrapped_ = true;
+    for (int32_t i : ring_order_) {
+        Place& p = place_[i];
+        if (p.retired || !p.read || p.early || p.free_on != s) continue;
+        retire(p);
+        *resync = true;
+    }
+    return stage_early(resync);
+}
+
+/* The next trunk pass's first layers, layers [n_early_, kLead), paced on this pass's layer
+ * n - kLead + k as if the two passes were one. Stops at the first layer whose pace layer the run
+ * never reached or whose room the ring has not freed yet; end_pass calls this again after it has
+ * retired the pass. A layer with nothing pooled counts as settled either way: the next pass has
+ * nothing of it to wait for. */
+int PrefillStager::stage_early(bool* resync) {
+    const int32_t n = (int32_t)layers_.size();
+    while (n_early_ < kLead && n_early_ < n) {
+        const int32_t g = n - kLead + n_early_;
+        if (g < first_li_ || gate_li_[g % kGates] != g) break;
+        int got = kLater;
+        RAD_TRY(stage_layer(n_early_, /*now=*/false, /*early=*/true, gate_[g % kGates], &got));
+        if (got == kLater) break;
+        if (got == kStaged && resync) *resync = true;
+        ++n_early_;
+    }
+    return RAD_OK;
+}
+
+/* Retire everything this pass staged, except what it staged ahead for the next one. Then finish
+ * the wrap: whatever its pacing or the ring's room left short goes out here, now that the places
+ * are back.
+ *
+ * The `free` of a place already read is recorded again, behind the pass's last op. That is later
+ * than the read it stands for, and the wrap is what avoids paying for it; here it is the point,
+ * because this stream is behind the lane join, so a place whose last reader ran on the other lane
+ * is behind everything this records over. */
 int PrefillStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
     int rc = RAD_OK;
     for (int32_t i : ring_order_) {
         Place& p = place_[i];
-        if (p.retired) continue;
+        if (p.retired || p.early) continue;
         const int r = rad_event_record(p.free, s);
         if (r < 0 && rc >= 0) rc = r;
         p.free_rec = r >= 0 || p.free_rec;
         retire(p);
     }
     if (rc < 0 || !next_prefill_) return rc;
-    const int32_t n = (int32_t)layers_.size();
-    for (int32_t k = 0; k < kLead && k < n; ++k) {
-        const int32_t g = n - kLead + k;
-        if (g < first_li_ || gate_li_[g % kGates] != g) break;
-        int got = kLater;
-        RAD_TRY(stage_layer(k, /*now=*/false, gate_[g % kGates], &got));
-        if (got == kLater) break;
-        n_early_ = k + 1;
-    }
-    return RAD_OK;
+    return stage_early(nullptr);
 }
 
 /* ================================================================== the file stager */

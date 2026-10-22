@@ -46,8 +46,9 @@
  *   a layer's first op      wait on its copies; publish the host addresses of earlier layers
  *                           again; stage further layers into the freed room
  *   a layer's last op       record "free" behind it on the op's stream
- *   the pass's end          the same for anything still staged; and, when the next step continues
- *                           a prompt, stage the first layers of its trunk pass
+ *   the first op past the   give back the places that read is behind, and stage the first layers
+ *   last routed layer       of the next trunk pass (the wrap, below)
+ *   the pass's end          the same for anything still staged, and the wrap's leftovers
  *
  * A layer's place in the ring is counted in bytes handed out since bring-up, so a copy finds the
  * places it overwrites from the count alone. Before a copy is issued, the mover's stream waits on
@@ -64,15 +65,36 @@
  * cost a 26K-token prompt 0.6% and one layer ahead cost a 160K-token prompt 2.4% (its heavy late
  * layers waited); three ahead covered the late layers at the least cost to short prompts.
  *
- * ---- the next step's first layers --------------------------------------------------------------
+ * ---- the next chunk's first layers -------------------------------------------------------------
  *
- * A step carrying a prompt chunk is issued only after the previous step is read back, so its first
- * layer would otherwise wait for all its own copies. When the next step continues a prompt
- * (set_next_prefill), this pass's end stages the next trunk pass's first layers, paced on this
- * pass's last layers as if the passes were one, and publishes them at once. The next trunk pass
- * adopts them when armed; an unarmed trunk pass publishes their host addresses again in
- * begin_pass, which the run phase calls before updating the weight tables. A draft pass in
- * between reads none of the trunk's layers and leaves them.
+ * A chunk is issued while the chunk before it is still queued, so its first layer would otherwise
+ * wait for all its own copies with the link idle. When the next step continues a prompt
+ * (set_next_prefill), this pass stages the next trunk pass's first layers, paced on this pass's
+ * last layers as if the passes were one, and publishes them at once. The next trunk pass adopts
+ * them when armed; an unarmed trunk pass publishes their host addresses again in begin_pass, which
+ * the run phase calls before updating the weight tables. A draft pass in between reads none of the
+ * trunk's layers and leaves them.
+ *
+ * Where the pass issues an op past its last routed layer -- a prompt's tail has the gather and the
+ * head, and every trunk pass of a hybrid model ends at the mixer's state read -- the wrap goes out
+ * there rather than at the pass's end (wrap_early), which gives back the places that read is
+ * behind. Two things follow: a copy that laps one of those places waits on the read that finished
+ * it, not on the end of the pass, and the copies are in flight while the pass still has its tail
+ * to run. The point has to be an op and cannot be after_op of the last routed layer's last one:
+ * a step longer than the MoE block's row pass issues that op again, and only the next op says the
+ * repeats are over. Staged there on a gate a later repeat moves, the copies would land in the
+ * middle of this chunk, where the file header's pacing says they cost the layers they overlap; and
+ * a place could only be given back once its last reader was provably behind, which after_op of an
+ * op that may repeat cannot say. A place whose read was recorded on another lane is left for
+ * end_pass, whose stream is behind the join. With no op past the last routed layer, or with a
+ * place that lane has still to give back, end_pass stages the same layers, and finishes whatever
+ * the wrap's pacing or the ring's room left short.
+ *
+ * What the wrap does not cross is a decode step between two chunks, whether --prefill-interleave
+ * or another sequence's step: set_next_prefill is false for the chunk before it, and the decode
+ * pass runs at a level that lends the ring's place to the slab, so it would withdraw what the
+ * chunk staged ahead. Overlap across such a step wants the region held through the small step,
+ * not the copies moved earlier; that is the half of the overlap still missing (issue #7).
  *
  * ---- trunk only --------------------------------------------------------------------------------
  *
@@ -152,12 +174,16 @@ private:
         RadEvent done = nullptr;               /* behind its copies, on the mover stream */
         RadEvent free = nullptr;               /* behind its last reader */
         bool     free_rec = false;
+        /* The stream `free` was last recorded on. A place goes back early only to a wrap issued on
+         * that stream, where the op being issued now is behind that read (stager.h). */
+        RadStream free_on = nullptr;
         /* Its last op has been issued at least once and `free` is recorded behind it. A step
          * longer than the MoE block's pass of rows issues a layer's ops once per pass, so the last
          * op can repeat: each repeat moves `free` behind itself, and the copies are published away
          * only at the next layer's first op. */
         bool     read = false;
         bool     retired = false;              /* its units are published at their pool slots */
+        bool     early = false;                /* staged for the next trunk pass, not this one */
         std::vector<int32_t> staged;
     };
     /* More places than a two-share ring can hold at the smallest per-layer share; a full table
@@ -194,13 +220,21 @@ private:
     bool     staged_ = false;
     bool     next_prefill_ = false;
     bool     first_op_ = false;        /* the pass has issued nothing yet */
+    bool     wrapped_ = false;         /* this pass has tried the wrap at its last layer (stager.h) */
     int32_t  next_ = 0;                /* the next layer to stage this pass */
-    /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
+    /* The next trunk pass's first layers, staged ahead of it: layers [0, n_early_). */
     int32_t  n_early_ = 0;
 
     enum { kStaged, kNone, kLater };
     int  stage_ahead(int32_t cur, bool* resync);
-    int  stage_layer(int32_t li, bool now, RadEvent gate, int* got);
+    int  stage_layer(int32_t li, bool now, bool early, RadEvent gate, int* got);
+    /* The next trunk pass's first layers, layers [n_early_, lead()), paced on this pass's last
+     * layers as if the two passes were one (stager.h). `resync` reports a table change to the run
+     * phase, and is null from end_pass, which has no op left to resolve. */
+    int  stage_early(bool* resync);
+    /* The wrap: the op about to be issued is past every read of a staged layer, so give back the
+     * places this stream's read is behind and stage the next pass's first layers. */
+    int  wrap_early(RadStream s, bool* resync);
     void withdraw_early();
     int  take(int64_t want, bool partial, int32_t* out);
     int  recycle_front();
