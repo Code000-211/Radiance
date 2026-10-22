@@ -83,8 +83,8 @@ set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core
 # radiance binary, which never links this archive) and by the ten tests in RAD_TESTS_WITH_ENGINE --
 # engine_step_test.cpp, engine_loop_test.cpp, engine_loop_move_test.cpp, engine_history_test.cpp,
 # engine_profile_test.cpp, engine_cost_drift_test.cpp, engine_couple_short_row_test.cpp,
-# engine_start_fill_test.cpp, engine_dtor_order_test.cpp and engine_reference_test.cpp, each of
-# them directly (the move, profile, cost-drift, coupled-short-row, start-fill, dtor-order and
+# engine_start_fill_test.cpp, engine_dtor_order_test.cpp and engine_reference_basis_test.cpp, each
+# of them directly (the move, profile, cost-drift, coupled-short-row, start-fill, dtor-order and
 # reference tests include engine_test_peer.h as well). All ten are compiled with the macro. A
 # unit that starts including
 # engine.h must join this list, or one program would hold both definitions. Re-check with
@@ -117,7 +117,7 @@ endif()
 set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_loop_move_test
                             engine_history_test engine_profile_test engine_cost_drift_test
                             engine_couple_short_row_test engine_start_fill_test
-                            engine_dtor_order_test engine_reference_test)
+                            engine_dtor_order_test engine_reference_basis_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
