@@ -8,26 +8,35 @@
  *     state is what the run leaves on its ranks, and the export's own guard
  *     (Engine::export_draft_cost_profile) is the engine's enforceable proof: a run that lent
  *     anything -- KV or arena -- must not write a file that claims a no-loan basis.
- *  2. A serving run keeps its loan dynamic and still matches the reference. Both identities are
- *     derived by Engine::draft_cost_runtime, not written by hand here: the calibration's has
- *     basis=NoLoan, no live_loan, while the serving run's names a non-zero loan. The reference
- *     file loads on it, stays active and is flagged reference(); a changed arena-level identity or
- *     a changed plan still refuses it, because a real placement change is not a loan move.
+ *  2. A serving run keeps its loan dynamic and still admits the reference. The serving run's
+ *     identity is derived by Engine::draft_cost_runtime from the loan it actually took, so it
+ *     names a non-zero loan while the reference file has none. That file loads, stays active and
+ *     is flagged reference(); a changed arena-level identity or a changed plan still refuses it,
+ *     because a real placement change is not a loan move.
  *  3. A live profile keeps the strict treatment: the same file, loaded against a run whose loan
  *     differs, is inactive and names live_loan. The reference's exemption is the reference's.
+ *
+ * ADMISSION TEST, NOT A PROOF OF REAL DYNAMIC LOANS. The runtime fingerprint is derived by the
+ * engine, but the profile *file* is hand-built from it (admission_profile_file below) and the
+ * lending deployment is a fixture. What these cases prove is that a reference file is admitted
+ * exactly when its identity matches a run that lends -- not that a real serving run, with its own
+ * model, plan and card, borrows, returns and is then matched against its reference.
  *
  * The deployment around the ranks is a fixture (tests/engine_start_fill_test.cpp's shape: a
  * fixture program, the Planner's real plan, a real Mover and a real loan), so no model, plugin or
  * card is involved. Not covered, and not to be read as covered:
- *   - the in-start() part of "both lenders off": `Engine::start` skips `lend_from` for
- *     kLendKV/kLendArena under --draft-reference (core/engine_bringup.cpp), and reaching that
- *     needs a started engine. What is proven here is the contract around it (a reference run must
- *     be a calibration, and an export refuses a run that lent) with a real Mover and real loans.
+ *   - the actual lender proof: the in-start() part of "both lenders off" -- `Engine::start` skips
+ *     `lend_from` for kLendKV/kLendArena under --draft-reference (core/engine_bringup.cpp) --
+ *     needs a started engine with a real KV pool. What is proven here is the contract around it
+ *     (a reference run must be a calibration, and an export refuses a run that lent) with a real
+ *     Mover and real loans.
  *   - the arena-level identity against two non-empty level sets: arena_rows_ is built in start(),
  *     and this fixture has no start. The field is compared (a changed arena refuses, below); the
  *     rows themselves need a started deployment.
- *   - immutability and Measured-only after load (tests/draft_cost_test.cpp owns the table), and
- *     the depth-coverage rule R (tests/sched_draft_test.cpp).
+ *   - the table's own rules: immutability, Measured-only lookup, the depth-coverage rule R and
+ *     live learning on the same bucket are tests/draft_reference_test.cpp's (with
+ *     tests/draft_cost_test.cpp and tests/sched_draft_test.cpp). This file owns the engine-side
+ *     admission only.
  */
 #include "rad_test.h"
 
@@ -218,10 +227,12 @@ const char* kBucket = R"({
   "flags": ["ahead"]
 })";
 
-/* The file a calibration of `rt` writes, with the fields this case overrides. `arena`/`placement`
- * are the reader's view of a different deployment: the fingerprint above is derived, so a changed
- * one stands for a plan or level set this run does not have. */
-std::string profile_file(const DraftCostRuntime& rt, const std::string& leaf,
+/* An admission file: the profile a calibration of `rt` *would* write, laid out in the reader's
+ * shape and pointed at the runtime identity `rt` derived. Building it here rather than writing it
+ * from a calibration is what makes every case below an admission test -- the bytes are the test's,
+ * only the identity is the engine's. `arena`/`placement` are the reader's view of a different
+ * deployment: a changed one stands for a plan or level set this run does not have. */
+std::string admission_profile_file(const DraftCostRuntime& rt, const std::string& leaf,
                          const std::string& arena = std::string(),
                          const std::string& placement = std::string()) {
     nlohmann::json fp;
@@ -383,13 +394,14 @@ TEST(a_reference_export_refuses_a_run_that_lent) {
     }
 }
 
-/* Serving keeps its loan dynamic and the reference still matches. Both identities come from
- * Engine::draft_cost_runtime: the calibration derived its own with no lender registered, the
- * serving run derives its own from the loan it took at start. They differ in exactly the fields
- * the reference rule ignores (basis, live_loan) and agree on the ones it compares -- so the file
- * loads, is admitted and is flagged as a reference. What the rule does not ignore still refuses:
- * a changed arena-level identity and a changed plan are placement changes, not loan moves. */
-TEST(a_reference_identity_loads_on_a_serving_run_that_lends) {
+/* Serving keeps its loan dynamic and the reference is still admitted. This is the admission case,
+ * not a dynamic-loan proof: the run takes and holds a real loan, its identity is what the engine
+ * derived from it, and the reference file is the hand-built one. The two identities differ in
+ * exactly the fields the reference rule ignores (basis, live_loan) and agree on the ones it
+ * compares -- so the file loads, is admitted and is flagged as a reference. What the rule does not
+ * ignore still refuses: a changed arena-level identity and a changed plan are placement changes,
+ * not loan moves. */
+TEST(an_admission_reference_loads_on_a_serving_run_that_lends) {
     Rig cal(24, 8, 2);
     Config cal_cfg = cal.cfg;
     cal_cfg.draft_reference = true;
@@ -402,7 +414,7 @@ TEST(a_reference_identity_loads_on_a_serving_run_that_lends) {
     REQUIRE(ref_rt.fingerprint.basis == DraftCostBasis::NoLoan);
     REQUIRE(ref_rt.fingerprint.live_loan.empty());
 
-    const std::string path = profile_file(ref_rt, "engine_reference_serving.json");
+    const std::string path = admission_profile_file(ref_rt, "engine_reference_serving.json");
 
     Rig srv(24, 8, 2);
     Config srv_cfg = srv.cfg;
@@ -447,9 +459,10 @@ TEST(a_reference_identity_loads_on_a_serving_run_that_lends) {
 
 /* A live profile keeps the strict match it had before the reference existed: the loan a live run
  * took is part of its identity, and a file measured under another loan does not price this one.
- * Only the reference's basis is exempt from the loan comparison; here the same file on the same
- * plan, with a different loan, is refused by name and the table stays inactive. */
-TEST(a_live_profile_keeps_the_strict_loan_match) {
+ * Only the reference's basis is exempt from the loan comparison; here the same hand-built
+ * admission file on the same plan, with a different loan, is refused by name and the table stays
+ * inactive. */
+TEST(an_admission_live_profile_keeps_the_strict_loan_match) {
     Rig cal(24, 8, 2);
     Engine ce(cal.cfg);
     EngineTestPeer::drafter(ce, serial_head(6));
@@ -466,7 +479,7 @@ TEST(a_live_profile_keeps_the_strict_loan_match) {
     REQUIRE(live_rt.fingerprint.basis == DraftCostBasis::Live);
     REQUIRE(!live_rt.fingerprint.live_loan.empty());
 
-    const std::string path = profile_file(live_rt, "engine_live_profile_strict.json");
+    const std::string path = admission_profile_file(live_rt, "engine_live_profile_strict.json");
 
     Rig srv(24, 8, 2);
     Config srv_cfg = srv.cfg;
