@@ -184,11 +184,14 @@ bool bucket_usable(const DraftCostBucket& b) {
 uint16_t bucket_class(uint16_t flags) { return (uint16_t)(flags & kDisturbing); }
 
 /* The conservative fallback may only borrow from an anchor of the same context class, sampling,
- * replay, loaded drafter and pipeline depth: a bound scaled across a different drafter process or
- * another overlap structure would be a bound on another measurement. */
+ * replay, loaded drafter and pipeline depth -- and, since no measured scaling exists for them, of
+ * the same history and prefill work. A bound scaled across a different drafter process, another
+ * overlap structure or another amount of history/prefill is a bound on another measurement. The
+ * verify window is the one dimension left, and its scaling is explicitly heuristic (estimate()). */
 bool anchor_class_matches(const DraftVerifyShape& a, const DraftVerifyShape& b) {
     return a.ctx_class == b.ctx_class && a.sampling == b.sampling && a.replay == b.replay &&
-           a.drafter == b.drafter && a.pipeline_depth == b.pipeline_depth;
+           a.drafter == b.drafter && a.pipeline_depth == b.pipeline_depth &&
+           a.history_tokens == b.history_tokens && a.prefill_tokens == b.prefill_tokens;
 }
 
 bool finite(double x) { return std::isfinite(x); }
@@ -551,11 +554,13 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 3. No bucket at all for this shape: a heuristic bound scaled from the nearest measured anchor
-     * of the same class *and the same executed draft distribution*. The ratio scales verify work
-     * only; it is never allowed to stand in for draft work, because the draft part is not linear in
-     * the verify window and a scaling factor for it would be a slope A has not measured. A query
-     * that plans more draft rounds than any bucket ran therefore gets no number at all -- the
-     * caller's named baseline -- instead of pricing the deeper plan at a shallower run's cost,
+     * of the same class -- which includes history and prefill work, since no measured scaling
+     * exists for them and a borrowed bound across a different amount of either would be a bound on
+     * another measurement -- and the same executed draft distribution. The ratio scales verify
+     * work only; it is never allowed to stand in for draft work, because the draft part is not
+     * linear in the verify window and a scaling factor for it would be a slope A has not measured.
+     * A query that plans more draft rounds than any bucket ran therefore gets no number at all --
+     * the caller's named baseline -- instead of pricing the deeper plan at a shallower run's cost,
      * which is what made the deepest tier win for free. The ratio is never below 1, so the bound
      * never prices a shape under a measured one, and the margin is reported as uncertainty rather
      * than hidden -- it is a rule of thumb, not a proven upper bound. */

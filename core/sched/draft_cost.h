@@ -34,13 +34,15 @@
  *
  * Units are milliseconds or nothing. A shape with no bucket is priced by one documented
  * interpolation step (the neighbouring context class) or by a heuristic fallback: a measured
- * anchor that ran the same executed draft distribution, scaled by the verify-token ratio plus a
- * fixed margin. The fallback scales verify work only -- it never prices draft work it has not
- * measured, so a query planning more draft rounds than any bucket ran gets no number and the
- * caller's named baseline instead of a shallower run's cost. That margin is a rule of thumb for
- * preferring a bound over nothing, not a proven upper bound, and the estimate carries it
- * as uncertainty. With no anchor at all the estimate is invalid and the caller uses its named fixed
- * baseline. A unitless prior is never reported as milliseconds.
+ * anchor that ran the same executed draft distribution and the same history and prefill work,
+ * scaled by the verify-token ratio plus a fixed margin. History and prefill are part of the class
+ * because no measured scaling exists for them -- borrowing across a different amount of either
+ * would be a bound on another measurement. The fallback scales verify work only -- it never prices
+ * draft work it has not measured, so a query planning more draft rounds than any bucket ran gets no
+ * number and the caller's named baseline instead of a shallower run's cost. That margin is a rule
+ * of thumb for preferring a bound over nothing, not a proven upper bound, and the estimate carries
+ * it as uncertainty. With no anchor at all the estimate is invalid and the caller uses its named
+ * fixed baseline. A unitless prior is never reported as milliseconds.
  *
  * Only a sample draft_sample_attributable() accepts updates a measured bucket, and only when its
  * identity is known: a sample whose cycle_id or policy_version is 0 (unattributed) is refused, and
@@ -183,9 +185,10 @@ public:
      * `draft_k`/`draft_rows[]` is the distribution it plans to execute, and only a bucket measured
      * at exactly that distribution prices it. A query that plans more than was ever measured gets
      * no measurement, however close the bucket's plan was; so does one with no anchor that ran its
-     * own distribution. Measured from an exact bucket, Interpolated from the neighbouring context
-     * class, or a heuristic fallback scaled from the nearest anchor that ran the same distribution.
-     * valid = false when there is no such anchor at all. Allocation-free. */
+     * own distribution with the same history and prefill. Measured from an exact bucket,
+     * Interpolated from the neighbouring context class, or a heuristic fallback scaled from the
+     * nearest anchor that ran the same distribution, history and prefill. valid = false when there
+     * is no such anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
     /* Learns from one completed cycle. Refuses an incomplete observation, one that does not

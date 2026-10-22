@@ -433,14 +433,18 @@ TEST(a_missing_bucket_is_one_interpolation_or_a_named_bound) {
     CHECK(!e.valid);
     CHECK_EQ(e.ms, 0.0);
 
-    /* A bound is still available where only the verify side differs: same executed distribution,
-     * more history in the key. The ratio is 1 and the margin is the whole bound. */
+    /* More history than the anchor ran is not an anchor: no measured ratio covers history work, so
+     * there is no number to borrow -- the named baseline. */
     CHECK_EQ(t.estimate(query(0, 8, 3, { 0, 8, 8, 8 }, 512), &e), RAD_OK);
-    CHECK(e.valid);
-    CHECK(e.source == DraftCostSource::ConservativeFallback);
-    CHECK_EQ(e.coverage, 0);
-    CHECK_EQ(e.ms, 43.0 * 1.25);
-    CHECK(std::fabs(e.unc_ms - std::sqrt(0.6 * 0.6 + 10.75 * 10.75)) < 1e-9);
+    CHECK(!e.valid);
+    CHECK_EQ(e.ms, 0.0);
+
+    /* The same for prefill work sharing the step. */
+    DraftVerifyShape prefill = query(0, 8, 3, { 0, 8, 8, 8 });
+    prefill.prefill_tokens = 1;
+    CHECK_EQ(t.estimate(prefill, &e), RAD_OK);
+    CHECK(!e.valid);
+    CHECK_EQ(e.ms, 0.0);
 
     /* Two classes away with nothing measured between: no anchor, no number. */
     CHECK_EQ(t.estimate(query(3, 8, 3, { 0, 8, 8, 8 }), &e), RAD_OK);
@@ -662,11 +666,17 @@ TEST(an_ahead_bucket_is_found_again_as_measured_through_its_plan) {
     CHECK_EQ(e.ms, 40.0);
     CHECK_EQ(e.coverage, 1);
 
-    /* The k6 verify window is another shape key and must not be priced by the k3 sample. */
+    /* The k6 verify window is another shape key and must not be priced by the k3 sample. It is
+     * priced as the documented heuristic instead: the same executed distribution and the same
+     * history/prefill, scaled by the verify-token ratio 56/24 plus the named margin -- the one
+     * dimension the bound may scale, and a rule of thumb, not a measurement. */
     const DraftVerifyShape k6 = make_shape(0, 8, { 0, 8, 8, 8, 8, 8, 8 }, 0, 6,
                                            { 0, 8, 8, 8, 8, 8, 8 }, 6);
     CHECK_EQ(t.estimate(k6, &e), RAD_OK);
-    CHECK(e.source != DraftCostSource::Measured);
+    CHECK(e.source == DraftCostSource::ConservativeFallback);
+    CHECK_EQ(e.coverage, 0);
+    CHECK(std::fabs(e.ms - 40.0 * (56.0 / 24.0) * 1.25) < 1e-9);
+    CHECK(std::fabs(e.unc_ms - 40.0 * (56.0 / 24.0) * 0.25) < 1e-9);
 }
 
 TEST(a_short_execution_is_not_the_price_of_a_short_plan) {
