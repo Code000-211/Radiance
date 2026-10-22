@@ -758,6 +758,11 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    /* --no-prefill-overlap: leave each prefill chunk to stage its own first layers at its own first
+     * op, instead of the chunk before it staging them across the gap. The mechanism is the stager's
+     * wrap (core/place/stager.h); off is the control arm of the paired A/B issue #7 asks for, with
+     * the chunk size as the only other difference between the runs. */
+    bool    prefill_overlap = true;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the

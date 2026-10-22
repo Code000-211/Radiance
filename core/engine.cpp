@@ -1168,10 +1168,12 @@ int Engine::arena_step(const RadBatch* b) {
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
-    /* Whether the next step continues a prompt, so the stager stages its first layers at this
-     * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
-     * hold). */
-    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    /* Whether the next step continues a prompt, so the stager stages its first layers across the
+     * gap between them. Never for a step issued ahead (a decode step whose plan the scheduler does
+     * not hold), and never with --no-prefill-overlap, which is the control arm of the A/B for the
+     * wrap (core/place/stager.h). */
+    const bool more = cfg_.prefill_overlap && b->phase != RAD_PHASE_DECODE &&
+                      sched_.prefill_continues();
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
