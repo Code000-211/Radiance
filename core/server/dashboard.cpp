@@ -368,9 +368,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
         /* The activation arena's levels and the one chosen for the last prepared batch (see
          * LiveSnapshot): `level_rows` is that level's capacity, not the batch's token count. A
-         * reader polling during a request can see which level is in force; before the first step
-         * `level_rows` is 0. Omitted when nothing is lent, for any of the reasons the field's
-         * comment lists. */
+         * reader polling during a request can see which level is in force; before the first
+         * batch `level_rows` is 0 -- nothing prepared yet -- and `level` is then the nominal 0 of
+         * an empty choice, not a level the engine picked. Omitted when nothing is lent, for any of
+         * the reasons the field's comment lists. */
         if (!s.arena_levels.empty()) {
             json a;
             a["level"]      = s.arena_level;

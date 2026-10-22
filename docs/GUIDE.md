@@ -734,7 +734,8 @@ weights; the first larger step takes it back before it runs (an address change, 
 prints what each size lends (`activation arena: lends ...`), and `/stats` reports the whole set
 (`arena.levels`) with the level chosen for the last prepared batch (`arena.level`, and
 `arena.level_rows` for that level's capacity -- the step size it serves, not the batch's token
-count). A plugin opts in with `RadArchProbe::shape_probe_ok`; one that does not keeps its whole
+count; 0 until the first batch is prepared, with `arena.level` then a nominal 0 and not a choice).
+A plugin opts in with `RadArchProbe::shape_probe_ok`; one that does not keeps its whole
 arena.
 
 Related flags:

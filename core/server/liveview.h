@@ -148,7 +148,9 @@ struct LiveSnapshot {
     /* The activation arena's levels (Engine::arena_rows_), largest step first, and the one the
      * engine chose for the last batch it prepared: `arena_level` is its index into `arena_levels`
      * and `arena_level_rows` the step size that level serves. That is a capacity, not the batch's
-     * token count, and not a step known to have finished on a card.
+     * token count, and not a step known to have finished on a card. 0 rows mean no batch has been
+     * prepared yet; `arena_level` is then the initial 0, a nominal index and not a choice, and the
+     * two say nothing about each other.
      *
      * The list is empty when nothing is lent, for four different reasons, each with its own
      * startup line: the plugin answers no sizing declare ("activation arena: not lent -- ..."),

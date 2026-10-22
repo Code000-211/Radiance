@@ -2921,6 +2921,18 @@ TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
     CHECK(run_log.find("is not used for this deployment") == std::string::npos);
     CHECK(run_log.find("while steps are at most 256 tokens") != std::string::npos);
 
+    /* Before any request: no batch has been prepared, so the snapshot publishes 0 rows -- "nothing
+     * prepared yet" -- and index 0. That index is the nominal 0 of an empty choice, not a level
+     * the engine picked, and the rows/index pairing asserted after the completion does not apply
+     * here. */
+    const json fresh = stats(run.port);
+    REQUIRE(fresh.is_object() && fresh.contains("arena"));
+    if (fresh["arena"].value("level_rows", -1.0) != 0.0 ||
+        fresh["arena"].value("level", -1) != 0)
+        fprintf(stderr, "    the idle engine published %s\n", fresh["arena"].dump().c_str());
+    CHECK_EQ(fresh["arena"].value("level_rows", -1.0), 0.0);
+    CHECK_EQ(fresh["arena"].value("level", -1), 0);
+
     /* A real completion, so the levels are exercised and not only bound: the prompt and every
      * decode step of it are far under 256 tokens, so the engine chooses the 256-row level for
      * every batch of it and may lend the arena above that level to the slab. /stats publishes

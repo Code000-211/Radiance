@@ -597,7 +597,8 @@ private:
      * for the /stats snapshot: not that batch's token count, and not a step known to have
      * finished on the card -- it is stored before the level is bound and the batch issued. The
      * step thread stores it, the HTTP thread reads it once; relaxed, since it carries a number
-     * and no other state depends on it. 0 before the first step. */
+     * and no other state depends on it. 0 until a batch has been prepared, so a snapshot taken
+     * before the first step reports no prepared batch instead of a level. */
     std::atomic<int64_t> arena_last_{0};
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
