@@ -144,9 +144,12 @@ prediction and sample.
   checked was committed), and `raw_match <= verified` always -- the paired verify window, not this
   plan's `generated`: a plan issued ahead drafts and verifies different windows, and `raw_match` is
   `accept_greedy`'s uncensored count taken before the end-of-generation cut, so the cut must not
-  shrink it. `Stopped` carries no label at `accepted`, and the censor decides where commitment
-  stopped -- `DraftController::observe` takes the committed count from the card -- so a taller
-  tally is accepted there: refusing it would lose every real label in a censored cycle.
+  shrink it. The two windows are never chained: `verified` is not bounded by `published`, because a
+  verify window above the draft window computes positions this plan did not publish and one below
+  it stops short of them. Only `accepted <= published` crosses them, since a committed draft is one
+  this plan published. `Stopped` carries no label at `accepted`, and the censor decides where
+  commitment stopped -- `DraftController::observe` takes the committed count from the card -- so a
+  taller tally is accepted there: refusing it would lose every real label in a censored cycle.
 - **The output budget includes the bonus token.** `remaining` counts the tokens the request may
   still emit, and the verify step always emits the target's bonus token after the accepted prefix.
   Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
@@ -420,7 +423,7 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
   pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
   CEST, last artifact of that run 02:17:52). `e0a053c`, `9bc94cd` and `8c91876`, and the
   completion/bench change after them, add checks and are **unexecuted** -- the tree now carries
-  375/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
+  381/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
   objects on the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the
   older libavx objects are not part of these binaries.
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the

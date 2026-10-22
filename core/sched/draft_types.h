@@ -559,17 +559,25 @@ inline bool draft_predictions_current(const DraftBatchView& view, const DraftPre
     return true;
 }
 
-/* A row that may be learned from: the counts are ordered (generated >= published >= verified >=
- * checked >= accepted), `raw_match` counts matches among what the paired verify computed and covers
- * the committed prefix, and `end` classifies the cut. An unclassified row is refused instead of
- * guessed.
+/* A row that may be learned from: the counts are ordered *within each of the two windows they come
+ * from*, `raw_match` counts matches among what the paired verify computed and covers the committed
+ * prefix, and `end` classifies the cut. An unclassified row is refused instead of guessed.
+ *
+ * The two windows are not interchangeable, and the row carries both:
+ *   - this plan's drafting -- `generated >= published`, and a committed draft was published
+ *     (`accepted <= published`);
+ *   - the paired verify -- `verified >= checked >= accepted`, and the tally is a comparison, so
+ *     `raw_match <= verified` and `raw_match >= accepted`.
+ * Only `accepted <= published` crosses them, because a committed draft is one this plan published.
+ * `verified` is deliberately *not* chained to `published`: a plan issued ahead drafts and verifies
+ * different windows, so a verify window above the draft window makes `verified > published` and one
+ * below makes `verified < published`, both legitimate. Binding them is the confusion `verify_k`
+ * exists to avoid.
  *
  * `raw_match` is accept_greedy's uncensored tally, taken before `accept_cut_at_eog`: the cut
- * shortens what is committed, not what was compared. Its bound is that same paired window --
- * `raw_match <= verified` -- because a match is a comparison the target actually made. `generated`
- * is this plan's own drafting and bounds nothing here: a plan issued ahead drafts and verifies
- * different windows, and reading `k[i]` for the tally is the same confusion `verify_k` exists to
- * avoid.
+ * shortens what is committed, not what was compared. Its window is the paired verify's, which is
+ * why `raw_match <= verified` and not `<= generated`: a match is a comparison the target actually
+ * made, and reading `k[i]` for the tally would bound it by a count from the other window.
  *
  * `raw_match` is bounded further where it protects a label and nowhere else. `Rejected` writes a 0
  * at position `accepted` (draft_label), so the tally must agree that this position did not match:
@@ -583,8 +591,10 @@ inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     const int a = (int)o.accepted, c = (int)o.checked, v = (int)o.verified;
     if (o.generated > RAD_SCHED_MAX_SPEC || o.published > RAD_SCHED_MAX_SPEC) return false;
     if (a > RAD_SCHED_MAX_SPEC || c > RAD_SCHED_MAX_SPEC || v > RAD_SCHED_MAX_SPEC) return false;
+    /* This plan's drafting. */
     if (o.published > o.generated) return false;
-    if (a > (int)o.published || v > (int)o.published) return false;
+    if (a > (int)o.published) return false;
+    /* The paired verify's window. `v > published` is not an error: see the header comment. */
     if (a > c || c > v) return false;
     if (o.raw_match > (uint64_t)v) return false;
     if (o.raw_match < (uint64_t)a) return false;

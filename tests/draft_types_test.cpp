@@ -979,6 +979,37 @@ TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
     over.accepted = 1; over.checked = 1; over.raw_match = 64;
     over.end = DraftSeqEnd::AllAccepted;
     CHECK(!draft_seq_observation_valid(over));
+
+    /* The two windows are separate, in both directions. A verify window above this plan's draft
+     * window computes positions this plan never published, and one below it stops short of them;
+     * chaining `verified` to `published` would refuse the first and misread the second. */
+    DraftSeqObservation wider;   /* verify-K above draft-K */
+    wider.generated = 2; wider.published = 2; wider.verified = 4;
+    wider.accepted = 2; wider.checked = 2; wider.raw_match = 2;
+    wider.end = DraftSeqEnd::AllAccepted;
+    CHECK(draft_seq_observation_valid(wider));
+    wider.raw_match = 3;         /* a match past the drafts that were published */
+    CHECK(!draft_seq_observation_valid(wider));
+    wider.raw_match = 2;
+
+    DraftSeqObservation narrower;   /* verify-K below draft-K */
+    narrower.generated = 4; narrower.published = 4; narrower.verified = 2;
+    narrower.accepted = 2; narrower.checked = 2; narrower.raw_match = 2;
+    narrower.end = DraftSeqEnd::AllAccepted;
+    CHECK(draft_seq_observation_valid(narrower));
+    narrower.raw_match = 3;         /* more matches than the verify window compared */
+    CHECK(!draft_seq_observation_valid(narrower));
+
+    /* K0 with the paired verify still pending: nothing drafted, nothing compared, nothing
+     * committed. A zero verified is a measured zero here, and a tally of one would be a match the
+     * target never had a draft to compare. */
+    DraftSeqObservation k0;
+    k0.generated = 0; k0.published = 0; k0.verified = 0;
+    k0.accepted = 0; k0.checked = 0; k0.raw_match = 0;
+    k0.end = DraftSeqEnd::AllAccepted;
+    CHECK(draft_seq_observation_valid(k0));
+    k0.raw_match = 1;
+    CHECK(!draft_seq_observation_valid(k0));
 }
 
 TEST(the_verify_distribution_is_the_plans_own_when_nothing_is_issued_ahead) {
