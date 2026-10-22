@@ -361,6 +361,7 @@ became text." Never compare the two across that boundary.
 | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |
 | [`docs/TP3.md`](docs/TP3.md) | any world size: the attention world and uneven delta-net heads; three ranks |
 | [`docs/OPS.md`](docs/OPS.md), [`docs/KERNELS.md`](docs/KERNELS.md) | the op vocabulary, and what `rad-kbench` last measured |
+| [`docs/PREFILL-OVERLAP.md`](docs/PREFILL-OVERLAP.md) | what a prefill chunk can and cannot share a step with, the ordering a mixed step depends on, and the A/B that decides whether sharing pays |
 | [`spec.md`](spec.md) | the design |
 
 ## License

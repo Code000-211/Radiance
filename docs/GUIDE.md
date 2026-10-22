@@ -1020,6 +1020,15 @@ short of the boundary and the next step finishes it. A prompt with nothing besid
 `off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
 under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
 
+What a shared step was actually made of is on `/stats`, so an A/B can attribute what it measured
+rather than describe it: `steps_multi_prefill` counts the steps that carried two or more chunks
+(prefill against prefill), `decode_rows_mixed`, `prefill_rows_mixed` and `prefill_tok_mixed` say how
+much of a mixed step was each kind, and `prefill_rows_unstaged` counts the chunks that rode a step
+too small for the prefill stager to arm, which is the difference between a smaller GEMM and a link
+read inside every routed layer. [`docs/PREFILL-OVERLAP.md`](PREFILL-OVERLAP.md) is what those
+numbers are for, what a chunk cannot share a step with and why, and which measurement closes the
+question; `scripts/fnmix.sh` runs that measurement.
+
 **Check the prefix cache after changing the chunk.** The larger arena shrinks the KV pool (here
 516,864 to 499,920 pool tokens, 3.3%), and §4.3's cliff is sharp. With two ~180K sessions (first
 turns back to back, then the first session's second turn), a 512 chunk took 137.7 s, 130.0 s and
@@ -2882,6 +2891,9 @@ there is none.
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
 | `engine_steps_held_total` | decode-only steps `--prefill-interleave` ran between chunks (§4.5) |
+| `engine_steps_multi_prefill_total` | steps carrying two or more chunks (§4.5) |
+| `engine_decode_rows_mixed_total`, `engine_prefill_rows_mixed_total`, `engine_prefill_tokens_mixed_total` | how much of a mixed step was decode rows and how much was chunks (§4.5) |
+| `engine_prefill_rows_unstaged_total` | chunks that rode a step too small for the prefill stager to arm (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
