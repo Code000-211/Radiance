@@ -418,6 +418,17 @@ bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostF
            str("kv_format", a.kv_format, b.kv_format) && str("placement", a.placement, b.placement);
 }
 
+std::string draft_cost_gpus(const std::vector<std::string>& names) {
+    if (names.empty()) return "none";
+    bool same = true;
+    for (const std::string& n : names)
+        if (n != names[0]) { same = false; break; }
+    if (same) return std::to_string(names.size()) + "x " + names[0];
+    std::string s;
+    for (const std::string& n : names) s += (s.empty() ? "" : ", ") + n;
+    return s;
+}
+
 int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std::string* err) {
     if (!out) return RAD_E_INVAL;
     *out = DraftCostProfile{};

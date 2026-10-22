@@ -167,6 +167,10 @@ private:
 
     int load_plugins();
     int read_metadata();
+    /* --draft-profile: read once before the scheduler initialises and configure the cost table
+     * against this deployment's fingerprint. A mismatch is not an error here (the table stays
+     * inactive and names it); an unreadable or malformed file is. */
+    int load_draft_cost_profile();
     int read_checkpoint_metadata();
     /* --rope-scaling over the free-form keys, then the startup line and the context checks;
      * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */

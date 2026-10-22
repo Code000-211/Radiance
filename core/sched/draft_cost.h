@@ -138,6 +138,10 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
 /* Reads `path` and parses it. The file is not on the step path. */
 int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std::string* err);
 
+/* The `gpus` fingerprint field from the ranks' device names, in rank order: identical names
+ * collapse to "Nx NAME", mixed ones stay comma-separated, an empty list is "none". */
+std::string draft_cost_gpus(const std::vector<std::string>& names);
+
 /* How many buckets a table reserves by default: 2048 covers the wave-1 matrix (4 context classes
  * x 7 depths x the documented N_j windows x sampling x replay) with headroom. */
 enum { kDraftCostDefaultBuckets = 2048 };

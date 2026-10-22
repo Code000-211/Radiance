@@ -1086,4 +1086,15 @@ TEST(the_documented_c8_gradient_is_reproduced_without_a_new_measurement) {
     CHECK(a.ms < b.ms);   /* the policy's comparison: K3 wins */
 }
 
+/* The fingerprint's gpus field is derived from the ranks' device names, not typed by the user:
+ * identical cards keep the documented "Nx NAME" form, a mixed set stays comma-separated in rank
+ * order so the string still names the deployment. */
+TEST(the_gpus_field_names_the_ranks_in_order) {
+    CHECK_EQ(draft_cost_gpus({ "Radeon AI PRO R9700", "Radeon AI PRO R9700" }),
+             std::string("2x Radeon AI PRO R9700"));
+    CHECK_EQ(draft_cost_gpus({ "A", "B" }), std::string("A, B"));
+    CHECK_EQ(draft_cost_gpus({}), std::string("none"));
+    CHECK_EQ(draft_cost_gpus({ "one" }), std::string("1x one"));
+}
+
 RAD_TEST_MAIN()

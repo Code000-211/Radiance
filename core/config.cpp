@@ -165,6 +165,9 @@ static const Flag g_flags[] = {
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
+    { "--draft-profile",      "PATH",   "a rad-draft-profile/2 file measured on this deployment,\n"
+    "                                    read before the scheduler starts; a fingerprint or\n"
+    "                                    execution mismatch disables it and is named in the log" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -656,6 +659,10 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-profile")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->draft_profile = v;
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1080,6 +1087,7 @@ const ShowRow kShow[] = {
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-policy",       [](const Config& c) { return std::string(draft_policy_name(c.draft_policy)); } },
+    { "--draft-profile",      [](const Config& c) { return or_none(c.draft_profile, "none"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

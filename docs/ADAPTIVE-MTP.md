@@ -7,11 +7,12 @@ versioned profile and benchmark-manifest formats, the CLI names, and which files
 **Status: host-wired, inactive by default.** The contracts, their fakes and the scheduler wiring
 exist and are tested on the host: B's predictor and A's cost table are both fed from the cycle
 ring, and the cost policy is opt-in (`--draft-policy cost`; the default stays `legacy`). Cost is
-still inactive without a configured profile: `DraftCostTable::configure` is called by no
-deployment path yet, so `--draft-policy cost` is refused at `Scheduler::init` by name (the
-baseline lock: an active table **and** either a bucket usable by the rule `estimate()` applies or
-an explicit `admit_fallback()`) and every estimate takes its named fallback. The sample path only
-measures: it activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
+still inactive without a configured profile: `--draft-profile PATH` is read once at startup and
+configured against this deployment's fingerprint before `Scheduler::init`, and without a matching
+profile `--draft-policy cost` is refused there by name (the baseline lock: an active table **and**
+either a bucket usable by the rule `estimate()` applies or an explicit `admit_fallback()`) and
+every estimate takes its named fallback. The sample path only measures: it activates nothing. No
+profile has been generated or measured yet and no M1/M2 or GPU result is claimed here.
 
 ## The seam
 
@@ -315,9 +316,9 @@ fabricated success the contracts forbid.
 |------|--------|---------|-------|
 | `--num-speculative-tokens` | N / `auto` | `auto` | existing; 0 = no drafter process |
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
-| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
+| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; with a matched profile A's table prices the shapes, otherwise every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
-| `--draft-profile` | path | none | profile reader lands with A |
+| `--draft-profile` | path | none | accepted; read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
@@ -388,6 +389,14 @@ refused by name, not reinterpreted under the current keys.
   `--draft-policy cost` the same mismatch is a start abort: `Scheduler::init` refuses by name (see
   below), so a Cost deployment never runs on the fixed baseline because its profile silently did
   not match.
+  The runtime fields are derived from the deployment, never typed by the user: `model` is the
+  container's name (its arch id when unnamed), `quant` its quantisation (`bf16` when none), `tp`
+  the rank count, `tp_wire` `--tp-wire`, `gpus` the ranks' device names in order (`Nx NAME` when
+  all are identical, comma-separated otherwise), `kernels` the loaded libraries (`name@version`,
+  selection order) plus the device architecture, `kv_format` `--kv-cache-dtype` and `placement`
+  `--placement` (an `auto` deployment records `auto`, so a profile generated under an explicit
+  placement will not match it). `execution` is `rectangular`: E2's shrinking rounds are not
+  implemented. A profile generator that writes these same strings is still wave 2/3 work (F).
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually
@@ -408,8 +417,10 @@ refused by name, not reinterpreted under the current keys.
   positive ceiling) is not a baseline and never was. A pre-configured table therefore survives
   `init` instead of being cleared; only an inactive one is cleared, and `clear()` drops the
   admission with the rest of the table. Configuring the table after `init` is not a bootstrap: the
-  policy the scheduler admitted was already chosen under a fallback. The profile reader that fills
-  the runtime fingerprint from the deployment is still the missing production link.
+  policy the scheduler admitted was already chosen under a fallback. The startup reader now fills
+  the runtime fingerprint from the deployment; `admit_fallback()` is reachable from an embedding
+  caller, not from a CLI flag, so a matched profile with no usable bucket is refused rather than
+  admitted until such a flag exists.
 - **`execution`.** `rectangular` (all N_j equal) and `shrinking` (E2: per-request caps, N_j falling
   with j) produce different kernels and times, so they are different profiles. Changing the
   execution invalidates the old file rather than rescaling it.

@@ -894,6 +894,10 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
+    /* --draft-profile: a rad-draft-profile/2 file measured on this deployment. Read once before
+     * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
+     * inactive and names the difference, and Cost is then refused by Scheduler::init. */
+    std::string draft_profile;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

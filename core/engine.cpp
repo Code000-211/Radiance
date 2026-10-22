@@ -1522,6 +1522,56 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+int Engine::load_draft_cost_profile() {
+    if (cfg_.draft_profile.empty()) return RAD_OK;
+    DraftCostProfile profile;
+    std::string err;
+    const int rc = draft_cost_profile_read(cfg_.draft_profile, &profile, &err);
+    if (rc != RAD_OK) {
+        RAD_ERR("--draft-profile '%s': %s", cfg_.draft_profile.c_str(),
+                err.empty() ? rad_strerror(rc) : err.c_str());
+        return rc;
+    }
+
+    /* Every field is what this deployment is, not what a flag asked for: the profile is refused
+     * on any difference (DraftCostTable::configure names the first). The gpus string is the
+     * ranks' device names in order; kernels is the loaded libraries plus the device arch. */
+    DraftCostFingerprint fp;
+    fp.model   = meta_.name ? meta_.name : "";
+    fp.quant   = meta_.quant && *meta_.quant ? meta_.quant : "bf16";
+    fp.tp      = (int32_t)ranks_.size();
+    fp.tp_wire = cfg_.tp_wire_exact ? "exact" : "wht6";
+    std::vector<std::string> gpus;
+    std::string arch;
+    for (const auto& rk : ranks_) {
+        RadDeviceProps p{};
+        if (const int prc = rad_dev_props(rk->device, &p); prc != RAD_OK) {
+            RAD_ERR("--draft-profile: device %d: %s", rk->device, rad_dev_last_error());
+            return prc;
+        }
+        gpus.push_back(p.name);
+        if (arch.empty()) arch = p.arch;
+    }
+    fp.gpus      = draft_cost_gpus(gpus);
+    fp.kernels   = plugins_.libraries() + (arch.empty() ? "" : " " + arch);
+    fp.kv_format = cfg_.kv_cache_dtype;
+    fp.placement = cfg_.placement;
+
+    DraftCostRuntime runtime;
+    runtime.fingerprint = fp;
+    /* E2's shrinking rounds are not implemented, so every run of this engine is rectangular. */
+    runtime.execution = DraftCostExecution::Rectangular;
+    RAD_TRY(sched_.draft_costs().configure(profile, runtime));
+
+    if (!sched_.draft_costs().active())
+        RAD_WARN("--draft-profile '%s' is not used for this deployment: %s",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().reason().c_str());
+    else
+        RAD_INFO("--draft-profile '%s': %zu buckets match this deployment",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
+    return RAD_OK;
+}
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -1730,6 +1780,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
+        RAD_TRY(load_draft_cost_profile());
         RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio,
                             &geo_));
 #ifdef RAD_TEST_HOOKS

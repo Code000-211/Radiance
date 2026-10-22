@@ -435,7 +435,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
-        { "--draft-policy", { "cost" } },
+        { "--draft-policy", { "cost" } }, { "--draft-profile", { "/p.json" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -747,6 +747,18 @@ TEST(the_draft_policy_is_legacy_or_cost) {
     CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
+}
+
+/* --draft-profile is a path, read by the engine once the deployment is up. Nothing parses the file
+ * here: the reader owns that, and a missing or malformed file is a start error there. */
+TEST(the_draft_profile_is_a_path_and_optional) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.draft_profile.empty());
+    Config c;
+    CHECK_EQ(parse({ "--draft-profile", "/profiles/r9700-tp2.json" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_profile, std::string("/profiles/r9700-tp2.json"));
+    CHECK_EQ(parse({ "--draft-profile" }, &c), RAD_E_INVAL);
 }
 
 /* An unknown policy name is refused; falling through to the default would make a comparison
