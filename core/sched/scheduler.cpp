@@ -2173,7 +2173,6 @@ void Scheduler::step_finished() {
 int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     std::lock_guard<std::mutex> lk(mu_);
     serial_.clear();
-    serial_hist_built_ = false;   /* a new snapshot: no pass has been built under it yet */
     if (!rounds || *rounds <= 0 || !out || max <= 0) return 0;
 
     /* May anything draft? The controller sets depth from measured acceptance; 0 means drafting is
@@ -2384,24 +2383,15 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     }
     if (serial_plan_.e.empty()) return nullptr;
 
-    /* Round 0 is the history pass: once it is built, its rows' history was written. A build that
-     * comes back null ran nothing, and serial_end() must not count it. */
-    const bool hist = round == 0;
-
     /* RADIANCE_DEBUG_STAGE: splits a draft pass's host staging into the plan loop above and
      * `builder_.build`, reporting the average of each. Both are small next to issuing the pass
      * (engine_draft.cpp has that split). Off by default; two clock reads when on. */
-    if (!stg) {
-        const RadBatch* b = builder_.build(serial_plan_, *kv_, step);
-        if (hist && b) serial_hist_built_ = true;
-        return b;
-    }
+    if (!stg) return builder_.build(serial_plan_, *kv_, step);
 
     static double acc_plan = 0.0, acc_build = 0.0;
     static long   n_calls = 0;
     const auto t1 = std::chrono::steady_clock::now();
     const RadBatch* b = builder_.build(serial_plan_, *kv_, step);
-    if (hist && b) serial_hist_built_ = true;
     const auto t2 = std::chrono::steady_clock::now();
     acc_plan  += std::chrono::duration<double, std::micro>(t1 - t_stage0).count();
     acc_build += std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -2416,8 +2406,13 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
  * token, so the history is exact up to n_computed. Rounds past it write speculatively and are not
  * counted; redoing them next step costs one head pass over a few tokens. A history-only row is
  * exact up to where its history reached: n_computed if it covered the verified positions, its
- * host-known end otherwise. */
-void Scheduler::serial_end(int rounds_done) {
+ * host-known end otherwise.
+ *
+ * `history_ran` is the driver's completion signal for round 0, not this scheduler's view of it: a
+ * built batch is not an executed pass (the engine may reject the cycle, or the host pass may have
+ * failed), and only the caller sees which happened. A caller that cannot say passes false, which
+ * costs a repeated history pass and never a wrong watermark. */
+void Scheduler::serial_end(int rounds_done, bool history_ran) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const SerialSeq& m : serial_) {
         if (m.slot < 0 || (size_t)m.slot >= reqs_.size()) continue;
@@ -2425,12 +2420,11 @@ void Scheduler::serial_end(int rounds_done) {
         if (!s.req || s.req->id != m.seq) continue;
         const int64_t filled = m.dev ? s.req->n_computed
                                      : m.hist_pos + m.hist_n;
-        /* Every row's history comes from round 0, so nothing counts when that pass was not built.
+        /* Every row's history comes from round 0, so nothing counts unless that pass ran.
          * A drafting row additionally needs a draft round to have run: without one its verified
          * positions were never written. A K0 row owes only the history pass, and a history-only
          * row owes nothing else. */
-        const bool counts = serial_hist_built_ &&
-                            (m.dev ? (rounds_done >= 1 || m.draft_idx < 0) : true);
+        const bool counts = history_ran && (m.dev ? (rounds_done >= 1 || m.draft_idx < 0) : true);
         if (counts && filled > s.draft_filled) s.draft_filled = filled;
     }
     /* The snapshot ends here: every pass naming these rows is built, and keeping them would keep

@@ -449,7 +449,7 @@ TEST(a_row_planned_off_still_owes_its_history_and_resumes_at_six) {
     CHECK_EQ(hb->n_tok, 7);
     CHECK_EQ(hb->n_draft_out, 1);                /* round 1 rides on the history pass */
     CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
-    f.sch.serial_end(6);
+    f.sch.serial_end(6, true);
 
     const int64_t after6 = f.sch.find(id)->n_computed;
     CHECK_EQ(after6, 161 + 7);
@@ -468,7 +468,7 @@ TEST(a_row_planned_off_still_owes_its_history_and_resumes_at_six) {
     CHECK_EQ(h0->n_draft_out, 0);
     CHECK_EQ(h0->ctx_lens[0], (int32_t)after6); /* no redo of what B already wrote */
     f.commit_plain(12);
-    f.sch.serial_end(0);
+    f.sch.serial_end(0, true);
 
     const int64_t after0 = f.sch.find(id)->n_computed;
     CHECK_EQ(after0, after6 + 1);
@@ -489,7 +489,7 @@ TEST(a_row_planned_off_still_owes_its_history_and_resumes_at_six) {
     CHECK_EQ(hd->n_draft_out, 1);
     CHECK_EQ(hd->ctx_lens[0], (int32_t)after0);
     f.commit_plain(13);
-    f.sch.serial_end(6);
+    f.sch.serial_end(6, true);
     CHECK_OK(f.sch.set_draft(id, drafts, 6));
 
     /* Cycle E: six verified again, history from the committed end with no gap. */
@@ -507,9 +507,10 @@ TEST(a_row_planned_off_still_owes_its_history_and_resumes_at_six) {
 }
 
 /* ================================================================== the history watermark */
-/* serial_end() moves a sequence's watermark only for a pass that ran. A drafting row needs a draft
- * round on top of the round-0 history pass; a history-only row owes nothing but that pass, so it
- * counts when the pass was built and not when the build came back null and the engine skipped it.
+/* serial_end() moves a sequence's watermark only for a pass the driver reports as run. A drafting
+ * row needs a draft round on top of the round-0 history pass; a history-only row owes nothing but
+ * that pass. Built is not run: the counter-probes below build the pass on the scheduler's side and
+ * then report it as not executed (the engine rejected the cycle, or its host pass failed).
  * Each call gets a freshly opened snapshot: serial_end() ends the one it reads, so a second call
  * would check an empty one. */
 TEST(a_draft_rows_watermark_needs_a_round_and_a_history_pass) {
@@ -544,7 +545,7 @@ TEST(a_draft_rows_watermark_needs_a_round_and_a_history_pass) {
     REQUIRE(f.sch.serial_batch(0, 2) != nullptr);
     CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
     const int64_t after_rounds = f.sch.find(id)->n_computed;
-    f.sch.serial_end(4);
+    f.sch.serial_end(4, true);
     CHECK_EQ(f.sch.draft_watermark(id), after_rounds);
 
     /* Cycle C: another fresh snapshot with its history pass built, but zero rounds. The verified
@@ -556,7 +557,18 @@ TEST(a_draft_rows_watermark_needs_a_round_and_a_history_pass) {
     CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
     const int64_t after_abort = f.sch.find(id)->n_computed;
     CHECK(after_abort > after_rounds);
-    f.sch.serial_end(0);
+    f.sch.serial_end(0, true);
+    CHECK_EQ(f.sch.draft_watermark(id), after_rounds);
+
+    /* Cycle D: the build came back, the pass did not run. The driver reports that, and the
+     * watermark stays put although this scheduler built a batch and four rounds were asked for. */
+    REQUIRE(f.sch.step() != nullptr);
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 1);
+    REQUIRE(f.sch.serial_batch(0, 4) != nullptr);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    CHECK(f.sch.find(id)->n_computed > after_abort);
+    f.sch.serial_end(4, false);
     CHECK_EQ(f.sch.draft_watermark(id), after_rounds);
 }
 
@@ -585,11 +597,22 @@ TEST(a_history_only_rows_watermark_needs_its_pass) {
     REQUIRE(hb != nullptr);
     CHECK_EQ(hb->n_draft_out, 0);
     f.commit_plain(11);
-    f.sch.serial_end(0);
+    f.sch.serial_end(0, true);
     CHECK_EQ(f.sch.draft_watermark(id), hist_end);
 
-    /* The next chunk, on a fresh snapshot whose history pass is never built: the step commits, but
-     * nothing wrote the head's history, so the watermark must not move. */
+    /* The next chunk, same build, but the driver reports the pass as not executed: the step
+     * commits and nothing wrote the head's history, so the watermark must not move. */
+    REQUIRE(f.sch.step() != nullptr);
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);
+    REQUIRE(f.sch.serial_batch(0, 2) != nullptr);   /* built ... */
+    f.commit_plain(11);
+    CHECK(f.sch.find(id)->n_computed > hist_end);
+    f.sch.serial_end(0, false);                     /* ... and did not run */
+    CHECK_EQ(f.sch.draft_watermark(id), hist_end);
+
+    /* The next chunk, on a fresh snapshot whose history pass is never built: same outcome, and
+     * the default argument states it without the driver having to say so. */
     REQUIRE(f.sch.step() != nullptr);
     rounds = 6;
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);
@@ -684,7 +707,7 @@ TEST(a_round_runs_only_the_rows_that_still_have_a_draft) {
     CHECK(f.sch.serial_batch(4, 5) == nullptr);
 
     f.commit_plain(11);
-    f.sch.serial_end(2);                  /* rounds 2 and 3 ran */
+    f.sch.serial_end(2, true);           /* rounds 2 and 3 ran, over their history pass */
     CHECK_EQ(f.sch.draft_watermark(c), f.sch.find(c)->n_computed);
     CHECK_EQ(f.sch.draft_watermark(d), f.sch.find(d)->n_computed);   /* its history pass ran */
 }
@@ -863,7 +886,8 @@ TEST(an_admission_in_flight_keeps_the_next_step_from_being_issued_ahead) {
 /* The priced shape is written down, not left at its defaults. A K0 plan with history is "policy
  * K0 with history", so every row of a cycle with the head loaded carries the verified token's
  * history row (frozen K 0 here), the prefill sharing the step is named, the loaded drafter is
- * Serial, and this runtime plays no tape. The plan says the same per row. */
+ * Serial, and the replay dimension is flagged Unknown because this cycle did not observe one. The
+ * plan says the same per row. */
 struct ShapeLog {
     DraftVerifyShape last;
     int calls = 0;
@@ -926,7 +950,9 @@ TEST(the_priced_shape_carries_history_prefill_and_the_loaded_drafter) {
     CHECK_EQ(log.last.history_tokens, 1);   /* the verified token's own history row */
     CHECK_EQ(log.last.prefill_tokens, 0);   /* nothing running prefills yet */
     CHECK(log.last.drafter == DraftDrafter::Serial);
-    CHECK(log.last.replay == DraftReplay::None);
+    /* No replay state was observed this cycle, so the shape marks the dimension Unknown instead of
+     * claiming `None` and letting a model key it as measured. */
+    CHECK_EQ(log.last.unknown, (uint32_t)kDraftShapeReplayUnknown);
 
     const DraftPlan* p = f.sch.draft().plan();
     REQUIRE(p != nullptr);
@@ -983,13 +1009,18 @@ TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
 }
 
 /* The A/C seam against the real model: a version-2 profile measured for this deployment, read by
- * A's table, prices every candidate the planner considers. The profile says a two-draft cycle is
- * the cheapest per emitted token here, so the plan must choose 2 because the model said so.
+ * A's table, sees the shape the planner prices. The cycle does not observe its own replay state
+ * -- `DraftBatchView` carries none -- so the planner marks that dimension Unknown and the shape is
+ * not a measured key. A's table therefore refuses it, and a cycle it cannot price becomes the
+ * named baseline: a fallback, never an invented number.
+ *
+ * The last block shows what the same profile does once that dimension is supplied, which is the
+ * piece the interface is missing (see the request in the issue).
  *
  * The buckets are keyed the way this runtime runs: publish-then-verify at pipeline depth 1, so a
  * bucket's verify window is the previous cycle's distribution (nothing yet, on the first cycle)
  * and its draft distribution is the cycle's own. */
-TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
+TEST(the_real_profile_needs_the_replay_dimension_the_planner_cannot_observe) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
@@ -1058,11 +1089,20 @@ TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
     CHECK_EQ(last_shape.pipeline_depth, 1);
     CHECK_EQ(last_shape.verify_k, 0);      /* nothing was published before this cycle */
     CHECK_EQ(last_shape.verify_tokens, 1);
-    CHECK_EQ(last_shape.unknown, 0u);
-    CHECK(p->source == DraftPlanSource::Cost);
-    CHECK_EQ(p->k[0], 2);
+    /* The cycle saw no replay state, so the shape says so rather than asserting `None`. */
+    CHECK_EQ(last_shape.unknown, (uint32_t)kDraftShapeReplayUnknown);
+    CHECK(!draft_shape_priceable(last_shape));
+    DraftCostEstimate refused;
+    CHECK_EQ(table.estimate(last_shape, &refused), RAD_E_INVAL);
+    /* Unpriceable is a fallback with a name, not a failed step and not a made-up price. */
+    CHECK(p->source == DraftPlanSource::Fallback);
+    CHECK(p->fallback == DraftFallback::UnknownShape);
+    CHECK_EQ(p->k[0], dp.policy.fallback_k);
     CHECK_EQ(p->pipeline_depth, 1);
-    /* The model really priced the shape this plan names: its own estimate for it is measured. */
+    CHECK_EQ(draft_plan_valid(*p), RAD_OK);
+
+    /* The rest of the seam already fits: this profile prices the same cycle as measured once the
+     * replay dimension is known. Supplying it is the missing interface piece. */
     DraftVerifyShape shape;
     shape.n_rows = 1;
     shape.verify_k = 0;
@@ -1074,8 +1114,10 @@ TEST(the_real_cost_profile_prices_the_cycle_it_plans) {
     shape.draft_rows[1] = 1;
     shape.draft_rows[2] = 1;
     shape.drafter = DraftDrafter::Serial;
+    shape.replay = DraftReplay::None;   /* what the driver would report for a live pass */
     CHECK(draft_shape_priceable(shape));
-    CHECK(draft_shape_matches_plan(shape, *p));
+    CHECK_EQ(shape.verify_k, p->verify_k);
+    CHECK_EQ(shape.pipeline_depth, p->pipeline_depth);
     DraftCostEstimate est;
     CHECK_OK(table.estimate(shape, &est));
     CHECK(est.valid);

@@ -30,8 +30,11 @@
  *
  * The priced shape is written down, not left at its defaults. `history_tokens` is the history the
  * paired step owes per row (one row for the verified token plus one per draft it verifies, the
- * serial head's rule), `prefill_tokens` comes from the view, `drafter` names what is loaded, and
- * `replay` is None because this runtime plays no tape. The plan carries the same per-row numbers
+ * serial head's rule), `prefill_tokens` comes from the view, `drafter` names what is loaded. The
+ * replay dimension is not observable from the view, so the shape marks it Unknown
+ * (kDraftShapeReplayUnknown) instead of claiming `None`: no model may price it, and the search
+ * falls back to the named baseline until the batch view or the driver carries the cycle's replay
+ * state (see the interface request in the issue). The plan carries the same per-row numbers
  * (`ctx_class`, `history_tokens`) and who may spend each `k[]` (`fill`): a K0 plan with history is
  * "policy K0 with history", and the n-gram fallback is a drafter too, barred where `k[]` is 0.
  *

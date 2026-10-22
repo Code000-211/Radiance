@@ -107,9 +107,12 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
     /* The loaded drafter, not who spends k[]: a head that is loaded keeps the history and KV of
      * a K0 row, so its K0 is a different bucket from a process with no head at all. */
     s->drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
-    /* This runtime plays no tape (core/runtime/stager.h); a recorded or replayed shape is a
-     * different key, never this one. */
+    /* `DraftBatchView` carries no replay state, so this cycle did not observe one. That is a
+     * missing dimension, not a `None`: the field stays at its default and the flag says not to read
+     * it, so draft_shape_priceable() refuses the shape instead of a model keying it as measured.
+     * `DraftReplay::None` here would be the same claim with the evidence missing. */
     s->replay = DraftReplay::None;
+    s->unknown |= (uint32_t)kDraftShapeReplayUnknown;
     s->pipeline_depth = view.pipeline_depth;
     bool sampled = false;
     for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -132,9 +135,8 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
         if (view.seq[i].ctx_class > s->ctx_class) s->ctx_class = view.seq[i].ctx_class;
         if (view.seq[i].sampling == DraftSampling::Sampled) sampled = true;
     }
-    /* Every dimension above is known here: history from the frozen plan, prefill from the view,
-     * no tape, and both distributions from the cycle. A missing one would set the bit instead. */
-    s->unknown = 0;
+    /* The other dimensions are observed here: history from the frozen plan, prefill from the view,
+     * both distributions from the cycle. Replay is not, and set its flag above. */
     s->sampling = sampled ? DraftSampling::Sampled : DraftSampling::Greedy;
 }
 
@@ -188,6 +190,10 @@ int DraftPlanner::price(const DraftBatchView& view, const DraftPredictions& pred
 
     DraftCostEstimate est;
     const int rc = costs.estimate(costs.ctx, shape, &est);
+    /* A model refuses a shape it has no key for (draft_shape_priceable, e.g. the replay dimension
+     * above). That is "not priced", not a broken cycle: the search then falls back to the named
+     * baseline instead of failing the step. */
+    if (rc == RAD_E_INVAL) return RAD_OK;
     if (rc < 0) return rc;
     if (!est.valid || !(est.ms > 0.0) || !std::isfinite(est.ms)) return RAD_OK;   /* not priced */
 
@@ -215,6 +221,8 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->source         = src;
     out->fallback       = fb;
     out->probe          = DraftProbe::None;
+    /* Unobserved, like the shape's dimension: the plan has no unknown channel, so the priced shape
+     * it points at is where a reader must look (shape_of sets kDraftShapeReplayUnknown). */
     out->replay         = DraftReplay::None;
     out->timing_valid   = false;   /* the planner does not time the cycle */
     out->prefill_tokens = view.prefill_tokens;

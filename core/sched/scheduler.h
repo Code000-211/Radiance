@@ -311,7 +311,8 @@ public:
      *               prefix of the snapshot and a row's depth is the last round it was in. Rows
      *               continuing a sampled verify are device rows (advance.h): the card fills their
      *               positions and tokens, so no pass waits on the host.
-     *   serial_end     after commit(), with the rounds that ran: moves the history watermark.
+     *   serial_end     after commit(), with the rounds that ran and whether the history pass did:
+     *               moves the history watermark.
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
      *               keeps n_draft 0 and the n-gram drafter fills in.
      */
@@ -323,8 +324,13 @@ public:
     int serial_begin(int* rounds, SerialRow* out, int max);
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
-     * round 0 carries it. Call serial_end() once the step has committed. */
-    void serial_end(int rounds_done);
+     * round 0 carries it. Call serial_end() once the step has committed.
+     *
+     * `history_ran` is the driver's word that the round-0 pass it built actually executed: a built
+     * batch is not a run pass (the cycle may be rejected, the build may come back null, the host
+     * pass may fail), and only the driver sees which. It defaults to false so a caller that cannot
+     * report the outcome repeats the history pass instead of claiming a watermark it did not earn. */
+    void serial_end(int rounds_done, bool history_ran = false);
 
     /* ----------------------------------------------------- the block drafter (spec §10)
      *
@@ -620,10 +626,6 @@ private:
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
-    /* Whether this snapshot's round-0 (history) pass was built. A row's history is written by that
-     * pass; a snapshot opened and ended without it (the engine's build came back null and the pass
-     * was skipped) must not move the watermark. */
-    bool                serial_hist_built_ = false;
 
     /* The block drafter's rows, valid between block_begin() and block_end(): one per entry of the
      * trunk step just run, in order, with `ctx_len`/`n_tokens` mirroring it. The drafter reads
