@@ -80,10 +80,11 @@ set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core
 # that is why these units are built a second time here instead of defining it on the test alone.
 # The set of such units is exactly this list: engine.h is included by engine_priv.h (included by
 # these nine engine units, and by tests/engine_test_peer.h for Engine::Rank), by core/main.cpp (the
-# radiance binary, which never links this archive) and by the six tests in RAD_TESTS_WITH_ENGINE --
+# radiance binary, which never links this archive) and by the seven tests in RAD_TESTS_WITH_ENGINE --
 # engine_step_test.cpp, engine_loop_test.cpp, engine_loop_move_test.cpp, engine_history_test.cpp,
-# engine_profile_test.cpp and engine_cost_drift_test.cpp, each of them directly (the move, profile
-# and cost-drift tests include engine_test_peer.h as well). All six are compiled with the macro. A
+# engine_profile_test.cpp, engine_cost_drift_test.cpp and engine_couple_short_row_test.cpp, each of
+# them directly (the move, profile, cost-drift and coupled-short-row tests include
+# engine_test_peer.h as well). All seven are compiled with the macro. A
 # unit that starts including
 # engine.h must join this list, or one program would hold both definitions. Re-check with
 #   grep -rn '#include[[:space:]]*"\(core/\)\?engine\.h"' --include=*.cpp --include=*.h core tests
@@ -113,7 +114,8 @@ if(RAD_FFMPEG_FOUND)
 endif()
 
 set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_loop_move_test
-                            engine_history_test engine_profile_test engine_cost_drift_test)
+                            engine_history_test engine_profile_test engine_cost_drift_test
+                            engine_couple_short_row_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)

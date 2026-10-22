@@ -119,6 +119,71 @@ struct EngineTestPeer {
         return e.sched_.draft_watermark(request_id);
     }
 
+    /* --- RADIANCE_MTP_COUPLED (tests/engine_couple_short_row_test.cpp) -----------------------
+     * A rank with the engine's own Ctx over a fixture program, and the calls that reach the
+     * coupled step path. Without bringup there is no rank, and both halves of the coupling need
+     * one: the readback reads rank 0's ctx (buf_ptr, stream), and the advance writes the rank's
+     * StepSlots. The Ctx creates its own stream, as a rank's does, so it never outlives one the
+     * fixture destroys first. `prog` is copied: Ctx::bind_buffers rewrites the copy's buffer
+     * pointers, and the scheduler must see the same program the Ctx bound. */
+    static int bind_rank(Engine& e, int32_t index, const Program& prog) {
+        if ((int32_t)e.ranks_.size() <= index) e.ranks_.resize((size_t)index + 1);
+        if (!e.ranks_[(size_t)index]) e.ranks_[(size_t)index] = std::make_unique<Engine::Rank>();
+        Engine::Rank& rk = *e.ranks_[(size_t)index];
+        rk.index  = index;
+        rk.device = 0;
+        rk.program = prog;
+        CtxDesc d;
+        d.program        = &rk.program;
+        d.rank           = index;
+        d.world_size     = 1;
+        d.device         = 0;
+        d.record_passes  = false;
+        return rk.ctx.init(d);
+    }
+    static RadStream rank_stream(Engine& e, int32_t index) {
+        return e.ranks_[(size_t)index]->ctx.stream();
+    }
+    /* Where the head's proposals are read from (advance.h, ADV_TAKE). */
+    static void tok_buf(Engine& e, int32_t index, rad_buf b) { e.ranks_[(size_t)index]->tok_buf = b; }
+    /* The vocabulary the coupled bind validates sampled states against; bringup sets it from the
+     * loaded model. */
+    static void meta_vocab(Engine& e, int64_t n) { e.meta_.n_vocab = n; }
+    /* Scheduler::init over the rank's own program and stream, as serve() does: the builder
+     * uploads on the stream the Ctx runs on, so the two cannot diverge. */
+    static int init_sched_rank0(Engine& e, const Config& cfg, IKVManager* kv, IPrefixCache* pc) {
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, e.ranks_[0]->ctx.stream(), &e.ranks_[0]->program });
+        return e.sched_.init(e.ranks_[0]->program, cfg, kv, pc, rio);
+    }
+    static int  step_state_init(Engine& e) { return e.step_state_init(); }
+    /* The rank's sampler, declared the way Engine::declare_sampler does (minus the logits
+     * sizing, which needs a plugin). The coupled finish calls set_mtp_couple on every rank, and
+     * an undeclared sampler refuses that call with RAD_E_STATE -- so a coupled fixture must
+     * declare one even though nothing samples through it. */
+    static int declare_sampler(Engine& e, int32_t index, RadBuilder* b, const SamplerConfig& cfg) {
+        return e.ranks_[(size_t)index]->sampler.declare(b, cfg);
+    }
+    static bool coupled(const Engine& e) { return e.mtp_couple_; }
+    static int64_t couple_rows(const Engine& e) { return e.couple_rows_; }
+    static RadMtpCoupleState* couple_readback(Engine& e) { return e.couple_readback_; }
+    /* The card's state plane as the Ctx bound it (arena base + offset), which is what the 2D
+     * readback copies from. */
+    static void* couple_plane(Engine& e) {
+        return e.ranks_[0]->ctx.buf_ptr(e.couple_state_buf_);
+    }
+    static RadMtpCoupleDraw couple_draw(const Engine& e, int i) {
+        return e.couple_draw_stage_[(size_t)i];
+    }
+    /* The frozen per-row plan the finish reads: the row's card slot and the rounds it ran. */
+    static Scheduler::SerialRow serial_row(const Engine& e, int i) {
+        return e.serial_row_[(size_t)i];
+    }
+    static int k_of(const Engine& e, int i) { return e.serial_k_[(size_t)i]; }
+    /* The card's slots as the step read them back (advance_impl.h, ADV_ACCEPT/ADV_TAKE write
+     * gen/tok on the host backend, so these are production state). */
+    static StepSlot* slots(Engine& e) { return e.slots_host_; }
+
     /* The release kind a fixture's tiering hook answers for (Engine::issue_what_). */
     static constexpr int kIssueSampler = Engine::kIssueSampler;
     static constexpr int kIssueModel   = Engine::kIssueModel;
