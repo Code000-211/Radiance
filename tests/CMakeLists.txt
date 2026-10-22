@@ -76,8 +76,13 @@ set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core
 
 # The engine's completion cases reach collect_step through the EngineTestPeer friend, which
 # core/engine.h declares only under RAD_TEST_HOOKS. A friend is part of the class definition, so
-# the test unit and every engine unit in that link have to be compiled with the macro together --
+# every unit of a link that includes core/engine.h has to be compiled with the macro together --
 # that is why these units are built a second time here instead of defining it on the test alone.
+# The set of such units is exactly this list: engine.h is included by engine_priv.h (which only
+# these nine include), by core/main.cpp (the radiance binary, which never links this archive) and
+# by engine_step_test.cpp (compiled with the macro). A unit that starts including engine.h must
+# join this list, or one program would hold both definitions. Re-check with
+#   grep -rn '#include[[:space:]]*"\(core/\)\?engine\.h"' --include=*.cpp --include=*.h core tests
 # rad_core keeps its own, hook-free copies and is never asked for them: this archive goes in whole
 # and before it. Only engine_step_test links it, so no other test pays for the engine.
 set(RAD_ENGINE_SRC

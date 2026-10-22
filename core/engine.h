@@ -111,8 +111,10 @@ private:
 #ifdef RAD_TEST_HOOKS
     /* Test-build-only: engine_step_test drives collect_step's completion branch on a
      * default-constructed Engine, which needs no model and no started scheduler. The macro is
-     * defined only for the test copy of the engine translation units (tests/CMakeLists.txt), so
-     * rad_core and every translation unit it is linked with see this class without the friend. */
+     * defined for the test copies of the engine units and for the test unit itself
+     * (tests/CMakeLists.txt), which is every unit of that link that includes this header. The only
+     * other one, core/main.cpp, belongs to the radiance binary and never links those copies, so no
+     * program holds both definitions of the class. */
     friend struct EngineTestPeer;
 #endif
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
