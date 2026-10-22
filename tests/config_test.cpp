@@ -436,6 +436,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
         { "--draft-policy", { "cost" } }, { "--draft-profile", { "/p.json" } },
+        { "--draft-profile-out", { "/out.json" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },

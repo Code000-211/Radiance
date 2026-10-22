@@ -2104,6 +2104,14 @@ void Scheduler::draft_ring_flush() {
         if (draft_ring_[i].active) draft_ring_close(draft_ring_[i].cycle_id);
 }
 
+/* The same close from outside, for an engine that is still up: serve() has joined the step and
+ * rank threads before it exports, so no cycle is in flight and what is closed here is what
+ * shutdown would have delivered. */
+void Scheduler::flush_draft_observations() {
+    std::lock_guard<std::mutex> lk(mu_);
+    draft_ring_flush();
+}
+
 /* A's sample for one resolved cycle. The price is the cost of the distribution that RAN
  * (draft_cost.h): `rounds`/`draft_round_rows` come from what each row published, the verify window
  * from what each row actually verified. `shape.draft_k`/`draft_rows` stay the plan's -- provenance
@@ -2155,6 +2163,14 @@ void Scheduler::draft_cost_observe(DraftCycleRecord& r) {
         for (int32_t j = 1; j <= (int32_t)r.seq[i].published; ++j) ++s.draft_round_rows[j];
     for (int32_t j = 1; j <= s.rounds; ++j) s.draft_rows_total += s.draft_round_rows[j];
     for (int32_t i = 0; i < r.n_seq; ++i) s.drafted += (int32_t)r.seq[i].generated;
+
+    /* The provenance of each verify row: the state the verify window consumed, not the origin this
+     * cycle published (which is its own drafting). Without it the writer would have to default
+     * rows to none and price a head row as a lookup row. */
+    if (r.n_seq <= RAD_SCHED_MAX_SPEC) {
+        for (int32_t i = 0; i < r.n_seq; ++i) s.origins[i] = r.seq[i].label_origin;
+        s.origins_valid = 1;
+    }
 
     if (r.timed) s.flags |= kDraftSampleValid;
     /* The bracket timed less than the shape it would be filed under: the deepest planned round

@@ -1522,6 +1522,55 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
+    if (!out) return RAD_E_INVAL;
+    DraftCostFingerprint& fp = out->fingerprint;
+    /* Every field is what this deployment is, not what a flag asked for: the profile is refused
+     * on any difference (DraftCostTable::configure names the first). The gpus string is the
+     * ranks' device names and arch ids in order; kernels is the loaded libraries, the arch plugin
+     * and the device arch; the model name falls back to the container's arch id where a container
+     * carries no model_name (the checkpoint path already does the same). */
+    fp.model   = meta_.name ? meta_.name : "";
+    if (fp.model.empty() && meta_.arch_id) fp.model = meta_.arch_id;
+    fp.quant   = meta_.quant && *meta_.quant ? meta_.quant : "bf16";
+    fp.tp      = (int32_t)ranks_.size();
+    /* The same string engine_info() reports, "n/a" at TP1 included, so a record is reproducible
+     * from the info output. */
+    fp.tp_wire = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";
+    std::vector<std::string> gpus;
+    std::string arch;
+    for (const auto& rk : ranks_) {
+        RadDeviceProps p{};
+        if (const int prc = rad_dev_props(rk->device, &p); prc != RAD_OK) {
+            RAD_ERR("draft cost runtime: device %d: %s", rk->device, rad_dev_last_error());
+            return prc;
+        }
+        /* The product name alone collides across steppings; the arch id does not (rad_device.h). */
+        gpus.push_back(p.arch[0] ? std::string(p.name) + " (" + p.arch + ")"
+                                 : std::string(p.name));
+        if (arch.empty()) arch = p.arch;
+    }
+    fp.gpus      = draft_cost_gpus(gpus);
+    /* The arch plugin is part of the kernel identity: two plugins over the same kernel libraries
+     * are still two different selectors (build/startup.h keeps the two lists apart). */
+    fp.kernels   = plugins_.libraries();
+    if (!plugins_.arch_plugin.empty()) {
+        if (!fp.kernels.empty()) fp.kernels += ' ';
+        fp.kernels += plugins_.arch_plugin + "@" +
+                      (plugins_.arch_version.empty() ? "0" : plugins_.arch_version);
+    }
+    if (!arch.empty()) fp.kernels += " " + arch;
+    fp.kv_format = cfg_.kv_cache_dtype;
+    fp.placement = cfg_.placement;
+
+    /* The backend's round model, not this cycle's distribution: the serial head runs one round per
+     * row, so it is shrinking even when a cycle's K are uniform. A block drafter, no drafter, or
+     * drafting switched off (n_spec == 0, already resolved from auto in declare()) has no rounds.
+     * The distribution keeps its identity in the bucket key. */
+    out->execution = draft_cost_execution(serial_drafting(), cfg_.n_spec);
+    return RAD_OK;
+}
+
 int Engine::load_draft_cost_profile() {
     if (cfg_.draft_profile.empty()) return RAD_OK;
     DraftCostProfile profile;
@@ -1533,34 +1582,8 @@ int Engine::load_draft_cost_profile() {
         return rc;
     }
 
-    /* Every field is what this deployment is, not what a flag asked for: the profile is refused
-     * on any difference (DraftCostTable::configure names the first). The gpus string is the
-     * ranks' device names in order; kernels is the loaded libraries plus the device arch. */
-    DraftCostFingerprint fp;
-    fp.model   = meta_.name ? meta_.name : "";
-    fp.quant   = meta_.quant && *meta_.quant ? meta_.quant : "bf16";
-    fp.tp      = (int32_t)ranks_.size();
-    fp.tp_wire = cfg_.tp_wire_exact ? "exact" : "wht6";
-    std::vector<std::string> gpus;
-    std::string arch;
-    for (const auto& rk : ranks_) {
-        RadDeviceProps p{};
-        if (const int prc = rad_dev_props(rk->device, &p); prc != RAD_OK) {
-            RAD_ERR("--draft-profile: device %d: %s", rk->device, rad_dev_last_error());
-            return prc;
-        }
-        gpus.push_back(p.name);
-        if (arch.empty()) arch = p.arch;
-    }
-    fp.gpus      = draft_cost_gpus(gpus);
-    fp.kernels   = plugins_.libraries() + (arch.empty() ? "" : " " + arch);
-    fp.kv_format = cfg_.kv_cache_dtype;
-    fp.placement = cfg_.placement;
-
     DraftCostRuntime runtime;
-    runtime.fingerprint = fp;
-    /* E2's shrinking rounds are not implemented, so every run of this engine is rectangular. */
-    runtime.execution = DraftCostExecution::Rectangular;
+    RAD_TRY(draft_cost_runtime(&runtime));
     RAD_TRY(sched_.draft_costs().configure(profile, runtime));
 
     if (!sched_.draft_costs().active())
@@ -1569,6 +1592,71 @@ int Engine::load_draft_cost_profile() {
     else
         RAD_INFO("--draft-profile '%s': %zu buckets match this deployment",
                  cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
+    return RAD_OK;
+}
+
+/* --draft-profile-out: the calibration mode. Refused, not ignored, when it cannot produce an
+ * honest profile: the two flags together would read and write the same identity, Cost would price
+ * with the numbers it is recording, and an existing path would be replaced. All three are checked
+ * here, at startup, so a run that cannot export says so before serving instead of after. */
+int Engine::begin_draft_calibration() {
+    if (cfg_.draft_profile_out.empty()) return RAD_OK;
+    if (!cfg_.draft_profile.empty()) {
+        RAD_ERR("--draft-profile-out with --draft-profile: a calibration run measures its own "
+                "profile and does not read one; pass only one of the two");
+        return RAD_E_INVAL;
+    }
+    if (cfg_.draft_policy == DraftPolicyKind::Cost) {
+        RAD_ERR("--draft-profile-out: calibrate under --draft-policy legacy. Under cost the table "
+                "prices with the numbers the run is recording");
+        return RAD_E_INVAL;
+    }
+    if (cfg_.kld()) {
+        RAD_ERR("--draft-profile-out: the KL mode scores the trunk and drafts nothing, so it "
+                "measures no draft cycle to export");
+        return RAD_E_INVAL;
+    }
+    if (::access(cfg_.draft_profile_out.c_str(), F_OK) == 0) {
+        RAD_ERR("--draft-profile-out '%s' already exists; a calibration run does not overwrite a "
+                "profile -- move it or choose another path", cfg_.draft_profile_out.c_str());
+        return RAD_E_INVAL;
+    }
+    /* One honest limit of this mode: the observation ring is opened by the cost policy, so a
+     * calibration run under legacy/adaptive records no cycles yet. Named, because an empty file
+     * would otherwise look like a measurement of zero. */
+    RAD_WARN("--draft-profile-out: the observation ring runs only under --draft-policy cost, so "
+             "this calibration run writes an empty profile; the recording wiring is the next step");
+    draft_calibrating_ = true;
+    return RAD_OK;
+}
+
+int Engine::export_draft_cost_profile() {
+    if (!draft_calibrating_) return RAD_OK;
+    DraftCostRuntime runtime;
+    RAD_TRY(draft_cost_runtime(&runtime));
+
+    /* Everything the step loop measured has to reach the table before the table is read. */
+    sched_.flush_draft_observations();
+
+    DraftCostProfile p;
+    p.fingerprint = runtime.fingerprint;
+    p.execution   = runtime.execution;
+    p.buckets.assign(sched_.draft_costs().buckets().begin(), sched_.draft_costs().buckets().end());
+
+    int32_t skipped = 0;
+    std::string err;
+    const int rc = draft_cost_profile_write_file(cfg_.draft_profile_out, p, &skipped, &err);
+    if (rc != RAD_OK) {
+        RAD_ERR("--draft-profile-out '%s': %s", cfg_.draft_profile_out.c_str(),
+                err.empty() ? rad_strerror(rc) : err.c_str());
+        return rc;
+    }
+    if (skipped > 0)
+        RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
+                 "their flag)", skipped);
+    RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
+             cfg_.draft_profile_out.c_str(), p.buckets.size(), runtime.fingerprint.model.c_str(),
+             runtime.execution == DraftCostExecution::Shrinking ? "shrinking" : "rectangular");
     return RAD_OK;
 }
 
@@ -1751,6 +1839,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    /* Validated before any path starts serving: a calibration run that cannot export must say so
+     * now, not after a complete run. */
+    RAD_TRY(begin_draft_calibration());
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
@@ -1834,9 +1925,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    /* A calibration export is part of the run's result, not a courtesy: its failure is the
+     * engine's status. The transport's status still wins when both are non-zero. */
+    const int xrc = export_draft_cost_profile();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
-    return ls < 0 ? ls : s;
+    if (ls < 0) return ls;
+    if (xrc != RAD_OK) return xrc;
+    return s;
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from

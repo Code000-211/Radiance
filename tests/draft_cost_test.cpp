@@ -16,6 +16,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -1095,6 +1098,201 @@ TEST(the_gpus_field_names_the_ranks_in_order) {
     CHECK_EQ(draft_cost_gpus({ "A", "B" }), std::string("A, B"));
     CHECK_EQ(draft_cost_gpus({}), std::string("none"));
     CHECK_EQ(draft_cost_gpus({ "one" }), std::string("1x one"));
+}
+
+/* ------------------------------------------------------------------ the writer */
+
+/* A parsed profile read back out is a byte-for-byte identity of what the reader understood:
+ * fingerprint, execution, every priced field of every bucket and its origin mix. The writer's
+ * output is parsed with the reader, so a roundtrip that drifts fails here. */
+TEST(the_writer_round_trips_what_the_reader_understood) {
+    const DraftCostProfile p =
+        parse_or_fail(profile_text({ bucket_json(2, 8, 3, { 0, 8, 8, 8 }, 41.5, 0.7, 5,
+                                                  { "ahead" }, "play", 32),
+                                     bucket_json(0, 4, 2, { 0, 4, 4 }, 12.0) }));
+    std::string text, err;
+    int32_t skipped = -1;
+    CHECK_EQ(draft_cost_profile_write(p, &text, &skipped, &err), RAD_OK);
+    CHECK_EQ(skipped, 0);
+    if (!err.empty()) fprintf(stderr, "  write error: %s\n", err.c_str());
+
+    DraftCostProfile q;
+    CHECK_EQ(draft_cost_profile_parse(text, &q, &err), RAD_OK);
+    CHECK(draft_cost_fingerprint_same(p.fingerprint, q.fingerprint, nullptr));
+    CHECK(p.execution == q.execution);
+    CHECK_EQ((int)q.buckets.size(), (int)p.buckets.size());
+    for (size_t i = 0; i < p.buckets.size() && i < q.buckets.size(); ++i) {
+        const DraftCostBucket& a = p.buckets[i];
+        const DraftCostBucket& b = q.buckets[i];
+        CHECK_EQ(a.shape.ctx_class, b.shape.ctx_class);
+        CHECK_EQ(a.shape.n_rows, b.shape.n_rows);
+        CHECK_EQ(a.shape.verify_k, b.shape.verify_k);
+        CHECK_EQ(a.shape.verify_tokens, b.shape.verify_tokens);
+        CHECK_EQ(a.shape.history_tokens, b.shape.history_tokens);
+        CHECK_EQ(a.shape.pipeline_depth, b.shape.pipeline_depth);
+        CHECK_EQ(a.shape.draft_k, b.shape.draft_k);
+        CHECK_EQ(a.flags, b.flags);
+        CHECK_EQ(a.rounds, b.rounds);
+        CHECK_EQ(a.draft_rows_total, b.draft_rows_total);
+        CHECK_EQ(a.n, b.n);
+        CHECK_EQ(a.mean_ms, b.mean_ms);
+        CHECK_EQ(a.unc_ms, b.unc_ms);
+        CHECK(b.origins_known);
+        for (int32_t j = 0; j < a.shape.n_rows; ++j) {
+            CHECK(a.origins[j] == b.origins[j]);
+            CHECK_EQ(a.shape.rows[j], b.shape.rows[j]);
+            CHECK_EQ(a.shape.draft_rows[j], b.shape.draft_rows[j]);
+        }
+    }
+}
+
+/* No invented provenance: a bucket whose samples never captured an origin mix cannot be written.
+ * The alternative -- defaulting rows to `none` -- would let a head row price a lookup row. */
+TEST(the_writer_refuses_a_bucket_with_no_captured_origins) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket b;
+    b.shape = query(0, 4, 2, { 0, 4, 4 });
+    b.rounds = 2;
+    b.draft_round_rows[1] = 4;
+    b.draft_round_rows[2] = 4;
+    b.draft_rows_total = 8;
+    b.mean_ms = 10.0;
+    b.n = 3;
+    b.origins_known = false;
+    p.buckets.push_back(b);
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
+    CHECK(err.find("origin") != std::string::npos);
+}
+
+/* The file has no name for a runtime-only diagnostic flag. Such a bucket is a diagnostic, not a
+ * measurement: it is left out and counted, never written under a guessed name. */
+TEST(the_writer_counts_buckets_whose_flag_it_cannot_name) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket good;
+    good.shape = query(0, 4, 2, { 0, 4, 4 });
+    good.rounds = 2;
+    good.draft_round_rows[1] = 4;
+    good.draft_round_rows[2] = 4;
+    good.draft_rows_total = 8;
+    good.mean_ms = 10.0;
+    good.n = 3;
+    good.origins_known = true;
+    for (int32_t j = 0; j < good.shape.n_rows; ++j) good.origins[j] = DraftOrigin::Head;
+    p.buckets.push_back(good);
+
+    DraftCostBucket truncated_bucket = good;
+    truncated_bucket.flags = kDraftSampleShortened;   /* no file name */
+    p.buckets.push_back(truncated_bucket);
+
+    std::string text, err;
+    int32_t skipped = 0;
+    CHECK_EQ(draft_cost_profile_write(p, &text, &skipped, &err), RAD_OK);
+    CHECK_EQ(skipped, 1);
+    DraftCostProfile q;
+    CHECK_EQ(draft_cost_profile_parse(text, &q, &err), RAD_OK);
+    CHECK_EQ((int)q.buckets.size(), 1);
+}
+
+/* The output path is created, never replaced: an existing profile survives, the temporary is
+ * gone, and the failure is visible. */
+TEST(write_file_never_overwrites_an_existing_profile) {
+    char dir[] = "/tmp/rad-draft-profile-XXXXXX";
+    CHECK(::mkdtemp(dir) != nullptr);
+    const std::string path = std::string(dir) + "/p.json";
+    {
+        std::ofstream f(path, std::ios::binary);
+        f << "{\"format\":\"rad-draft-profile/2\"}";
+    }
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    std::string err;
+    const int rc = draft_cost_profile_write_file(path, p, nullptr, &err);
+    CHECK_EQ(rc, RAD_E_IO);
+    CHECK(err.find("already exists") != std::string::npos);
+
+    std::ifstream f(path, std::ios::binary);
+    std::string kept((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK_EQ(kept, std::string("{\"format\":\"rad-draft-profile/2\"}"));
+
+    /* A fresh path publishes the whole file. */
+    const std::string fresh = std::string(dir) + "/fresh.json";
+    CHECK_EQ(draft_cost_profile_write_file(fresh, p, nullptr, &err), RAD_OK);
+    DraftCostProfile q;
+    CHECK_EQ(draft_cost_profile_read(fresh, &q, &err), RAD_OK);
+}
+
+/* The backend's round model, not this cycle's distribution: a uniform cycle on the serial backend
+ * still writes `shrinking`. The distribution itself is in the bucket key, so a uniform bucket
+ * does not price a query planning a different one. */
+TEST(a_uniform_bucket_of_a_shrinking_backend_is_still_one_profile) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket b;
+    b.shape = query(0, 4, 2, { 0, 4, 4 });
+    b.origins_known = true;
+    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origins[j] = DraftOrigin::Head;
+    b.rounds = 2;
+    b.draft_round_rows[1] = 4;
+    b.draft_round_rows[2] = 4;
+    b.draft_rows_total = 8;
+    b.mean_ms = 10.0;
+    b.n = 3;
+    p.buckets.push_back(b);
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_OK);
+    CHECK(text.find("\"execution\": \"shrinking\"") != std::string::npos);
+
+    DraftCostRuntime r = runtime();
+    r.execution = DraftCostExecution::Rectangular;
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(text), r), RAD_OK);
+    CHECK(!t.active());   /* the backend is part of the identity, strictly */
+
+    r.execution = DraftCostExecution::Shrinking;
+    CHECK_EQ(t.configure(parse_or_fail(text), r), RAD_OK);
+    CHECK(t.active());
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(query(0, 4, 2, { 0, 4, 4 }), &e), RAD_OK);
+    CHECK(e.source == DraftCostSource::Measured);
+    /* A query planning a different distribution is a different key, not a different profile. At
+     * pipeline_depth 0 that mix is refused as unpriceable rather than priced as the bucket's. */
+    DraftCostEstimate other;
+    CHECK_EQ(t.estimate(make_shape(0, 4, { 0, 4, 4 }, 0, 2, { 0, 4, 2 }, 0), &other), RAD_E_INVAL);
+}
+
+/* The backend's round model: a serial head that runs rounds per row is shrinking even when a
+ * cycle's K are uniform; a block drafter, no head, or drafting off is rectangular. */
+TEST(the_execution_is_the_backend_round_model_not_a_cycle) {
+    CHECK(draft_cost_execution(true, 3) == DraftCostExecution::Shrinking);
+    CHECK(draft_cost_execution(true, 1) == DraftCostExecution::Shrinking);
+    CHECK(draft_cost_execution(true, 0) == DraftCostExecution::Rectangular);   /* drafting off */
+    CHECK(draft_cost_execution(false, 3) == DraftCostExecution::Rectangular);  /* block / no head */
+}
+
+/* A profile stamped for the other backend is refused by name, not restamped; the same file is
+ * accepted where its execution matches. */
+TEST(a_rectangular_profile_is_refused_on_a_shrinking_backend_by_name) {
+    const DraftCostProfile p =
+        parse_or_fail(profile_text({ bucket_json(0, 4, 2, { 0, 4, 4 }, 12.0) }));
+    DraftCostRuntime r = runtime();
+    r.execution = DraftCostExecution::Shrinking;
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, r), RAD_OK);
+    CHECK(!t.active());
+    CHECK(t.reason().find("execution") != std::string::npos);
+
+    r.execution = DraftCostExecution::Rectangular;
+    CHECK_EQ(t.configure(p, r), RAD_OK);
+    CHECK(t.active());
 }
 
 RAD_TEST_MAIN()

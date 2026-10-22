@@ -415,6 +415,11 @@ public:
      * profile through the mutable form. */
     const DraftCostTable& draft_costs() const { return draft_costs_; }
     DraftCostTable&       draft_costs() { return draft_costs_; }
+    /* Delivers every cycle record that is already fully measured into the cost table -- the same
+     * close the shutdown path performs -- so a profile exported from a running engine is not
+     * missing the cycles still held in the observation ring. A pending row is closed as dropped,
+     * so this is exactly what shutdown would have recorded, only earlier. */
+    void flush_draft_observations();
     int64_t               draft_cost_refused() const { return draft_cost_refused_; }
     const DraftPredictState* draft_predict_state(int32_t slot) const {
         if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;

@@ -215,10 +215,11 @@ struct DraftBatchView {
 
 /* What a verify pass computes, separated from what the draft rounds actually ran. `rows[j]` is
  * N_j, the number of requests whose verify reaches position j: a rectangular window has all N_j
- * equal, E2's shrinking rounds do not. `draft_rows[j]` is the plan's own N_j for the drafting
- * rounds, so the shape can be checked against the cycle that asked for it instead of against a
- * total. The profile versions the two executions apart, and keying a shape on (rows, max K) alone
- * would mix a rectangular cycle with a shrinking one.
+ * equal, a cycle of a shrinking backend does not. `draft_rows[j]` is the plan's own N_j for the
+ * drafting rounds, so the shape can be checked against the cycle that asked for it instead of
+ * against a total. This shape is the bucket key, and it already separates a rectangular cycle
+ * from a shrinking one; the profile's `execution` names the backend's round model instead, so a
+ * cycle's distribution never changes the profile identity.
  *
  * `unknown` exists because a missing measurement is not a zero: a caller that lacks history,
  * prefill, replay or the plan's draft distribution sets the flag, and the model refuses the shape
@@ -274,6 +275,12 @@ struct DraftCostSample {
     double  draft_ms = -1.0;
     double  host_ms = -1.0;
     uint16_t flags = 0;         /* DraftSampleFlag */
+    /* The per-row provenance of the verify window the shape describes (index i = row i), from
+     * DraftSeqObservation::label_origin. `origins_valid` is the caller's statement that the
+     * executing path captured it; a profile writer refuses a bucket without it rather than
+     * defaulting rows to None. Not part of any key -- see draft_cost.h's note. */
+    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
+    uint8_t     origins_valid = 0;
 };
 
 /* A price for one shape. `valid` false means nothing usable; the caller then uses its named

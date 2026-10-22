@@ -353,7 +353,7 @@ refused by name, not reinterpreted under the current keys.
     "kv_format": "bf16",
     "placement": "all_vram"
   },
-  "execution": "rectangular",
+  "execution": "shrinking",
   "buckets": [
     {
       "ctx_class": 0,
@@ -367,7 +367,8 @@ refused by name, not reinterpreted under the current keys.
         "rows": [0, 8, 8, 8],
         "draft_k": 3,
         "draft_rows": [0, 8, 8, 8],
-        "origins": ["head"],
+        "origins": ["head", "head", "head", "head",
+                    "head", "head", "head", "head"],
         "sampling": "greedy",
         "replay": "play",
         "drafter": "serial"
@@ -391,12 +392,29 @@ refused by name, not reinterpreted under the current keys.
   not match.
   The runtime fields are derived from the deployment, never typed by the user: `model` is the
   container's name (its arch id when unnamed), `quant` its quantisation (`bf16` when none), `tp`
-  the rank count, `tp_wire` `--tp-wire`, `gpus` the ranks' device names in order (`Nx NAME` when
-  all are identical, comma-separated otherwise), `kernels` the loaded libraries (`name@version`,
-  selection order) plus the device architecture, `kv_format` `--kv-cache-dtype` and `placement`
-  `--placement` (an `auto` deployment records `auto`, so a profile generated under an explicit
-  placement will not match it). `execution` is `rectangular`: E2's shrinking rounds are not
-  implemented. A profile generator that writes these same strings is still wave 2/3 work (F).
+  the rank count, `tp_wire` what `engine_info` reports for `--tp-wire` (`exact`/`wht6`, `n/a` at
+  TP1), `gpus` the ranks' device names with their arch ids in order (`Nx NAME (ARCH)` when all are
+  identical, comma-separated otherwise), `kernels` the loaded libraries (`name@version`, selection
+  order) plus the arch plugin and the device architecture, `kv_format` `--kv-cache-dtype` and
+  `placement` `--placement` (an `auto` deployment records `auto`, so a profile generated under an
+  explicit placement will not match it). `execution` is the backend's round model: `shrinking` for
+  the serial head that runs one round per row (also in a cycle whose K are uniform), `rectangular`
+  for a block drafter, a disabled drafter or drafting switched off. The reader derives it and the
+  `--draft-profile-out` writer derives it from the same function, so read and write cannot drift.
+  A `rectangular`-stamped profile for a serial deployment is refused by name and must be
+  recalibrated, not restamped.
+- **Writing a profile (`--draft-profile-out`).** A calibration run names an output path; when the
+  engine exits, after the observation ring is flushed, it writes the buckets it measured with the
+  same fingerprint and execution the reader derives. It refuses `--draft-profile` (a calibration
+  does not read its own input), refuses `--draft-policy cost` (the table would price with the
+  numbers it is recording), and refuses a path that already exists -- the file is written to a
+  temporary in the same directory and published with `link()`, so it appears whole or not at all
+  and an existing file is never replaced. A bucket whose origin mix was not captured, or whose
+  rows do not fit its drafter, is not written at all: the serializer refuses rather than inventing
+  `head`. Diagnostic buckets whose flags the file cannot name (truncations, warmup/record/audit)
+  are left out and counted in the log. `--draft-profile-out` writes an empty profile today under
+  legacy: the observation ring is opened by the cost policy, and wiring recording into
+  the calibration policy is the next step.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually
@@ -421,9 +439,14 @@ refused by name, not reinterpreted under the current keys.
   the runtime fingerprint from the deployment; `admit_fallback()` is reachable from an embedding
   caller, not from a CLI flag, so a matched profile with no usable bucket is refused rather than
   admitted until such a flag exists.
-- **`execution`.** `rectangular` (all N_j equal) and `shrinking` (E2: per-request caps, N_j falling
-  with j) produce different kernels and times, so they are different profiles. Changing the
-  execution invalidates the old file rather than rescaling it.
+- **`execution`.** The backend's round model: `shrinking` is a drafter that runs rounds per row
+  (the serial head, `depth > 0`), so N_j falls where row depths differ -- and the profile stays
+  `shrinking` in a cycle whose K are uniform; `rectangular` is a backend without per-row rounds
+  (a block drafter's pass over `block` positions), a disabled drafter, or drafting off. The two
+  run different kernels and times, so they are different profiles. The executed distribution
+  itself is part of the bucket key (`rounds`, `draft_round_rows[]`, and the planned
+  `draft_k`/`draft_rows[]` it is bounded by), so a uniform bucket never matches a query with a
+  different distribution. Changing the backend invalidates the old file rather than rescaling it.
 - **`shape` is the lookup key.** It is the verify token count and length distribution
   (`n_rows`, `verify_k`, `verify_tokens`), context class, history tokens, prefill tokens, `N_j`,
   sampling class, replay state and the loaded drafter. The planned draft distribution

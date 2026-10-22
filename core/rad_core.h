@@ -898,6 +898,11 @@ struct Config {
      * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
      * inactive and names the difference, and Cost is then refused by Scheduler::init. */
     std::string draft_profile;
+    /* --draft-profile-out: where a calibration run writes the cost profile it measured, with the
+     * same fingerprint and execution the reader derives. Written once at the end of serve(), after
+     * the observation ring is flushed; never over an existing file. Calibration runs under legacy:
+     * under cost the table would be pricing with the same numbers it records. */
+    std::string draft_profile_out;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

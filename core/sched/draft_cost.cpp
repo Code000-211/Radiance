@@ -14,9 +14,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -212,7 +216,8 @@ int parse_fingerprint(const json& j, DraftCostFingerprint* f, std::string* err) 
     return RAD_OK;
 }
 
-int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* err) {
+int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, DraftOrigin* origins,
+                std::string* err) {
     const std::string where = "buckets[" + std::to_string(idx) + "]: ";
     int32_t ctx = 0;
     if (!get_int(b, "ctx_class", &ctx) || ctx < 0 || ctx >= RAD_DRAFT_CTX_CLASSES)
@@ -290,7 +295,6 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
     if (orig == sh.end() || !orig->is_array() || (int32_t)orig->size() != s->n_rows)
         return refuse(err, RAD_E_INVAL, where + "shape.origins: missing or not exactly n_rows long");
     static const char* const kOrigin[] = { "none", "head", "lookup" };
-    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
     for (int32_t i = 0; i < s->n_rows; ++i) {
         const json& o = (*orig)[(size_t)i];
         if (!o.is_string()) return refuse(err, RAD_E_INVAL, where + "shape.origins: not a string");
@@ -339,8 +343,13 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
     const std::string where = "buckets[" + std::to_string(idx) + "]: ";
     if (!b.is_object()) return refuse(err, RAD_E_INVAL, where + "not an object");
 
-    int rc = parse_shape(b, idx, &out->shape, err);
+    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
+    int rc = parse_shape(b, idx, &out->shape, origins, err);
     if (rc < 0) return rc;
+    /* Kept, not only validated: the writer has to state the mix it read, and a head row does not
+     * price a lookup row. */
+    for (int32_t i = 0; i < out->shape.n_rows; ++i) out->origins[i] = origins[i];
+    out->origins_known = true;
 
     rc = parse_flags(b, idx, &out->flags, err);
     if (rc < 0) return rc;
@@ -486,6 +495,198 @@ int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std:
     ss << f.rdbuf();
     if (!f.good() && !f.eof()) return refuse(err, RAD_E_INVAL, "profile: cannot read " + path);
     return draft_cost_profile_parse(ss.str(), out, err);
+}
+
+/* ------------------------------------------------------------------ the writer */
+
+namespace {
+
+/* The names the file has for a bucket flag, and the subset of bits they cover. Everything else --
+ * kDraftSampleValid (never stored), kDraftSampleShortened and kDraftBucketUnpriced -- is a
+ * runtime-only record: the file has no spelling for it, so the writer leaves such a bucket out
+ * instead of inventing one (kDraftBucketUnpriced's contract already says it is never written). */
+constexpr struct { uint16_t bit; const char* name; } kFlagNames[] = {
+    { kDraftSampleAhead, "ahead" },
+    { kDraftSampleWarmup, "warmup" },
+    { kDraftSampleRecord, "record" },
+    { kDraftSampleAudit, "audit" },
+    { kDraftSampleAdmission, "admission" },
+    { kDraftSamplePlacement, "placement" },
+};
+constexpr uint16_t kNamedFlags = kDraftSampleAhead | kDraftSampleWarmup | kDraftSampleRecord |
+                                 kDraftSampleAudit | kDraftSampleAdmission | kDraftSamplePlacement;
+
+const char* const kOriginNames[] = { "none", "head", "lookup" };
+
+bool fingerprint_writable(const DraftCostFingerprint& f) {
+    return !f.model.empty() && !f.quant.empty() && !f.tp_wire.empty() && !f.gpus.empty() &&
+           !f.kernels.empty() && !f.kv_format.empty() && !f.placement.empty() && f.tp >= 1;
+}
+
+json rows_json(const int32_t* rows, int32_t len) {
+    json a = json::array();
+    for (int32_t j = 0; j < len; ++j) a.push_back(rows[j]);
+    return a;
+}
+
+/* One bucket, in the reader's shape. Every invariant the reader checks is checked here first: a
+ * bucket the reader would refuse is a writer error, not a file to discover at the next start. */
+int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string* err) {
+    const std::string where = "buckets[" + std::to_string(idx) + "]: ";
+    const DraftVerifyShape& s = b.shape;
+    if (!b.origins_known)
+        return refuse(err, RAD_E_INVAL,
+                      where + "the samples behind it recorded no origin mix (or two of them "
+                              "disagreed); a writer does not invent provenance");
+    if (!origins_fit_drafter(b.origins, s.n_rows, s.drafter))
+        return refuse(err, RAD_E_INVAL, where + "its origins do not fit its drafter");
+    if (!draft_shape_priceable(s))
+        return refuse(err, RAD_E_INVAL, where + "the shape is not a priceable key");
+    if (!distributions_agree(s))
+        return refuse(err, RAD_E_INVAL, where + "the planned and verify distributions disagree at "
+                                              "pipeline_depth 0");
+    if (!executed_consistent(b.rounds, b.draft_round_rows, b.draft_rows_total, s.n_rows))
+        return refuse(err, RAD_E_INVAL, where + "the executed distribution cannot have run");
+    if (b.rounds > s.draft_k)
+        return refuse(err, RAD_E_INVAL, where + "the executed extent exceeds the planned one");
+    for (int32_t j = 1; j <= b.rounds; ++j)
+        if (b.draft_round_rows[j] > s.draft_rows[j])
+            return refuse(err, RAD_E_INVAL, where + "round " + std::to_string(j) +
+                                                " ran more rows than planned");
+    if (!finite(b.mean_ms) || !(b.mean_ms > 0.0) || !finite(b.unc_ms) || b.unc_ms < 0.0 || b.n < 1)
+        return refuse(err, RAD_E_INVAL, where + "its timing is not a measured mean");
+
+    json sh;
+    sh["n_rows"]         = s.n_rows;
+    sh["verify_k"]       = s.verify_k;
+    sh["verify_tokens"]  = s.verify_tokens;
+    sh["history_tokens"] = s.history_tokens;
+    sh["prefill_tokens"] = s.prefill_tokens;
+    sh["pipeline_depth"] = s.pipeline_depth;
+    sh["rows"]           = rows_json(s.rows, s.verify_k + 1);
+    sh["draft_k"]        = s.draft_k;
+    sh["draft_rows"]     = rows_json(s.draft_rows, s.draft_k + 1);
+    json origins = json::array();
+    for (int32_t i = 0; i < s.n_rows; ++i) {
+        const int o = (int)b.origins[i];
+        if (o < 0 || o > 2)
+            return refuse(err, RAD_E_INVAL, where + "row " + std::to_string(i) +
+                                                " carries no known origin");
+        origins.push_back(kOriginNames[o]);
+    }
+    sh["origins"]  = std::move(origins);
+    sh["sampling"] = s.sampling == DraftSampling::Sampled ? "sampled" : "greedy";
+    /* By name, like the reader: DraftReplay::Unknown is never a file value. */
+    const char* replay = s.replay == DraftReplay::Play     ? "play"
+                         : s.replay == DraftReplay::Record ? "record"
+                         : s.replay == DraftReplay::Audit  ? "audit"
+                                                           : "none";
+    sh["replay"]  = replay;
+    sh["drafter"] = s.drafter == DraftDrafter::Serial ? "serial"
+                    : s.drafter == DraftDrafter::Ngram ? "ngram"
+                                                       : "none";
+
+    json j;
+    j["ctx_class"] = s.ctx_class;
+    j["shape"]     = std::move(sh);
+    j["extent"]    = { { "rounds", b.rounds },
+                       { "draft_rows_total", b.draft_rows_total },
+                       { "draft_round_rows", rows_json(b.draft_round_rows, b.rounds + 1) } };
+    j["time_ms"]   = { { "mean", b.mean_ms }, { "unc", b.unc_ms }, { "n", b.n } };
+    /* The split is written only whole: the file has one `valid` for all three, and a partial
+     * split (one phase untimed) has no honest spelling. Omitting it keeps the mean, which is the
+     * number the model prices with. */
+    if (b.target_ms >= 0.0 && b.draft_ms >= 0.0 && b.host_ms >= 0.0 && finite(b.target_ms) &&
+        finite(b.draft_ms) && finite(b.host_ms))
+        j["components_ms"] = { { "target", b.target_ms },
+                               { "draft", b.draft_ms },
+                               { "host", b.host_ms },
+                               { "valid", true } };
+    json flags = json::array();
+    for (const auto& fn : kFlagNames)
+        if (b.flags & fn.bit) flags.push_back(fn.name);
+    j["flags"] = std::move(flags);
+    *out = std::move(j);
+    return RAD_OK;
+}
+
+}  /* namespace */
+
+int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_t* skipped,
+                             std::string* err) {
+    if (!out) return RAD_E_INVAL;
+    if (skipped) *skipped = 0;
+    if (!fingerprint_writable(p.fingerprint))
+        return refuse(err, RAD_E_INVAL, "fingerprint: a field is empty or tp is below 1");
+
+    json j;
+    j["format"] = "rad-draft-profile/" + std::to_string(RAD_DRAFT_PROFILE_VERSION);
+    j["fingerprint"] = { { "model", p.fingerprint.model },
+                         { "quant", p.fingerprint.quant },
+                         { "tp", p.fingerprint.tp },
+                         { "tp_wire", p.fingerprint.tp_wire },
+                         { "gpus", p.fingerprint.gpus },
+                         { "kernels", p.fingerprint.kernels },
+                         { "kv_format", p.fingerprint.kv_format },
+                         { "placement", p.fingerprint.placement } };
+    j["execution"] = p.execution == DraftCostExecution::Shrinking ? "shrinking" : "rectangular";
+
+    json buckets = json::array();
+    int32_t skip = 0;
+    for (size_t i = 0; i < p.buckets.size(); ++i) {
+        const DraftCostBucket& b = p.buckets[i];
+        if ((b.flags & ~kNamedFlags) != 0) { ++skip; continue; }   /* no name in the file */
+        json bj;
+        const int rc = bucket_to_json(b, (int32_t)i, &bj, err);
+        if (rc < 0) return rc;
+        buckets.push_back(std::move(bj));
+    }
+    j["buckets"] = std::move(buckets);
+    if (skipped) *skipped = skip;
+    *out = j.dump(2) + "\n";
+    return RAD_OK;
+}
+
+int draft_cost_profile_write_file(const std::string& path, const DraftCostProfile& p,
+                                  int32_t* skipped, std::string* err) {
+    if (path.empty()) return refuse(err, RAD_E_INVAL, "output: no path");
+    std::string text;
+    int rc = draft_cost_profile_write(p, &text, skipped, err);
+    if (rc < 0) return rc;
+
+    /* Read back before publishing: a writer that emits a file its own reader refuses has produced
+     * nothing, and at shutdown there is no later start to discover it. */
+    DraftCostProfile check;
+    std::string perr;
+    rc = draft_cost_profile_parse(text, &check, &perr);
+    if (rc < 0)
+        return refuse(err, rc, "output: the writer produced a file its reader refuses: " + perr);
+
+    /* Same directory, so publishing is one link(): the target appears whole or not at all, and an
+     * existing file makes link() fail with EEXIST instead of being replaced. */
+    const std::string tmp = path + ".tmp." + std::to_string((long long)::getpid());
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return refuse(err, RAD_E_IO, "output: cannot create " + tmp);
+        f << text;
+        f.flush();
+        if (!f.good()) {
+            f.close();
+            ::unlink(tmp.c_str());
+            return refuse(err, RAD_E_IO, "output: cannot write " + tmp);
+        }
+    }
+    if (::link(tmp.c_str(), path.c_str()) != 0) {
+        const int e = errno;
+        ::unlink(tmp.c_str());
+        if (e == EEXIST)
+            return refuse(err, RAD_E_IO, "output: " + path +
+                                             " already exists; refusing to overwrite it");
+        return refuse(err, RAD_E_IO, "output: cannot publish " + path + ": " +
+                                         std::strerror(e));
+    }
+    ::unlink(tmp.c_str());
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ the table */
@@ -642,6 +843,7 @@ DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uin
 void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
     DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_round_rows);
     if (!b) return;
+    const bool fresh = b->n == 0;
     const double x = s.total_ms;
     if (b->n == 0) {
         b->mean_ms = x;
@@ -650,6 +852,19 @@ void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
         const double d = x - b->mean_ms;
         b->mean_ms += d / (double)(b->n + 1);
         b->unc_ms = std::max(b->unc_ms, std::fabs(d));
+    }
+    /* The origin mix is provenance for the writer, not a key: the first sample states it, and a
+     * later sample of the same bucket that names another mix leaves the bucket without one (the
+     * write refuses it then -- no single mix describes it). */
+    if (fresh) {
+        b->origins_known = s.origins_valid != 0;
+        if (b->origins_known)
+            for (int32_t i = 0; i < s.shape.n_rows; ++i) b->origins[i] = s.origins[i];
+    } else if (b->origins_known) {
+        bool same = s.origins_valid != 0;
+        for (int32_t i = 0; same && i < s.shape.n_rows; ++i)
+            if (b->origins[i] != s.origins[i]) same = false;
+        b->origins_known = same;
     }
     ++b->n;
     if (flags & kDraftSampleAhead) ++b->n_ahead;

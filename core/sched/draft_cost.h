@@ -79,9 +79,23 @@ struct DraftCostFingerprint {
 bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostFingerprint& b,
                                  std::string* first);
 
-/* Rectangular and shrinking (E2) executions run different kernels, so they are different
- * profiles. A profile for the other execution is refused, not rescaled. */
+/* The backend's round model -- how the active drafter issues draft work, not how one cycle's K
+ * happened to fall. Shrinking is a serial head that runs one round per row, so N_j falls with j
+ * whenever the row depths differ -- and stays shrinking in a cycle whose K are all equal; the
+ * distribution is the bucket key, not the profile identity. Rectangular is a backend without
+ * per-row rounds (a block drafter in one pass over `block` positions), a disabled drafter, or
+ * drafting switched off. The two run different kernels, so they are different profiles, and a
+ * profile for the other execution is refused, not rescaled. */
 enum class DraftCostExecution : uint8_t { Rectangular = 0, Shrinking = 1 };
+
+/* The backend's round model from the drafter that is actually active: `serial_head` is a serial
+ * drafter with a positive depth, and `n_spec` is its resolved depth (0 when drafting is off, and
+ * already resolved from auto before the scheduler starts). The reader and the writer both derive
+ * the execution here, so a record cannot be stamped with anything but what the engine is. */
+inline DraftCostExecution draft_cost_execution(bool serial_head, int32_t n_spec) {
+    return serial_head && n_spec > 0 ? DraftCostExecution::Shrinking
+                                     : DraftCostExecution::Rectangular;
+}
 
 /* What the running deployment is: the profile is accepted only against this. */
 struct DraftCostRuntime {
@@ -100,9 +114,9 @@ struct DraftCostRuntime {
  * took, which the execution could not exceed and which therefore bounds it: the bucket's provenance
  * and its upper bound, so a query planning a deeper distribution does not match.
  *
- * The origin mix (`shape.origins` in the file) is validated against the bucket's own drafter, but
- * it is not stored here: DraftVerifyShape has no origins field, so a query could not discriminate
- * on it anyway. See the note on that interface request above.
+ * The origin mix (`shape.origins` in the file) is validated against the bucket's own drafter and
+ * kept as provenance, but it is not part of the key: DraftVerifyShape has no origins field, so a
+ * query could not discriminate on it anyway. See the note on that interface request above.
  *
  * `flags` are the attribution flags of the samples it was built from; a bucket carrying a disturbing
  * flag -- or the online-only kDraftBucketUnpriced -- is a diagnostic record and is never used to
@@ -110,6 +124,13 @@ struct DraftCostRuntime {
 struct DraftCostBucket {
     DraftVerifyShape shape;
     uint16_t flags = 0;
+    /* The per-row provenance of the verify window the shape describes, captured from the samples
+     * that built it (DraftCostSample::origins). Provenance only, never a key. `origins_known` is
+     * false when no sample captured one or two samples of the same bucket disagreed: no single mix
+     * describes the bucket then, and the writer refuses it rather than picking one. A bucket read
+     * from a file carries the file's mix, so read -> write round-trips it. */
+    DraftOrigin origins[RAD_SCHED_MAX_SPEC] = {};
+    bool        origins_known = false;
     /* The executed extent. rounds = -1 means "unknown", which matches no query. */
     int32_t  rounds = -1;       /* deepest draft round that actually ran */
     int32_t  draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {};  /* actual N_j, index 0 unused */
@@ -137,6 +158,21 @@ struct DraftCostProfile {
 int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std::string* err);
 /* Reads `path` and parses it. The file is not on the step path. */
 int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std::string* err);
+
+/* The inverse reader: `p` as a rad-draft-profile/2 file, in `*out`. Refuses (RAD_E_INVAL with
+ * `err` naming the bucket) rather than inventing what it cannot state: a bucket whose origin mix
+ * was not captured, or whose origins do not fit its drafter, is not written. Buckets carrying a
+ * flag the file cannot name -- the runtime-only kDraftSampleShortened / kDraftBucketUnpriced -- are
+ * diagnostics, are left out, and are counted in `*skipped` (optional); the caller reports them.
+ * The text parses back with draft_cost_profile_parse. */
+int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_t* skipped,
+                             std::string* err);
+/* Writes `p` to `path` atomically and never over an existing file: the text is built and parsed
+ * back first, written to a temporary in the same directory, then published with link(), which
+ * fails with EEXIST instead of replacing. Every failure is RAD_E_IO (or the writer's own refusal)
+ * with `err` naming the path and the reason -- an export that did not happen is never silent. */
+int draft_cost_profile_write_file(const std::string& path, const DraftCostProfile& p,
+                                  int32_t* skipped, std::string* err);
 
 /* The `gpus` fingerprint field from the ranks' device names, in rank order: identical names
  * collapse to "Nx NAME", mixed ones stay comma-separated, an empty list is "none". */

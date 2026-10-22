@@ -171,6 +171,20 @@ private:
      * against this deployment's fingerprint. A mismatch is not an error here (the table stays
      * inactive and names it); an unreadable or malformed file is. */
     int load_draft_cost_profile();
+    /* The one derivation of "what this deployment is" for a cost profile -- fingerprint and
+     * execution. Read by load_draft_cost_profile() and by the --draft-profile-out export, so the
+     * reader and the writer cannot drift. The execution is the backend's round model: the serial
+     * head runs one round per row (shrinking), even in a cycle whose K are uniform; a block
+     * drafter or no drafter at all is rectangular, as is disabled drafting. RAD_E_INVAL when a
+     * device property cannot be read. */
+    int draft_cost_runtime(DraftCostRuntime* out) const;
+    /* --draft-profile-out: validates once at startup (output path free, no --draft-profile) and
+     * names the mode. Refuses under --draft-policy cost: the table would price with the numbers
+     * the run is recording. */
+    int begin_draft_calibration();
+    /* Flushes the observation ring and writes the profile. Called by serve() after the step and
+     * rank threads are joined; a failure is logged and returned, never swallowed. */
+    int export_draft_cost_profile();
     int read_checkpoint_metadata();
     /* --rope-scaling over the free-form keys, then the startup line and the context checks;
      * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */
@@ -425,6 +439,8 @@ private:
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter and the host's block driver both read the committed sequence). */
     bool pipelining_ = false;
+    /* --draft-profile-out was validated at startup and this run exports on exit. */
+    bool draft_calibrating_ = false;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round
