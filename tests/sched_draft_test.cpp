@@ -852,12 +852,35 @@ TEST(all_draft_rows_can_fall_away_and_the_history_pass_is_still_asked_for) {
     CHECK_EQ(h->n_seq, 1);
     CHECK_EQ(h->n_tok, 7);                /* the 1 + 6 positions it still owes */
     CHECK_EQ(h->n_draft_out, 0);
+    CHECK(!f.sch.serial_batch_failed());  /* the owed history pass was built */
     CHECK(f.sch.serial_batch(2, 3) == nullptr);   /* nothing past the history; rounds stops at 1 */
+    /* No drafting row: the null above is a round with nothing to do, not a pass that failed. */
+    CHECK(!f.sch.serial_batch_failed());
 
     /* The pass ran: the watermark moves to what it wrote, and no draft round was needed for it. */
     CHECK_OK(f.commit(11, 0, [](const StepEntry& x) { return x.n_spec; }));
     f.sch.serial_end(0, true);
     CHECK_EQ(f.sch.draft_watermark(id), f.sch.find(id)->n_computed);
+}
+
+/* Counter-case to the one above: a snapshot with no row at all. Nothing is owed, so the null batch
+ * is idleness -- and only serial_batch_failed() can say that, because `n == 0` looks the same as a
+ * K0-only snapshot whose history pass could not be built. */
+TEST(an_empty_snapshot_owes_no_pass_and_reports_no_failure) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);   /* no request, no row */
+    CHECK_EQ(rounds, 1);                                 /* only the history round is asked */
+
+    CHECK(f.sch.serial_batch(0, 1) == nullptr);
+    CHECK(!f.sch.serial_batch_failed());
 }
 
 /* ================================================================== identity across admission */

@@ -2173,6 +2173,7 @@ void Scheduler::step_finished() {
 int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     std::lock_guard<std::mutex> lk(mu_);
     serial_.clear();
+    serial_failed_ = false;   /* a new snapshot: the previous cycle's answer is spent */
     if (!rounds || *rounds <= 0 || !out || max <= 0) return 0;
 
     /* May anything draft? The controller sets depth from measured acceptance; 0 means drafting is
@@ -2331,6 +2332,7 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     const auto t_stage0 = stg ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
     std::lock_guard<std::mutex> lk(mu_);
+    serial_failed_ = false;   /* this call's answer, not the snapshot's */
     if (round < 0 || serial_.empty()) return nullptr;
     /* Round 1 has no pass of its own: the history pass carries it (RadBatch::draft_out_ids). */
     if (round == 1) return nullptr;
@@ -2357,8 +2359,12 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
             continue;      /* history only, or this row's depth ended before this round */
         const Request* rq = serial_req(m);
         /* Unreachable while reap() defers on block_holds(); if it happens the round is skipped,
-         * costing one step's draft. */
-        if (!rq) return nullptr;
+         * costing one step's draft, and stands as a failure so the driver does not read the lost
+         * row as a round with nothing to do. */
+        if (!rq) {
+            serial_failed_ = true;
+            return nullptr;
+        }
 
         StepEntry e;
         e.req      = rq;
@@ -2394,24 +2400,39 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         serial_plan_.e.push_back(e);
         serial_plan_.n_tok += e.n_tokens;
     }
+    /* Nothing owed: no drafting row reaches this round, and round 0 had no history row either.
+     * Not a failure -- serial_begin() never asked for this round in the first place. */
     if (serial_plan_.e.empty()) return nullptr;
 
     /* RADIANCE_DEBUG_STAGE: splits a draft pass's host staging into the plan loop above and
      * `builder_.build`, reporting the average of each. Both are small next to issuing the pass
      * (engine_draft.cpp has that split). Off by default; two clock reads when on. */
-    if (!stg) return builder_.build(serial_plan_, *kv_, step);
+    if (!stg) {
+        const RadBatch* b = builder_.build(serial_plan_, *kv_, step);
+        serial_failed_ = b == nullptr;
+        return b;
+    }
 
     static double acc_plan = 0.0, acc_build = 0.0;
     static long   n_calls = 0;
     const auto t1 = std::chrono::steady_clock::now();
     const RadBatch* b = builder_.build(serial_plan_, *kv_, step);
     const auto t2 = std::chrono::steady_clock::now();
+    serial_failed_ = b == nullptr;
     acc_plan  += std::chrono::duration<double, std::micro>(t1 - t_stage0).count();
     acc_build += std::chrono::duration<double, std::micro>(t2 - t1).count();
     if (++n_calls % 400 == 0)
         RAD_INFO("stage: %ld draft batches; plan %.1f us, build %.1f us a call",
                  n_calls, acc_plan / (double)n_calls, acc_build / (double)n_calls);
     return b;
+}
+
+/* The last serial_batch() owed a pass and built none. Only serial_batch() sets it, so a reader
+ * that calls the two together sees whether a null return was work that could not be built or work
+ * that was never owed; see the declaration for why a row count cannot answer this. */
+bool Scheduler::serial_batch_failed() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return serial_failed_;
 }
 
 /* The watermark moves to what actually ran, read off the committed sequence: the history pass

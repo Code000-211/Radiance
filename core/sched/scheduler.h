@@ -312,7 +312,8 @@ public:
      *               the rows whose frozen K reaches it, deepest first, so every round's rows are a
      *               prefix of the snapshot and a row's depth is the last round it was in. Rows
      *               continuing a sampled verify are device rows (advance.h): the card fills their
-     *               positions and tokens, so no pass waits on the host.
+     *               positions and tokens, so no pass waits on the host. A null return alone does not
+     *               say why; read serial_batch_failed() with it.
      *   serial_end     after commit(), with the rounds that ran and whether the history pass did:
      *               moves the history watermark.
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
@@ -333,6 +334,16 @@ public:
      * pass may fail), and only the driver sees which. It defaults to false so a caller that cannot
      * report the outcome repeats the history pass instead of claiming a watermark it did not earn. */
     void serial_end(int rounds_done, bool history_ran = false);
+
+    /* Did the last serial_batch() fail to build a pass it owed? A null return alone conflates that
+     * with "nothing owed" (empty snapshot, round 1, a round no row reaches), and with a round-0
+     * history pass that no drafting row survives into. Not derivable from `n == 0`: the history a
+     * K0-only snapshot still owes is exactly what a row count cannot see. Set only where a pass
+     * was owed and no batch came back, so the driver can fail the cycle instead of reading the
+     * error as idleness. Cleared by serial_begin() and at every serial_batch() entry, so it speaks
+     * for the last call only. Orthogonal to `history_ran`: this is "could it be built", that is
+     * "did it run". */
+    bool serial_batch_failed() const;
 
     /* ----------------------------------------------------- the block drafter (spec §10)
      *
@@ -628,6 +639,8 @@ private:
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
+    /* The last serial_batch() owed a pass and built none; see serial_batch_failed(). */
+    bool                serial_failed_ = false;
 
     /* The block drafter's rows, valid between block_begin() and block_end(): one per entry of the
      * trunk step just run, in order, with `ctx_len`/`n_tokens` mirroring it. The drafter reads
