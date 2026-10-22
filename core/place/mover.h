@@ -567,11 +567,14 @@ private:
         int64_t  pool_slot = -1;
         int64_t  to_slot = -1;
         RadEvent ev = nullptr;
+        /* A promotion the fill issued into a free slot, not a swap's decision. */
+        bool     fill = false;
 
         void clear() {
             state = State::Free;
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
+            fill = false;
         }
         /* Whether the move hands `slab_slot` back once its quarantine clears. */
         bool frees_slab() const { return kind != Kind::Promote && kind != Kind::Stage; }
@@ -721,8 +724,9 @@ private:
     int64_t donor_slot(size_t klass, int32_t layer, HeatEngine* heat);
     /* A donor out of a lent slot into a free budgeted one, if one is free: false when none is. */
     bool migrate(int32_t unit, HeatEngine* heat);
-    /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. */
-    int  promote_to(int32_t unit, int64_t slot);
+    /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. `fill`
+     * marks one the fill issued rather than a swap, for HeatStats::fill_promotions. */
+    int  promote_to(int32_t unit, int64_t slot, bool fill = false);
     /* Promote the hottest pooled units of one class into up to `room` free slots. */
     int  fill(size_t klass, int64_t room, HeatEngine* heat);
     void count_flex();

@@ -2451,6 +2451,68 @@ TEST(a_drifted_residency_marks_every_later_record_until_the_run_ends) {
     CHECK_EQ(drifted->shape.verify_k, 6);
 }
 
+/* A cost calibration is record-only: it prices nothing, so a moved residency cannot turn its
+ * records into prices for a placement the run has left. It must therefore not be swept up by the
+ * online fail-closed rule -- it keeps measuring the named baseline, marks every cycle after the
+ * move, and the export leaves those out. The one-way latch belongs to an online table. */
+TEST(a_record_only_calibration_keeps_recording_after_a_move) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_policy      = DraftPolicyKind::Cost;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_only_drift.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);                        /* empty profile, fallback admitted */
+    f.sch.draft_costs().record_only();        /* --draft-profile-out under cost */
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft_costs().records_only());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    auto cycle = [&](int64_t moves_since_bind) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+        DraftStepEvidence live;
+        live.replay_known = true;
+        live.replay = DraftReplay::None;
+        live.moves_since_bind = moves_since_bind;
+        f.sch.step_finished(live);
+    };
+    cycle(0);
+    cycle(1);   /* the scheduler's ticks moved a unit between the two brackets */
+    cycle(0);   /* no move of its own -- and no longer on the start placement either */
+
+    /* Not deactivated and not latched: the calibration goes on measuring. */
+    CHECK(f.sch.draft_costs().active());
+    CHECK(f.sch.draft_costs().records_only());
+    CHECK(!f.sch.draft_cost_aborted());
+
+    /* The next planning opens a cycle, which the online rule would have refused, and the plan it
+     * opens is still the named baseline, never a price. */
+    const DraftPlan* before = f.sch.draft().plan();
+    REQUIRE(before != nullptr);
+    const uint64_t cycle_before = before->cycle_id;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft().plan()->cycle_id, cycle_before + 1);
+    CHECK_EQ(f.sch.draft().plan()->source, DraftPlanSource::Fallback);
+    f.commit_plain(11);
+
+    /* Only the start cycle is unmarked; every cycle after the move is filed under the placement
+     * flag, which the export leaves out. */
+    int64_t clean = 0, drifted = 0;
+    for (const DraftCostBucket& x : f.sch.draft_costs().buckets()) {
+        if (x.flags & kDraftSamplePlacement) drifted += x.n;
+        else clean += x.n;
+    }
+    CHECK_EQ(clean, 1);
+    CHECK_EQ(drifted, 2);
+}
+
 /* The online policy under a moved residency: the loaded profile was measured on the start
  * placement, so it stops pricing and stops learning. Fail closed and visibly, on the name -- not
  * admit_fallback(), which would let the policy price without a measurement it was admitted on. */

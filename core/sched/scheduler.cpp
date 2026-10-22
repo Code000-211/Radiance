@@ -1968,8 +1968,9 @@ void Scheduler::draft_cost_cycle() {
     /* After a divergence there is no cycle this profile may price: it was measured on a placement
      * the run has left. Opening the cycle anyway would leave draft_cap() at the ceiling, which is
      * the implicit fallback the admission rule refuses at init; the cycle is refused and the next
-     * planning site reports it, so the engine ends the run on its error path. */
-    if (draft_drift_) {
+     * planning site reports it, so the engine ends the run on its error path. A record-only
+     * calibration prices nothing to begin with and keeps recording (draft_drift_note). */
+    if (draft_drift_ && !draft_costs_.records_only()) {
         if (!draft_cost_aborted_) {
             draft_cost_aborted_ = true;
             RAD_ERR("draft cost: %s; the cost run cannot price another cycle",
@@ -2753,17 +2754,20 @@ void Scheduler::draft_drift_note(int64_t moves_since_bind) {
     /* Sticky, because the run cannot move back to it: every later bracket is marked, and no
      * measurement after the move describes the start residency however clean it looks. */
     draft_drift_ = true;
-    if (draft_.cost_policy() && draft_costs_.active()) {
-        /* Fail closed: the loaded profile was measured on the start placement, so it stops
-         * pricing and stops learning. Not admit_fallback() -- drift is no admission to
-         * price without measurements, and the policy's own named baseline is not a substitute. */
+    /* A record-only table is a calibration: it prices nothing (DraftCostTable::record_only), so a
+     * move leaves no price of its own describing a placement the run has left. It keeps recording
+     * -- the documented contract -- and every record after the move is marked `placed` and kept
+     * out of the export. An online table stops pricing and stops learning instead. Neither is an
+     * admit_fallback(): drift is no admission to price without the measurement the deployment was
+     * admitted on, and the policy's own named baseline is not a substitute. */
+    if (draft_.cost_policy() && draft_costs_.active() && !draft_costs_.records_only()) {
         draft_costs_.deactivate("residency drifted from the fingerprint's start placement");
         RAD_WARN("draft cost: %s; the loaded profile stops pricing and learning",
                  draft_costs_.reason().c_str());
     } else if (draft_record_) {
         RAD_WARN("draft cost: residency drifted from the fingerprint's start placement; "
-                 "no cycle recorded after this point describes it and the calibration "
-                 "cannot export a usable bucket");
+                 "the calibration keeps recording and the export leaves every cycle after it "
+                 "out");
     }
 }
 

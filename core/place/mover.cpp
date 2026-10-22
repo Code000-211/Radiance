@@ -1146,7 +1146,7 @@ bool Mover::migrate(int32_t unit, HeatEngine* heat) {
     return true;
 }
 
-int Mover::promote_to(int32_t unit, int64_t slot) {
+int Mover::promote_to(int32_t unit, int64_t slot, bool fill) {
     UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
     const int rec = free_move_record();
@@ -1166,6 +1166,7 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
+    m.fill = fill;
     ++copying_[(size_t)unit];
     stats_.h2d_bytes += (uint64_t)us.bytes;
     return RAD_OK;
@@ -1213,7 +1214,7 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
             const int64_t slot = pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
             if (slot < 0) return RAD_OK;
             if (heat) heat->set_busy(u, true);
-            if (promote_to(u, slot) < 0) {                   /* no record left: next time */
+            if (promote_to(u, slot, /*fill=*/true) < 0) {     /* no record left: next time */
                 pools_[klass].slab.add_free(slot);
                 if (heat) heat->set_busy(u, false);
                 return RAD_OK;
@@ -1511,7 +1512,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.tier = Tier::VRAM;
                 us.site = Site::Device;
                 ++stats_.promotions;
-                if (heat) heat->set_tier(m.unit, Tier::VRAM);
+                if (heat) heat->set_tier(m.unit, Tier::VRAM, m.fill);
                 break;
             case Move::Kind::Demote:
                 /* Out of a lent slot, the unit was a donor (donor_slot): any other unit there is

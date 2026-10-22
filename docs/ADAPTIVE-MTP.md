@@ -273,23 +273,34 @@ prediction and sample.
 - **A move between two brackets belongs to the bracket after it.** The per-step facts cover one
   bracket, but the scheduler's own tier and arena ticks run after `step_finished()` and move units
   with no step to stamp. The engine therefore reports `DraftStepEvidence::moves_since_bind`, the
-  cumulative promotions + demotions over every rank since the profile was bound, and compares it
-  with the count at the loop's start. Once it is non-zero the record's `placed` is sticky: every
-  later cycle is marked placement-affected, including one whose own bracket saw no move, because
-  the run cannot move back to the start placement. Dropping only the bucket the mover directly
-  marked would leave a later clean-looking bracket to be priced as the start residency. In the
-  online policy the same divergence deactivates the loaded table (`DraftCostTable::deactivate`,
-  reason "residency drifted from the fingerprint's start placement"): it stops pricing and stops
-  learning, and it does not `admit_fallback()` -- drift is no admission to price without the
-  measurement the deployment was admitted on. Calibration keeps recording so the drift is visible
-  and counted, but every record after the move is marked and the export leaves them out.
+  cumulative moves over every rank since the profile was bound -- swap promotions plus every
+  demotion -- and compares it with the count at the loop's start. A fill promotion is not a move:
+  `Mover::fill()` copies pooled units into slots the plan left free (the memory is lent until the
+  owner needs it back), it evicts nothing and it changes no planned resident, so it materialises
+  the start placement rather than leaving it; `HeatStats::fill_promotions` carries that subset and
+  `Engine::residency_moves()` leaves it out. The first fill may issue before the baseline and
+  retire many brackets after it, and it is still not a drift. Once the count is non-zero the
+  record's `placed` is sticky: every later cycle is marked placement-affected, including one whose
+  own bracket saw no move, because the run cannot move back to the start placement. Dropping only
+  the bucket the mover directly marked would leave a later clean-looking bracket to be priced as
+  the start residency. In the online policy the same divergence deactivates the loaded table
+  (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's start
+  placement"): it stops pricing and stops learning, and it does not `admit_fallback()` -- drift is
+  no admission to price without the measurement the deployment was admitted on. An explicit
+  record-only calibration (`DraftCostTable::record_only`, `--draft-policy cost` with
+  `--draft-profile-out`) prices nothing by construction, so a move ends neither its recording nor
+  the run: it keeps measuring the named baseline, marks every record after the move, and the
+  export leaves those cycles out. There is no blanket drift exception: a loaded profile that does
+  price keeps the fail-closed rule above, and a record-only table never gains a price it did not
+  measure.
 - **The online policy fails closed before the next planning, not inside the step it affects.**
   `step_finished` is not the only place the count is read: the engine reports the same cumulative
   evidence at the top of every `step_loop` iteration (`Scheduler::draft_residency`), before
   `promote_next()`/`step()` open the next cycle. The scheduler's idle ticks run after
   `step_finished`, so a move published there would otherwise be seen only by the cycle after the
-  one it priced. Once the divergence is noted under `cost`, `draft_cost_cycle()` refuses to open a
-  cycle at all: it sets a one-way latch (`draft_cost_aborted`), logs the deactivation reason, and
+  one it priced. Once the divergence is noted under `cost` with an online table,
+  `draft_cost_cycle()` refuses to open a cycle at all: it sets a one-way latch
+  (`draft_cost_aborted`), logs the deactivation reason, and
   leaves the last plan in force. `step()` returns no plan, and `promote_next()` does not make the
   step issued ahead current: that work was already issued to the ranks but is never collected or
   committed. The engine then ends the run on its existing error path

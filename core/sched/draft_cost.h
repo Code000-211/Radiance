@@ -246,6 +246,7 @@ public:
      * second cycle's plan -- and the exported numbers would describe a run that was steered by
      * them. The fallback baseline is what such a run executes, and exactly what it measures. */
     void record_only() { record_only_ = true; }
+    bool records_only() const { return record_only_; }
 
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }

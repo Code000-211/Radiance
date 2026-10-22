@@ -1504,6 +1504,10 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     CHECK(m.stats().demotions >= 1);
     CHECK(m.stats().h2d_bytes > 0);
     CHECK(m.stats().d2h_bytes > 0);
+    /* No fill ran here, so every promotion is a swap's decision: the drift evidence counts all of
+     * them, unlike the fill's (HeatStats::moves). */
+    CHECK_EQ(h.stats().fill_promotions, (uint64_t)0);
+    CHECK_EQ(h.stats().moves(), (int64_t)(h.stats().promotions + h.stats().demotions));
     /* The first round found no pool slot for its demotion, and the starvation counter records it. */
     CHECK(m.stats().starved_pool >= 1);
 
@@ -1660,6 +1664,12 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     CHECK_EQ(r.m.flex_used_bytes(), expect * r.hf.plan.classes[0].stride);
     CHECK(r.m.loan_held(Mover::kLendKV) > 0);
     CHECK(r.m.loan_held(Mover::kLendKV) <= Loan::kAll);
+    /* The fill's promotions move bytes, not the plan: they are the start placement being
+     * materialised into memory the plan left lent, so the cost policy's drift evidence counts
+     * none of them (HeatStats::moves, Engine::residency_moves). */
+    CHECK_EQ(r.h.stats().promotions, (uint64_t)expect);
+    CHECK_EQ(r.h.stats().fill_promotions, r.h.stats().promotions);
+    CHECK_EQ(r.h.stats().moves(), (int64_t)0);
 
     /* Every unit the fill promoted lives inside the stretches, at least one slot apart, never
      * overlapping and never in the alignment unit left empty at a stretch's top. */
@@ -1677,6 +1687,36 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
+}
+
+/* The cost profile's drift baseline is taken when the loop starts; a dynamic plan's first fill is
+ * issued there and its copies retire over the dispatches after it. That is the start placement
+ * being materialised into memory the plan lent -- not a move away from it -- so the count the
+ * profile is compared against (HeatStats::moves) must not budge while the fill lands late.
+ * A swap's promotion is a move and does count (mover_promotes_and_demotes_through_the_shadow_slots
+ * keeps the other half). */
+TEST(a_fill_that_lands_after_the_baseline_is_no_placement_move) {
+    LoanRig r;
+    CHECK_OK(r.build());
+    const int64_t base = r.h.stats().moves();          /* the loop's baseline, before any fill */
+    const int64_t slots = r.m.flex_capacity() / r.hf.plan.classes[0].stride;
+    const int64_t expect = std::min<int64_t>(slots - r.m.turnover_slots(), r.pooled());
+    CHECK(expect > 1);
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    /* The dispatch that issues the whole fill has landed nothing yet. */
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.h.stats().promotions, (uint64_t)0);
+    CHECK_EQ(r.h.stats().moves(), base);
+
+    /* The copies retire over the next dispatches; the move count stays at the baseline. */
+    for (Deadline dl; resident_count(r.h, r.hf.plan) < r.planned + expect && !dl.passed();) {
+        CHECK_OK(r.dispatch());
+        CHECK_EQ(r.h.stats().moves(), base);
+    }
+    CHECK_EQ(r.h.stats().promotions, (uint64_t)expect);
+    CHECK_EQ(r.h.stats().fill_promotions, r.h.stats().promotions);
+    CHECK_EQ(r.h.stats().moves(), base);
 }
 
 /* The turnover slots stay free, and a shrinking loan does not take them for good. The fill stops

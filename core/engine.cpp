@@ -440,10 +440,11 @@ bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
 
 int64_t Engine::residency_moves() const {
     int64_t moves = 0;
-    for (const auto& r : ranks_) {
-        const HeatStats hs = r->heat.stats();
-        moves += (int64_t)hs.promotions + (int64_t)hs.demotions;
-    }
+    /* HeatStats::moves() leaves the fill's promotions out: a fill is the plan's start placement
+     * being materialised into lent spare slots, not a change to it. It evicts nothing and every
+     * slot it can take was free at the start or came back from a demotion counted here, so the
+     * first fill -- however late its copies land -- is not a drift. */
+    for (const auto& r : ranks_) moves += r->heat.stats().moves();
 #ifdef RAD_TEST_HOOKS
     moves += rad_test_residency_moves();
 #endif
@@ -529,7 +530,8 @@ int Engine::step_loop() {
         RAD_ERR("step loop: could not bind rank 0's device");
     /* The cost profile's fingerprint names the residency at start. Every cycle's move evidence is
      * reported against this count, so a move between two brackets still invalidates what follows
-     * it (Scheduler::step_finished). */
+     * it (Scheduler::step_finished). The start placement's own fill is not part of the count
+     * (residency_moves), so it may retire after this baseline without reading as a move. */
     draft_moves_baseline_ = residency_moves();
     StepOut so;
     int idle = 0;
@@ -946,7 +948,7 @@ int Engine::step_loop() {
         if (!step_evidence(b->step, &ev)) ev = DraftStepEvidence{};
         /* The per-step fields above describe this bracket; the residency is cumulative, so a move
          * the scheduler's own ticks made between two brackets still reaches the bracket measured
-         * after it. */
+         * after it. Fills are not moves (residency_moves). */
         ev.moves_since_bind = residency_moves() - draft_moves_baseline_;
 #ifdef RAD_TEST_HOOKS
         rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,

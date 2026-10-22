@@ -373,10 +373,13 @@ private:
      * when no rank ran a pass for it, which the caller must treat as Unknown, not as a measured
      * None -- a step issued ahead is collected after its pass, so a miss means no pass at all. */
     bool step_evidence(int32_t step, DraftStepEvidence* out) const;
-    /* Placement moves (promotions + demotions) over every rank, cumulative. Cumulative on purpose:
-     * the per-step evidence covers one bracket, but the scheduler's tier and arena ticks move
-     * units after step_finished, so a move between two brackets would otherwise never reach the
-     * bracket measured after it. Compared against draft_moves_baseline_. */
+    /* Placement moves (swap promotions + demotions) over every rank, cumulative. Cumulative on
+     * purpose: the per-step evidence covers one bracket, but the scheduler's tier and arena ticks
+     * move units after step_finished, so a move between two brackets would otherwise never reach
+     * the bracket measured after it. The fill's promotions are not moves: they materialise the
+     * plan's start placement into lent spare slots and evict nothing (HeatStats::fill_promotions),
+     * so the first fill is not a drift however late its copies land. Compared against
+     * draft_moves_baseline_. */
     int64_t residency_moves() const;
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after

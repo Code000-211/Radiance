@@ -95,6 +95,16 @@ struct HeatRanked { float h; int32_t rc; int32_t unit; };
 struct HeatStats {
     uint64_t dispatches = 0;
     uint64_t proposed = 0, promotions = 0, demotions = 0;
+    /* A subset of `promotions`: the ones Mover::fill issued into lent spare slots. A fill
+     * materialises the plan's start placement -- it evicts nothing and only uses memory the
+     * plan left free -- so the cost profile's drift evidence leaves it out
+     * (Engine::residency_moves). A swap's promotion is not one. */
+    uint64_t fill_promotions = 0;
+
+    /* The placement moves the cost profile's drift evidence counts. */
+    int64_t moves() const {
+        return (int64_t)(promotions - fill_promotions) + (int64_t)demotions;
+    }
     /* Why a dispatch moved nothing. `refused` is the guard declining, the healthy steady state.
      * `no_candidate` is an empty end of the ranking (everything movable is resident, or nothing
      * is), a budget question rather than a policy one. */
@@ -141,8 +151,9 @@ public:
     /* ---- tier map, written by the mover when a move publishes, not when it is issued ---------
      *
      * Until publish both copies are valid and dispatch reads the old one, so the tier here must
-     * match dispatch's view. `set_busy` is what keeps an in-flight unit from being picked again. */
-    void set_tier(int32_t unit, Tier t);
+     * match dispatch's view. `set_busy` is what keeps an in-flight unit from being picked again.
+     * `fill` marks the promotion as the fill's (HeatStats::fill_promotions). */
+    void set_tier(int32_t unit, Tier t, bool fill = false);
     void set_busy(int32_t unit, bool busy);
     Tier tier(int32_t unit) const { return tier_[(size_t)unit]; }
     bool busy(int32_t unit) const { return busy_[(size_t)unit] != 0; }
