@@ -43,6 +43,10 @@
 #include "engine.h"
 #include "engine_test_peer.h"
 
+#include <chrono>
+#include <memory>
+#include <thread>
+
 /* Only FakeKV and FakePC: this binary runs on the real device layer, as the engine does. */
 #define SCHED_FAKES_KV_ONLY
 #include "sched_fakes.h"
@@ -195,6 +199,113 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
 
     chunk(0, 64);
     if (chunk_done) chunk(64, 128);         /* a failed first chunk leaves nothing to compare */
+}
+
+/* The engine's idle branch is the other releaser of a deferred KV free. A request cancelled while
+ * a drafter snapshot still names it keeps its blocks (Scheduler::cancel: pending_free); commit()
+ * normally gives them back, and with no next step to commit, Engine::step_loop's idle branch
+ * drains every rank's stream and calls release_deferred(). This case builds exactly that state on
+ * the scheduler the engine itself runs -- a committed step, a block snapshot opened and closed
+ * around the cancel -- then runs the real step_loop until its sweep has fired. No direct
+ * release_deferred() call: the release under test is the loop's.
+ *
+ * The pool is sized so the admission after the sweep has teeth: 20 blocks of 16 tokens. Request 1
+ * holds 10 after its 160-token prompt; the 192-token prompt submitted next needs 12, so a sweep
+ * that did not run leaves free_blocks at 10 and step() without a plan for it. What the rank below
+ * contributes is only the branch's entry condition (step_loop binds ranks_[0]); it has no program
+ * and issues no pass, so the sync it guards has nothing to drain here -- the release and its
+ * effect on the pool are the facts this case asserts. */
+TEST(idle_step_loop_sweeps_a_cancelled_requests_deferred_free) {
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
+                  "(configure -DRAD_WITH_HIP=OFF)");
+    return;
+#endif
+    HostProgram h;
+    sched_fake::build_program(h.prog, h.cfg, h.kv, h.pc, h.owned,
+                              /*blocks*/ 20, /*states*/ 64, /*max_tok*/ 512, /*max_ctx*/ 4096);
+
+    Engine e(h.cfg);
+    RadStream stream = nullptr;
+    REQUIRE_EQ(rad_stream_create(&stream, 0), RAD_OK);
+    struct SchedGuard {
+        Engine&   e;
+        RadStream stream;
+        bool      inited = false;
+        ~SchedGuard() {
+            /* The last step's uploads point into the builder's staging ring, which fini() frees;
+             * a rank thread has synced its stream by the time the scheduler is finalized, and this
+             * fixture must too or stream_destroy would run the queued task over freed memory. */
+            if (inited && stream) (void)rad_stream_sync(stream);
+            if (inited) EngineTestPeer::fini_sched(e);
+            if (stream) rad_stream_destroy(stream);
+        }
+    } sched_guard{e, stream};
+    REQUIRE_EQ(EngineTestPeer::init_sched(e, h.prog, h.cfg, &h.kv, &h.pc, stream), RAD_OK);
+    sched_guard.inited = true;
+    EngineTestPeer::drafter(e, h.prog.drafter);
+    EngineTestPeer::barrier(e, 1);
+    EngineTestPeer::add_rank(e);
+
+    auto req1 = std::make_unique<rad::Request>();
+    req1->id         = 1;
+    req1->prompt.resize(160);
+    for (size_t i = 0; i < req1->prompt.size(); ++i)
+        req1->prompt[i] = (int32_t)(1 + (i * 37) % 318);
+    req1->max_tokens = 8;
+    req1->ignore_eos = true;
+    req1->sink       = nullptr;
+    const int64_t before = h.kv.free_blocks(0);
+    REQUIRE_EQ(EngineTestPeer::submit(e, std::move(req1)), RAD_OK);
+
+    /* Its one step, committed the way the loop commits: the plan the block snapshot below reads.
+     * The step takes the prompt's ten blocks, so the pool proves the deferral below. */
+    REQUIRE(EngineTestPeer::sched(e).step() != nullptr);
+    REQUIRE_EQ(EngineTestPeer::commit(e, 11), RAD_OK);
+    REQUIRE_EQ(h.kv.free_blocks(0), before - 10);
+
+    /* The drafter's snapshot names request 1; the cancel therefore defers the free, and the
+     * snapshot's end does not sweep it. */
+    rad::Scheduler::BlockRow rows[4];
+    (void)EngineTestPeer::sched(e).block_begin(8, 7, 0, 99, rows, 4);
+    CHECK_EQ(EngineTestPeer::sched(e).cancel(1), RAD_OK);
+    EngineTestPeer::sched(e).block_end();
+    REQUIRE(EngineTestPeer::sched(e).has_deferred());
+    CHECK(h.kv.has_sequence(1));
+
+    /* The real loop. With nothing queued it reaches its idle branch, which syncs the ranks and
+     * sweeps the deferred free; stop() ends it once that has happened. */
+    std::thread loop([&] { EngineTestPeer::step_loop(e); });
+    bool swept = false;
+    for (int i = 0; i < 1000 && !swept; ++i) {
+        swept = !EngineTestPeer::sched(e).has_deferred();
+        if (!swept) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EngineTestPeer::stop(e);
+    loop.join();
+
+    CHECK(swept);
+    CHECK(!h.kv.has_sequence(1));
+    CHECK_EQ(h.kv.free_blocks(0), before);
+
+    /* Freed blocks, so the next admission is planned: 12 blocks against the 20 the sweep gave
+     * back. Without the sweep the pool has 10 and this step builds no plan. */
+    auto req2 = std::make_unique<rad::Request>();
+    req2->id         = 2;
+    req2->prompt.resize(192);
+    for (size_t i = 0; i < req2->prompt.size(); ++i)
+        req2->prompt[i] = (int32_t)(1 + (i * 37) % 318);
+    req2->max_tokens = 8;
+    req2->ignore_eos = true;
+    req2->sink       = nullptr;
+    REQUIRE_EQ(EngineTestPeer::submit(e, std::move(req2)), RAD_OK);
+    const RadBatch* b2 = EngineTestPeer::sched(e).step();
+    REQUIRE(b2 != nullptr);
+    const StepPlan& p2 = EngineTestPeer::sched(e).plan();
+    REQUIRE_EQ(p2.e.size(), 1u);
+    CHECK_EQ(p2.e[0].seq, (uint64_t)2);
+    CHECK(p2.e[0].is_prefill);
+    CHECK_EQ(EngineTestPeer::commit(e, 11), RAD_OK);
 }
 
 }  /* namespace */

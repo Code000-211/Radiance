@@ -1765,6 +1765,63 @@ TEST(an_idle_engine_counts_a_cycle_no_later_open_can_finish_as_discarded) {
     CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0 + 1);
 }
 
+/* The other place a cycle opens: with a step issued ahead, promote_next() makes it current and its
+ * draft_cycle() is the head that closes the record the previous cycle measured. This is the
+ * pipelined path, where most cycles of a serving run open -- the idle tests above cover the step()
+ * head only. One delivery per record: issuing the next step ahead opens nothing, a second
+ * promote_next() with nothing ahead returns at its guard, and the promoted step's own record is
+ * left open for the next step() head rather than counted at the promote. */
+TEST(a_promoted_step_delivers_the_measured_cycle_once_and_only_once) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+
+    /* Cycle A opens at step() and is measured by its commit and its published proposals. */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);   /* measured; no head has closed it yet */
+    const int64_t dropped0 = f.sch.draft_cycles_dropped();
+
+    /* Cycle B opens at step() and delivers A on the way in -- the step() head, already covered. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+
+    /* B is measured in turn: its proposals are published under it, then the next step is issued
+     * ahead. Building that step opens no cycle, so B stays open and undelivered. */
+    f.sch.expect_draft(id, 6);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    REQUIRE(f.sch.step_next() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+
+    /* Its verify commits, and promote_next() makes the issued step current: B is delivered here. */
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    f.sch.promote_next();
+    CHECK_EQ(f.sch.draft_cycles_done(), 2);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
+
+    /* Idempotent: nothing is open ahead now, so the guard returns before any close. */
+    f.sch.promote_next();
+    CHECK_EQ(f.sch.draft_cycles_done(), 2);
+
+    /* The promoted step ran B's drafts, so its own cycle -- opened at the promote head -- is a
+     * measurement too: its verify commit fills the row, and the next step() head delivers it once. */
+    f.commit_plain(11);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 3);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
+}
+
 /* Preemption by recompute keeps the slot and its generation (only add() bumps it), so B's per-slot
  * estimate is the same request's after the resume. The cycle whose row left before its verify,
  * though, never completes: it is counted, not delivered with a hole. */

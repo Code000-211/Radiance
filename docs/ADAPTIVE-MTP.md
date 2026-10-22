@@ -268,13 +268,15 @@ prediction and sample.
   covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly;
   a genuine tape run remains the missing proof that a Record/Audit draft pass reaches the bucket
   rule above.
-- **The last cycle is delivered by the next `step()`, not by an extra idle close.** Every
-  `Scheduler::step()` and `promote_next()` opens by closing the current record
-  (`draft_cost_cycle()`), and `Engine::step_loop` calls one of them before its idle branch and
-  before `drain_completed()` recycles a slot -- so a fully reported cycle is delivered on the idle
-  step itself, and a record no later open can finish is counted as dropped there. There is no
-  separate idle flush to rely on. A cycle measured by the truly last step of a run has no step
-  after it, so `shutdown()`/`fini()` flush the ring before the requests' identities are released.
+- **The last cycle is delivered by the next `step()` or `promote_next()`, not by an extra idle
+  close.** Every `Scheduler::step()` and `promote_next()` opens by closing the current record
+  (`draft_cost_cycle()`), and `Engine::step_loop` calls one of them before its idle branch -- so a
+  fully reported cycle is delivered on the idle step itself, and a record no later open can finish
+  is counted as dropped there. There is no separate idle flush to rely on. `drain_completed()` on
+  that path ends the finished requests' sampler state; it recycles no slot, which
+  `Scheduler::reap()` frees later (`sweep_deferred()` when the free was deferred). A cycle measured
+  by the truly last step of a run has no step after it, so `shutdown()`/`fini()` flush the ring
+  before the requests' identities are released.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.
@@ -391,7 +393,11 @@ refused by name, not reinterpreted under the current keys.
   (`DraftCostTable::has_usable_bucket()`: no disturbing flag, a positive sample count, a finite
   positive mean), or `DraftCostTable::admit_fallback()`. A non-empty `buckets()` list is not that
   price: a profile of only warmup/record/audit/admission/placement records passes it and still
-  prices nothing. `active()` alone is
+  prices nothing. The disturbance set is wider than what a profile file can name:
+  `kDisturbing` (`core/sched/draft_cost.cpp`) also carries `kDraftSampleShortened` and
+  `kDraftBucketUnpriced`, the runtime-only records of a cycle cut short or of a bracket whose
+  deepest round never ran, so those never price either -- they are written with their flag and
+  stay diagnostic. `active()` alone is
   not the admission: a matching profile with no bucket proves the reader ran, not that anyone
   accepted pricing every shape with the policy's named fixed baseline. The deployment must say so,
   in so many words, before `init`; otherwise `init` returns `RAD_E_UNSUPPORTED` with
