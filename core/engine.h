@@ -400,6 +400,7 @@ private:
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
+    int  publish_draft(uint64_t seq, const int32_t* tok, int n);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
@@ -410,8 +411,11 @@ private:
     bool pipelining_ = false;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
-     * asked for, and the rounds that ran. */
+     * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round
+     * each row was still in the batch, read off the passes that were actually issued, so the
+     * finish can compare the card's StepSlot::gen against the plan rather than the cycle's depth. */
     std::vector<Scheduler::SerialRow> serial_row_;
+    std::vector<int32_t> serial_k_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
     /* A history pass (serial round 0) was built and enqueued for the current step. It is the
      * engine's own record of what it issued, not a claim that anything ran: the pass proves itself
