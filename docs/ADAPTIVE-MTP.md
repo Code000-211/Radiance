@@ -167,10 +167,14 @@ prediction and sample.
   the executing path did; `DraftPlan::replay` is what was decided at issue time and is never proof
   that a replay ran. `DraftReplay::None` is a claim of a plain run and may only be written from
   evidence -- a caller that cannot tell leaves `Unknown`, including across a mixed record/play
-  pass. `kDraftSampleShortened` marks a cycle that ended before its planned extent (fewer rounds
-  than `plan.max_k`, or a cancelled row): its bracket times less work than the shape it would be
-  filed under, so it is stored, never folded into the bucket it would otherwise name. The plan
-  itself is not rewritten afterwards to make `timing_valid` true; that field says the executing
+  pass. `draft_sample_attributable` enforces both halves: a sample whose replay state is `Unknown`
+  fills no bucket, and the bucket's key must be the state the run established
+  (`sample.shape.replay == sample.replay`), so a plan's declared `None` cannot key a sample the
+  execution did not evidence. `kDraftSampleShortened` marks a cycle that ended before its planned
+  extent (fewer rounds than `plan.max_k`, or a cancelled row): its bracket times less work than the
+  shape it would be filed under, so it is stored, never folded into the bucket it would otherwise
+  name. The plan itself is not rewritten afterwards to make `timing_valid` true; that field says
+  the executing
   path opened the bracket before the cycle's first work and closed it after its last.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
@@ -416,7 +420,7 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
   pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
   CEST, last artifact of that run 02:17:52). `e0a053c`, `9bc94cd` and `8c91876`, and the
   completion/bench change after them, add checks and are **unexecuted** -- the tree now carries
-  369/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
+  375/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
   objects on the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the
   older libavx objects are not part of these binaries.
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the

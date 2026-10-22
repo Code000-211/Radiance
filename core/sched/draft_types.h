@@ -737,12 +737,20 @@ inline bool draft_sample_storable(const DraftCostSample& s) {
  * sample may, if the caller checked the bracket; it stays flagged so the model can weigh it. Real
  * DMA cost is not an outlier: the placement flag routes it to its own bucket, it is not dropped.
  * Record and audit samples have no path here at all; they are stored through
- * draft_sample_storable and never folded into a play bucket. */
+ * draft_sample_storable and never folded into a play bucket.
+ *
+ * The bucket is keyed by replay state, so that state has to be the run's, twice: the executing path
+ * must have established one (`Unknown` fills no bucket), and the key the sample is filed under must
+ * be that same state. A plan's declared `None` is a declaration, not evidence that no replay ran;
+ * letting it key a sample whose replay state the run could not establish is what prices a shape
+ * with a fact nobody measured. */
 inline bool draft_sample_attributable(const DraftCostSample& s) {
     const uint16_t disturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
                                 kDraftSampleAdmission | kDraftSamplePlacement |
                                 kDraftSampleShortened;
     if (s.cycle_id == 0) return false;   /* nothing to attribute it to */
+    if (s.replay == DraftReplay::Unknown) return false;
+    if (s.shape.replay != s.replay) return false;
     return draft_sample_storable(s) && !(s.flags & disturbing);
 }
 

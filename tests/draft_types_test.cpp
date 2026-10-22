@@ -319,6 +319,8 @@ TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
     DraftCostSample s;
     s.cycle_id = 7;
     s.total_ms = 10.0;
+    s.replay = DraftReplay::None;
+    s.shape.replay = DraftReplay::None;   /* the run established the state the key names */
     CHECK(!draft_sample_attributable(s));   /* not marked valid */
 
     s.flags = kDraftSampleValid;
@@ -354,6 +356,18 @@ TEST(only_cleanly_attributed_samples_may_update_a_measured_bucket) {
         CHECK(draft_sample_storable(nonplay));
         CHECK(!draft_sample_attributable(nonplay));
     }
+
+    /* Replay state is part of the bucket key, so an unevidenced state fills nothing -- and the key
+     * must be the state the run established, not the one the plan declared. */
+    DraftCostSample unknown = s;
+    unknown.replay = DraftReplay::Unknown;
+    unknown.shape.replay = DraftReplay::None;
+    CHECK(draft_sample_storable(unknown));       /* still a bracket */
+    CHECK(!draft_sample_attributable(unknown));  /* but not a measurement of any play bucket */
+    DraftCostSample declared = s;
+    declared.replay = DraftReplay::Play;
+    declared.shape.replay = DraftReplay::None;   /* key from the plan, run says playback */
+    CHECK(!draft_sample_attributable(declared));
 }
 
 TEST(a_missing_profile_falls_back_visibly_instead_of_inventing_a_price) {
@@ -431,6 +445,8 @@ TEST(observing_a_completed_cycle_does_not_write_into_its_plan) {
     sample.policy_version = f.plan.policy_version;
     sample.total_ms = 12.0;
     sample.flags = kDraftSampleValid;
+    sample.replay = DraftReplay::None;
+    sample.shape.replay = DraftReplay::None;
     CHECK(draft_sample_attributable(obs, sample));
 
     draft_fake::Observer observer;
@@ -860,6 +876,8 @@ TEST(the_delivery_and_attribution_gates_refuse_a_plan_that_fails_its_own_check) 
     sample.policy_version = f.plan.policy_version;
     sample.total_ms = 4.0;
     sample.flags = kDraftSampleValid;
+    sample.replay = DraftReplay::None;
+    sample.shape.replay = DraftReplay::None;
 
     CHECK(draft_observation_deliverable(obs));
     CHECK(draft_sample_attributable(obs, sample));
