@@ -78,6 +78,11 @@ struct EngineTestPeer {
         return e.load_draft_cost_profile(runtime);
     }
 
+    /* The identity serve() derives right before it reads --draft-profile. A fixture that has to
+     * write a matching profile after start() resolved the plan (and before serve() reads the
+     * file) needs the same derivation, not a guessed fingerprint. */
+    static int runtime(Engine& e, DraftCostRuntime* out) { return e.draft_cost_runtime(out); }
+
     /* --draft-profile-out's two production calls (core/engine.cpp): the startup check serve() makes
      * before Scheduler::init, and the export it makes at the end. A host fixture reaches every
      * refusal that runs before the identity is derived; the derivation itself needs ranks. */
@@ -116,6 +121,7 @@ struct EngineTestPeer {
 
     /* The release kind a fixture's tiering hook answers for (Engine::issue_what_). */
     static constexpr int kIssueSampler = Engine::kIssueSampler;
+    static constexpr int kIssueModel   = Engine::kIssueModel;
 
     /* One note into a rank's evidence slot: the exact call the rank thread makes after a pass
      * (Rank::note_evidence), injected from the fixture because no rank thread, device or Ctx pass

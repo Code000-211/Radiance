@@ -81,6 +81,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -108,6 +109,10 @@ struct Rec {
     bool    hist_issued    = false;  /* round 0's pass was built for this step */
     bool    withheld       = false;  /* this call withdrew that record before the finish read it */
     int64_t watermark      = -1;     /* the request's history watermark, before this step's finish */
+    /* The step issued ahead by this step, as the rank loop's release hook has already recorded it
+     * (`issue_ahead`'s second barrier join is before this seam). -1 when nothing was issued. */
+    int32_t ahead_step     = -1;
+    bool    tripped        = false;  /* this call published the injected residency move */
 
     /* What the finish will see: the pass was built and the issuance record still stands. */
     bool recorded() const { return hist_issued && !withheld; }
@@ -135,6 +140,15 @@ struct Driver {
     bool                    serving  = false;  /* the engine reported the transport running */
     int                     submit_rc = RAD_OK;
 
+    /* The ahead-shutdown case. `trip_ahead` arms the seam: the first row-carrying step then
+     * publishes one residency move, and the loop's next top refuses the cycle it would open for
+     * the step issued ahead. The rank loop's release hook records every trunk pass it issued
+     * ahead (kIssueModel) so the seam can name that step. Both the hook and the reads below run
+     * under this mutex; the test reads only after serve() joined every thread. */
+    bool                 trip_ahead       = false;
+    bool                 ahead_tripped    = false;
+    std::vector<int32_t> model_passes;
+
     size_t live_before(size_t end) const {
         size_t n = 0;
         for (size_t i = 0; i < end && i < trace.size(); ++i)
@@ -144,6 +158,10 @@ struct Driver {
 };
 
 Driver g_driver;
+
+/* The engine's cumulative residency count adds this to every rank's heat counters. Zero unless the
+ * ahead-shutdown case armed it, so the watermark case runs no drift. */
+std::atomic<int64_t> g_ahead_moves{0};
 
 std::string trace_text_locked() {
     std::string s = "   step  rows  prior  reset  hist  withheld  watermark\n";
@@ -215,6 +233,10 @@ extern "C" void rad_test_step_point(int step, int rows, bool prior_complete, boo
     r.complete       = complete;
     r.hist_issued    = EngineTestPeer::history_issued(*g_driver.engine);
     r.watermark      = EngineTestPeer::watermark(*g_driver.engine, g_driver.req_id);
+    /* The pass `issue_ahead` just released is the next step's; the rank loop's hook recorded it
+     * before the barrier join this seam follows. */
+    for (int32_t st : g_driver.model_passes)
+        if (st > step && st > r.ahead_step) r.ahead_step = st;
     /* The constructed follow-up step: the first row-carrying step after one that completed. Its
      * finish must not move the watermark, so the record the finish reads is withdrawn here --
      * after the pass was built, before collect_step and the commit. */
@@ -223,8 +245,34 @@ extern "C" void rad_test_step_point(int step, int rows, bool prior_complete, boo
         r.withheld        = true;
         EngineTestPeer::history_issued(*g_driver.engine, false);
     }
+    /* The ahead-shutdown case: one move, published only once an ahead pass is in flight (this
+     * step's successor). The loop reads it after this step's commit -- step_finished notes the
+     * drift -- and its next top refuses the cycle the ahead step would open. */
+    if (g_driver.trip_ahead && rows > 0 && !g_driver.ahead_tripped) {
+        g_driver.ahead_tripped = true;
+        r.tripped              = true;
+        g_ahead_moves.store(1, std::memory_order_release);
+    }
     g_driver.trace.push_back(r);
     g_driver.cv.notify_all();
+}
+
+/* The engine's cumulative residency count. The ahead-shutdown case publishes one move through
+ * this seam; nothing else in this binary arms it. */
+extern "C" int64_t rad_test_residency_moves() {
+    return g_ahead_moves.load(std::memory_order_acquire);
+}
+
+/* The rank loop's release hook. It injects no move here (0, the weak default's answer) and records
+ * the trunk pass the loop issued ahead, on the rank thread that ran it -- after run_step, so a
+ * step named here really executed. */
+extern "C" int64_t rad_test_tiering_moves(int rank, int32_t step, int what) {
+    if (what == EngineTestPeer::kIssueModel) {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        if (g_driver.engine) g_driver.model_passes.push_back(step);
+    }
+    (void)rank;
+    return 0;
 }
 
 /* The evidence hook: what the engine hands Scheduler::step_finished for `step`. Recorded on the
@@ -266,6 +314,230 @@ extern "C" void rad_test_serving_ready(int port) {
 }
 
 namespace {
+
+/* The ahead-shutdown proof: a cost run stops on a residency drift while the next step's forward
+ * pass is already issued, and nothing of that step is collected, committed or published.
+ *
+ * The drift is injected through the test build's cumulative-count seam (rad_test_residency_moves,
+ * core/engine.cpp), as in engine_cost_drift_test.cpp. What this case adds is the shape the idle
+ * drift case cannot produce: a real request, so `issue_ahead` actually releases the next step's
+ * trunk pass (kIssueModel) before the current step is collected. The seam then publishes one move
+ * on the first row-carrying step (the tail chunk). `Scheduler::step_finished` of that step notes
+ * the drift; the next loop top refuses the cycle `promote_next()` would open for the step issued
+ * ahead, and the engine takes `fail_loop` -- before that step's sampler, collect and commit.
+ *
+ * What the run proves:
+ *  - the ahead pass really ran on the rank: the rank loop's release hook (which fires after
+ *    run_step) named its step, and Engine::step_evidence still holds that step's frozen record;
+ *  - it was never committed or published: no step point and no evidence hook names it, and the
+ *    scheduler counted no commit for it;
+ *  - the stop drained and joined: serve() returned only after joining the stepper and the rank
+ *    threads (core/engine.cpp), with the request failed by Scheduler::shutdown;
+ *  - nothing was released under a running pass: the seam that publishes the move runs after
+ *    issue_ahead's second barrier join -- i.e. after the rank's pass returned -- while
+ *    Scheduler::shutdown runs at the next loop top; the request's release therefore follows the
+ *    pass that read it.
+ *
+ * The limit this host run cannot cross: the host backend executes run_step synchronously on the
+ * rank thread, so "the pass completed before the release" is observable here, but an asynchronous
+ * stream drain is not -- there is no unwaited device work to observe. On a device the completion
+ * boundary is the teardown sync in Ctx::shutdown (core/runtime/ctx.cpp), which this test cannot
+ * see; that half stays a code-path claim, not a measured one.
+ *
+ * Order: this case must stay ahead of the watermark case below. Each starts its own engine in
+ * this process; the watermark case ends by raising SIGTERM, and the watcher that answers it reads
+ * a process-global flag run_server never clears (core/engine.cpp:2250, 3249). A second engine
+ * started after that raise would find the flag already set, stop a transport that has not reached
+ * its accept loop (a no-op), and then serve a server nothing can stop. This case raises no signal,
+ * so it leaves the flag as it found it. */
+TEST(a_cost_drift_stop_leaves_the_step_issued_ahead_uncommitted_and_drains_it) {
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
+                  "(configure -DRAD_WITH_HIP=OFF)");
+    return;
+#endif
+    setenv("ROCR_VISIBLE_DEVICES", "99", 1);
+    setenv("RADIANCE_HOST_VRAM_MIB", "512", 1);
+
+    tiny::TempDir dir("engine_loop_ahead");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+
+    const std::string profile_path = dir / "ahead-profile.json";
+    const int kChunk = 64;
+    Argv argv({ "--model", dir.path,
+                "--radiance-home", home(),
+                "--kernels", "libref",
+                "--debug-accept-reference-kernels",
+                /* The cost policy's default tier ladder tops out at 6 (DraftPolicyConfig::tiers);
+                 * a shallower ceiling is refused as unconfigurable, not clamped. */
+                "--num-speculative-tokens", "6",
+                "--draft-window", "fixed",
+                "--draft-policy", "cost",
+                "--draft-profile", profile_path,
+                "--max-num-batched-tokens", std::to_string(kChunk),
+                "--host", "127.0.0.1",
+                "--port", "0" });
+    rad::Config cfg;
+    REQUIRE_EQ(rad::config_parse(argv.argc(), argv.argv.data(), &cfg), RAD_OK);
+    REQUIRE(rad::device_is_host());
+
+    Engine e(std::move(cfg));
+    REQUIRE_EQ(e.start(), RAD_OK);
+    {
+        const nlohmann::json info = nlohmann::json::parse(EngineTestPeer::info(e));
+        const nlohmann::json sp = info.value("speculation", nlohmann::json::object());
+        REQUIRE(sp.value("enabled", false));
+        REQUIRE_EQ(sp.value("kind", std::string()), std::string("serial"));
+        REQUIRE_EQ(sp.value("depth", -1), 6);
+    }
+
+    /* The identity serve() will derive and read the profile against. start() resolved the plan,
+     * so the runtime is derivable here; serve() reads the file only after this. The one bucket is
+     * a legal key (measured cleanly), but no shape this fixture plans matches it, so every cycle
+     * prices through the policy's named fallback -- the point here is the drift, not the price. */
+    rad::DraftCostRuntime rt;
+    REQUIRE_EQ(EngineTestPeer::runtime(e, &rt), RAD_OK);
+    {
+        rad::DraftCostProfile prof;
+        prof.fingerprint = rt.fingerprint;
+        prof.execution   = rt.execution;
+        rad::DraftCostBucket b;
+        b.shape.n_rows         = 1;
+        b.shape.verify_k       = 1;
+        b.shape.rows[1]        = 1;
+        b.shape.verify_tokens  = 2;
+        b.shape.history_tokens = 1;
+        b.shape.pipeline_depth = 1;
+        b.shape.draft_k        = 0;
+        b.shape.sampling       = rad::DraftSampling::Greedy;
+        b.shape.replay         = rad::DraftReplay::None;
+        b.shape.drafter        = rad::DraftDrafter::Serial;
+        b.origin_set[0]        = (uint8_t)(1u << (unsigned)rad::DraftOrigin::Head);
+        b.rounds               = 0;
+        b.draft_rows_total     = 0;
+        b.draft_round_rows[0]  = 0;
+        b.mean_ms              = 1.0;
+        b.unc_ms               = 0.1;
+        b.n                    = 1;
+        prof.buckets.push_back(b);
+        int32_t skipped = 0;
+        std::string err;
+        REQUIRE_EQ(rad::draft_cost_profile_write_file(profile_path, prof, &skipped, &err), RAD_OK);
+        CHECK_EQ(skipped, 0);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine        = &e;
+        g_driver.req_id        = 1;
+        g_driver.withheld      = false;
+        g_driver.serving       = false;
+        g_driver.submit_rc     = RAD_OK;
+        g_driver.trace.clear();
+        g_driver.ev.clear();
+        g_driver.model_passes.clear();
+        g_driver.ahead_tripped = false;
+        g_driver.trip_ahead    = true;
+    }
+    g_ahead_moves.store(0, std::memory_order_release);
+
+    std::promise<int> served;
+    std::future<int>  done = served.get_future();
+    std::thread serve_thread([&] {
+        const int rc = e.serve(nullptr);
+        served.set_value(rc);
+    });
+
+    /* No signal: the aborted step loop stops the transport itself (fail_loop's loop_status_). A
+     * serve() that does not return means that stop failed; the engine owns threads nothing else
+     * can join, so the process ends here as the failure it is. */
+    if (done.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+        std::fprintf(stderr, "engine_loop_test: serve() did not return within 60 s after the cost "
+                             "drift:\n%s\n", trace_text().c_str());
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    serve_thread.join();
+
+    std::vector<Rec>     tr;
+    std::vector<EvRec>   ev;
+    std::vector<int32_t> model_passes;
+    bool                 tripped = false;
+    {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine     = nullptr;
+        g_driver.trip_ahead = false;
+        tripped             = g_driver.ahead_tripped;
+        tr                  = g_driver.trace;
+        ev                  = g_driver.ev;
+        model_passes        = g_driver.model_passes;
+    }
+
+    CHECK_EQ(done.get(), RAD_E_STATE);
+    CHECK(tripped);
+    REQUIRE(!tr.empty());
+    std::fprintf(stderr, "engine_loop_test (ahead): %s\n", trace_text().c_str());
+
+    /* The tail chunk: the first step that produced a logit row, and the seam's trip point. */
+    size_t it = (size_t)-1;
+    for (size_t i = 0; i < tr.size(); ++i)
+        if (tr[i].tripped) { it = i; break; }
+    REQUIRE(it != (size_t)-1);
+    const Rec& tail = tr[it];
+    CHECK(tail.rows > 0);
+
+    /* The pass issued ahead: exactly one model release in this fixture (mid-prompt chunks issue
+     * none), for the step after the tail. The seam saw it already run. */
+    REQUIRE_EQ(model_passes.size(), (size_t)1);
+    const int32_t ahead_step = model_passes[0];
+    CHECK_EQ(ahead_step, tail.step + 1);
+    CHECK_EQ(tail.ahead_step, ahead_step);
+
+    /* The rank's frozen record for that step still names it: the pass really executed. */
+    rad::DraftStepEvidence ahead_ev{};
+    CHECK(EngineTestPeer::step_evidence(e, ahead_step, &ahead_ev));
+
+    /* And no step ever collected or committed it: one step point per committed step, one evidence
+     * record per commit, none for the ahead step. */
+    for (const Rec& r : tr) CHECK(r.step != ahead_step);
+    REQUIRE_EQ(ev.size(), tr.size());
+    for (const EvRec& x : ev) CHECK(x.step != ahead_step);
+    for (size_t i = 0; i < ev.size(); ++i) CHECK_EQ(ev[i].step, tr[i].step);
+    const rad::SchedMetrics m = EngineTestPeer::sched(e).metrics();
+    CHECK_EQ(m.steps, (int64_t)tr.size());
+    CHECK_EQ(m.failed, 1);
+    CHECK_EQ(m.finished, 0);
+    CHECK_EQ(m.running, 0);
+    CHECK_EQ(m.queue_depth, 0);
+
+    /* The drift itself: the loaded profile stopped pricing, the cycle for the ahead step was
+     * refused, and the run did not fall back to the ceiling. */
+    CHECK(EngineTestPeer::sched(e).draft_cost_aborted());
+    CHECK_EQ(EngineTestPeer::sched(e).draft_costs().buckets().size(), (size_t)1);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
+    CHECK_EQ(EngineTestPeer::sched(e).draft_costs().reason(),
+             std::string("residency drifted from the fingerprint's start placement"));
+    CHECK(!EngineTestPeer::sched(e).draft_costs().fallback_admitted());
+
+    /* Leave the fixture as the case below expects to find it. It was written as the only case in
+     * this binary and so resets nothing itself: this run's records, its transport report and its
+     * injected move must not survive it. */
+    g_ahead_moves.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.trip_ahead    = false;
+        g_driver.ahead_tripped = false;
+        g_driver.withheld      = false;
+        g_driver.serving       = false;
+        g_driver.submit_rc     = RAD_OK;
+        g_driver.model_passes.clear();
+        g_driver.trace.clear();
+        g_driver.ev.clear();
+    }
+}
 
 /* Both endpoints of the history watermark, on one engine started for real.
  *
