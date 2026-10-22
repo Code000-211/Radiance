@@ -146,13 +146,19 @@ int DraftPredictModel::predict_hook(void* self, const DraftBatchView& view,
     return static_cast<DraftPredictModel*>(self)->predict(view, out);
 }
 
-void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o) const {
-    /* Another drafter's matches are not this head's acceptance, and a K0 row measured nothing.
-     * The plan's fill[] is the permission (draft_origin_fits_plan); this is the fact. */
-    if (o.origin != DraftOrigin::Head || o.generated == 0 || p_.max_depth <= 0) return;
+bool DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o) const {
+    /* Another drafter's matches are not this head's acceptance, and a row nobody drafted measured
+     * nothing. The gate is the provenance of the window the verify consumed (`label_origin`), not
+     * the plan this observation names: with pipeline_depth > 0 the labels belong to the previous
+     * cycle's publication, and a row that changed drafter between the two would otherwise teach
+     * the head from a lookup's matches (or drop the head's). The plan's fill[] is the permission
+     * (draft_origin_fits_plan); this is the fact. */
+    if (o.label_origin != DraftOrigin::Head || o.label_generated == 0 || p_.max_depth <= 0)
+        return false;
 
     /* The shared mask, not a second one: 1 on the accepted prefix, 0 at a real rejection, and no
      * label at a matched-but-uncommitted stop. A censor past the rejection does not erase it. */
+    bool applied = false;
     const int D = p_.max_depth;
     for (int j = 0; j < (int)o.checked && j < D; ++j) {
         float x = 0.0f;
@@ -161,15 +167,19 @@ void DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o
         s.a[j] = (float)((double)s.a[j] + w * ((double)x - (double)s.a[j]));
         s.ess[j] = (float)settle_ess((double)s.ess[j], w);
         if (s.n[j] < UINT16_MAX) ++s.n[j];
+        applied = true;
     }
     /* Positions past the window the verify computed drift toward its deepest position, the same
      * basis and step as DraftController::adapt_observe. No count, no valid bit. */
     int verified = (int)o.verified;
     if (verified > D) verified = D;
-    if (verified <= 0) return;
+    if (verified <= 0) return applied;
     const double edge = (double)s.a[verified - 1];
-    for (int j = verified; j < D; ++j)
+    for (int j = verified; j < D; ++j) {
         s.a[j] = (float)((double)s.a[j] + alpha_ * (edge - (double)s.a[j]));
+        applied = true;
+    }
+    return applied;
 }
 
 int DraftPredictModel::observe(const DraftObservation& obs) const {
@@ -209,10 +219,15 @@ int DraftPredictModel::observe(const DraftObservation& obs) const {
     for (int32_t i = 0; i < obs.n_seq; ++i) {
         const int32_t slot = obs.slot[i];
         DraftPredictState& s = states_[slot];
+        ++counts_.rows_attempted;
         /* A recycled slot belongs to another request now. The cycle stays deliverable, but its
          * rows must never merge into the new generation's estimate: skip them. */
-        if (s.req_id != obs.req_id[i] || s.slot_gen != obs.slot_gen[i]) continue;
-        learn(s, obs.seq[i]);
+        if (s.req_id != obs.req_id[i] || s.slot_gen != obs.slot_gen[i]) {
+            ++counts_.rows_skipped;
+            continue;
+        }
+        if (learn(s, obs.seq[i])) ++counts_.rows_applied;
+        else ++counts_.rows_skipped;
     }
     return RAD_OK;
 }

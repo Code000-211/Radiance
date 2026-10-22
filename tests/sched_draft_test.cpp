@@ -8,8 +8,9 @@
  * again.
  *
  * The plan is enabled through the public seam the engine will use (DraftController::Params), so
- * these tests need no config wiring: the cost policy is still not reachable from Config, and
- * activation is the integrator's step.
+ * these tests need no file-based config: `--draft-policy cost` reaches it through Config, but a
+ * profile still has to be configured for the runtime or Scheduler::init refuses the policy by
+ * name (the baseline lock below). The fixtures install one explicitly (activate_costs).
  */
 #include "rad_test.h"
 
@@ -170,8 +171,8 @@ TEST(a_cycle_measures_the_executed_distribution_and_refuses_unknown_evidence) {
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
-    CHECK_OK(f.start());
     activate_costs(f);
+    CHECK_OK(f.start());
 
     const uint64_t a = f.submit(160), b = f.submit(170);
     f.prefill(a);
@@ -270,8 +271,8 @@ TEST(an_untimed_cycle_is_refused_by_a_rather_than_priced_at_zero) {
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
-    CHECK_OK(f.start());
     activate_costs(f);
+    CHECK_OK(f.start());
 
     const uint64_t a = f.submit(160);
     f.prefill(a);
@@ -1533,6 +1534,7 @@ TEST(the_cost_policy_is_wired_through_config_and_observes_each_cycle_exactly_onc
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
+    activate_costs(f);          /* the baseline a Cost deployment is admitted with */
     CHECK_OK(f.start());
 
     const uint64_t id = f.submit(160);
@@ -1605,6 +1607,7 @@ TEST(a_preempted_slot_keeps_its_history_and_its_cycle_is_dropped) {
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
+    activate_costs(f);
     CHECK_OK(f.start());
 
     const uint64_t a = f.submit(64, 512, /*priority=*/0);
@@ -1664,6 +1667,132 @@ TEST(a_preempted_slot_keeps_its_history_and_its_cycle_is_dropped) {
     CHECK(preempted);
 }
 
+/* Review 2, finding 2: the labels a cycle's verify reports measure the window it consumed -- the
+ * previous plan's publication or this step's own lookup fallback -- never the plan the row is
+ * named after. Both directions are exercised in one run: cycle A's verify is a lookup while A
+ * publishes the head's proposals; cycle B's verify measures A's head window while B itself
+ * publishes nothing (its lookup fills). */
+TEST(the_labels_carry_the_provenance_of_the_verified_window_not_the_plan) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit_pattern(2);   /* enough repetition for prompt lookup */
+    f.prefill(id, /*token=*/1);                /* the tail keeps repeating after the prompt */
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+
+    /* Cycle A: no head proposal, so the step fills from prompt lookup. */
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* ea = entry_of(f.sch, id);
+    REQUIRE(ea != nullptr);
+    const int32_t slot = ea->slot;
+    CHECK(ea->ngram);
+    const int32_t kA = ea->n_spec;
+    REQUIRE(kA > 0);
+    f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; });   /* all accepted */
+    f.sch.step_finished();
+
+    /* A publishes the head's proposals for the next step. When A is delivered, its own origin is
+     * Head, but the labels it measured were the lookup's: B's estimate must not move. */
+    CHECK_OK(f.sch.set_draft(id, six, kA));
+    REQUIRE(f.sch.step() != nullptr);            /* opens B, delivers A */
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+    const DraftPredictState* st = f.sch.draft_predict_state(slot);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, id);
+    CHECK_EQ(st->n[0], 0);
+    CHECK_EQ(f.sch.metrics().draft_obs_applied, 0);
+    CHECK_EQ(f.sch.metrics().draft_obs_skipped, 1);
+
+    /* B verifies A's published head window but publishes nothing itself. Its delivery must teach:
+     * the old gate read B's own (empty) origin and would have dropped the head's labels. */
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return 2; }));
+    REQUIRE(f.sch.step() != nullptr);            /* opens C, delivers B */
+    CHECK_EQ(f.sch.draft_cycles_done(), 2);
+    st = f.sch.draft_predict_state(slot);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->n[0], 1);
+    CHECK_EQ(st->n[1], 1);
+    CHECK_EQ(st->n[2], 1);      /* accepted 2, then the first rejection */
+    CHECK_EQ(st->n[3], 0);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_obs_attempted, 2);
+    CHECK_EQ(m.draft_obs_applied, 1);
+    CHECK_EQ(m.draft_obs_skipped, 1);
+    CHECK_EQ(m.draft_obs_discarded, 0);
+}
+
+/* Review 2, finding 4: the last cycle has no next open to be delivered at. Shutdown must deliver
+ * what is already complete, before the request identities are gone, and only once. */
+TEST(shutdown_delivers_the_last_complete_cycle_and_not_twice) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+
+    REQUIRE(f.sch.step() != nullptr);            /* cycle A */
+    f.commit_plain(11);                          /* A's verify: nothing drafted */
+    f.sch.step_finished();
+    CHECK_OK(f.sch.set_draft(id, six, 6));       /* A's publication: six, verified by B */
+    const int64_t done0 = f.sch.draft_cycles_done();
+    REQUIRE(f.sch.step() != nullptr);            /* opens B, delivers A */
+    CHECK_EQ(f.sch.draft_cycles_done(), done0 + 1);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return 2; }));   /* B's verify: reported */
+    f.sch.step_finished();
+
+    /* No further open. B is complete and must reach the predictor now. */
+    f.sch.shutdown("test done", 0);
+    CHECK_EQ(f.sch.draft_cycles_done(), done0 + 2);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_obs_attempted, 2);
+    CHECK_EQ(m.draft_obs_applied, 1);   /* B measured A's head window */
+    CHECK_EQ(m.draft_obs_skipped, 1);   /* A measured nothing */
+    CHECK_EQ(m.draft_obs_discarded, 0);
+
+    /* A second shutdown (or fini) must not apply B again. */
+    f.sch.shutdown("again", 0);
+    CHECK_EQ(f.sch.draft_cycles_done(), done0 + 2);
+    CHECK_EQ(f.sch.metrics().draft_obs_attempted, 2);
+}
+
+/* The other half of the same rule: a cycle whose row never reported is not a smaller observation.
+ * It is dropped, visibly, and never delivered with a hole. */
+TEST(shutdown_counts_an_incomplete_last_cycle_as_discarded) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);   /* cycle A opens with this decode row pending */
+    f.sch.shutdown("test stop", 0);     /* the row will never report */
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 1);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_obs_attempted, 0);
+    CHECK_EQ(m.draft_obs_discarded, 1);
+}
+
 /* docs/ADAPTIVE-MTP.md: cost is serial-only and needs a ceiling. The refusal is by name, at init,
  * where the container's drafter is known -- never a silent fall back to legacy. */
 TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
@@ -1680,6 +1809,13 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
     CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
 
     f.cfg.n_spec = 6;
+    /* A serial head and a ceiling are the shape, not a baseline: without a profile admitted for
+     * this runtime Cost is still refused, and the ceiling alone is not one. */
+    const std::string refused =
+        stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+    CHECK(has(refused, "no admissible cost baseline"));
+
+    activate_costs(f);
     CHECK_OK(f.start());
 }
 RAD_TEST_MAIN()

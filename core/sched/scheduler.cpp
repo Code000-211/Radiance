@@ -132,6 +132,19 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                 (int)prog.drafter.depth, cfg.n_spec);
         return RAD_E_UNSUPPORTED;
     }
+    /* ... and a baseline admitted for THIS runtime. DraftCostTable::configure() is the only way a
+     * table becomes active, and it refuses every fingerprint but its own, so `active()` is the
+     * proof that a profile was loaded and matched. A configured K-ceiling alone is not a cost
+     * baseline (docs/ADAPTIVE-MTP.md): without one every price would be a guess, so Cost is
+     * refused by name rather than run on unknowns. The table is configured before init; the
+     * conditional clear below keeps it, since it is the baseline this deployment was admitted
+     * with. */
+    if (cfg.draft_policy == DraftPolicyKind::Cost && !draft_costs_.active()) {
+        RAD_ERR("--draft-policy cost: no admissible cost baseline -- configure a profile for "
+                "this runtime (model, quant, tp wire, gpus, kernels, kv format, placement) before "
+                "init");
+        return RAD_E_UNSUPPORTED;
+    }
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
@@ -156,8 +169,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         dp.predictor = DraftPredictor{ &draft_predict_, &DraftPredictModel::predict_hook };
     }
     /* No profile is loaded, so every price is invalid and the policy issues its named fallback;
-     * the table is still the handle open_cycle prices through. */
-    draft_costs_.clear();
+     * the table is still the handle open_cycle prices through. A table configured before init is
+     * the baseline a Cost deployment was admitted with -- keep it. */
+    if (!draft_costs_.active()) draft_costs_.clear();
     dp.costs = draft_costs_.handle();
     /* The ring's storage: fixed at init so a cycle never allocates one. */
     for (int32_t i = 0; i < (int32_t)kDraftRing; ++i) {
@@ -264,6 +278,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 }
 
 void Scheduler::fini() {
+    /* A scheduler torn down without shutdown() still owes its last completed cycle to the
+     * predictor. No-op when shutdown() already flushed. */
+    draft_ring_flush();
     for (auto& s : reqs_)
         if (s && s->req && (s->running || s->pending_free)) kv_->free_sequence(s->req->id);
     builder_.fini();
@@ -652,6 +669,10 @@ void Scheduler::shutdown(const char* reason, int status) {
         close_request(s, ReqState::Failed, closed_reason_, /*defer_free=*/false,
                       /*publish=*/false, closed_status_, closed_reason_);
     }
+    /* No next open will deliver the last cycle. Its rows are final now: the ones the closes above
+     * did not resolve are marked dropped, so the record either delivers (all reported) or is
+     * counted as discarded -- never silently in flight. */
+    draft_ring_flush();
     /* Nothing will commit again, so no entry of the last step still owns its slot. */
     step_open_ = false;
     next_open_ = false;
@@ -1972,6 +1993,22 @@ void Scheduler::draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t
             o.checked = (uint8_t)accepted;
             o.end = DraftSeqEnd::Stopped;
         }
+        /* The provenance of the window this verify actually consumed, which is NOT this plan's
+         * own drafting (`origin`/`generated`, published after this commit): the step verifies the
+         * head proposals the previous plan published, or the prompt-lookup fallback this step's
+         * planning filled itself. B must be told which, or a row whose plan published nothing
+         * would hide the head's labels -- and a row whose plan publishes next step would teach
+         * from a lookup's matches (draft_predictor.cpp's learn() gates on this, not on origin). */
+        if (v <= 0) {
+            o.label_origin    = DraftOrigin::None;
+            o.label_generated = 0;
+        } else if (e.ngram) {
+            o.label_origin    = DraftOrigin::Lookup;
+            o.label_generated = (uint8_t)v;
+        } else {
+            o.label_origin    = DraftOrigin::Head;
+            o.label_generated = (uint8_t)v;
+        }
         r->state[j] = 1;
         return;
     }
@@ -2041,6 +2078,18 @@ void Scheduler::draft_ring_close(uint64_t cycle_id) {
     }
     r.active = false;
     r.n_seq  = 0;
+}
+
+/* The last cycle has no next open: shutdown must deliver what is already fully measured before
+ * the request identities are released, and count what never completed as dropped (visible in
+ * SchedMetrics::draft_obs_discarded) rather than leave it in flight. Called at shutdown after the
+ * requests are closed -- so a pending row has been marked dropped -- and again at fini, where
+ * every record is already retired and the call is a no-op. */
+void Scheduler::draft_ring_flush() {
+    draft_ring_close(draft_ring_cur_);
+    draft_ring_cur_ = 0;
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
+        if (draft_ring_[i].active) draft_ring_close(draft_ring_[i].cycle_id);
 }
 
 /* A's sample for one resolved cycle. The price is the cost of the distribution that RAN
@@ -3231,6 +3280,13 @@ SchedMetrics Scheduler::metrics_locked() const {
         const int kDepth = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
         for (int d = 0; d < kDepth; ++d) m.draft_verify_depth[d] = draft_.verified_at(d);
     }
+    /* The delivery ledger: what the predictor was handed, what it applied, what it skipped, and
+     * what never arrived. A predictor call that returns OK has not necessarily taught anything. */
+    const DraftPredictModel::Counts& dc = draft_predict_.counts();
+    m.draft_obs_attempted = (int64_t)dc.rows_attempted;
+    m.draft_obs_applied   = (int64_t)dc.rows_applied;
+    m.draft_obs_skipped   = (int64_t)dc.rows_skipped;
+    m.draft_obs_discarded = draft_cycles_dropped_;
     return m;
 }
 

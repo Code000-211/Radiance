@@ -7,9 +7,10 @@ versioned profile and benchmark-manifest formats, the CLI names, and which files
 **Status: host-wired, inactive by default.** The contracts, their fakes and the scheduler wiring
 exist and are tested on the host: B's predictor and A's cost table are both fed from the cycle
 ring, and the cost policy is opt-in (`--draft-policy cost`; the default stays `legacy`). Cost is
-still inactive without a configured profile -- `DraftCostTable::configure` is called by no
-deployment path yet, so every estimate takes its named fallback -- and the sample path only
-measures: it activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
+still inactive without a configured profile: `DraftCostTable::configure` is called by no
+deployment path yet, so `--draft-policy cost` is refused at `Scheduler::init` by name (the
+baseline lock) and every estimate takes its named fallback. The sample path only measures: it
+activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
 
 ## The seam
 
@@ -62,18 +63,34 @@ prediction and sample.
   off-slot; B cannot, because the table belongs to the slot. A smaller `max_seqs` may not be
   configured while an open cycle names a slot above it -- shrink is refused or applied after the
   drain, never by dropping the cycle.
-- **Delivery and application are two acts, and application is all-or-nothing.** The observer
-  returns one `applied` bit: every row was learned, or none was. A cycle that could not bind a
-  request's state right now is delivered again later from its original plan and state -- never
-  partially applied, so re-delivery cannot learn a row twice -- and it does not expire on the
-  ring's end: the ring holds the state until the cycle applies, and at full capacity uses the
-  scheduler's existing drain/backpressure limit. A cycle already applied is an caller error to
-  deliver again; B keeps no queue and allocates nothing in the path.
+- **Delivery and application are two acts, and application is per row and counted.** The
+  scheduler delivers a completed cycle once (at the next cycle's open, or at shutdown); the
+  observer answers `RAD_OK` even when it applied nothing, so that return value is not evidence of
+  application. `DraftPredictModel::observe` counts the rows apart: `attempted` (every row of a
+  deliverable cycle), `applied` (a row whose labels moved a request's estimate) and `skipped` (a
+  row with no teachable label, or one whose `(req_id, slot_gen)` no longer binds). A cycle the
+  predictor refuses, and one that never completed, are `discarded` by the scheduler -- a refused
+  observation is a dropped cycle, not a retried one. `SchedMetrics` exposes all four
+  (`draft_obs_attempted`, `_applied`, `_skipped`, `_discarded`): a rising `attempted` with
+  `applied` flat is a policy whose rows teach nothing, and a non-zero `discarded` is a cycle lost
+  before it taught. A row that cannot bind is skipped, never applied partially, so one cycle's
+  evidence cannot learn the same row twice.
+- **The last cycle is delivered before its identities are lost.** Delivery at "the next open"
+  leaves the final cycle of a run with no open to deliver at; `shutdown` and `fini` flush the ring
+  before the requests' slot generations are released. A complete record is delivered there exactly
+  once (`draft_ring_cur_` is cleared and the record retired, so a second call is a no-op); an
+  incomplete one -- a row that left and never reported -- is dropped and counted in
+  `draft_obs_discarded`, not delivered with a hole. The cycle's cost sample was already taken when
+  it resolved, so the flush changes only label delivery.
 - **The per-row windows are quantities of the cycle, not of one K.** A row's `generated` is bounded
-  by its own `plan.k[i]`; its `verified` is bounded by `plan.verify_k`, which under
-  `pipeline_depth > 0` is deliberately the window of the plan the paired step verifies, so
-  `verified <= k[i]` would be wrong there. `draft_observation_deliverable` refuses two rows for the
-  same `req_id` in one cycle: one cycle's evidence is applied to a state once.
+  by its own `plan.k[i]`. Its `verified` is bounded by the window the paired step could have run:
+  `plan.verify_k` (what a plan issued ahead verifies, i.e. the frozen previous plan's
+  distribution) **or** this plan's own `k[i]` where the head published nothing and the step filled
+  from the prompt lookup -- that fill is verified in the same step that made it, so a K raised
+  above the frozen window is legitimate and a complete cycle must not be dropped for it. Which of
+  the two the verify consumed is `label_origin`, not this bound. `draft_observation_deliverable`
+  refuses two rows for the same `req_id` in one cycle: one cycle's evidence is applied to a state
+  once.
 - **Completion is evidence, not a rank count.** The rank handoff is a host barrier, which joins
   each rank's *enqueue*, and `step_end_` is a card-local event recorded on rank 0: neither says
   another rank's stream has finished. `Engine::await_step_end()` is therefore the step's one
@@ -105,6 +122,17 @@ prediction and sample.
   amount: `Head`/`Lookup` require `0 < generated <= k[i]`, so a row reporting more proposals than
   its budget is not this plan's work, and a row that produced nothing is `None` whatever its budget
   was. An observation with no origin is not priced as head.
+- **Learning labels carry the provenance of the window they measured, not of the plan.** A cycle
+  record keeps two windows in one row: `origin`/`generated` is what this plan drafted and published
+  after the commit, while `checked`/`verified` is what the paired step verified -- the head
+  proposals the previous plan published, or the step's own prompt-lookup fill. `origin` cannot
+  describe the labels: a cycle whose own plan publishes head proposals may have verified a lookup,
+  and a cycle that publishes nothing may have verified the head. So the record stamps
+  `label_origin`/`label_generated` from the verify itself (`StepEntry::n_spec` and `ngram`, at
+  report time), `draft_seq_observation_valid` ties a `None` label origin to zero labels, and
+  `DraftPredictModel::learn` gates on the labels only. Teaching from `origin` mislabels both
+  directions: a lookup's matches would be filed as a head's, and a head's accepted prefix would be
+  dropped because the following plan published nothing.
 - **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
 - **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
@@ -232,14 +260,15 @@ fabricated success the contracts forbid.
 |------|--------|---------|-------|
 | `--num-speculative-tokens` | N / `auto` | `auto` | existing; 0 = no drafter process |
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
-| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head and a positive ceiling (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
+| `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and an active profile for this runtime's fingerprint (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; no profile reader yet, so every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | profile reader lands with A |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
-`cost` is accepted only with a serial drafter and a valid ceiling contract; unsupported
-combinations are refused by name, never silently mapped to `legacy`. Block drafters are unchanged.
+`cost` is accepted only with a serial drafter, a valid ceiling contract and an active profile for
+the runtime's fingerprint; unsupported combinations are refused by name, never silently mapped to
+`legacy`. Block drafters are unchanged.
 The K0 rules are in the plan: K0 with the drafter loaded stays a temporary operating state with
 weights, buffers and arena geometry unchanged (history for the MTP KV/QSA keeps being maintained),
 and it is measured separately from a process started with `--num-speculative-tokens 0` and no
@@ -299,6 +328,14 @@ refused by name, not reinterpreted under the current keys.
 - **Fingerprint.** A profile is valid only when model, quantisation, TP wire and rank count, GPUs,
   kernel/build stamp and KV format/placement match. A mismatch disables the profile and the policy
   falls back to the known fixed configuration, naming the mismatch in the log and in the plan.
+- **No cost policy without an admissible baseline.** `Scheduler::init` refuses
+  `draft_policy = Cost` unless the cost table is already `active()`, i.e. `configure()` matched a
+  profile to this runtime's fingerprint -- the drafter shape alone (a serial head, a positive
+  ceiling) is not a baseline and never was. A pre-configured table therefore survives `init`
+  instead of being cleared; only an inactive one is cleared. Configuring the table after `init` is
+  not a bootstrap: the policy the scheduler admitted was already chosen under a fallback. The
+  profile reader that fills the runtime fingerprint from the deployment is still the missing
+  production link.
 - **`execution`.** `rectangular` (all N_j equal) and `shrinking` (E2: per-request caps, N_j falling
   with j) produce different kernels and times, so they are different profiles. Changing the
   execution invalidates the old file rather than rescaling it.

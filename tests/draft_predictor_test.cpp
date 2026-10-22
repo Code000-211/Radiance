@@ -148,6 +148,10 @@ struct Rig {
         sobs[0].published = sobs[0].generated;
         sobs[0].raw_match = (uint64_t)(e == DraftSeqEnd::Stopped ? accepted + 1 : accepted);
         sobs[0].censor = censor;
+        /* A single-window fixture by default: the plan named here published the window the verify
+         * measured. Tests that need two plans set the label fields after arm(). */
+        sobs[0].label_origin = sobs[0].origin;
+        sobs[0].label_generated = sobs[0].generated;
 
         plan.cycle_id = obs.cycle_id;
         plan.cap = kCap;
@@ -355,6 +359,67 @@ TEST(the_origin_is_the_observations_and_the_plan_is_only_the_permission) {
     CHECK_OK(k0.observe(20, 0, 0, DraftCensor::None, 0, 0, DraftDrafter::None, 0, 1, -1,
                         (int)DraftOrigin::None));
     CHECK_EQ(k0.state[0].n[0], 0);
+}
+
+/* Review 2, finding 2: with pipeline_depth 1 the labels belong to the window the PREVIOUS cycle
+ * published, so the teaching origin is the label's, not the named plan's. */
+TEST(the_labels_teach_by_the_window_they_measured_not_by_the_plans_origin) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+
+    /* Head -> Lookup: plan N's row is a lookup row (fill Ngram, origin None), but its paired
+     * verify measured the head window plan N-1 published. The head's labels teach. */
+    r.arm(10, 6, 6, DraftCensor::None, -1, /*generated=*/0, DraftDrafter::Ngram, 0, 1, -1,
+          (int)DraftOrigin::None);
+    r.sobs[0].label_origin    = DraftOrigin::Head;
+    r.sobs[0].label_generated = 6;
+    CHECK_OK(r.model.observe(r.obs));
+    CHECK_EQ(r.state[0].n[0], 1);
+    CHECK_EQ(r.model.counts().rows_applied, 1u);
+    CHECK_EQ(r.model.counts().rows_skipped, 0u);
+    const float learned = r.state[0].a[0];
+
+    /* Lookup -> Head: plan N's row is the head's, but the window it verified was the previous
+     * cycle's lookup fill, which never published. Nothing to learn, and the estimate is intact. */
+    r.arm(10, 6, 6);
+    r.sobs[0].label_origin    = DraftOrigin::None;
+    r.sobs[0].label_generated = 0;
+    CHECK_OK(r.model.observe(r.obs));
+    CHECK_EQ(r.state[0].n[0], 1);
+    CHECK_EQ(r.state[0].a[0], learned);
+    CHECK_EQ(r.model.counts().rows_applied, 1u);
+    CHECK_EQ(r.model.counts().rows_skipped, 1u);
+
+    /* K0/changing K: a row whose label window drafted nothing teaches nothing, whatever this
+     * plan's own K is; the next drafted window learns again, per position. */
+    r.arm(10, 3, 3);
+    r.sobs[0].label_origin    = DraftOrigin::None;
+    r.sobs[0].label_generated = 0;
+    CHECK_OK(r.model.observe(r.obs));
+    CHECK_EQ(r.state[0].n[0], 1);
+
+    r.arm(10, 3, 2);
+    r.sobs[0].label_origin    = DraftOrigin::Head;
+    r.sobs[0].label_generated = 3;
+    CHECK_OK(r.model.observe(r.obs));
+    CHECK_EQ(r.state[0].n[0], 2);
+    CHECK_EQ(r.state[0].n[1], 2);
+    CHECK_EQ(r.state[0].n[2], 2);
+    CHECK_EQ(r.model.counts().rows_applied, 2u);
+    CHECK_EQ(r.model.counts().rows_skipped, 2u);
+}
+
+/* Review 2, finding 3: RAD_OK is not application. A deliverable cycle whose every row was
+ * recycled away applies nothing, and the ledger has to say so. */
+TEST(a_deliverable_cycle_whose_rows_were_all_skipped_still_counts_them) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    /* The state at slot 0 belongs to another generation now. */
+    CHECK_OK(r.observe(10, 6, 6, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 2));
+    CHECK_EQ(r.state[0].n[0], 0);
+    CHECK_EQ(r.model.counts().rows_attempted, 1u);
+    CHECK_EQ(r.model.counts().rows_applied, 0u);
+    CHECK_EQ(r.model.counts().rows_skipped, 1u);
 }
 
 TEST(lookups_and_k0_rows_never_enter_the_head_estimate) {

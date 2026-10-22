@@ -16,12 +16,16 @@
  *     a[verified - 1], exactly as DraftController::adapt_observe does. The drift is not a sample:
  *     it does not touch n[] or ess[] and never sets a valid bit, so a prior cannot turn into
  *     calibration evidence.
- *   - Only the head's own proposals teach this model. Origin is per observation row
- *     (DraftSeqObservation::origin), and the plan's fill[] is only the permission the contract
- *     checks with draft_origin_fits_plan. A row of any other origin is skipped, never averaged in;
- *     an observation that names no plan is refused by the gate -- null never means Head.
- *   - A K0 cycle (generated == 0, origin None) leaves the estimate untouched: the request keeps
- *     its history and recovers at the next drafted cycle.
+ *   - Only the head's own proposals teach this model. The teaching origin is the one of the
+ *     window the verify consumed (DraftSeqObservation::label_origin), not of the plan the row is
+ *     named after: with pipeline_depth > 0 the labels measured the PREVIOUS cycle's publication,
+ *     and a row that changed drafter between the two plans must be judged by what it actually
+ *     verified. The plan's fill[] is only the permission the contract checks with
+ *     draft_origin_fits_plan for the row's own drafting half. A row whose label window was of any
+ *     other origin is skipped, never averaged in; an observation that names no plan is refused by
+ *     the gate -- null never means Head.
+ *   - A K0 cycle (label_generated == 0, label_origin None) leaves the estimate untouched: the
+ *     request keeps its history and recovers at the next drafted cycle.
  *
  * Versions: predict serves only the current policy and refuses a view of another version. observe
  * accepts any cycle its plan identifies, whatever version planned it: the plan and observation
@@ -91,6 +95,18 @@ public:
     /* The trampoline an integrator puts in DraftHooks::predictor. */
     static int predict_hook(void* self, const DraftBatchView& view, DraftPredictions* out);
 
+    /* observe()'s delivery ledger, cumulative. RAD_OK says the cycle was deliverable; it does not
+     * say a row reached the estimate -- every row of a cycle can be skipped by a recycled
+     * (req_id, slot_gen) and the call still returns OK. The scheduler publishes these as
+     * SchedMetrics::draft_obs_*. */
+    struct Counts {
+        uint64_t rows_attempted = 0;  /* rows of deliverable observations handed to the loop */
+        uint64_t rows_applied = 0;    /* rows whose labels moved this request's estimate */
+        uint64_t rows_skipped = 0;    /* rows that taught nothing: recycled identity, other
+                                       * origin, or K0 */
+    };
+    const Counts& counts() const { return counts_; }
+
     /* DraftObserveFn's B half, composed by the integrator after a cycle the caller declared
      * complete. The cycle must pass draft_observation_deliverable: it names its plan, its rows are
      * complete and valid, and each row's origin fits the plan's permission. Refuses a malformed
@@ -101,13 +117,14 @@ public:
 
 private:
     void  start(DraftPredictState& s, uint64_t req_id, uint32_t slot_gen) const;
-    void  learn(DraftPredictState& s, const DraftSeqObservation& o) const;
+    bool  learn(DraftPredictState& s, const DraftSeqObservation& o) const;
     float unc_at(const DraftPredictState& s, int j) const;
 
     Params p_;
     DraftPredictState* states_ = nullptr;
     int32_t cap_ = 0;
     double  alpha_ = 0.0;   /* the EMA step at half_life */
+    mutable Counts counts_;
 };
 
 }  /* namespace rad */

@@ -385,6 +385,12 @@ struct DraftSeqObservation {
     uint8_t  accepted = 0;
     DraftSeqEnd end = DraftSeqEnd::Unset;
     DraftOrigin origin = DraftOrigin::None;
+    /* The provenance of the window the verify actually consumed. With pipeline_depth > 0 that
+     * window was published by the previous cycle's plan, so `origin`/`generated` (what THIS plan
+     * drafted) and `label_origin`/`label_generated` (what the verify measured) name different
+     * plans. Only `label_*` says whose labels `checked`/`verified` carry. */
+    DraftOrigin label_origin = DraftOrigin::None;
+    uint8_t     label_generated = 0;
     DraftCensor censor = DraftCensor::None;
     float   feat[RAD_DRAFT_MAX_FEATURES] = {};  /* optional head features (margin, ...) */
     uint8_t feat_valid = 0;                     /* bit i: feat[i] is meaningful */
@@ -602,6 +608,10 @@ inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     const int a = (int)o.accepted, c = (int)o.checked, v = (int)o.verified;
     if (o.generated > RAD_SCHED_MAX_SPEC || o.published > RAD_SCHED_MAX_SPEC) return false;
     if (a > RAD_SCHED_MAX_SPEC || c > RAD_SCHED_MAX_SPEC || v > RAD_SCHED_MAX_SPEC) return false;
+    /* The label provenance is a state and an amount that must agree: a row the verified window
+     * did not draft carries no labels from it, whatever this plan drafted. */
+    if (o.label_generated > RAD_SCHED_MAX_SPEC) return false;
+    if ((o.label_origin == DraftOrigin::None) != (o.label_generated == 0)) return false;
     /* This plan's drafting. `a > published` is not a drafting error: `accepted` counts the paired
      * verify's commits, which can be drafts another plan published. See the header comment. */
     if (o.published > o.generated) return false;
@@ -656,10 +666,14 @@ inline bool draft_observation_deliverable(const DraftObservation& o) {
         if (!draft_origin_fits_plan(p, i, s)) return false;
         /* The two windows are per-row quantities, not a single K: this row's drafter may only
          * produce what its own k[i] paid for, and it may only claim positions the paired verify
-         * step actually ran. `verify_k` is that window even when it was chosen by the partner
-         * plan, which is why an ahead row is not bounded by its own k[i] here. */
+         * step actually ran. That window is the frozen previous plan's (`verify_k`) OR, where the
+         * head published nothing and the step filled from the prompt lookup, this plan's own
+         * budget for the row -- the lookup fill is verified in the same step that made it, so a K
+         * raised above the frozen window is legitimate and a complete cycle must not be dropped
+         * for it. Which of the two it was is `label_origin`, not this bound. */
         if ((int32_t)s.generated > p.k[i]) return false;
-        if ((int32_t)s.verified > p.verify_k) return false;
+        const int32_t window = p.verify_k > p.k[i] ? p.verify_k : p.k[i];
+        if ((int32_t)s.verified > window) return false;
         /* One row per request per cycle: two rows for the same request would apply one cycle's
          * gradient to the same state twice. `draft_plan_identifies` already ties row i to row i
          * of the plan, so this only has to catch a plan/view that names one request twice. */

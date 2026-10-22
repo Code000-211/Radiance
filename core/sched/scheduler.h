@@ -627,6 +627,8 @@ private:
     int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
     bool             draft_cost_warned_ = false;
 
+    /* The row's label provenance (whose window the verify measured) is stamped at report time;
+     * see draft_ring_report(). */
     void draft_ring_open(const DraftPlan& plan);
     DraftCycleRecord* draft_ring_cycle(uint64_t cycle_id);
     void draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin origin);
@@ -634,6 +636,10 @@ private:
                            uint64_t raw_match);
     void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);
     void draft_ring_close(uint64_t cycle_id);
+    /* Close every record still open, delivering the ones already fully measured and counting the
+     * rest as dropped. Idempotent; the scheduler calls it at shutdown and at fini, so the last
+     * completed cycle reaches the predictor before its request identities are released. */
+    void draft_ring_flush();
     /* Hand one resolved record to A: the executed distribution, the verify window that ran, the
      * step bracket and the evidence step_finished() stamped on it. */
     void draft_cost_observe(DraftCycleRecord& r);
