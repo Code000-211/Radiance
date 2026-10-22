@@ -328,6 +328,15 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         ++r.heat_credited;
     }
 
+    /* A reference calibration freezes the placement bringup settled. Its file prices the plan's
+     * start residency without borrowed copies, and Scheduler::draft_drift_note marks every cycle
+     * after the first move and keeps it out of the export -- so a move here would leave nothing
+     * priceable to write. The freeze is this tail: no swap, no fill and no drop. It is not a
+     * placement mode: no flag, plan field, arena row or fingerprint input changes, and a serving
+     * run (the flag off) still swaps, fills, lends and recalls. begin_dispatch above still retires
+     * what bringup issued, so the start placement's own copies land as they would. */
+    if (cfg_.draft_reference) return;
+
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
      * transfer stream, and the turnover slots are filled for it (below). Histograms are still
      * credited; the next unstaged step swaps on them. */

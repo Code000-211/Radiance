@@ -233,6 +233,16 @@ struct EngineTestPeer {
     }
     static Mover&      mover_of(Engine& e, int32_t rank) { return e.ranks_[(size_t)rank]->mover; }
     static HeatEngine& heat_of(Engine& e, int32_t rank) { return e.ranks_[(size_t)rank]->heat; }
+    /* The engine's per-step heat seam (Engine::tiering_dispatch). A fixture drives it directly
+     * because it has a real plan, heat engine and mover but no rank thread and no landed
+     * histogram: heat is primed through HeatEngine::observe, which is what a landed histogram
+     * calls. This is the call --draft-reference freezes (tests/engine_reference_basis_test.cpp). */
+    static void tiering_dispatch(Engine& e, int32_t rank, int step) {
+        e.tiering_dispatch(*e.ranks_[(size_t)rank], step);
+    }
+    /* The drift evidence the scheduler reads (Engine::residency_moves): promotions and demotions
+     * over every rank, less the initial fill the resolve froze. */
+    static int64_t residency_moves(const Engine& e) { return e.residency_moves(); }
     /* serve()'s startup completion and the fill it runs, as the engine calls them. */
     static int  complete_start_fill(Engine& e) { return e.complete_start_fill(); }
     static int  prepare_serving(Engine& e) { return e.prepare_serving(); }

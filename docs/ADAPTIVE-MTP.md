@@ -455,7 +455,7 @@ parses and does nothing would be the fabricated success the contracts forbid.
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | accepted; a `rad-draft-profile/4` file, read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. A `no-loan` file is a reference: it loads on a serving run whose loans stay dynamic, is immutable and prices only exact measured buckets. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. The bound is the executable head depth (`min(ceiling, drafter depth)`), not the ceiling alone: a plan above it would execute fewer rounds than it planned and record a shortened bucket. An explicit list with a tier above that depth is refused by name; otherwise the list is the whole ladder. A top **below** it is left as given: when the active profile prices that top, the cycle runs it (a valid reload). Only a cycle whose top is unpriced while the named baseline would run deeper is refused, by the policy that can see the shape, with a one-time diagnostic -- nothing is learnt at a depth the ladder never offers, and the run stops on the fail-closed latch (`draft_cost_aborted` -> `Engine::fail_loop`) instead of drafting on at the ceiling. The default ladder is trimmed to the depth (its deepest value replaced by the depth), so a shallow head does not lock out valid tiers |
-| `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall), so the written profile is the plan's start placement without borrowed copies. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
+| `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall) and expert placement stays frozen at the one bringup settled (no swap, fill or drop), so the written profile is the plan's start placement without borrowed copies and every played cycle is exportable. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
 `cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
@@ -696,9 +696,14 @@ are regenerated, never rescaled.
   `flex_used_bytes() == 0`, `kv.loan_tokens() == 0` and `loan_held()` zero for both lenders on
   every rank. A run that lent anything fails the export with `RAD_E_STATE` rather than writing a
   file that claims a reference it did not measure.
-  In a calibration the first budgeted move ends the exported set: `kDraftSamplePlacement` marks
-  every later cycle and the export leaves them out. That is the calibration's rule. On a serving
-  run a budgeted move is inconsequential instead -- nothing is learned from it, and the loaded
+  In a reference calibration the placement is frozen at the one bringup settled:
+  `Engine::tiering_dispatch` credits the histograms and then returns before its swap, fill and
+  drop tail, so no cycle is marked `kDraftSamplePlacement` and every played bucket stays
+  exportable. The freeze is no placement mode -- the plan, its flags, the arena rows and the
+  fingerprint are the serving run's, and a serving run still swaps, fills, lends and recalls. A
+  live calibration keeps the rule above: the first budgeted move ends its exported set, because
+  the file has no field that could name the residency the mover drifted to. On a serving run a
+  budgeted move is inconsequential instead -- nothing is learned from it, and the loaded
   reference is not a recording of the live placement.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.

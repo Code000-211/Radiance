@@ -508,4 +508,122 @@ TEST(an_admission_live_profile_keeps_the_strict_loan_match) {
     CHECK(t.reason().find("live_loan") != std::string::npos);
 }
 
+/* The freezing half of the reference contract: --draft-reference measures the plan's start
+ * placement, and a budgeted move during the run makes Scheduler::draft_drift_note mark every
+ * later cycle `kDraftSamplePlacement`; the export then leaves those cycles out, which is what a
+ * real calibration hit ("none of the 1 kept bucket(s) is priceable"). Engine::tiering_dispatch
+ * therefore returns before its swap/fill tail under the flag. This case pins that at the seam the
+ * scheduler reads -- Engine::residency_moves() -- with the fixture's real plan, heat engine and
+ * Mover: a histogram primed exactly as a landed one credits heat, the dispatch runs, and the
+ * mover's books stay at zero. The serving arms are the control: the same plan and heat move
+ * (with and without a loan) and a serving run still lends, so the zero is the flag's freeze and
+ * not a fixture that cannot move.
+ *
+ * The identity check is the reference rule's own: both runs derive their fingerprint from the same
+ * plan, so placement and arena agree; they differ only in basis/live_loan, which the no-loan
+ * reference is exempt from (core/sched/draft_cost.cpp). */
+namespace {
+
+/* A unit the heat engine can promote on this run: movable, pooled, and still in the pool after
+ * the start fill (a serving run has promoted the hottest into lent slots). -1 when none is left,
+ * which makes the case vacuous rather than green. */
+int32_t pooled_candidate(Engine& e, const Plan& p) {
+    HeatEngine& h = EngineTestPeer::heat_of(e, 0);
+    for (int32_t u = 0; u < (int32_t)p.units.size(); ++u) {
+        const MoveUnit& mu = p.units[(size_t)u];
+        if (!mu.movable || mu.expert < 0 || mu.tier != Tier::HostPinned) continue;
+        if (h.tier(u) == Tier::HostPinned) return u;
+    }
+    return -1;
+}
+
+/* The drain's cadence: one histogram crediting one expert heavily, as a routed pass does, then
+ * the engine's tiering dispatch; the mover's stream is synced between dispatches so the copies
+ * land and the next begin_dispatch retires them. */
+int drive_heat(Engine& e, const Plan& p, int32_t hot, int n_expert, int steps) {
+    HeatEngine& h = EngineTestPeer::heat_of(e, 0);
+    Mover&      m = EngineTestPeer::mover_of(e, 0);
+    std::vector<int32_t> counts((size_t)n_expert, 0);
+    counts[(size_t)p.units[(size_t)hot].expert] = 500;
+    for (int step = 0; step < steps; ++step) {
+        h.observe(0, counts.data(), n_expert, 1.0f);
+        EngineTestPeer::tiering_dispatch(e, 0, step);
+        RAD_TRY(rad_stream_sync(m.transfer_stream()));
+    }
+    EngineTestPeer::tiering_dispatch(e, 0, steps);   /* retire the last copies */
+    return rad_stream_sync(m.transfer_stream());
+}
+
+}  /* namespace */
+
+TEST(a_reference_calibration_freezes_the_placement_bringup_settled) {
+    constexpr int kExperts = 48;
+    constexpr int kSteps   = 8;
+
+    /* The reference arm is production's: no lender, so nothing is carved or filled, and heat
+     * that the controls below show would move a unit on the same plan shape. */
+    Rig ref(kExperts, /*strips*/ 4, /*turnover*/ 2);
+    Config ref_cfg = ref.cfg;
+    ref_cfg.draft_reference   = true;
+    ref_cfg.draft_profile_out = radtest::tmp_path("engine_reference_freeze.json");
+    Engine re(ref_cfg);
+    REQUIRE_EQ(ref.build(re, Lend::None), RAD_OK);
+    Mover&      rm = EngineTestPeer::mover_of(re, 0);
+    HeatEngine& rh = EngineTestPeer::heat_of(re, 0);
+    CHECK_EQ(rm.flex_capacity(), 0);
+    CHECK_OK(EngineTestPeer::complete_start_fill(re));   /* serve's completion, as production */
+    const int32_t ref_hot = pooled_candidate(re, ref.plan);
+    REQUIRE(ref_hot >= 0);
+    REQUIRE_EQ(drive_heat(re, ref.plan, ref_hot, kExperts, kSteps), RAD_OK);
+
+    CHECK_EQ(rh.stats().proposed, (uint64_t)0);
+    CHECK_EQ(rh.stats().promotions, (uint64_t)0);
+    CHECK_EQ(rh.stats().demotions, (uint64_t)0);
+    /* The count Scheduler::draft_residency receives: zero, so no bracket is marked placed. */
+    CHECK_EQ(EngineTestPeer::residency_moves(re), (int64_t)0);
+    /* And the plan's placement is still the one the fingerprint names. */
+    for (int32_t u = 0; u < (int32_t)ref.plan.units.size(); ++u)
+        CHECK_EQ((int)rh.tier(u), (int)ref.plan.units[(size_t)u].tier);
+
+    /* Control 1: the same plan, heat and dispatch cadence on a serving run without a loan. The
+     * heat engine proposes and the mover moves. */
+    Rig srv(kExperts, 4, 2);
+    Engine se(srv.cfg);
+    REQUIRE_EQ(srv.build(se, Lend::None), RAD_OK);
+    HeatEngine& sh = EngineTestPeer::heat_of(se, 0);
+    CHECK_OK(EngineTestPeer::complete_start_fill(se));
+    const int32_t srv_hot = pooled_candidate(se, srv.plan);
+    REQUIRE(srv_hot >= 0);
+    REQUIRE_EQ(drive_heat(se, srv.plan, srv_hot, kExperts, kSteps), RAD_OK);
+    CHECK(sh.stats().proposed > 0);
+    CHECK(EngineTestPeer::residency_moves(se) > 0);
+
+    /* Control 2: a serving run still lends -- the KV strip fills the lent slots at the start
+     * fill and the same heat moves the slab. */
+    Rig live(kExperts, 4, 2);
+    Engine le(live.cfg);
+    REQUIRE_EQ(live.build(le, Lend::Kv), RAD_OK);
+    Mover& lm = EngineTestPeer::mover_of(le, 0);
+    REQUIRE(lm.flex_capacity() > 0);
+    REQUIRE_EQ(lm.set_loan(Mover::kLendKV, live.loan.all()), RAD_OK);
+    CHECK_OK(EngineTestPeer::complete_start_fill(le));
+    CHECK(lm.flex_used_bytes() > 0);
+    const int32_t live_hot = pooled_candidate(le, live.plan);
+    REQUIRE(live_hot >= 0);
+    REQUIRE_EQ(drive_heat(le, live.plan, live_hot, kExperts, kSteps), RAD_OK);
+    CHECK(EngineTestPeer::residency_moves(le) > 0);
+
+    /* Identity: the freeze changes no field the reference rule compares -- placement and arena
+     * are the plan's in both bases; only basis/live_loan differ, and the reference is no-loan. */
+    DraftCostRuntime ref_rt, live_rt;
+    REQUIRE_EQ(EngineTestPeer::runtime(re, &ref_rt), RAD_OK);
+    REQUIRE_EQ(EngineTestPeer::runtime(le, &live_rt), RAD_OK);
+    CHECK(ref_rt.fingerprint.basis == DraftCostBasis::NoLoan);
+    CHECK(ref_rt.fingerprint.live_loan.empty());
+    CHECK(live_rt.fingerprint.basis == DraftCostBasis::Live);
+    CHECK(!live_rt.fingerprint.live_loan.empty());
+    CHECK_EQ(ref_rt.fingerprint.placement, live_rt.fingerprint.placement);
+    CHECK_EQ(ref_rt.fingerprint.arena, live_rt.fingerprint.arena);
+}
+
 RAD_TEST_MAIN()
