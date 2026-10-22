@@ -50,6 +50,36 @@ prediction and sample.
   never merges into it. Delivery never consults the live slot -- so a recycled generation cannot
   drop a measured cycle -- and refuses a row whose origin does not fit its plan, and a plan that
   fails its own gate.
+- **History belongs to the request, the slot generation is only the binding.** A prediction state
+  (`a`, `n`, `ess`) survives preemption and resume with its `req_id`; a new slot generation for the
+  same `req_id` is adopted, not reset, and only a different `req_id` starts from the prior. An
+  observation row is matched by `req_id` for the same reason: waiting for the slot generation a
+  preempted request no longer occupies would wait for a generation that never comes back. The
+  scheduler copies the state out of the slot at preempt and back in at resume, or holds it
+  off-slot; B cannot, because the table belongs to the slot. A smaller `max_seqs` may not be
+  configured while an open cycle names a slot above it -- shrink is refused or applied after the
+  drain, never by dropping the cycle.
+- **Delivery and application are two acts, and application is all-or-nothing.** The observer
+  returns one `applied` bit: every row was learned, or none was. A cycle that could not bind a
+  request's state right now is delivered again later from its original plan and state -- never
+  partially applied, so re-delivery cannot learn a row twice -- and it does not expire on the
+  ring's end: the ring holds the state until the cycle applies, and at full capacity uses the
+  scheduler's existing drain/backpressure limit. A cycle already applied is an caller error to
+  deliver again; B keeps no queue and allocates nothing in the path.
+- **The per-row windows are quantities of the cycle, not of one K.** A row's `generated` is bounded
+  by its own `plan.k[i]`; its `verified` is bounded by `plan.verify_k`, which under
+  `pipeline_depth > 0` is deliberately the window of the plan the paired step verifies, so
+  `verified <= k[i]` would be wrong there. `draft_observation_deliverable` refuses two rows for the
+  same `req_id` in one cycle: one cycle's evidence is applied to a state once.
+- **Completion is evidence, not a rank count.** The rank handoff is a host barrier, which joins
+  each rank's *enqueue*, and `step_end_` is a card-local event recorded on rank 0: neither says
+  another rank's stream has finished. `Engine::await_step_end()` is therefore the step's one
+  completion point -- it waits on rank 0's event and on every other rank's own end event, all
+  recorded at the same place, before the step issued ahead -- and `collect_step` uses it wherever
+  it already waits. The no-rows path keeps its run-ahead and proves nothing: a caller that
+  advances state there (a history-only pass, a water level) calls `await_step_end()` itself
+  first. A water level advances only past work whose completion this evidence covers; a failed,
+  rejected or history-only batch has a distinct outcome from a completed one and never advances it.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
   handed came from the plan they name — the observation carries both the identity arrays and the
@@ -116,13 +146,22 @@ prediction and sample.
   `DraftCostSource::ConservativeFallback` with a bound; a unitless prior is never reported as ms.
 - **Only cleanly attributed samples update a measured play bucket** (`draft_sample_attributable`):
   the sample names the cycle and policy version the observation names, has a finite positive
-  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement flag. A
-  sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
+  bracket, `kDraftSampleValid`, and no warmup, record, audit, admission, placement or shortened
+  flag. A sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
   total is not a duration. Real DMA cost is routed away by its flag, not discarded as an outlier.
   An `ahead` sample stays flagged so the model can weigh it. The observation overload also requires
   a completed cycle over a plan that passes `draft_plan_valid`: an unfinished cycle has no bracket
   to fold in, and a plan that fails its own gate names no shape the sample could have been measured
   under.
+- **The sample reports the run, the plan reports the intention.** `DraftCostSample::replay` is what
+  the executing path did; `DraftPlan::replay` is what was decided at issue time and is never proof
+  that a replay ran. `DraftReplay::None` is a claim of a plain run and may only be written from
+  evidence -- a caller that cannot tell leaves `Unknown`, including across a mixed record/play
+  pass. `kDraftSampleShortened` marks a cycle that ended before its planned extent (fewer rounds
+  than `plan.max_k`, or a cancelled row): its bracket times less work than the shape it would be
+  filed under, so it is stored, never folded into the bucket it would otherwise name. The plan
+  itself is not rewritten afterwards to make `timing_valid` true; that field says the executing
+  path opened the bracket before the cycle's first work and closed it after its last.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.

@@ -333,6 +333,12 @@ private:
      * next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
+    /* One end event per rank, index 0 unused (step_end_ is rank 0's). The rank handoff is a host
+     * barrier, which joins the ranks' enqueues, not their execution, and step_end_ is card-local:
+     * without these, a rank's stream may still be running when the host reads the step. Recorded
+     * by the scheduler at the same point as step_end_ and waited on in await_step_end(). */
+    std::vector<RadEvent> rank_end_;
+    int  await_step_end();
 
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the

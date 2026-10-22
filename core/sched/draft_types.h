@@ -147,9 +147,12 @@ enum class DraftOrigin : uint8_t { None = 0, Head = 1, Lookup = 2 };
  * invalid set when it cannot even bound the cost), never Measured. */
 enum class DraftCostSource : uint8_t { Measured = 0, Interpolated = 1, ConservativeFallback = 2 };
 
-/* The runtime's replay state for a pass, so a sample taken while recording or auditing never
- * updates the profile that prices normal operation. */
-enum class DraftReplay : uint8_t { None = 0, Play = 1, Record = 2, Audit = 3 };
+/* The cycle's replay state as the executing path saw it, so a sample taken while recording or
+ * auditing never updates the profile that prices normal operation. `None` is a claim ("provably
+ * no replay" -- a plain run), so it may only be written from evidence; a caller that cannot tell
+ * leaves `Unknown`, which is never read as a measurement. `plan.replay` is what was decided at
+ * issue time and is not proof of what ran. */
+enum class DraftReplay : uint8_t { Unknown = 0, None = 1, Play = 2, Record = 3, Audit = 4 };
 
 /* A cost sample's attribution. Only a sample with kDraftSampleValid and none of the disturbing
  * flags may update a measured bucket (draft_sample_attributable). */
@@ -162,6 +165,9 @@ enum DraftSampleFlag : uint16_t {
     kDraftSampleAudit     = 1u << 4,  /* replay audit */
     kDraftSampleAdmission = 1u << 5,  /* an admission or compaction ran inside the bracket */
     kDraftSamplePlacement = 1u << 6,  /* a placement/DMA move ran inside the bracket */
+    kDraftSampleShortened = 1u << 7,  /* the cycle ended before its planned extent (rounds <
+                                       * plan.max_k, or a cancelled row): its bracket times less
+                                       * work than the shape it would be filed under */
 };
 
 /* ------------------------------------------------------------------ the cycle's inputs */
@@ -251,6 +257,8 @@ struct DraftCostSample {
     uint64_t cycle_id = 0;      /* the plan this sample belongs to; 0 = unattributed */
     uint32_t policy_version = 0;
     DraftVerifyShape shape;
+    DraftReplay replay = DraftReplay::Unknown;  /* what the executing path did, not what the plan
+                                                 * declared; Unknown when it cannot be evidenced */
     int32_t rounds = 0;         /* deepest draft round the head actually ran */
     int32_t draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {}; /* actual N_j per round, index 0 unused */
     int32_t draft_rows_total = 0; /* sum_j draft_round_rows[j] actually executed */
@@ -322,7 +330,8 @@ struct DraftPlan {
     DraftPlanSource source = DraftPlanSource::Legacy;
     DraftFallback   fallback = DraftFallback::None;  /* set when source is Fallback */
     DraftProbe      probe = DraftProbe::None;
-    DraftReplay     replay = DraftReplay::None;      /* the cycle's replay state, part of its shape */
+    DraftReplay     replay = DraftReplay::Unknown;   /* the cycle's replay state, part of its shape;
+                                                      * None only when proven absent */
     bool            timing_valid = false;            /* total_ms is a real bracket for this plan */
     int32_t         prefill_tokens = 0;              /* prefill sharing the step; 0 decode-only */
 
@@ -601,9 +610,23 @@ inline bool draft_observation_deliverable(const DraftObservation& o) {
     if (!draft_plan_identifies(*o.plan, o)) return false;
     if (draft_plan_valid(*o.plan) != RAD_OK) return false;
     if (o.n_seq > 0 && !o.seq) return false;
+    const DraftPlan& p = *o.plan;
     for (int32_t i = 0; i < o.n_seq; ++i) {
-        if (!draft_seq_observation_valid(o.seq[i])) return false;
-        if (!draft_origin_fits_plan(*o.plan, i, o.seq[i])) return false;
+        const DraftSeqObservation& s = o.seq[i];
+        if (!draft_seq_observation_valid(s)) return false;
+        if (!draft_origin_fits_plan(p, i, s)) return false;
+        /* The two windows are per-row quantities, not a single K: this row's drafter may only
+         * produce what its own k[i] paid for, and it may only claim positions the paired verify
+         * step actually ran. `verify_k` is that window even when it was chosen by the partner
+         * plan, which is why an ahead row is not bounded by its own k[i] here. */
+        if ((int32_t)s.generated > p.k[i]) return false;
+        if ((int32_t)s.verified > p.verify_k) return false;
+        /* One row per request per cycle: two rows for the same request would apply one cycle's
+         * gradient to the same state twice. `draft_plan_identifies` already ties row i to row i
+         * of the plan, so this only has to catch a plan/view that names one request twice. */
+        for (int32_t j = 0; j < i; ++j) {
+            if (o.req_id[j] == o.req_id[i]) return false;
+        }
     }
     return true;
 }
@@ -699,7 +722,8 @@ inline bool draft_sample_storable(const DraftCostSample& s) {
  * draft_sample_storable and never folded into a play bucket. */
 inline bool draft_sample_attributable(const DraftCostSample& s) {
     const uint16_t disturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
-                                kDraftSampleAdmission | kDraftSamplePlacement;
+                                kDraftSampleAdmission | kDraftSamplePlacement |
+                                kDraftSampleShortened;
     if (s.cycle_id == 0) return false;   /* nothing to attribute it to */
     return draft_sample_storable(s) && !(s.flags & disturbing);
 }

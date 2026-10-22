@@ -49,6 +49,9 @@ int Engine::step_state_init() {
     slots_host_ = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
     if (!slots_host_) return RAD_E_NOMEM;
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    rank_end_.assign(ranks_.size(), nullptr);
+    for (size_t i = 1; i < ranks_.size(); ++i)
+        RAD_TRY(rad_event_create_as(&rank_end_[i], RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
 }
 
@@ -62,6 +65,9 @@ void Engine::step_state_fini() {
     }
     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
     slots_host_ = nullptr;
+    for (RadEvent& ev : rank_end_)
+        if (ev) rad_event_destroy(ev);
+    rank_end_.clear();
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
 }
