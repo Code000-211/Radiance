@@ -7,6 +7,7 @@
 #include "engine_priv.h"
 
 #include "../arch/common/rad_spechub_config.h"
+#include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
 
@@ -58,6 +59,19 @@ int Engine::step_state_init() {
      * own declare), and a silent no-op would serve uncoupled drafts while the flag said otherwise. */
     mtp_couple_ = mtp_coupled_enabled();
     if (mtp_couple_) {
+        /* THE DRAFTER SHAPE IS CHECKED HERE, where the declaration is in hand, not against
+         * environment variables nobody else reads. Coupling is defined on a LINEAR chain: a block
+         * drafter proposes a whole block at once from one pass and writes it to its proposal
+         * buffer, so there is no per-round draw to couple and no per-round state to read back.
+         * Left unchecked, a block drafter would silently serve uncoupled drafts while the flag
+         * said otherwise. */
+        if (drafter_.kind != RAD_DRAFT_SERIAL || drafter_.depth <= 0) {
+            RAD_ERR("RADIANCE_MTP_COUPLED requires the linear serial draft chain (RAD_DRAFT_SERIAL "
+                    "with depth > 0); this model declares drafter '%s' kind %d depth %d, which has "
+                    "no per-round draw to couple",
+                    drafter_.name ? drafter_.name : "(none)", drafter_.kind, drafter_.depth);
+            return RAD_E_UNSUPPORTED;
+        }
         const Program& prog = ranks_[0]->program;
         for (size_t i = 0; i < prog.buffers.size(); ++i) {
             const std::string& name = prog.buffers[i].name;
@@ -80,6 +94,11 @@ int Engine::step_state_init() {
             return RAD_E_STATE;
         }
         couple_rows_ = sd.shape[1];
+        /* ONE ENTRY PER CARD SLOT, indexed by StepEntry::card exactly as slots_host_ is: the plan
+         * names a request's sequence on the slot the advance writes, and the draft row carries the
+         * same `card`. A vector left empty makes every lookup miss, so the first step that drafts
+         * would refuse with "has no plan entry on its card" instead of staging its draw. */
+        couple_by_card_.assign((size_t)n_slot, RadMtpCoupleDraw{});
         couple_draw_stage_ = static_cast<RadMtpCoupleDraw*>(
             rad_dev_alloc(n_slot * (int64_t)sizeof(RadMtpCoupleDraw), RAD_MEM_HOST_PINNED));
         couple_readback_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
@@ -331,22 +350,17 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * The coordinate is the PRE-commit output size, which strictly grows between two steps that draft
  * one request (each commits at least one token), so (base, round) never repeats a draft stream. The
  * card is the slot the advance writes, and the plugin refuses a row whose staged draw names another
- * -- which is what makes a stale draw a refusal here rather than a wrong token later. */
+ * -- which is what makes a stale draw a refusal here rather than a wrong token later. The rule
+ * itself is sched/mtp_couple_plan.h, where it is checked without a card. */
 int Engine::stage_couple_draws(int n) {
-    std::fill(couple_by_card_.begin(), couple_by_card_.end(), RadMtpCoupleDraw{});
-    for (const auto& e : sched_.plan().e)
-        if (e.req && e.card >= 0 && (size_t)e.card < couple_by_card_.size())
-            couple_by_card_[(size_t)e.card] = { e.req->sp.seed, (uint64_t)e.req->output.size(),
-                                                e.seq, e.card, e.req->sp.greedy() ? 0u : 1u };
-    for (int i = 0; i < n; ++i) {
-        const auto& row = serial_row_[(size_t)i];
-        if (row.card < 0 || (size_t)row.card >= couple_by_card_.size() ||
-            couple_by_card_[(size_t)row.card].seq != row.seq) {
-            RAD_ERR("MTP coupled: drafting row %d (sequence %llu, card %d) has no plan entry on its "
-                    "card", i, (unsigned long long)row.seq, (int)row.card);
-            return RAD_E_STATE;
-        }
-        couple_draw_stage_[i] = couple_by_card_[(size_t)row.card];
+    std::string why;
+    const int stg = mtp_couple_plan_stage(sched_.plan(),
+                                          (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
+                                          serial_row_.data(), n, &couple_by_card_,
+                                          couple_draw_stage_, &why);
+    if (stg < 0) {
+        RAD_ERR("MTP coupled: %s", why.c_str());
+        return stg;
     }
     for (auto& rk : ranks_) {
         void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
