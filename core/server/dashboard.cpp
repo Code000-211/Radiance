@@ -366,14 +366,16 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["stream_bytes"]   = s.link.stream_bytes;
             o["link"] = std::move(l);
         }
-        /* The activation arena's levels and the one the last step ran at (see LiveSnapshot): the
-         * level decides which step sizes the slab may borrow the arena's top for, so a reader
-         * polling during a request can see which one is in force. `rows` is 0 before a step. */
+        /* The activation arena's levels and the one chosen for the last prepared batch (see
+         * LiveSnapshot): `level_rows` is that level's capacity, not the batch's token count. A
+         * reader polling during a request can see which level is in force; before the first step
+         * `level_rows` is 0. Omitted when nothing is lent, for any of the reasons the field's
+         * comment lists. */
         if (!s.arena_levels.empty()) {
             json a;
-            a["level"]  = s.arena_level;
-            a["rows"]   = (double)s.arena_rows;
-            a["levels"] = s.arena_levels;
+            a["level"]      = s.arena_level;
+            a["level_rows"] = (double)s.arena_level_rows;
+            a["levels"]     = s.arena_levels;
             o["arena"] = std::move(a);
         }
 

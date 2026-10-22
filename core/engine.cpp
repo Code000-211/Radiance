@@ -1557,8 +1557,11 @@ int Engine::arena_step(const RadBatch* b) {
         b->n_tok, (int64_t)b->n_seq * (1 + std::max(cfg_.n_spec, 0)));
     const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
-    arena_last_ = arena_rows_[(size_t)level];
-    if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
+    /* The level's capacity, published for /stats. Published before the level is bound and the
+     * batch issued, so a reader sees the batch being prepared, not one that has completed. */
+    const int64_t rows = arena_rows_[(size_t)level];
+    arena_last_.store(rows, std::memory_order_relaxed);
+    if (rows >= arena_floor_) { arena_floor_ = rows; arena_floor_ns_ = now; }
     /* Whether the next step continues a prompt, so the stager stages its first layers at this
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
@@ -1580,7 +1583,7 @@ int Engine::arena_step(const RadBatch* b) {
          * span's shared level keeps a place of its own for it (stager.h); every other level
          * lends both. */
         char* const ring = level == 0 ? r->stager.ring_full()
-                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
+                         : rows == arena_span_rows_ && r->arena_low_off >= 0
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
         /* The next step's first layers go ahead only from the full plan, into the region at the
@@ -1604,8 +1607,9 @@ void Engine::arena_tick(uint64_t now_ns) {
     /* The reference calibration keeps both lenders at zero for the whole run: the levels are its
      * identity, not a loan it may take. */
     if (cfg_.draft_reference) return;
-    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
-        arena_floor_ = arena_last_;
+    const int64_t last = arena_last_.load(std::memory_order_relaxed);
+    if (last < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
+        arena_floor_ = last;
         arena_floor_ns_ = now_ns;
     }
     const int level = arena_level(arena_floor_);
@@ -2706,12 +2710,13 @@ int Engine::run_server() {
             s.cards.push_back(std::move(c));
         }
 
-        /* The arena level in force. `arena_rows_` is written once at start; `arena_last_` at each
-         * step boundary, so a read racing a step sees one step's value or the next. `arena_rows`
-         * stays 0 until a step has run, and the level with it. */
-        s.arena_levels = arena_rows_;
-        s.arena_rows   = arena_last_;
-        s.arena_level  = arena_last_ > 0 ? arena_level(arena_last_) : 0;
+        /* The arena diagnostic. One relaxed read of the published step size, and the level index
+         * derived from that same value, so the pair always describes one prepared batch; the
+         * level list is written once at start and is immutable from here on. */
+        const int64_t level_rows = arena_last_.load(std::memory_order_relaxed);
+        s.arena_levels     = arena_rows_;
+        s.arena_level_rows = level_rows;
+        s.arena_level      = level_rows > 0 ? arena_level(level_rows) : 0;
 
         /* The expert plane from rank 0's placement plan; empty for a dense model, and the
          * renderers then omit the panel. */

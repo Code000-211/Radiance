@@ -593,12 +593,17 @@ private:
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
+    /* The step size (the capacity) of the level arena_step chose for the last batch it prepared,
+     * for the /stats snapshot: not that batch's token count, and not a step known to have
+     * finished on the card -- it is stored before the level is bound and the batch issued. The
+     * step thread stores it, the HTTP thread reads it once; relaxed, since it carries a number
+     * and no other state depends on it. 0 before the first step. */
+    std::atomic<int64_t> arena_last_{0};
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */
     int64_t  arena_span_rows_ = 0;
     int64_t  arena_floor_ = 0;
-    int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
     /* VRAM the budget reserves for allocations after start(), on top of --gpu-headroom-mib: the
      * step batch's staging (allocated by serve()) and what is built on first use, if ever (the KV

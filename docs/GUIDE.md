@@ -732,8 +732,10 @@ to a power of two, at least 256, then each level 4x the one below, up to the ste
 into the bottom of the arena. While recent steps fit a smaller size, the top of the arena holds expert
 weights; the first larger step takes it back before it runs (an address change, not a copy). Startup
 prints what each size lends (`activation arena: lends ...`), and `/stats` reports the whole set
-(`arena.levels`) with the one the last step ran at (`arena.level`, `arena.rows`). A plugin opts in
-with `RadArchProbe::shape_probe_ok`; one that does not keeps its whole arena.
+(`arena.levels`) with the level chosen for the last prepared batch (`arena.level`, and
+`arena.level_rows` for that level's capacity -- the step size it serves, not the batch's token
+count). A plugin opts in with `RadArchProbe::shape_probe_ok`; one that does not keeps its whole
+arena.
 
 Related flags:
 
