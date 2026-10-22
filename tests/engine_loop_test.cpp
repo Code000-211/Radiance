@@ -28,27 +28,44 @@
  * and collect_step set it (and only there). Rounds done and rows committed are neither; they are
  * recorded below as context and never asserted on.
  *
- * This case covers the issuance half. It withdraws the record after the pass really ran and shows
- * that the finish then leaves the watermark alone -- with the completion fact *present*, since on
- * the host backend every wait that ran ends complete (an unrecorded event is completed
- * immediately).
+ * This case covers both halves of that rule, on the two paths this run produces:
  *
- * It does not cover a completion fact that is pending or has failed while the issuance record
- * stands. That needs an end event that stays unrecorded, which the host backend cannot produce;
- * it stays open in the issue with the pending-end-event item.
+ *  - Mid-prompt, the row-less half. A chunk short of the prompt end commits no logit row, but its
+ *    hidden states are history the head still needs, so round 0 is built for it anyway
+ *    (Scheduler::serial_begin keeps one round when no row drafts, "because round 0 is the history
+ *    pass the remaining rows still owe"). collect_step therefore takes the repaired
+ *    `n_rows <= 0 && serial_hist_issued_` branch: it awaits the end and sets complete. The finish
+ *    moves the watermark by exactly the chunk, and the next seam shows both facts -- prior_complete,
+ *    and a watermark one chunk further on.
+ *  - The withheld step, the issuance half. Its row exists and its wait completes, but the record is
+ *    withdrawn after the pass was built and before the finish reads it, so the finish leaves the
+ *    watermark alone with the completion fact present (on the host backend every wait that ran ends
+ *    complete: an unrecorded event is completed immediately).
  *
- * One fact the end-of-step observer cannot give by itself, and which this driver therefore
- * constructs: before=true, after=false. A step whose wait ran leaves complete = true, so the
- * sequence cannot arise from a step's own end. The seam sits at the issue site, immediately after
- * the reset, and reports the value read before `so.complete = false` beside the value the reset
- * left -- the pair is observed, not assumed.
+ * The seam runs after the step's draft passes were issued (`issue_serial_drafter`) and after
+ * `issue_ahead`, immediately before `collect_step` -- the step's one wait. It therefore sees
+ * `complete` as the reset left it (false, nothing has waited yet), the issuance record as the step
+ * path set it, and the watermark *before* this step's finish. The row-less branch's wait is exactly
+ * what the seam is in front of; it is read at the next seam, as prior_complete and as the watermark
+ * step that wait made possible. The trace is thus a sequence of pre-finish values, and a step's own
+ * finish is judged by comparing its value with the next one's.
  *
- * The watermark is read at the seam, before that step's finish runs. Therefore the value a finish
- * produced is read at the *next* step's seam: the trace is a sequence of pre-finish values, and a
- * step's own finish is judged by comparing its value with the next one's.
+ * Not covered: a completion fact that is pending or has failed while the issuance record stands.
+ * That needs an end event that stays unrecorded, which the host backend cannot produce; it stays
+ * open in the issue with the pending-end-event item. Also open: a second participating rank, and
+ * the error paths a failed wait or a failed rank takes (fail_loop runs before the finish).
  *
- * Also not covered here, and open in the issue: a second participating rank, and the error paths a
- * failed wait or a failed rank takes (fail_loop runs before the finish).
+ * Limits of this driver. One request: the seam records a per-step fact and reads a per-request
+ * watermark, which name the same thing only while one request is in flight -- a step carrying
+ * several rows moves each row's own watermark (Scheduler::serial_end), and "the" watermark would
+ * be ambiguous. And the fixture runs `--draft-window fixed`, the policy under which every
+ * drafting row keeps the full depth: the shrinking rounds of an adaptive or cost-planned cycle
+ * are not exercised here.
+ *
+ * One fact the seam cannot give by itself, and which this driver therefore constructs:
+ * before=true, after=false. A step whose wait ran leaves complete = true, so the sequence cannot
+ * arise from a step's own end. The seam reports the value read before `so.complete = false`
+ * beside the value the reset left -- the pair is observed, not assumed.
  */
 #include "rad_test.h"
 #include "tiny_model.h"
@@ -211,9 +228,10 @@ namespace {
 
 /* Both endpoints of the history watermark, on one engine started for real.
  *
- * Prompt 192 tokens against 64 a step: two mid-prompt chunks (no logit row, no pass issued, no
- * completion), then the tail (a row, the pass, the record), then decode steps. The tail is the
- * first step the watermark can move on; the step after it is the withheld one. */
+ * Prompt 192 tokens against 64 a step: two mid-prompt chunks (no logit row, but each with the
+ * history pass it owes), then the tail -- the third chunk, which commits the first row -- then
+ * decode steps. Every chunk's finish moves the history watermark; the step after the tail is the
+ * withheld one. */
 TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     /* Host execution has to hold *before* start(), not be checked after it: a HIP build probes the
@@ -235,13 +253,17 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     s.assistant = true;
     REQUIRE(tiny::write_gemma4(dir.path, s));
 
+    /* The chunk size the prefill assertions below rely on: a row-less chunk's finish moves the
+     * watermark by exactly the history it covered, which is this many tokens. */
+    const int kChunk = 64;
+
     Argv argv({ "--model", dir.path,
                 "--radiance-home", home(),
                 "--kernels", "libref",
                 "--debug-accept-reference-kernels",
                 "--num-speculative-tokens", "3",
                 "--draft-window", "fixed",
-                "--max-num-batched-tokens", "64",
+                "--max-num-batched-tokens", std::to_string(kChunk),
                 "--host", "127.0.0.1",
                 "--port", "0" });
     rad::Config cfg;
@@ -254,10 +276,6 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     REQUIRE(rad::device_is_host());
 
     Engine e(std::move(cfg));
-    {
-        std::lock_guard<std::mutex> lk(g_driver.mu);
-        g_driver.engine = &e;
-    }
     REQUIRE_EQ(e.start(), RAD_OK);
 
     /* A headless run is an intermediate state, not this case: without the head there is no serial
@@ -267,6 +285,13 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     REQUIRE(sp.value("enabled", false));
     CHECK_EQ(sp.value("kind", std::string()), std::string("serial"));
     CHECK_EQ(sp.value("depth", -1), 3);
+
+    /* Attached for the rest of the case, and only now: nothing of the engine's runs before the
+     * serve thread below, and every early return that follows the join releases it first. */
+    {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine = &e;
+    }
 
     std::promise<int> served;
     std::future<int>  done = served.get_future();
@@ -331,6 +356,16 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     }
     serve_thread.join();
 
+    /* serve() has joined the stepper, so the trace is final and no hook can be in flight; the
+     * engine is released here rather than after the checks, so the early return below leaves no
+     * global pointing at an engine that is about to die. */
+    std::vector<Rec> tr;
+    {
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine = nullptr;
+        tr = g_driver.trace;
+    }
+
     if (!observed || g_driver.submit_rc != RAD_OK) {
         std::fprintf(stderr, "engine_loop_test: the run did not reach the expected steps "
                              "(submit rc %d):\n%s\n", g_driver.submit_rc, trace_text().c_str());
@@ -340,13 +375,6 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     }
     CHECK_EQ(done.get(), RAD_OK);
 
-    /* serve() has joined the stepper, so the trace is final. */
-    std::vector<Rec> tr;
-    {
-        std::lock_guard<std::mutex> lk(g_driver.mu);
-        g_driver.engine = nullptr;
-        tr = g_driver.trace;
-    }
     std::fprintf(stderr, "engine_loop_test: %s\n", trace_text().c_str());
 
     size_t iw = (size_t)-1;
@@ -357,13 +385,18 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     const Rec& tail = tr[iw - 1];
     REQUIRE(tail.rows > 0);
 
-    /* The mid-prompt chunks: no row, no pass built, no completion, and the watermark untouched.
-     * That is the natural case -- neither half is there, so nothing may advance. */
+    /* The mid-prompt chunks: no logit row, and yet round 0's pass was built -- the scheduler keeps
+     * one round when no row drafts because that round is the history pass the chunk still owes. At
+     * the seam the wait has not run (complete is the reset's false); the repaired row-less branch
+     * awaits the end, and the *next* seam is where that shows: prior_complete is the completion it
+     * set, and the watermark has moved by the chunk that pass covered. Asserting the flag without
+     * this pair would only restate the seam's own reading. */
     for (size_t i = 0; i + 1 < iw; ++i) {
         CHECK_EQ(tr[i].rows, 0);
+        CHECK(tr[i].hist_issued);
         CHECK(!tr[i].complete);
-        CHECK(!tr[i].hist_issued);
-        CHECK_EQ(tr[i].watermark, tr[0].watermark);
+        CHECK(tr[i + 1].prior_complete);
+        CHECK_EQ(tr[i + 1].watermark, tr[i].watermark + kChunk);
     }
 
     /* The tail step: its pass was built and its wait ran (`complete` after the wait is the
