@@ -900,8 +900,9 @@ struct Config {
     /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
      * The default is the ladder the policy was tuned with. An explicit tier above the executable
      * head depth is refused by Scheduler::init, which is where that depth is known (auto resolves
-     * it); the default ladder is trimmed to it instead, so a valid deployment is not refused for
-     * the ladder's deeper end. */
+     * it), and so is a ladder whose top is below it: the named baseline runs at that depth, so a
+     * lower top would measure a depth the ladder never offers. The default ladder is trimmed to
+     * the depth instead, so a valid deployment is not refused for the ladder's deeper end. */
     int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
     int     draft_n_tiers = 5;
     bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */

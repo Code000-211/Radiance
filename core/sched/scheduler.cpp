@@ -211,6 +211,23 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         if (dp.policy.n_tiers > 0 && t <= dp.policy.tiers[dp.policy.n_tiers - 1]) continue;
         dp.policy.tiers[dp.policy.n_tiers++] = t;
     }
+    /* The explicit ladder is the whole set the cost policy may offer, and the named baseline runs
+     * at exec_depth. A ladder ending below it would let the baseline measure a depth the ladder
+     * never offers while the deepest offered tier stays unpriced. Refuse it by name: neither
+     * extending the user's list nor moving the calibration depth is this flag's call. Whoever wants
+     * to offer only the ladder's depth sets the ceiling to it as well. */
+    if (cfg.draft_policy == DraftPolicyKind::Cost && cfg.draft_tiers_set &&
+        dp.policy.n_tiers > 0) {
+        const int32_t top = dp.policy.tiers[dp.policy.n_tiers - 1];
+        if (top < exec_depth) {
+            RAD_ERR("--draft-depth-tiers: the explicit ladder ends at %d, below the executable "
+                    "head depth %d (ceiling %d, drafter depth %d); end the ladder at %d, or set "
+                    "the ceiling to %d so the executable depth is the ladder's top",
+                    (int)top, (int)exec_depth, (int)cfg.n_spec, (int)prog.drafter.depth,
+                    (int)exec_depth, (int)top);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     if (cfg.draft_policy == DraftPolicyKind::Cost && !cfg.draft_tiers_set) {
         int32_t top = dp.policy.tiers[dp.policy.n_tiers - 1];
         if (top < exec_depth) {

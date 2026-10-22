@@ -2211,6 +2211,110 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
     CHECK_OK(f.start());
 }
 
+/* --draft-depth-tiers under cost must end at the executable head depth. The named baseline runs
+ * at that depth, so a ladder topping below it would measure a depth the ladder never offers and
+ * leave the deepest offered tier permanently unpriced. The refusal is by name; the list is not
+ * silently extended and the calibration depth is not moved to fit it. */
+TEST(an_explicit_ladder_below_the_executable_depth_is_refused_by_name) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    f.cfg.draft_tiers_set = true;
+    f.cfg.draft_n_tiers   = 2;
+    f.cfg.draft_tiers[0]  = 0;
+    f.cfg.draft_tiers[1]  = 2;
+    activate_costs(f);
+
+    const std::string refused = stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+    CHECK(has(refused, "explicit ladder"));
+    CHECK(has(refused, "ends at 2"));
+    CHECK(has(refused, "executable head depth 6"));
+}
+
+/* The same ladder is admitted when the executable depth really is 2: the ceiling may be deeper,
+ * the drafter caps it, and the deepest offered plan is the depth the baseline measures. */
+TEST(an_explicit_ladder_at_the_executable_depth_is_admitted) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;                     /* the ceiling alone does not decide the depth */
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 2;             /* the head can publish two rounds */
+    f.cfg.draft_tiers_set = true;
+    f.cfg.draft_n_tiers   = 2;
+    f.cfg.draft_tiers[0]  = 0;
+    f.cfg.draft_tiers[1]  = 2;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    CHECK(p->source == DraftPlanSource::Fallback);   /* the empty baseline is the named fallback */
+    CHECK_EQ(p->k[0], 2);                            /* at the ladder's top / executable depth */
+    CHECK_EQ(draft_plan_valid(*p), RAD_OK);
+}
+
+/* The feedback R depends on: the named baseline's measurement is a price for the deepest offered
+ * plan, so a later cycle can choose it. A live table starts with no bucket. Cycle A verifies
+ * nothing and falls back at six; its bucket is a first-cycle shape (verify_k 0). Cycle B prices
+ * A's published window, does not find that shape either, falls back once more and measures the
+ * exact shape it executed; cycle C prices it and issues a cost plan at the deepest tier. */
+TEST(a_fallback_cycle_measures_the_deepest_offered_plan_for_the_next_cycle) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);                    /* live, empty, fallback admitted */
+    CHECK_OK(f.start(DraftReplay::None));
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+
+    /* Cycle A: nothing priced, so the fallback runs at six; the step verifies nothing. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* a = f.sch.draft().plan();
+    REQUIRE(a != nullptr);
+    CHECK(a->source == DraftPlanSource::Fallback);
+    CHECK_EQ(a->k[0], 6);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    /* Cycle B: A is delivered first. Its bucket verified nothing; this cycle prices a shape that
+     * verifies A's six, so it is not that bucket and the named baseline runs again. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* b = f.sch.draft().plan();
+    REQUIRE(b != nullptr);
+    CHECK(b->source == DraftPlanSource::Fallback);
+    CHECK_EQ(b->k[0], 6);
+    CHECK_EQ(b->verify_k, 6);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    CHECK_OK(f.sch.set_draft(id, six, 6));
+    f.sch.step_finished(live);
+
+    /* Cycle C: B's observation closed on this open and priced the shape the deepest tier asks
+     * for -- the plan is now a cost decision at six, not the baseline. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* c = f.sch.draft().plan();
+    REQUIRE(c != nullptr);
+    CHECK(c->source == DraftPlanSource::Cost);
+    CHECK(c->fallback == DraftFallback::None);
+    CHECK_EQ(c->k[0], 6);
+    CHECK_EQ(c->verify_k, 6);
+}
+
 /* The other side of the same gate: one bucket estimate() would price from (no disturbing flag, a
  * positive sample count, a finite positive mean) is a measured baseline on its own -- Cost starts
  * with no fallback admission, and the table's own predicate says so. */

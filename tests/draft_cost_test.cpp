@@ -429,6 +429,44 @@ TEST(a_fingerprint_or_execution_mismatch_disables_the_profile) {
     CHECK(t.active());
 }
 
+/* `arena` is part of the placement identity for every basis: two starts with different level rows
+ * lend at different step sizes, so a file measured under one does not price the other. The refusal
+ * names the field, like the other identity mismatches. */
+TEST(an_arena_level_mismatch_disables_the_profile) {
+    const DraftCostProfile p = parse_or_fail(
+        profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
+
+    DraftCostRuntime other = runtime();
+    other.fingerprint.arena = "8192,2048,512";
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, other), RAD_OK);   /* refused, not an error */
+    CHECK(!t.active());
+    CHECK(has(t.reason(), "arena"));
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(query(0, 8, 3, { 0, 8, 8, 8 }), &e), RAD_OK);
+    CHECK(!e.valid);
+    CHECK_EQ(e.coverage, 0);
+}
+
+/* A live profile compares the loan it was measured under; a different flex/lend identity is a
+ * different deployment. (A no-loan reference ignores the field by design; that rule is covered
+ * where the reference is.) */
+TEST(a_live_loan_mismatch_disables_a_live_profile) {
+    const DraftCostProfile p = parse_or_fail(
+        profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
+
+    DraftCostRuntime other = runtime();
+    other.fingerprint.live_loan = "flex=19922944 lend=0;flex=0 lend=0";
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, other), RAD_OK);   /* refused, not an error */
+    CHECK(!t.active());
+    CHECK(has(t.reason(), "live_loan"));
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(query(0, 8, 3, { 0, 8, 8, 8 }), &e), RAD_OK);
+    CHECK(!e.valid);
+    CHECK_EQ(e.coverage, 0);
+}
+
 TEST(an_exact_bucket_is_measured_and_carries_its_coverage) {
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 },
