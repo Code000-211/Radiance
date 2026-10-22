@@ -240,6 +240,22 @@ if(RAD_HIP_FOUND)
   endforeach()
 endif()
 
+# spechub_wiring_test dlopens the built spechub plugin and checks how its rows are classified: the
+# device rows must be production kernels and the host oracle rows must stay reference. It needs the
+# library path and the same RAD_SPECHUB_WITH_DEVICE answer the plugin was built with.
+if(TARGET spechub)
+  target_link_libraries(spechub_wiring_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(spechub_wiring_test PRIVATE
+    RAD_SPECHUB_LIB="${RAD_PLUGIN_OUT}/kernels/spechub.so")
+  if(RAD_HIP_FOUND)
+    target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
+  endif()
+  add_dependencies(spechub_wiring_test spechub)
+  # sample_test's coupling case declares a Sampler with RADIANCE_MTP_COUPLED and needs the verify
+  # op the spechub plugin carries (its host row); it skips when the library is absent.
+  add_dependencies(sample_test spechub)
+endif()
+
 # ================================================================== whole models on the CPU
 #
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on

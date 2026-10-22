@@ -1268,24 +1268,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
             /* RADIANCE_MTP_COUPLED. The coupling needs the 2-bit candidate head's reranked top-8,
              * because Q is that shortlist's own law; a plain bf16 head leaves one candidate and
-             * there is nothing to couple over. It also needs a LINEAR chain: a tree reads column 0
-             * as a parent index, so the flag refuses DARTREE, the DLoop drafter and the FullDrafter
-             * rather than proposing tokens into a tree plane. SpecHub is excluded by
-             * mtp_coupled_config_valid() and, if it ever were not, by the same tree test. */
+             * there is nothing to couple over. The drafter SHAPE (a linear serial chain, never a
+             * block drafter) is checked by the engine, which is where the declaration is in hand:
+             * the switches that once named tree drafters do not exist in this tree, and testing
+             * their environment variables here enforced nothing. */
             if (!rad::mtp_coupled_config_valid()) {
-                rad_note(b, "RADIANCE_MTP_COUPLED accepts 0|1 (or unset) and excludes "
-                            "RADIANCE_NO_DRAFT");
+                rad_note(b, "RADIANCE_MTP_COUPLED accepts 0|1 (or unset); any other value is "
+                            "refused, not treated as off");
                 return RAD_E_INVAL;
             }
             if (rad::mtp_coupled_enabled()) {
-                const bool dartree = std::getenv("RADIANCE_DARTREE") != nullptr;
-                const bool dloop   = std::getenv("RADIANCE_DLOOP_DRAFTER") != nullptr;
-                const bool full    = std::getenv("RADIANCE_FULLDRAFTER") != nullptr;
-                if (!m.b_mtp_didx || dartree || dloop || full || g.max_spec < 1 ||
-                    g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS) {
-                    rad_note(b, "RADIANCE_MTP_COUPLED requires the linear builtin MTP chain: the "
-                                "2-bit candidate head's reranked top8, no DARTREE / DLoop / "
-                                "FullDrafter, and max_spec 1..%d",
+                if (!m.b_mtp_didx || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS) {
+                    rad_note(b, "RADIANCE_MTP_COUPLED requires the 2-bit candidate head's reranked "
+                                "top8 and max_spec 1..%d",
                              RAD_MTP_COUPLE_MAX_ROUNDS);
                     return RAD_E_UNSUPPORTED;
                 }

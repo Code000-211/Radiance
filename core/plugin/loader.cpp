@@ -441,6 +441,9 @@ int Registry::commit_(Staged& s, int order) {
     }
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
     const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
+    /* Per row when exported, else the library's own answer: a plugin that ships a device row and
+     * its host oracle in one library must not have the oracle's status leak onto the device row. */
+    const auto kern_ref = dl_fn<RadKernelReferenceFn>(s.handle, "rad_kernel_reference");
     for (const auto& sr : staged_rows) {
         KernelRow row;
         row.info         = sr.first;
@@ -451,7 +454,7 @@ int Registry::commit_(Staged& s, int order) {
         const int coll   = collective ? collective(sr.second) : 0;
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
-        row.reference    = p.reference;
+        row.reference    = kern_ref ? kern_ref(sr.second) != 0 : p.reference;
         rows_.push_back(row);
     }
 

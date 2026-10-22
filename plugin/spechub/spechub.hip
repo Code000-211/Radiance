@@ -20,28 +20,15 @@
 
 namespace {
 
-/* THE DISPATCH LOG IS THIS DSO'S OWN. r4d_emit.h calls through it so a test can record dispatches,
- * but the loader maps plugins RTLD_LOCAL: a plugin cannot import libr4d's copy, and an unresolved
- * symbol refuses the whole library at load. Defining them here gives r4d_emit.h exactly what it
- * declares and keeps the recorder inert -- nothing in this plugin sets the log.
- *
- * The recorder is a tool's, not a kernel's: these counters are never consulted on a serving path. */
-const void** r4d_dispatch_log = nullptr;
-int          r4d_dispatch_cap = 0;
-int          r4d_dispatch_n   = 0;
-
 /* One thread a row: both ops are row-local and the M is the number of sampled positions. */
 __global__ void propose(RadMtpCoupleProposeCall c) {
     const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row < c.M) rad_mtp_couple_propose_row(c, row);
 }
-__global__ void verify(RadMtpCoupleVerifyCall c) {
-    const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < c.M) rad_mtp_couple_verify_row(c, row);
-}
 
-/* ONE WORKGROUP A ROW, 128 threads. The verify's weight plane is shared: at n_cand 1024 that is
- * 8 KiB of FP64, and the cuts read it once per candidate rather than once per thread. */
+/* ONE WORKGROUP A ROW, 128 threads. The verify's planes are shared: at n_cand 1024 the weights and
+ * the residual masses are 16 KiB of FP64, and the mass walk reads them once per candidate rather
+ * than once per thread. */
 constexpr int kThreads = 128;
 constexpr int64_t kMaxCand = 1024;
 
@@ -53,15 +40,19 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
                               { ld0, ld1, ld2, ld3, ld4 } };
     const int64_t row = blockIdx.x;
     if (row >= M) return;
-    /* Above the narrow band the general algorithm runs single-threaded: the shared plane is sized
-     * for kMaxCand and a wider row would overrun it. */
+    /* ABOVE THE NARROW BAND the general algorithm runs single-threaded: the shared planes are sized
+     * for kMaxCand and a wider row would overrun them. That is the 1025-and-above fallback, and it is
+     * the same FP64 order the cooperative path below keeps. */
     if (n_cand > kMaxCand) {
         if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
         return;
     }
-    __shared__ double weight[kMaxCand];
+    /* THE TWO COOPERATIVE PLANES. `weight` is P's unnormalised FP64 mass per candidate and `mass` is
+     * the residual (P-Q)+ per candidate; both are written by the whole workgroup and read in
+     * ASCENDING candidate order afterwards, which is the order the serial algorithm sums in. */
+    __shared__ double weight[kMaxCand], mass[kMaxCand], pq[8], sum;
     __shared__ float  top;
-    __shared__ int    eligible;
+    __shared__ int    eligible, first[8], ix, dominated;
     const auto& s = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
     const auto& p = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
     const int32_t* ids = c.idx + row * c.ld[0];
@@ -87,49 +78,66 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     }
     __syncthreads();
     if (!eligible) return;
+    /* THE FP64 MASS, done COOPERATIVELY: each thread takes a strided slice of the candidates and
+     * writes exp(v - max) into its own slot. No cross-thread reduction happens here -- the sum below
+     * is still walked in ascending order by one thread, which is what keeps the sum bit-identical to
+     * the serial algorithm. */
     for (int64_t j = threadIdx.x; j < c.n_cand; j += blockDim.x)
         if (ids[j] >= 0 && val[j] != -INFINITY) weight[j] = ::exp((double)val[j] - top);
     __syncthreads();
-    if (threadIdx.x != 0) return;
-
-    double  sum = 0, pq[8] = {};
-    for (int64_t j = 0; j < c.n_cand; ++j) {
-        if (ids[j] < 0 || val[j] == -INFINITY) continue;
-        const double w = weight[j];
-        sum += w;
-        for (int k = 0; k < s.count; ++k)
-            if (ids[j] == s.ids[k]) { pq[k] += w; break; }
+    if (threadIdx.x == 0) {
+        sum = 0;
+        for (int k = 0; k < s.count; ++k) { pq[k] = 0; first[k] = -1; }
+        for (int64_t j = 0; j < c.n_cand; ++j) {
+            if (ids[j] < 0 || val[j] == -INFINITY) continue;
+            const double w = weight[j];
+            sum += w;
+            for (int k = 0; k < s.count; ++k)
+                if (ids[j] == s.ids[k]) {
+                    if (first[k] < 0) first[k] = (int)j;
+                    pq[k] += w;
+                    break;
+                }
+        }
+        if (!(sum > 0) || !rad_spechub_finite(sum)) eligible = 0;
+        if (eligible) {
+            ix = -1;
+            dominated = true;
+            for (int k = 0; k < s.count; ++k) {
+                pq[k] /= sum;
+                dominated = dominated && pq[k] >= s.q[k];
+                if (s.ids[k] == s.x) ix = k;
+            }
+            if (ix < 0) eligible = 0;
+        }
     }
-    if (!(sum > 0) || !rad_spechub_finite(sum)) return;
-    int  ix = -1;
-    bool dominated = true;
-    for (int k = 0; k < s.count; ++k) {
-        pq[k] /= sum;
-        dominated = dominated && pq[k] >= s.q[k];
-        if (s.ids[k] == s.x) ix = k;
-    }
-    if (ix < 0) return;
-    /* The original skip and seen ORDER, kept exactly even when the first duplicate has weight
-     * zero: the mass walk is a prefix of this one, so reordering would change the token. */
-    unsigned seen = 0;
-    double   resid = 0;
-    for (int64_t j = 0; j < c.n_cand; ++j) {
+    __syncthreads();
+    if (!eligible) return;
+    /* THE RESIDUAL MASS, COOPERATIVELY. A Q token contributes max(0, P-Q) ONCE, at its first
+     * occurrence (`first[k]`), which is the duplicate-first rule; every other candidate contributes
+     * its own P. The plane is written per slot, so the walk below reads it in candidate order. */
+    for (int64_t j = threadIdx.x; j < c.n_cand; j += blockDim.x) {
         double m = 0;
         if (ids[j] >= 0 && val[j] != -INFINITY) {
             bool in_q = false;
             for (int k = 0; k < s.count; ++k)
                 if (s.ids[k] == ids[j]) {
                     in_q = true;
-                    if (!(seen & (1u << k))) {
-                        seen |= 1u << k;
-                        m = rad_spechub_positive(pq[k] - s.q[k]);
-                    }
+                    if (first[k] == (int)j) m = rad_spechub_positive(pq[k] - s.q[k]);
                     break;
                 }
             if (!in_q) m = weight[j] / sum;
         }
-        resid += m;
+        mass[j] = m;
     }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    /* THE ORDERED WALK. One thread, ascending candidate index, exactly the serial algorithm's
+     * arithmetic: the sums above and this walk are what the coupling's bit-exactness rests on, and
+     * parallelising either would reorder them. */
+    double resid = 0;
+    for (int64_t j = 0; j < c.n_cand; ++j) resid += mass[j];
     int32_t out = -1;
     const double u_resid = rad_spechub_uniform(p.seed, p.pos, RAD_SAMPLE_KEY_RESID);
     if (!dominated && !(resid > 0 && rad_spechub_finite(resid))) {
@@ -144,23 +152,9 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
         out = s.x;
     } else {
         double cdf = u_resid * resid;
-        seen = 0;
         for (int64_t j = 0; j < c.n_cand; ++j) {
             if (ids[j] == s.x) continue;
-            double m = 0;
-            if (ids[j] >= 0 && val[j] != -INFINITY) {
-                bool in_q = false;
-                for (int k = 0; k < s.count; ++k)
-                    if (s.ids[k] == ids[j]) {
-                        in_q = true;
-                        if (!(seen & (1u << k))) {
-                            seen |= 1u << k;
-                            m = rad_spechub_positive(pq[k] - s.q[k]);
-                        }
-                        break;
-                    }
-                if (!in_q) m = weight[j] / sum;
-            }
+            const double m = mass[j];
             if (m > 0) { out = ids[j]; cdf -= m; if (cdf < 0) break; }
         }
     }

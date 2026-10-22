@@ -81,6 +81,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -170,8 +171,9 @@ public:
 
     /* Stage this step's parameter rows, penalty history and grammar bitmasks into pinned memory.
      * Scheduler thread, before the rank threads are released at the barrier. Allocates nothing;
-     * every buffer was sized at declare against max_seqs (spec §3.1). */
-    int build_step(const std::vector<Request*>& reqs);
+     * every buffer was sized at declare against max_seqs (spec §3.1). `step` is the engine's step
+     * the build stages for, carried into the coupling snapshot. */
+    int build_step(const std::vector<Request*>& reqs, int64_t step = -1);
 
     /* Stage `n` greedy rows for a drafter: no penalties, mask or history, and no RNG use, so
      * only the argmax runs. Draft output is a proposal checked by a greedy verifier
@@ -205,6 +207,29 @@ public:
      * meaningful only where the row carries RAD_SP_MASK. */
     const uint32_t* staged_mask(int64_t row) const { return mask_stage_ + row * mask_words_; }
     int64_t         mask_words() const { return mask_words_; }
+    /* Staged row `row`'s bound coupled state, as `run` uploads it: all-zero where the row carries
+     * none (bonus row, greedy row, uncoupled step). Lets a build be checked without a device. */
+    const RadMtpCoupleState& staged_couple(int64_t row) const { return couple_stage_[row]; }
+    /* Whether any row of the last build carries a bound state, i.e. whether `run` issues the
+     * verify op at all. Cleared by build_greedy: a gate for run(), not for evidence. */
+    bool staged_any_couple() const { return any_couple_; }
+    /* The verify op the last build resolved, for naming its kernel in a log line. */
+    rad_op staged_couple_op() const { return op_couple_; }
+
+    /* What build_step staged for the coupled verify, frozen there: build_greedy (the drafter's
+     * greedy passes, issued between that build and the step's wait) clears any_couple_ and
+     * replaces cur_stage_/n_seq_, but must not make the evidence unreadable. */
+    struct CoupleBuild {
+        int64_t step = -1;   /* the engine step this build staged */
+        int64_t rows = 0;    /* bound rows */
+        /* The distinct sequences among them, with their bound rows. */
+        std::vector<std::pair<uint64_t, int64_t>> seqs;
+    };
+    const CoupleBuild& couple_build() const { return couple_build_; }
+    /* The engine step whose build this sampler's run() last issued the verify op for, or -1. The
+     * op and the build it belongs to are recorded together, so an evidence read can tell an
+     * actually issued verify from a staged row set. */
+    int64_t staged_couple_issued_step() const { return couple_issued_step_; }
 
 private:
     /* Whether the vocabulary is split, judged by this rank's logit width rather than the rank
@@ -274,6 +299,8 @@ private:
     RadMtpCoupleState* couple_stage_ = nullptr;   /* pinned, one row per sampled position */
     bool    couple_      = false;   /* RADIANCE_MTP_COUPLED */
     bool    any_couple_  = false;   /* does any row this step carry a bound state? */
+    CoupleBuild couple_build_{};    /* what the last build_step staged, for the evidence line */
+    int64_t couple_issued_step_ = -1;   /* step whose verify op run() last issued */
 
     /* Pinned staging, allocated once at declare. */
     DeviceSampleParams* params_stage_ = nullptr;

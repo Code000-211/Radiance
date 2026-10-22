@@ -186,7 +186,8 @@ int rad_couple_validate(const RadArgs* a, int op, int64_t* M, int64_t* vocab, in
                      (a->t[i].rank == 3 && a->t[i].stride[1] % 2)))
             return RAD_E_INVAL;
     }
-    if (!op && a->t[0].stride[1] != 2) return RAD_E_STRIDE;
+    /* An even ROW stride keeps every shortlist row 8-byte aligned; the innermost stride is 1. */
+    if (!op && a->t[0].stride[0] % 2) return RAD_E_STRIDE;
     for (int i = 0; i < 5; ++i)
         for (int j = i + 1; j < 5; ++j) {
             const uintptr_t x = (uintptr_t)a->t[i].data, y = (uintptr_t)a->t[j].data;

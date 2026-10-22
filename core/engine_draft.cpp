@@ -7,6 +7,9 @@
 #include "engine_priv.h"
 
 #include "../arch/common/rad_spechub_config.h"
+#include "sample/mtp_couple_evidence.h"
+#include "sched/mtp_couple_bind.h"
+#include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
 
@@ -58,6 +61,19 @@ int Engine::step_state_init() {
      * own declare), and a silent no-op would serve uncoupled drafts while the flag said otherwise. */
     mtp_couple_ = mtp_coupled_enabled();
     if (mtp_couple_) {
+        /* THE DRAFTER SHAPE IS CHECKED HERE, where the declaration is in hand, not against
+         * environment variables nobody else reads. Coupling is defined on a LINEAR chain: a block
+         * drafter proposes a whole block at once from one pass and writes it to its proposal
+         * buffer, so there is no per-round draw to couple and no per-round state to read back.
+         * Left unchecked, a block drafter would silently serve uncoupled drafts while the flag
+         * said otherwise. */
+        if (drafter_.kind != RAD_DRAFT_SERIAL || drafter_.depth <= 0) {
+            RAD_ERR("RADIANCE_MTP_COUPLED requires the linear serial draft chain (RAD_DRAFT_SERIAL "
+                    "with depth > 0); this model declares drafter '%s' kind %d depth %d, which has "
+                    "no per-round draw to couple",
+                    drafter_.name ? drafter_.name : "(none)", drafter_.kind, drafter_.depth);
+            return RAD_E_UNSUPPORTED;
+        }
         const Program& prog = ranks_[0]->program;
         for (size_t i = 0; i < prog.buffers.size(); ++i) {
             const std::string& name = prog.buffers[i].name;
@@ -80,6 +96,11 @@ int Engine::step_state_init() {
             return RAD_E_STATE;
         }
         couple_rows_ = sd.shape[1];
+        /* ONE ENTRY PER CARD SLOT, indexed by StepEntry::card exactly as slots_host_ is: the plan
+         * names a request's sequence on the slot the advance writes, and the draft row carries the
+         * same `card`. A vector left empty makes every lookup miss, so the first step that drafts
+         * would refuse with "has no plan entry on its card" instead of staging its draw. */
+        couple_by_card_.assign((size_t)n_slot, RadMtpCoupleDraw{});
         couple_draw_stage_ = static_cast<RadMtpCoupleDraw*>(
             rad_dev_alloc(n_slot * (int64_t)sizeof(RadMtpCoupleDraw), RAD_MEM_HOST_PINNED));
         couple_readback_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
@@ -314,16 +335,66 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         const uint64_t seq = serial_row_[(size_t)i].seq;
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (!mtp_couple_) continue;
-        /* BOUND WHETHER OR NOT THE REQUEST SURVIVED. A truncated publication keeps a prefix, whose
-         * rows carry their own rounds' states; a request the scheduler refused binds nothing, and
-         * set_mtp_couple(…, 0) clears what an earlier step left. */
-        RAD_TRY(bind_couple(i, done, slots_host_[serial_row_[(size_t)i].card]));
+        /* BOUND ONLY FOR A REQUEST STILL RUNNING. A truncated publication keeps a prefix, whose
+         * rows carry their own rounds' states; a request this commit finished (a max_tokens or
+         * context cut), or one the scheduler refused, binds nothing -- its rows are carried
+         * terminal work and will never sample again. set_mtp_couple(…, 0) clears what an earlier
+         * step left, and for a request already gone from the sampler it is RAD_E_NOTFOUND.
+         *
+         * The position coordinate is the request's committed output length AFTER this commit -- the
+         * value the next build_step reads as its n_out. It comes from the scheduler's commit
+         * snapshot, not from the plan's Request pointer: reap() may have destroyed that already.
+         * The rule is mtp_couple_bind_rounds (sched/mtp_couple_bind.h), where it is driven against
+         * a real commit without an Engine. */
+        MtpCoupleBindPoint bp;
+        bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
+        if (!bp.found)
+            RAD_WARN("MTP coupled: serial row for sequence %llu is not in the committed step; "
+                     "clearing its coupling", (unsigned long long)seq);
+        int n_bound = 0;
+        std::string why;
+        const int bs = mtp_couple_bind_rounds(
+            bp, couple_draw_stage_[(size_t)i], &couple_readback_[(size_t)i], (int)couple_rows_,
+            done, slots_host_[serial_row_[(size_t)i].card], meta_.n_vocab, couple_bound_,
+            &n_bound, &why);
+        if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
         for (auto& rk : ranks_) {
-            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, rc == RAD_OK ? done : 0);
+            const int st = rk->sampler.set_mtp_couple(seq, couple_bound_,
+                                                      rc == RAD_OK ? n_bound : 0);
             if (st < 0 && st != RAD_E_NOTFOUND) return st;
         }
     }
     return RAD_OK;
+}
+
+/* One line, once, at the first coupled verify that completed. What makes it evidence is where it
+ * reads: the snapshot build_step froze for the step whose wait just returned (sample/
+ * mtp_couple_evidence.h), the verify op run() actually issued for that build, and the op's domain.
+ * build_greedy -- the drafter's greedy passes, issued between that build and the wait -- clears
+ * any_couple_ but not the snapshot; gating on the former is why the line never appeared in the
+ * coupled path. Sequences are re-checked as Running after the wait under the scheduler's lock, so a
+ * request that left in between is not counted. Request numbers, the row count and the kernel name
+ * only: no tokens, no keys, no logits. A host-domain row prints the same line marked as not device
+ * evidence -- an oracle run must not be read as one. */
+void Engine::couple_verify_evidence(int step) {
+    if (!mtp_couple_ || couple_evidence_) return;
+    Sampler& smp = ranks_[0]->sampler;
+    const rad_op op = smp.staged_couple_op();
+    const MtpCoupleEvidence ev = mtp_couple_evidence(
+        smp.couple_build(), step, ranks_[0]->ctx.op_domain(op),
+        [this](uint64_t seq) { return sched_.running(seq); });
+    if (ev.rows <= 0 || smp.staged_couple_issued_step() != step) return;
+    const char* kernel = ranks_[0]->ctx.ip_kernel_name(op);
+    if (ev.device) {
+        couple_evidence_ = true;
+        RAD_INFO("MTP coupled verify completed: step %d, %lld bound row(s) over request(s) [%s], "
+                 "kernel %s, domain device", step, (long long)ev.rows, ev.seqs.c_str(), kernel);
+    } else if (!couple_host_note_) {
+        couple_host_note_ = true;
+        RAD_INFO("MTP coupled verify completed on the host domain: step %d, %lld bound row(s) over "
+                 "request(s) [%s], kernel %s -- not device evidence", step, (long long)ev.rows,
+                 ev.seqs.c_str(), kernel);
+    }
 }
 
 /* RADIANCE_MTP_COUPLED: the draw for every drafting row, before any serial pass reads it.
@@ -331,55 +402,23 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * The coordinate is the PRE-commit output size, which strictly grows between two steps that draft
  * one request (each commits at least one token), so (base, round) never repeats a draft stream. The
  * card is the slot the advance writes, and the plugin refuses a row whose staged draw names another
- * -- which is what makes a stale draw a refusal here rather than a wrong token later. */
+ * -- which is what makes a stale draw a refusal here rather than a wrong token later. The rule
+ * itself is sched/mtp_couple_plan.h, where it is checked without a card. */
 int Engine::stage_couple_draws(int n) {
-    std::fill(couple_by_card_.begin(), couple_by_card_.end(), RadMtpCoupleDraw{});
-    for (const auto& e : sched_.plan().e)
-        if (e.req && e.card >= 0 && (size_t)e.card < couple_by_card_.size())
-            couple_by_card_[(size_t)e.card] = { e.req->sp.seed, (uint64_t)e.req->output.size(),
-                                                e.seq, e.card, e.req->sp.greedy() ? 0u : 1u };
-    for (int i = 0; i < n; ++i) {
-        const auto& row = serial_row_[(size_t)i];
-        if (row.card < 0 || (size_t)row.card >= couple_by_card_.size() ||
-            couple_by_card_[(size_t)row.card].seq != row.seq) {
-            RAD_ERR("MTP coupled: drafting row %d (sequence %llu, card %d) has no plan entry on its "
-                    "card", i, (unsigned long long)row.seq, (int)row.card);
-            return RAD_E_STATE;
-        }
-        couple_draw_stage_[i] = couple_by_card_[(size_t)row.card];
+    std::string why;
+    const int stg = mtp_couple_plan_stage(sched_.plan(),
+                                          (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
+                                          serial_row_.data(), n, &couple_by_card_,
+                                          couple_draw_stage_, &why);
+    if (stg < 0) {
+        RAD_ERR("MTP coupled: %s", why.c_str());
+        return stg;
     }
     for (auto& rk : ranks_) {
         void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
-    }
-    return RAD_OK;
-}
-
-/* After commit: drafting row `row`'s rounds as rank 0's ops left them, checked against the draw
- * staged for that row and the card's own slot (written through RadBatch::seq_ids, independently of
- * the row index), then bound to the verify positions the next step samples: the committed output
- * size is base + n_acc for every request still running.
- *
- * A STOCHASTIC ROW THAT DID NOT COME BACK SAMPLED, or whose x is not the card's draft, is a broken
- * path and refuses the step: a status-0 bypass or a misattached Q must never pass for coupling. */
-int Engine::bind_couple(int row, int done, const StepSlot& S) {
-    const RadMtpCoupleDraw& d = couple_draw_stage_[row];
-    for (int rd = 1; rd <= done; ++rd) {
-        RadMtpCoupleState st = couple_readback_[(int64_t)(rd - 1) * couple_rows_ + row];
-        const bool sampled = d.mode == 1;
-        if (std::memcmp(&st.draw, &d, sizeof d) || st.round != rd || st.x != S.tok[rd] ||
-            st.status != (sampled ? 1 : 0) ||
-            (sampled && !rad_mtp_couple_state_valid(st, meta_.n_vocab))) {
-            RAD_ERR("MTP coupled: sequence %llu round %d returned status %d round %d x %d for card "
-                    "token %d (draw %s); refusing the step", (unsigned long long)d.seq, rd,
-                    st.status, st.round, st.x, S.tok[rd],
-                    std::memcmp(&st.draw, &d, sizeof d) ? "stale" : "current");
-            return RAD_E_STATE;
-        }
-        st.pos = d.base + (uint64_t)S.n_acc + (uint64_t)(rd - 1);
-        couple_bound_[rd - 1] = st;
     }
     return RAD_OK;
 }

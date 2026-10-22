@@ -530,7 +530,7 @@ int Engine::step_loop() {
             }
             if (t_on) phase_mark(PH_BEGIN);
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs);
+                const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
                 for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
@@ -717,6 +717,9 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* The step's sampler chain, verify op included, has returned: one line at the first
+         * coupled verify that actually completed. */
+        couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
             if (st < 0) return fail_loop(st);
