@@ -110,10 +110,12 @@ struct Fixture {
 
 /* ================================================================== A's production sample */
 
-/* Install an empty profile for this runtime so the table is active (a configured deployment with
- * no measurements yet). The samples then land in `buckets()`, which is what a host test can read
- * without a profile file. */
-void activate_costs(Fixture& f) {
+/* Install a profile for this runtime so the table is active. Empty by default (a configured
+ * deployment with no measurements yet), whose samples land in `buckets()`, which is what a host
+ * test can read without a profile file. `priced` installs one usable bucket instead, so a Cost
+ * deployment is admitted on a measurement rather than on the named fallback, and
+ * fallback_admitted() stays false for the test to check. */
+void activate_costs(Fixture& f, bool priced = false) {
     DraftCostProfile p;
     p.fingerprint.model     = "test";
     p.fingerprint.quant     = "q";
@@ -123,13 +125,30 @@ void activate_costs(Fixture& f) {
     p.fingerprint.kv_format = "bf16";
     p.fingerprint.placement = "all_vram";
     p.fingerprint.tp        = 1;
+    if (priced) {
+        DraftCostBucket b;
+        b.shape.n_rows        = 1;
+        b.shape.verify_k      = 1;
+        b.shape.verify_tokens = 2;
+        b.shape.rows[1]       = 1;
+        b.shape.draft_k       = 1;
+        b.shape.draft_rows[1] = 1;
+        b.shape.drafter       = DraftDrafter::Serial;
+        b.rounds              = 1;
+        b.draft_round_rows[1] = 1;
+        b.draft_rows_total    = 1;
+        b.mean_ms             = 12.0;
+        b.unc_ms              = 1.0;
+        b.n                   = 3;
+        p.buckets.assign(1, b);
+    }
     DraftCostRuntime rt;
     rt.fingerprint = p.fingerprint;
     CHECK_OK(f.sch.draft_costs().configure(p, rt));
     REQUIRE(f.sch.draft_costs().active());
     /* Matching is not admission: an empty profile has no price for any shape, so the deployment
      * says in so many words that Cost may run on the policy's named baseline (scheduler.cpp). */
-    f.sch.draft_costs().admit_fallback();
+    if (!priced) f.sch.draft_costs().admit_fallback();
 }
 
 /* The plan's scalars for one cycle, copied: the controller's storage moves with the next open. */
@@ -2064,8 +2083,8 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
         CHECK(has(empty, "no measured bucket"));
 
         /* A non-empty bucket list is not a baseline either: the gate asks the same question
-         * estimate() does (bucket_usable), so a profile of diagnostic buckets and one carrying no
-         * positive mean are still "no measured bucket". */
+         * estimate() does (draft_bucket_usable), so a profile of diagnostic buckets and one
+         * carrying no positive mean are still "no measured bucket". */
         DraftCostBucket b;
         b.shape.n_rows        = 1;
         b.shape.verify_k      = 1;
@@ -2215,15 +2234,19 @@ TEST(a_legacy_run_with_a_profile_out_records_the_cycles_it_ran) {
     CHECK(b1.shape.drafter == DraftDrafter::Serial);
 }
 
-/* The same recording under --draft-window adaptive: draft_cap() is now the sequence's stop, so the
- * cycle drafts fewer rows than the head's depth and the bucket must say so. Recording the ceiling
- * here would file a price for rounds nobody ran. */
-TEST(an_adaptive_run_with_a_profile_out_records_the_window_it_drafted) {
+/* The same recording under --draft-window adaptive, through the real driver: serial_begin() gives
+ * each row the rounds its own window allows, serial_batch() runs each round over the rows that
+ * still have one, and the bucket must price the distribution that ran. Two sequences are driven
+ * until one stops at 6 and the other at 3; the cycle then executes 6/3, and both the batches and
+ * the recorded bucket have to say so. Recording the cycle's deepest window for every row would
+ * time four rounds for the shallow row that never ran them (the review's high finding: the
+ * published extent, not the executed one). */
+TEST(an_adaptive_cycle_runs_and_records_the_rounds_each_row_actually_ran) {
     Fixture f;
     f.build();
     f.cfg.n_spec            = 6;
     f.cfg.draft_window      = DraftWindow::Adaptive;
-    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_adaptive.json");
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_adaptive_split.json");
     f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth    = 6;
     activate_costs(f);
@@ -2231,34 +2254,221 @@ TEST(an_adaptive_run_with_a_profile_out_records_the_window_it_drafted) {
     REQUIRE(f.sch.draft().adaptive());
     CHECK(!f.sch.draft().cost_policy());
 
+    const uint64_t a = f.submit(160, 2048), b = f.submit(170, 2048);
+    f.prefill(a);
+    f.prefill(b);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    Scheduler::SerialRow rows[8];
+    /* The engine's loop: open a cycle, run the serial passes, issue the next step ahead, commit,
+     * publish what ran under the cycle's plan, then promote the step issued ahead. The acceptance
+     * drive: A takes its whole window, so its stop stays at the head's depth; B takes three of
+     * four or more and two of three, so its estimate falls until its stop is 3. */
+    auto acc = [&](const StepEntry& e) {
+        if (e.seq == a) return e.n_spec;
+        if (e.n_spec >= 4) return 3;
+        if (e.n_spec == 3) return 2;
+        return e.n_spec;
+    };
+    bool found = false;
+    int  split_k[2] = { 0, 0 };
+    REQUIRE(f.sch.step() != nullptr);
+    for (int cycle = 0; cycle < 80 && !found; ++cycle) {
+        DraftStepEvidence live;
+        live.replay_known = true;
+        live.replay = DraftReplay::None;
+
+        int rounds = 6;
+        REQUIRE_EQ(f.sch.serial_begin(&rounds, rows, 8), 2);
+        const RadBatch* hist = f.sch.serial_batch(0, cycle + 1);
+        REQUIRE(hist != nullptr);
+        CHECK_EQ((int)hist->n_draft_out, 2);   /* both rows draft, so round 0 carries round 1 */
+        /* Rows are ordered deepest first, and each round is a prefix of the one before, so the
+         * per-round row count is each row's executed depth. */
+        int k[2] = { 1, 1 };
+        int n_round[7] = {};
+        n_round[1] = 2;
+        int done = 1;
+        for (int rd = 2; rd <= rounds; ++rd) {
+            const RadBatch* db = f.sch.serial_batch(rd, cycle + 1);
+            REQUIRE(db != nullptr);
+            CHECK(!f.sch.serial_batch_failed());
+            n_round[rd] = (int)db->n_seq;
+            for (int i = 0; i < n_round[rd] && i < 2; ++i) k[i] = rd;
+            done = rd;
+        }
+        if (rounds == 6 && n_round[2] == 2 && n_round[3] == 2 && n_round[4] == 1 &&
+            n_round[5] == 1 && n_round[6] == 1) {
+            found = true;
+            split_k[0] = k[0];
+            split_k[1] = k[1];
+        }
+
+        for (int i = 0; i < 2; ++i) f.sch.expect_draft(rows[i].seq, done);
+        REQUIRE(f.sch.step_next() != nullptr);
+        CHECK_OK(f.commit(11, 0, acc));
+        /* Published after the commit, as the engine does: `serial_k_[i]` is the depth the row ran,
+         * which the step issued ahead was planned to verify. */
+        for (int i = 0; i < 2; ++i) CHECK_OK(f.sch.set_draft(rows[i].seq, six, k[i]));
+        if (found) {
+            CHECK_EQ(f.sch.find(rows[0].seq)->n_draft, 6);
+            CHECK_EQ(f.sch.find(rows[1].seq)->n_draft, 3);
+        }
+        f.sch.serial_end(done, true);
+        f.sch.step_finished(live);
+        if (found) break;
+        f.sch.promote_next();
+        REQUIRE_EQ((int)f.sch.plan().e.size(), 2);
+    }
+    REQUIRE(found);
+    CHECK_EQ(split_k[0], 6);
+    CHECK_EQ(split_k[1], 3);
+
+    /* The next open closes the record: its bucket is the cycle's executed distribution. */
+    f.sch.promote_next();
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    const DraftCostBucket* hit = nullptr;
+    for (const DraftCostBucket& x : bs)
+        if (x.rounds == 6 && x.draft_round_rows[3] == 2 && x.draft_round_rows[4] == 1) hit = &x;
+    REQUIRE(hit != nullptr);
+    CHECK_EQ(hit->flags, 0);
+    CHECK_EQ(hit->n, 1);
+    CHECK_EQ(hit->shape.draft_k, 6);            /* the plan's deepest row */
+    CHECK_EQ(hit->shape.n_rows, 2);
+    CHECK_EQ(hit->shape.pipeline_depth, 1);
+    CHECK(hit->shape.drafter == DraftDrafter::Serial);
+    /* N_j of what ran: both rows through round 3, only the deep one to 6. */
+    CHECK_EQ(hit->rounds, 6);
+    CHECK_EQ(hit->draft_round_rows[1], 2);
+    CHECK_EQ(hit->draft_round_rows[2], 2);
+    CHECK_EQ(hit->draft_round_rows[3], 2);
+    CHECK_EQ(hit->draft_round_rows[4], 1);
+    CHECK_EQ(hit->draft_round_rows[5], 1);
+    CHECK_EQ(hit->draft_round_rows[6], 1);
+    CHECK_EQ(hit->draft_rows_total, 9);
+    /* The plan's own distribution, which the executed one is checked against. */
+    CHECK_EQ(hit->shape.draft_rows[1], 2);
+    CHECK_EQ(hit->shape.draft_rows[3], 2);
+    CHECK_EQ(hit->shape.draft_rows[4], 1);
+    CHECK_EQ(hit->shape.draft_rows[6], 1);
+}
+
+/* A cycle wider than the profile format can name (RAD_SCHED_MAX_SPEC). Recording a prefix of it
+ * would file a shape the step never ran -- the bracket timed all of the rows -- so the cycle is
+ * dropped whole and counted, and the table learns nothing from it. */
+TEST(a_cycle_over_the_row_limit_is_dropped_whole_not_truncated) {
+    Fixture f;
+    f.build(8192, 128, 512, 4096);
+    f.cfg.max_seqs          = 72;            /* a view wider than the 64 the format names */
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_over_rows.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+    CHECK(f.sch.draft_costs().buckets().empty());
+
+    /* One-step prompts: the first step admits and prefills all seventy, so the second opens a
+     * cycle with seventy decode rows. */
+    for (int i = 0; i < 70; ++i) f.submit(1, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 70);
+    f.commit_plain(11);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 1);
+    CHECK(f.sch.draft_costs().buckets().empty());
+    f.commit_plain(12);
+}
+
+/* The residency the profile was measured on. A move inside a step's bracket is reported by the
+ * rank; a move the scheduler's own ticks make between two brackets is not, so the engine reports
+ * the cumulative count since the profile was bound. Once it diverges, every later cycle is marked
+ * -- including one that saw no move of its own: the run cannot move back, and a later clean-looking
+ * bracket still does not describe the start placement. */
+TEST(a_drifted_residency_marks_every_later_record_until_the_run_ends) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_drift.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
     const uint64_t a = f.submit(160), b = f.submit(170);
     f.prefill(a);
     f.prefill(b);
+
     int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    auto cycle = [&](int64_t moves_since_bind) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+        DraftStepEvidence live;
+        live.replay_known = true;
+        live.replay = DraftReplay::None;
+        live.moves_since_bind = moves_since_bind;
+        f.sch.step_finished(live);
+    };
+    cycle(0);   /* measured on the start placement */
+    cycle(1);   /* the scheduler's ticks moved a unit between the two brackets */
+    cycle(0);   /* no move of its own -- and no longer on the start placement either */
+
+    /* The next open closes the last record. */
     REQUIRE(f.sch.step() != nullptr);
-    CHECK(f.sch.draft().plan() == nullptr);
-    f.commit(11, 0, [](const StepEntry&) { return 0; });
-    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    const DraftCostBucket* clean = nullptr;
+    const DraftCostBucket* drifted = nullptr;
+    for (const DraftCostBucket& x : bs) {
+        if (x.flags & kDraftSamplePlacement) drifted = &x;
+        else clean = &x;
+    }
+    REQUIRE(clean != nullptr);
+    REQUIRE(drifted != nullptr);
+    /* The one before the move stays: it measured the start plan. */
+    CHECK_EQ(clean->n, 1);
+    CHECK_EQ(clean->shape.verify_k, 0);
+    /* The move's cycle and the clean-looking one after it are both excluded. */
+    CHECK_EQ(drifted->n, 2);
+    CHECK_EQ(drifted->shape.verify_k, 6);
+}
+
+/* The online policy under a moved residency: the loaded profile was measured on the start
+ * placement, so it stops pricing and stops learning. Fail closed and visibly, on the name -- not
+ * admit_fallback(), which would let the policy price without a measurement it was admitted on. */
+TEST(a_drifted_residency_stops_the_cost_policy_from_pricing_the_loaded_profile) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 6;
+    f.cfg.draft_policy  = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true);
+    CHECK(!f.sch.draft_costs().fallback_admitted());
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    REQUIRE(f.sch.draft_costs().active());
+
     DraftStepEvidence live;
     live.replay_known = true;
     live.replay = DraftReplay::None;
+    live.moves_since_bind = 1;
     f.sch.step_finished(live);
-
-    REQUIRE(f.sch.step() != nullptr);
-    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
-    REQUIRE(bs.size() == 1);
-    const DraftCostBucket& b1 = bs[0];
-    CHECK_EQ(b1.flags, 0);
-    CHECK_EQ(b1.n, 1);
-    CHECK(b1.shape.drafter == DraftDrafter::Serial);
-    /* The window the controller chose, not the head's 6: whatever it is, the bucket, the rows and
-     * the round count all describe that one extent. */
-    const int32_t k = b1.shape.draft_k;
-    CHECK(k >= 1 && k <= 6);
-    CHECK_EQ(b1.rounds, k);
-    for (int32_t j = 1; j <= k; ++j) CHECK_EQ(b1.draft_round_rows[j], 2);
-    for (int32_t j = k + 1; j <= 6; ++j) CHECK_EQ(b1.draft_round_rows[j], 0);
-    CHECK_EQ(b1.draft_rows_total, 2 * k);
+    CHECK(!f.sch.draft_costs().active());
+    CHECK_EQ(f.sch.draft_costs().reason(),
+             std::string("residency drifted from the fingerprint's start placement"));
+    CHECK(!f.sch.draft_costs().fallback_admitted());
 }
 
 RAD_TEST_MAIN()

@@ -135,6 +135,12 @@ struct DraftStepEvidence {
     DraftReplay replay       = DraftReplay::Unknown;
     bool        staged       = false;  /* the trunk pass armed the pooled experts through the ring */
     bool        moved        = false;  /* the placement engine promoted or demoted */
+    /* Placement moves on every rank since the cost profile was bound, cumulative. The per-step
+     * `moved` above only covers the bracket it names: the scheduler's tier and arena ticks run
+     * after step_finished, so a move between two brackets would otherwise never be stamped on the
+     * bracket measured after it. > 0 means this run's residency is no longer the one the
+     * fingerprint names. */
+    int64_t     moves_since_bind = 0;
 };
 
 class Scheduler {
@@ -581,6 +587,8 @@ private:
     /* The depth the previous recording cycle drafted, -1 before the first: the paired step verifies
      * that window, which is what the record's plan carries as history rows. */
     int32_t draft_record_prev_k_ = -1;
+    /* A cycle wider than the format's widest window was dropped; said once, counted after. */
+    bool    draft_record_over_rows_warned_ = false;
 
     /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
@@ -651,12 +659,18 @@ private:
     bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
     int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
     bool             draft_cost_warned_ = false;
+    /* The run's residency diverged from the one the profile's fingerprint names (sticky): the
+     * scheduler's own ticks move units between brackets, where no per-step evidence reaches. Every
+     * record opened after the divergence is marked placed, so no cycle measured on the drifted
+     * placement can be priced or exported. */
+    bool             draft_drift_ = false;
 
     /* The row's label provenance (whose window the verify measured) is stamped at report time;
      * see draft_ring_report(). */
     void draft_ring_open(const DraftPlan& plan);
     DraftCycleRecord* draft_ring_cycle(uint64_t cycle_id);
-    void draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin origin);
+    void draft_ring_publish(const SchedReq& s, int32_t generated, int32_t published,
+                            DraftOrigin origin);
     void draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
                            uint64_t raw_match);
     void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);

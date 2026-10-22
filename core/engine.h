@@ -372,6 +372,11 @@ private:
      * when no rank ran a pass for it, which the caller must treat as Unknown, not as a measured
      * None -- a step issued ahead is collected after its pass, so a miss means no pass at all. */
     bool step_evidence(int32_t step, DraftStepEvidence* out) const;
+    /* Placement moves (promotions + demotions) over every rank, cumulative. Cumulative on purpose:
+     * the per-step evidence covers one bracket, but the scheduler's tier and arena ticks move
+     * units after step_finished, so a move between two brackets would otherwise never reach the
+     * bracket measured after it. Compared against draft_moves_baseline_. */
+    int64_t residency_moves() const;
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */
@@ -448,6 +453,9 @@ private:
      * was actually bound to. */
     bool draft_calibrating_ = false;
     DraftCostRuntime draft_calib_runtime_;
+    /* residency_moves() when the run started: the profile's fingerprint names the residency at
+     * that point, so every later bracket is measured against it (DraftStepEvidence). */
+    int64_t draft_moves_baseline_ = 0;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round

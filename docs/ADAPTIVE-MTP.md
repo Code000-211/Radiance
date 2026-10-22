@@ -162,6 +162,16 @@ prediction and sample.
   requires both distributions to be monotone and complete, `verify_tokens` to equal
   `n_rows + sum_j rows[j]`, and the deepest round of each to be non-empty: `verify_k > 0` with
   `rows[verify_k] == 0` is a missing shape, not a measured zero.
+- **The extent priced is the extent that ran, not the one published.** Under the adaptive window
+  `serial_begin()` gives each row the rounds its own cap allows (`draft_cap`: its stop inside the
+  cycle's D), and `serial_batch()` runs each round over the rows that still have one. A row that
+  stops at 3 in a cycle whose deepest row runs 6 executes three rounds, and `expect_draft()` caps
+  its verify to the same three. The ring keeps both facts separately: `generated` is what the head
+  executed for the row and `published` what the paired step will verify. `draft_cost_observe`
+  derives `rounds`/`draft_round_rows[]` from `generated`, so a commit that cut a row's verify
+  below the window it drafted still prices the rounds the bracket timed. A row that executed past
+  its plan entry is refused by `executed_within_plan` (`RAD_E_INVAL`) and counted as a refusal --
+  visibly unpriced, never priced at a window it did not run.
 - **A missing measurement is not zero.** `DraftVerifyShape::unknown` names an absent history,
   prefill, replay or plan distribution; `draft_shape_priceable` refuses the shape, and the caller
   takes its named fallback. A zero is only a zero when it was measured as one.
@@ -245,6 +255,19 @@ prediction and sample.
   sampler-only release when its record still names the step: that release carries the tiering
   dispatch of a step issued ahead, and a step with no draft pass (a shared-KV head that drew K=0)
   has no later release to report it before the next step re-bases the counter.
+- **A move between two brackets belongs to the bracket after it.** The per-step facts cover one
+  bracket, but the scheduler's own tier and arena ticks run after `step_finished()` and move units
+  with no step to stamp. The engine therefore reports `DraftStepEvidence::moves_since_bind`, the
+  cumulative promotions + demotions over every rank since the profile was bound, and compares it
+  with the count at the loop's start. Once it is non-zero the record's `placed` is sticky: every
+  later cycle is marked placement-affected, including one whose own bracket saw no move, because
+  the run cannot move back to the start placement. Dropping only the bucket the mover directly
+  marked would leave a later clean-looking bracket to be priced as the start residency. In the
+  online policy the same divergence deactivates the loaded table (`DraftCostTable::deactivate`,
+  reason "residency drifted from the fingerprint's start placement"): it stops pricing and stops
+  learning, and it does not `admit_fallback()` -- drift is no admission to price without the
+  measurement the deployment was admitted on. Calibration keeps recording so the drift is visible
+  and counted, but every record after the move is marked and the export leaves them out.
 - **A measurement is filed under the class the planner priced.** `draft_cost_observe` derives the
   shape's `ctx_class` as the deepest frozen row's, exactly `DraftPlanner::shape_of`; a constant
   (class 0, or the plan's per-row field) would file a long-context sample where no class-1 estimate
@@ -419,8 +442,11 @@ regenerated, never rescaled.
   and the rest of the run are exactly what they are without the flag, and `cost` stays refused
   rather than weakened. Each cycle's record names the depth the step really caps each row at
   (the head's own depth, the adaptive window, 0 for a row that may not speculate), so a bucket
-  describes a shape the run could execute. When the engine exits -- and only when the step loop
-  did not abort -- the ring is flushed and the measured buckets are written with the same
+  describes a shape the run could execute. A cycle with more decode rows than
+  `RAD_SCHED_MAX_SPEC` (64) is not recorded at all: naming a prefix would describe a shape shorter
+  than the bracket `step_finished()` times. It is counted (`Scheduler::draft_cycles_dropped()`)
+  and warned once, and the table learns nothing from it. When the engine exits -- and only when the
+  step loop did not abort -- the ring is flushed and the measured buckets are written with the same
   fingerprint and execution the reader derives. The identity is derived at startup, before the
   scheduler runs: an incomplete fingerprint refuses the calibration up front instead of failing
   after a complete run. It also refuses `--draft-profile` (a calibration does not read its own
@@ -429,8 +455,13 @@ regenerated, never rescaled.
   cycle would ever be recorded) and a path that already exists. The file is written to a
   temporary in the same directory with `O_CREAT|O_EXCL`, fsynced, published with `link()` (so it
   appears whole or not at all and an existing file is never replaced) and its directory is
-  synced. A run that measured no bucket is refused by the writer and never published: an empty
-  file would read as a calibration of nothing. A bucket whose origin set was not captured, or
+  synced. A `write()` that returns 0 is an error, not progress: the loop stops, the temporary is
+  unlinked and the export reports `RAD_E_IO` with "the write made no progress". A run that
+  measured no bucket is refused by the writer and never published: an empty
+  file would read as a calibration of nothing. Nor is a file of diagnostics a calibration: the
+  export refuses when no kept bucket is priceable by the same `draft_bucket_usable` rule
+  `estimate()`/`has_usable_bucket()` apply, rather than publishing a profile that prices
+  nothing. A bucket whose origin set was not captured, or
   whose rows do not fit its drafter, is not written at all: the serializer refuses rather than
   inventing `head`. The origin set follows the drafter that filled each row -- the lookup fallback
   fills rows the serial head left empty, so a serial bucket may carry `lookup` rows; a `head` row

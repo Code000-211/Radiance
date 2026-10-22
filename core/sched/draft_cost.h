@@ -159,6 +159,12 @@ struct DraftCostProfile {
     std::vector<DraftCostBucket> buckets;
 };
 
+/* Whether a bucket may price normal operation at all: measured cleanly (no disturbing flag), at
+ * least one sample, a finite positive mean. DraftCostTable::estimate()/has_usable_bucket() and the
+ * calibration export use this one rule -- an export that kept only diagnostic buckets would
+ * otherwise report a profile that can never price as a success. */
+bool draft_bucket_usable(const DraftCostBucket& b);
+
 /* Parses and validates one profile. RAD_OK, or a negative RAD_E_* (RAD_E_UNSUPPORTED for a
  * format id this reader does not know -- rad-draft-profile/1 has no draft distribution, pipeline
  * depth or origin mix, and rad-draft-profile/2 has no resolved placement or device equipment in
@@ -236,9 +242,14 @@ public:
 
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
+    /* Stops pricing and learning, naming why, while keeping the loaded buckets visible: the run's
+     * residency diverged from the fingerprint's start placement, so the profile is no longer a
+     * measurement of this deployment. Not admit_fallback(): drift is not an admission to price
+     * without measurements. */
+    void deactivate(const std::string& why) { active_ = false; reason_ = why; }
     const std::vector<DraftCostBucket>& buckets() const { return buckets_; }
     /* Whether any bucket may price a shape at all -- the same rule estimate() applies
-     * (bucket_usable): no disturbing flag, n > 0, a finite positive mean. The scheduler's baseline
+     * (draft_bucket_usable): no disturbing flag, n > 0, a finite positive mean. The scheduler's baseline
      * lock reads this: an unexamined buckets() list is not a measured baseline, since a profile of
      * nothing but diagnostic buckets passes it and prices nothing. */
     bool has_usable_bucket() const;

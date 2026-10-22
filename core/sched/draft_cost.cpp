@@ -188,11 +188,6 @@ bool distributions_agree(const DraftVerifyShape& s) {
     return true;
 }
 
-/* Whether a bucket may price normal operation at all: it was measured cleanly. */
-bool bucket_usable(const DraftCostBucket& b) {
-    return (b.flags & kDisturbing) == 0 && b.n > 0 && std::isfinite(b.mean_ms) && b.mean_ms > 0.0;
-}
-
 /* What separates two buckets of the same shape: the disturbing flags. The ahead bit does not --
  * an ahead sample belongs to the measured bucket, it only stays visible through n_ahead. */
 uint16_t bucket_class(uint16_t flags) { return (uint16_t)(flags & kDisturbing); }
@@ -637,6 +632,13 @@ int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string
 
 }  /* namespace */
 
+/* Whether a bucket may price normal operation at all: it was measured cleanly. estimate(),
+ * has_usable_bucket() and the calibration export share this one rule, so the export cannot report
+ * success for a profile that prices nothing. */
+bool draft_bucket_usable(const DraftCostBucket& b) {
+    return (b.flags & kDisturbing) == 0 && b.n > 0 && std::isfinite(b.mean_ms) && b.mean_ms > 0.0;
+}
+
 int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_t* skipped,
                              std::string* err) {
     if (!out) return RAD_E_INVAL;
@@ -705,11 +707,17 @@ int draft_cost_profile_write_file(const std::string& path, const DraftCostProfil
         return refuse(err, RAD_E_IO,
                       "output: cannot create " + tmp + ": " + std::strerror(errno));
     bool ok = true;
+    bool stalled = false;   /* write() returned 0: no progress, so looping is not waiting */
     size_t done = 0;
     while (ok && done < text.size()) {
         const ssize_t w = ::write(fd, text.data() + done, text.size() - done);
         if (w < 0) {
             if (errno == EINTR) continue;
+            ok = false;
+        } else if (w == 0) {
+            /* A write that takes the bytes and writes none is a failed write, not a retry: the
+             * loop would spin forever and report a profile that was never written. */
+            stalled = true;
             ok = false;
         } else {
             done += (size_t)w;
@@ -720,6 +728,9 @@ int draft_cost_profile_write_file(const std::string& path, const DraftCostProfil
     if (::close(fd) != 0 && ok) ok = false;
     if (!ok) {
         ::unlink(tmp.c_str());
+        if (stalled)
+            return refuse(err, RAD_E_IO, "output: cannot write " + tmp +
+                                             ": the write made no progress");
         return refuse(err, RAD_E_IO, "output: cannot write " + tmp + ": " +
                                          std::strerror(werr ? werr : errno));
     }
@@ -792,7 +803,7 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
 
 bool DraftCostTable::has_usable_bucket() const {
     for (const DraftCostBucket& b : buckets_)
-        if (bucket_usable(b)) return true;
+        if (draft_bucket_usable(b)) return true;
     return false;
 }
 
@@ -810,7 +821,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
 
     /* 1. The shape itself. */
     for (const DraftCostBucket& b : buckets_) {
-        if (!bucket_usable(b) || !shape_same(b.shape, s) ||
+        if (!draft_bucket_usable(b) || !shape_same(b.shape, s) ||
             !extent_same(b, s.draft_k, s.draft_rows))
             continue;
         out->ms = b.mean_ms;
@@ -827,7 +838,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
      * ties go to the larger class (more context, higher cost). */
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
-        if (!bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
+        if (!draft_bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
         if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (std::abs(b.shape.ctx_class - s.ctx_class) != 1) continue;
         if (!near || b.shape.ctx_class > near->shape.ctx_class) near = &b;
@@ -856,7 +867,7 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     const DraftCostBucket* anchor = nullptr;
     int32_t anchor_rank = INT32_MAX;
     for (const DraftCostBucket& b : buckets_) {
-        if (!bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
+        if (!draft_bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
         if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (b.shape.verify_tokens <= 0) continue;
         const int32_t rank = std::abs(b.shape.verify_k - s.verify_k);

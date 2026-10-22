@@ -273,6 +273,26 @@ TEST(the_export_refuses_a_calibration_whose_every_bucket_was_placement_affected)
     CHECK(!std::ifstream(out).good());
 }
 
+/* Diagnostic-only buckets are not a calibration either. A record/audit/warmup/admission bracket is
+ * kept out of the price (draft_bucket_usable), so a file made only of them would report a
+ * calibration whose every bucket the table refuses to price from. The export refuses instead --
+ * the same rule estimate() and has_usable_bucket() apply, not a second one. */
+TEST(the_export_refuses_a_calibration_with_no_priceable_bucket) {
+    const std::string out = radtest::tmp_path("engine_calib_diagnostic_only.json");
+    Config cfg;
+    cfg.draft_profile     = write_case_file("engine_calib_diagnostic_only_in.json",
+                                            calibrated_profile(bucket_json(0, R"("record")")));
+    cfg.draft_profile_out = out;
+    Engine e(std::move(cfg));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    REQUIRE_EQ((int)EngineTestPeer::sched(e).draft_costs().buckets().size(), 1);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().has_usable_bucket());
+
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    CHECK_EQ(EngineTestPeer::export_calibration(e), RAD_E_INVAL);
+    CHECK(!std::ifstream(out).good());
+}
+
 TEST(the_export_of_an_unarmed_run_writes_nothing) {
     const std::string path = radtest::tmp_path("engine_calib_unarmed.json");
     Config cfg;

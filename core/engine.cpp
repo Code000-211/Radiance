@@ -433,6 +433,15 @@ bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
     return known;
 }
 
+int64_t Engine::residency_moves() const {
+    int64_t moves = 0;
+    for (const auto& r : ranks_) {
+        const HeatStats hs = r->heat.stats();
+        moves += (int64_t)hs.promotions + (int64_t)hs.demotions;
+    }
+    return moves;
+}
+
 int Engine::prepare_release(const RadBatch* b) {
     /* The placement counters when this step's window opens, before the arena level's recall can
      * move a unit: the rank thread reports `moved` for the step from here (Rank::ev_moves_before),
@@ -510,6 +519,10 @@ int Engine::step_loop() {
      * device; the backend's current device is thread-local and starts at device 0. */
     if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("step loop: could not bind rank 0's device");
+    /* The cost profile's fingerprint names the residency at start. Every cycle's move evidence is
+     * reported against this count, so a move between two brackets still invalidates what follows
+     * it (Scheduler::step_finished). */
+    draft_moves_baseline_ = residency_moves();
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
@@ -908,6 +921,10 @@ int Engine::step_loop() {
         /* No rank ran a pass for this step (a sampler-only release with nothing issued ahead):
          * Unknown, so A excludes the sample instead of pricing it as undisturbed. */
         if (!step_evidence(b->step, &ev)) ev = DraftStepEvidence{};
+        /* The per-step fields above describe this bracket; the residency is cumulative, so a move
+         * the scheduler's own ticks made between two brackets still reaches the bracket measured
+         * after it. */
+        ev.moves_since_bind = residency_moves() - draft_moves_baseline_;
 #ifdef RAD_TEST_HOOKS
         rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,
                                (int)ev.moved);
@@ -1720,8 +1737,10 @@ int Engine::export_draft_cost_profile() {
      * left out -- only the affected ones: a clean cycle before the first move still measured the
      * start plan and stays. */
     int32_t placement = 0;
+    int32_t usable = 0;
     for (const DraftCostBucket& b : sched_.draft_costs().buckets()) {
         if (b.flags & kDraftSamplePlacement) { ++placement; continue; }
+        if (draft_bucket_usable(b)) ++usable;
         p.buckets.push_back(b);
     }
     /* A run that measured no cycle (no request served, no serial round executed) -- or one whose
@@ -1737,6 +1756,16 @@ int Engine::export_draft_cost_profile() {
         else
             RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
                     "cycle, which is not a calibration", cfg_.draft_profile_out.c_str());
+        return RAD_E_INVAL;
+    }
+    /* Every remaining bucket is a diagnostic the table never prices from -- a shortened run, an
+     * unpriced truncation, a warmup/record/audit/admission bracket. Writing those would report a
+     * calibration whose file can price nothing, so the export fails here instead. */
+    if (usable == 0) {
+        RAD_ERR("--draft-profile-out '%s': none of the %d kept bucket(s) is priceable (%d "
+                "placement-affected, the rest diagnostic only); a file of diagnostics is not a "
+                "calibration", cfg_.draft_profile_out.c_str(), (int)p.buckets.size(),
+                (int)placement);
         return RAD_E_INVAL;
     }
 
