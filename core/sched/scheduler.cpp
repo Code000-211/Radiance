@@ -2358,10 +2358,12 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         if (round > 0 && (m.draft_idx < 0 || m.k < round))
             continue;      /* history only, or this row's depth ended before this round */
         const Request* rq = serial_req(m);
-        /* Unreachable while reap() defers on block_holds(); if it happens the round is skipped,
-         * costing one step's draft, and stands as a failure so the driver does not read the lost
-         * row as a round with nothing to do. */
+        /* An invariant, not a case: reap() defers on block_holds() while a snapshot names the row.
+         * If it is ever broken the round cannot be built, and saying so beats a null the driver
+         * would have to read as a round with nothing to do. */
         if (!rq) {
+            RAD_ERR("draft: serial row %llu lost its request inside its own snapshot",
+                    (unsigned long long)m.seq);
             serial_failed_ = true;
             return nullptr;
         }

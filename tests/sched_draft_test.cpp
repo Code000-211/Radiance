@@ -883,6 +883,48 @@ TEST(an_empty_snapshot_owes_no_pass_and_reports_no_failure) {
     CHECK(!f.sch.serial_batch_failed());
 }
 
+/* ================================================================== a KV refusal keeps the history */
+
+/* Counter-case 4: the KV reservation, not the context, takes the draft right. The pool has exactly
+ * the blocks the next trunk step needs, so the lookahead reservation (head_max + rounds, `rounds`
+ * more than the verify writes) is refused. The row keeps its history, which it already has blocks
+ * for -- so `n == 0` and a round 0 that must still be built. That is why the failure status hangs
+ * on the planned work and on neither `rounds` nor a row count. */
+TEST(a_kv_refusal_takes_the_draft_and_leaves_the_history_pass_owed) {
+    Fixture f;
+    /* 16 tokens a block, 2 blocks: 21 committed + 1 + 6 fits, 21 + 6 + 6 does not. */
+    f.build(/*blocks=*/2, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(21);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK_EQ(e->n_spec, 6);
+    CHECK(e->ctx_len + e->n_spec + 6 <= 512);   /* the context would allow it */
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);   /* the pool, not the context, refused */
+    CHECK_EQ(rounds, 1);
+
+    const RadBatch* h = f.sch.serial_batch(0, 2);
+    REQUIRE(h != nullptr);                        /* buildable although no row drafts */
+    CHECK_EQ(h->n_seq, 1);
+    CHECK_EQ(h->n_tok, 7);
+    CHECK_EQ(h->n_draft_out, 0);
+    CHECK(!f.sch.serial_batch_failed());
+}
+
 /* ================================================================== identity across admission */
 
 /* A cancelled request's depth must not reach the next request on its slot. The slot is recycled
