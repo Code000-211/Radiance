@@ -6,8 +6,9 @@
  * the shape it produces costs, and this file picks each request's K.
  *
  * Welle 1 is deliberately ragged: one cycle verifies every row at its own K (which
- * StepEntry::n_spec already carries), and E2's shrinking rounds are not wired yet. `verify_k` in
- * the plan is the window the frozen previous plan issued; `max_k` is this cycle's.
+ * StepEntry::n_spec already carries). The scheduler bounds the serial rounds to the rows that
+ * still draft (Scheduler::serial_begin); the engine's rounds loop is not yet wired to that bound.
+ * `verify_k` in the plan is the window the frozen previous plan issued; `max_k` is this cycle's.
  *
  * The search is a heuristic, not an optimum: a few homogeneous baselines, then at most
  * `passes` deterministic coordinate passes over the requests, each change judged by the new

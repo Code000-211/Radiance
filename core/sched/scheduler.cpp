@@ -2289,11 +2289,24 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         if (can_draft) ++n_draft_rows;
     }
 
+    /* The rounds bound what the rows that survived this loop can fill. `*rounds` was taken from what
+     * the rows wanted before it, but a row can lose its draft here: its plan says K0, its lookahead
+     * crosses the context end, or the KV reservation was refused. A round past the deepest survivor
+     * would have no drafting row and no history row, so serial_batch() would build nothing while
+     * the driver still counted a pass. One round stays requested when no row drafts, because round
+     * 0 is the history pass the remaining rows still owe. */
+    int32_t deepest = 0;
+    for (const SerialSeq& m : serial_)
+        if (m.draft_idx >= 0 && m.k > deepest) deepest = m.k;
+    *rounds = deepest > 0 ? deepest : 1;
+
     /* A round runs only the rows that still have a draft at its depth, and the driver freezes each
-     * row's depth from the batches it saw. That needs the rows to be a prefix for every round, so
-     * the snapshot is ordered by depth, deepest first, plan order within a depth (draft_idx is
-     * still that order here). Only this snapshot's own draft order changes; the issued plan keeps
-     * its row order. */
+     * row's depth from the batches it saw. That needs the drafting rows to be a prefix for every
+     * round, so the snapshot orders them by depth, deepest first, and among equal depths by their
+     * distinct draft_idx, which is the plan's own order. History-only rows (draft_idx < 0) are
+     * equivalent under this comparator: they run only in the history pass, and nothing may depend on
+     * their order among themselves. Only this snapshot's own draft order changes; the issued plan
+     * keeps its row order. */
     std::sort(serial_.begin(), serial_.end(), [](const SerialSeq& a, const SerialSeq& b) {
         const int32_t ka = a.draft_idx >= 0 ? a.k : -1;
         const int32_t kb = b.draft_idx >= 0 ? b.k : -1;

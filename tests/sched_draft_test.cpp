@@ -746,6 +746,120 @@ TEST(a_planned_depth_is_clamped_by_the_contexts_remaining_room) {
     CHECK_EQ(e->n_tokens, 1);
 }
 
+/* A row the lookahead no longer fits loses its draft here, after the rounds were chosen, and keeps
+ * its history. The rounds must follow it: with the deepest row gone, a round past the shallower
+ * row's depth has no drafting row and no history row, so serial_batch() would build nothing while
+ * the driver still counted a pass.
+ *
+ * The deep row sits one context end away -- its six published drafts plus six more rounds would
+ * cross max_ctx -- and the shallower row is nowhere near it, so only the deep one falls. */
+TEST(the_rounds_stop_at_the_deepest_row_the_context_still_has_room_for) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t deep = f.submit(501);
+    pred.set(deep, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });   /* six drafts pay */
+    use_cost_policy(f, pred);
+    f.prefill(deep);
+
+    const uint64_t shallow = f.submit(8);
+    pred.set(shallow, { 0.9f, 0.9f, 0.01f });                         /* two pay */
+    f.prefill(shallow);
+
+    /* Cycle A opens both rows at their own depth; nothing is published under it yet. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, deep), 6);
+    CHECK_EQ(planned(f.sch, shallow), 2);
+    f.commit_plain(11);
+    int32_t six[6] = { 41, 42, 43, 44, 45, 46 };
+    int32_t two[2] = { 51, 52 };
+    CHECK_OK(f.sch.set_draft(deep, six, 6));
+    CHECK_OK(f.sch.set_draft(shallow, two, 2));
+
+    /* Cycle B verifies both. Six more rounds at the deep row's head would pass the context end;
+     * the shallower row's would not. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, deep), 6);
+    CHECK_EQ(planned(f.sch, shallow), 2);
+    const StepEntry* ed = entry_of(f.sch, deep);
+    const StepEntry* es = entry_of(f.sch, shallow);
+    REQUIRE(ed && es);
+    CHECK_EQ(ed->n_spec, 6);
+    CHECK_EQ(es->n_spec, 2);
+    CHECK(ed->ctx_len + ed->n_spec + 6 > 512);     /* the premise: six rounds no longer fit */
+    CHECK(es->ctx_len + es->n_spec + 6 <= 512);
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    const int n = f.sch.serial_begin(&rounds, rows, 6);
+    CHECK_EQ(n, 1);                      /* the deep row owes its history and drafts nothing */
+    CHECK_EQ(rows[0].seq, shallow);
+    CHECK_EQ(rounds, 2);                 /* the deepest survivor, not the cycle's six */
+
+    /* Every pass this bound leaves is asked for and builds; the round past it is never asked. */
+    const RadBatch* h = f.sch.serial_batch(0, 1);
+    REQUIRE(h != nullptr);
+    CHECK_EQ(h->n_seq, 2);
+    CHECK_EQ(h->n_draft_out, 1);
+    const RadBatch* r2 = f.sch.serial_batch(2, 2);
+    REQUIRE(r2 != nullptr);
+    CHECK_EQ(r2->n_seq, 1);
+    CHECK(f.sch.serial_batch(3, 3) == nullptr);   /* past the prefix; `rounds` stops at 2 */
+}
+
+/* The same rejection with no shallower row: every draft row falls away and the history pass is all
+ * that is left. The bound then asks for exactly that one pass, and the history-only watermark rule
+ * still holds for it. */
+TEST(all_draft_rows_can_fall_away_and_the_history_pass_is_still_asked_for) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(501);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+    int32_t drafts[6] = { 41, 42, 43, 44, 45, 46 };
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK_EQ(e->n_spec, 6);
+    CHECK(e->ctx_len + e->n_spec + 6 > 512);
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);   /* nobody drafts */
+    CHECK_EQ(rounds, 1);                                 /* one pass: the history */
+
+    const RadBatch* h = f.sch.serial_batch(0, 2);
+    REQUIRE(h != nullptr);
+    CHECK_EQ(h->n_seq, 1);
+    CHECK_EQ(h->n_tok, 7);                /* the 1 + 6 positions it still owes */
+    CHECK_EQ(h->n_draft_out, 0);
+    CHECK(f.sch.serial_batch(2, 3) == nullptr);   /* nothing past the history; rounds stops at 1 */
+
+    /* The pass ran: the watermark moves to what it wrote, and no draft round was needed for it. */
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& x) { return x.n_spec; }));
+    f.sch.serial_end(0, true);
+    CHECK_EQ(f.sch.draft_watermark(id), f.sch.find(id)->n_computed);
+}
+
 /* ================================================================== identity across admission */
 
 /* A cancelled request's depth must not reach the next request on its slot. The slot is recycled

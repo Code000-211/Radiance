@@ -304,7 +304,9 @@ public:
      *
      *   serial_begin   before commit(), right after the step is issued, while plan() describes it.
      *               Says which sequences may draft, reserves lookahead KV up to the furthest
-     *               position acceptance could reach, and clamps `rounds` to the current depth.
+     *               position acceptance could reach, and clamps `rounds` to the current depth and
+     *               then to the deepest row that still drafts. What it writes is the whole set of
+     *               passes to run: a round past it has no row, and none may be asked for.
      *   serial_batch   one batch per pass: 0 is the history, which also carries round 1 for the
      *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. A round runs only
      *               the rows whose frozen K reaches it, deepest first, so every round's rows are a
