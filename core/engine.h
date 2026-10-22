@@ -394,14 +394,6 @@ private:
     std::vector<Scheduler::SerialRow> serial_row_;
     std::vector<int32_t> serial_k_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
-    /* Round 0 -- the history pass -- was enqueued for every participating sequence. A fact about
-     * the enqueue, not about execution: it says nothing about whether the pass ran. */
-    bool serial_hist_issued_ = false;
-    /* Proof that the step just run completed on every participating rank, set by the step path
-     * only after a wait that covers that step's streams and cleared when the next step is issued,
-     * so a previous step's state can never be read as this one's (engine.cpp). Default false: no
-     * proof, no history watermark. */
-    bool step_complete_ = false;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
     int  step_state_init();

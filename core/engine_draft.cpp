@@ -135,7 +135,6 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
-    serial_hist_issued_ = false;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -239,8 +238,6 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             serial_k_[(size_t)i] = rd == 0 ? 1 : rd;
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
-        /* Round 0 was enqueued; whether it ran is a different word, and finish reads that one. */
-        if (rd == 0) serial_hist_issued_ = true;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
@@ -304,15 +301,13 @@ struct BlockHold {
  * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
-    /* The history watermark may move only on proof that round 0 ran on every participating rank.
-     * An enqueue is not proof, and neither is a rank count. Two proofs exist: the step path's
-     * completion word, which covers every rank, and -- for a step that has logit rows -- the wait
-     * collect_step already took on step_end_, which mark_step_end recorded after the passes; that
-     * one fences rank 0 only, so it counts for a single rank. A step without rows (a mid-prompt
-     * chunk, the history-only case) returns before that wait, so it needs the first proof. No
-     * proof, no watermark: the pass is repeated instead. */
-    const bool hist_ran = serial_hist_issued_ &&
-                          (step_complete_ || (ranks_.size() == 1 && so.n_rows > 0));
+    /* The history watermark may move only on the step's own completion proof: round 0 was built
+     * for this step (serial_hist_issued_, set by the step path when the round-0 batch came back
+     * non-null) and the step's wait covered every participating rank's stream (StepOut::complete,
+     * true only after that wait). An enqueue, a rank count or a row count is none of that -- a
+     * row-less mid-prompt step returns before the wait and has no proof to offer. Without both, the
+     * pass is repeated rather than recorded. */
+    const bool hist_ran = serial_hist_issued_ && so.complete;
     SerialHold hold(sched_, hist_ran);
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
