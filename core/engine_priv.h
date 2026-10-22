@@ -80,6 +80,34 @@ struct Engine::Rank {
     FileStager  fstager;
     StagerChain stagers;
     Ctx       ctx;
+    /* This rank's evidence for the steps it actually ran (DraftStepEvidence), frozen on the rank
+     * thread as each pass finished and keyed by step number. A cumulative counter delta read at
+     * collect time cannot answer this: the next step's ahead pass is released before this one is
+     * collected, and its tape branch and stager answer would land in the delta and in
+     * PrefillStager::staged(). A slot the finished step does not name is not evidence of no
+     * activity, so the reader leaves the state Unknown (Engine::step_evidence). */
+    struct StepSnap {
+        int32_t step   = -1;
+        uint8_t tape   = 0;      /* Ctx::StepTape, merged over the step's own passes */
+        bool    staged = false;  /* the stager armed for the step's trunk pass */
+        bool    moved  = false;  /* a heat promotion or demotion inside the step's window */
+    };
+    StepSnap ev[4];              /* keyed by step & 3: the ahead pass keeps the next step's */
+    /* Promotions + demotions on this rank when prepare_release armed the step, so the rank thread
+     * can bound `moved` to that step's window (arena reclaim runs on the scheduler thread). */
+    int64_t  ev_moves_before = 0;
+    void note_evidence(const Ctx::StepEvidence& e, bool moved) {
+        if (e.step < 0) return;
+        StepSnap& s = ev[(uint32_t)e.step & 3u];
+        if (s.step != e.step) s = StepSnap{};    /* a new step owns the slot */
+        s.step = e.step;
+        /* Record > Audit > Play > None, as the cycle's key was always chosen. */
+        if (e.tape == Ctx::kStepTapeRecord || s.tape == Ctx::kStepTapeNone ||
+            (e.tape == Ctx::kStepTapeAudit && s.tape == Ctx::kStepTapePlay))
+            s.tape = e.tape;
+        s.staged = s.staged || e.staged;
+        s.moved  = s.moved  || moved;
+    }
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
     /* Scored rows' logits (Request::token_scores), this rank's vocabulary shard, copied into pinned
      * memory ahead of the sampler. Grown to the most rows a step has scored. */

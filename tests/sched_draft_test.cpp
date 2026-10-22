@@ -137,10 +137,16 @@ struct PlanCopy {
     int32_t n_seq = 0;
     int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
     std::vector<int32_t> k;
+    std::vector<int32_t> ctx_class;
     std::vector<uint64_t> id;
     int at(uint64_t req) const {
         for (size_t i = 0; i < id.size(); ++i)
             if (id[(size_t)i] == req) return k[i];
+        return -1;
+    }
+    int32_t class_at(uint64_t req) const {
+        for (size_t i = 0; i < id.size(); ++i)
+            if (id[(size_t)i] == req) return ctx_class[i];
         return -1;
     }
 };
@@ -155,6 +161,7 @@ PlanCopy copy_plan(Scheduler& s) {
     for (int32_t j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) c.rows[j] = p->rows[j];
     for (int32_t i = 0; i < p->n_seq; ++i) {
         c.k.push_back(p->k[i]);
+        c.ctx_class.push_back(p->ctx_class[i]);
         c.id.push_back(p->req_id[i]);
     }
     return c;
@@ -287,6 +294,98 @@ TEST(an_untimed_cycle_is_refused_by_a_rather_than_priced_at_zero) {
     CHECK(f.sch.draft_costs().buckets().empty());
     CHECK_EQ(f.sch.draft_cost_refused(), 1);
     CHECK(f.sch.draft_cycles_done() >= 1);       /* B's path is unaffected by A's refusal */
+}
+
+/* A cycle is filed under the context class its plan was priced at: the deepest row's, as
+ * DraftPlanner::shape_of computes it. A class-0 constant would file a long-context measurement in
+ * a bucket no class-1 estimate can ever reach, and the planner's own query would miss it. */
+TEST(a_cycles_context_class_is_the_deepest_frozen_rows_like_the_planners) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    /* One row past the 4096-token boundary (class 1), one far below it (class 0): the plan's own
+     * shape is the max over the rows, and the sample must agree with it. */
+    const uint64_t deep  = f.submit(4200);
+    const uint64_t shortq = f.submit(160);
+    f.prefill(deep);
+    f.prefill(shortq);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy p1 = copy_plan(f.sch);
+    REQUIRE(p1.n_seq == 2);
+    CHECK_EQ(p1.class_at(deep), 1);
+    CHECK_EQ(p1.class_at(shortq), 0);
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    for (uint64_t id : { deep, shortq }) CHECK_OK(f.sch.set_draft(id, six, p1.at(id)));
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    REQUIRE(f.sch.step() != nullptr);   /* opens the next cycle: the first one is priced now */
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 1);
+    CHECK_EQ(bs[0].shape.ctx_class, 1);
+
+    /* The planner's query for this shape at class 1 finds that measurement; at class 0 it can only
+     * interpolate. Filed at 0, both answers would be wrong. */
+    DraftVerifyShape query = bs[0].shape;
+    DraftCostEstimate est;
+    CHECK_OK(f.sch.draft_costs().estimate(query, &est));
+    CHECK(est.valid);
+    CHECK(est.source == DraftCostSource::Measured);
+    query.ctx_class = 0;
+    CHECK_OK(f.sch.draft_costs().estimate(query, &est));
+    CHECK(est.source != DraftCostSource::Measured);
+}
+
+/* A deployment that observes without an admissible baseline still builds and validates every
+ * sample; the table simply has nowhere to put it. Counted apart from `ignored()` (a sample that
+ * proved nothing) and from a refusal (a sample that was malformed), so "nothing was learned" is
+ * never mistaken for "nothing was offered". */
+TEST(an_observe_against_an_inactive_table_is_counted_and_never_absorbed) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    /* Configured for start(), which refuses Cost without an active table, then dropped: the run
+     * observes, and the table is inactive from here. */
+    activate_costs(f);
+    CHECK_OK(f.start());
+    f.sch.draft_costs().clear();
+    REQUIRE(!f.sch.draft_costs().active());
+
+    const uint64_t a = f.submit(160);
+    f.prefill(a);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy p1 = copy_plan(f.sch);
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    CHECK_OK(f.sch.set_draft(a, six, p1.at(a)));
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    const int64_t inactive_before = f.sch.draft_costs().inactive();
+    const int64_t ignored_before  = f.sch.draft_costs().ignored();
+    REQUIRE(f.sch.step() != nullptr);            /* prices cycle 1 into an inactive table */
+    CHECK_EQ(f.sch.draft_costs().inactive(), inactive_before + 1);
+    CHECK_EQ(f.sch.draft_costs().ignored(), ignored_before);   /* the sample was not evidence-less */
+    CHECK(f.sch.draft_costs().buckets().empty());
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);     /* neither a refusal */
+    CHECK_EQ(f.sch.metrics().draft_obs_inactive, inactive_before + 1);
 }
 
 /* ------------------------------------------------------------------ the policy's hooks */

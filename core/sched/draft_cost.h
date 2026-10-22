@@ -179,6 +179,11 @@ public:
     const std::vector<DraftCostBucket>& buckets() const { return buckets_; }
     int64_t dropped() const { return dropped_; }   /* buckets dropped at capacity */
     int64_t ignored() const { return ignored_; }   /* observations with no timing to learn from */
+    /* A valid observation the table had no profile to learn into. Separate from ignored(): this
+     * sample was not refused and carried no disturbing flag, it simply met an inactive table, so a
+     * deployment that only observes (policy Cost with no admissible baseline) reports cycles here
+     * and adds nothing to buckets(). */
+    int64_t inactive() const { return inactive_; }
 
     /* Prices one shape. The key is the shape -- verify window, pipeline depth and the loaded
      * drafter included -- against the executed draft distribution: the query's
@@ -214,6 +219,7 @@ private:
     int32_t capacity_ = 0;
     int64_t dropped_ = 0;
     int64_t ignored_ = 0;
+    int64_t inactive_ = 0;
     bool active_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,

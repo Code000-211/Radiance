@@ -2102,7 +2102,12 @@ void Scheduler::draft_cost_observe(DraftCycleRecord& r) {
     s.policy_version = r.plan.policy_version;
     DraftVerifyShape& sh = s.shape;
     sh.n_rows         = r.n_seq;
+    /* The plan's shape takes the deepest row's class (draft_policy.cpp's shape_of); the price has
+     * to be filed under that same class, or an estimate looked up for a long-context plan lands in
+     * a bucket no measurement can ever reach. */
     sh.ctx_class      = 0;
+    for (int32_t i = 0; i < r.n_seq; ++i)
+        if (r.ctx_class[i] > sh.ctx_class) sh.ctx_class = r.ctx_class[i];
     sh.draft_k        = r.plan.max_k;
     for (int32_t j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) sh.draft_rows[j] = r.rows[j];
     sh.pipeline_depth = r.plan.pipeline_depth;
@@ -3287,6 +3292,7 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.draft_obs_applied   = (int64_t)dc.rows_applied;
     m.draft_obs_skipped   = (int64_t)dc.rows_skipped;
     m.draft_obs_discarded = draft_cycles_dropped_;
+    m.draft_obs_inactive  = draft_costs_.inactive();
     return m;
 }
 

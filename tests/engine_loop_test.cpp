@@ -74,6 +74,7 @@
 #include "device/device.h"
 #include "engine.h"
 #include "engine_test_peer.h"
+#include "runtime/stager.h"
 /* serve() takes the watch by value, so the call below destroys a temporary: the deleter needs
  * the complete type, which engine.h only forward-declares. */
 #include "util/stallwatch.h"
@@ -112,12 +113,22 @@ struct Rec {
     bool recorded() const { return hist_issued && !withheld; }
 };
 
+/* One step's evidence, as Scheduler::step_finished receives it. */
+struct EvRec {
+    int  step         = 0;
+    bool known        = false;  /* a rank reported this step: not Unknown */
+    int  replay       = 0;      /* DraftReplay */
+    bool staged       = false;  /* the step's own trunk pass armed the stager */
+    bool moved        = false;  /* placement moved a unit inside the step's window */
+};
+
 /* Written on the stepper thread from the hooks and read on the test's thread. Static storage: a
  * hook may still be in flight until serve() returns, which is after the last read. */
 struct Driver {
     std::mutex              mu;
     std::condition_variable cv;
     std::vector<Rec>        trace;
+    std::vector<EvRec>      ev;
     Engine*                 engine   = nullptr;
     uint64_t                req_id   = 1;
     bool                    withheld = false;
@@ -150,6 +161,21 @@ std::string trace_text() {
     std::lock_guard<std::mutex> lk(g_driver.mu);
     return trace_text_locked();
 }
+
+/* A stager the tiny deployment never has: it arms for a prompt chunk and for nothing else, so the
+ * step's `staged` bit is predictable per step. A draft pass returns early in every stager, so a
+ * pass that followed the step must not be able to clear the answer. */
+class PrefillStagerForTest final : public rad::OpStager {
+public:
+    bool begin_pass(const RadBatch* b) override {
+        return b && b->draft_pass == 0 && b->phase == RAD_PHASE_PREFILL;
+    }
+    int before_op(rad_op, RadStream, bool* resync) override {
+        *resync = false;
+        return RAD_OK;
+    }
+    int end_pass(RadStream) override { return RAD_OK; }
+};
 
 /* The readiness proof for the stop, replacing an earlier one built on the signal disposition: the
  * engine reports Server::port() from its watcher once it is nonzero, which is exactly when the
@@ -198,6 +224,17 @@ extern "C" void rad_test_step_point(int step, int rows, bool prior_complete, boo
         EngineTestPeer::history_issued(*g_driver.engine, false);
     }
     g_driver.trace.push_back(r);
+    g_driver.cv.notify_all();
+}
+
+/* The evidence hook: what the engine hands Scheduler::step_finished for `step`. Recorded on the
+ * stepper thread after the step's collect, which is after the next step's ahead pass has run --
+ * so this is exactly the point where a cumulative counter delta would report the wrong pass. */
+extern "C" void rad_test_step_evidence(int step, int replay_known, int replay, int staged,
+                                       int moved) {
+    std::lock_guard<std::mutex> lk(g_driver.mu);
+    if (!g_driver.engine) return;
+    g_driver.ev.push_back(EvRec{ step, replay_known != 0, replay, staged != 0, moved != 0 });
     g_driver.cv.notify_all();
 }
 
@@ -296,6 +333,11 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
         std::lock_guard<std::mutex> lk(g_driver.mu);
         g_driver.engine = &e;
     }
+    /* After start(), which attaches the deployment's own stager (none, on this fixture), and before
+     * the stepper: every rank answers `staged` from this stager from now on. Static storage: the
+     * rank threads hold the pointer until the join. */
+    PrefillStagerForTest staging;
+    EngineTestPeer::stager(e, &staging);
 
     std::promise<int> served;
     std::future<int>  done = served.get_future();
@@ -364,10 +406,12 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
      * engine is released here rather than after the checks, so the early return below leaves no
      * global pointing at an engine that is about to die. */
     std::vector<Rec> tr;
+    std::vector<EvRec> ev;
     {
         std::lock_guard<std::mutex> lk(g_driver.mu);
         g_driver.engine = nullptr;
         tr = g_driver.trace;
+        ev = g_driver.ev;
     }
 
     if (!observed || g_driver.submit_rc != RAD_OK) {
@@ -434,6 +478,34 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
         if (tr[i].rows > 0) { resumed = i; break; }
     REQUIRE(resumed != (size_t)-1);
     CHECK(tr[resumed].watermark > tr[after].watermark);
+
+    /* The cycle's evidence, as Scheduler::step_finished received it (rad_test_step_evidence reads
+     * it there, after the step's collect and therefore after the next step's ahead pass has run).
+     * One record per finished step, in step order, and tagged with the step that finished. */
+    REQUIRE_EQ(ev.size(), tr.size());
+    for (size_t i = 0; i < tr.size(); ++i) CHECK_EQ(ev[i].step, tr[i].step);
+    /* No rank reported nothing: every step here really ran a pass, on the host backend, so the
+     * state is a measured one and never Unknown. */
+    for (const EvRec& x : ev) CHECK(x.known);
+    /* The host backend has no tape (only the AQL one defines tape_begin), so every pass is issued
+     * live and the class is the measured None. Play/Record/Audit are not producible here, and the
+     * per-step freezing they need is the same record this checks. */
+    for (const EvRec& x : ev) CHECK_EQ(x.replay, (int)rad::DraftReplay::None);
+    /* Nothing in this fixture moves a unit between tiers (a static plan, no placement engine), and
+     * a step that claims otherwise would price itself with kDraftSamplePlacement. */
+    for (const EvRec& x : ev) CHECK(!x.moved);
+
+    /* Every prompt chunk was staged: the stager armed for that pass, and the answer is the step's
+     * own. The tail chunk is the one that matters -- the decode step behind it is issued ahead
+     * before the tail is collected, so a stager latch read at collect time would answer with the
+     * decode pass (false) instead of the tail's own (true). */
+    for (size_t i = 0; i < iw; ++i) {
+        CHECK_EQ(tr[i].step, ev[i].step);
+        CHECK(ev[i].staged);
+    }
+    /* And the decode steps that follow are not staged: a decode step must not inherit the flag of
+     * a prefill pass either. */
+    for (size_t i = iw; i < ev.size(); ++i) CHECK(!ev[i].staged);
 }
 
 }  /* namespace */

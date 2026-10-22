@@ -1238,6 +1238,7 @@ int Ctx::play_pass(PassTape& t) {
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
+    tape_path_ = kStepTapeNone;
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
     if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     const uint64_t key = pass_key(b);
@@ -1252,6 +1253,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
     if (t && t->plays > 0 && t->plays % kAuditPlays != 0) {
         bump(pc_played_);
+        tape_path_ = kStepTapePlay;
         pc_dispatched_.fetch_add(t->dispatches, std::memory_order_relaxed);
         pc_unordered_.fetch_add(t->unordered, std::memory_order_relaxed);
         return play_pass(*t);
@@ -1259,6 +1261,7 @@ int Ctx::run_pass(const RadBatch* b) {
 
     if (t) {
         bump(pc_audited_);
+        tape_path_ = kStepTapeAudit;
         /* Audit: issue the pass live, recording it, and compare. Runs before the first play and
          * then every kAuditPlays plays. */
         PassTape fresh;
@@ -1292,6 +1295,7 @@ int Ctx::run_pass(const RadBatch* b) {
     }
 
     bump(pc_recorded_);
+    tape_path_ = kStepTapeRecord;
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
@@ -1328,6 +1332,11 @@ int Ctx::run_step(const RadBatch* b) {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
+    /* Freeze this pass's evidence before anything else runs on this thread: a draft pass shares the
+     * step number and must not overwrite the trunk step's record, and the next step's ahead pass
+     * would otherwise be the one a reader sees. */
+    if (b->draft_pass == 0)
+        last_ev_ = StepEvidence{ b->step, tape_path_, staging_ };
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
      * compute stream, so work left on lane 1 could be read by the sampler or freed while in

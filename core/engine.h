@@ -46,6 +46,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
+class OpStager;   /* runtime/stager.h; test_set_stager only */
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
@@ -116,6 +117,10 @@ private:
      * other one, core/main.cpp, belongs to the radiance binary and never links those copies, so no
      * program holds both definitions of the class. */
     friend struct EngineTestPeer;
+    /* Test-build-only: attaches a stager to every rank's Ctx, as bringup does for a deployment
+     * whose budget left room for one. A test that checks the step's own placement evidence needs a
+     * stager that arms for a step it knows, which a tiny fixture never stages. */
+    void test_set_stager(OpStager* s);
 #endif
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
@@ -341,6 +346,11 @@ private:
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
+    /* The evidence the step `step` itself left (DraftStepEvidence): tape path and stager answer
+     * frozen on the rank threads as that step ran, and placement activity inside its window. False
+     * when no rank ran a pass for it, which the caller must treat as Unknown, not as a measured
+     * None -- a step issued ahead is collected after its pass, so a miss means no pass at all. */
+    bool step_evidence(int32_t step, DraftStepEvidence* out) const;
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */

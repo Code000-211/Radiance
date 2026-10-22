@@ -58,6 +58,15 @@ extern "C" __attribute__((weak)) void rad_test_step_point(int step, int rows, bo
  * every other test build that compiles these units linkable. */
 extern "C" __attribute__((weak)) void rad_test_serving() {}
 
+/* The same test copy's third seam: the evidence handed to Scheduler::step_finished, after the
+ * step's join and before the scheduler stamps it. A driver checks that what a step's cycle is keyed
+ * by is that step's own -- the ahead pass has run by now -- rather than reading the same fields off
+ * the engine, which would restate the call. tests/engine_loop_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) void rad_test_step_evidence(int step, int replay_known, int replay,
+                                                            int staged, int moved) {
+    (void)step; (void)replay_known; (void)replay; (void)staged; (void)moved;
+}
+
 /* The third seam: the server's running state, reported from run_server()'s watcher once
  * Server::port() turns nonzero. That is the first moment a stop is one the transport accepts --
  * before it, httplib's stop() closes nothing and the signal is dropped (core/server/http.cpp). A
@@ -300,6 +309,14 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     (void)r.mover.balance(&r.heat, !hold);
 }
 /* ------------------------------------------------------------------ the rank thread */
+#ifdef RAD_TEST_HOOKS
+void Engine::test_set_stager(OpStager* s) {
+    /* Every rank, as bringup does (engine_bringup.cpp): a pass and its evidence are per rank, and
+     * a stager attached to one only would leave the others answering for a pass it never armed. */
+    for (auto& r : ranks_) r->ctx.set_stager(s);
+}
+#endif
+
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
     if (r.ctx.bind_thread() < 0) {
@@ -324,6 +341,7 @@ void Engine::rank_loop(int index) {
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
+            const int64_t moves_before = r.ev_moves_before;
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -352,13 +370,54 @@ void Engine::rank_loop(int index) {
             /* Behind the pass, once a step: see tiering_dispatch. */
             if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
 
+            /* Freeze what this step's passes did, keyed by the step that ran them. Read here, on
+             * the thread and right after the passes: the next step's ahead pass is released before
+             * this one is collected, so a delta read at collect time would report it. The stager
+             * and the tape are per pass, which is why the trunk pass's Ctx record is what carries
+             * them; `moved` spans from the counters prepare_release snapshotted to here, the
+             * step's own window including its tiering dispatch. */
+            if (s >= 0 && what != kIssueSampler) {
+                const HeatStats hs = r.heat.stats();
+                const int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions;
+                r.note_evidence(r.ctx.last_step_evidence(), moves > moves_before);
+            }
+
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
     }
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
+bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
+    if (!out) return false;
+    bool known = false;
+    for (const auto& r : ranks_) {
+        const Rank::StepSnap& s = r->ev[(uint32_t)step & 3u];
+        if (s.step != step) continue;   /* this rank never ran the step: not evidence of None */
+        known = true;
+        out->staged = out->staged || s.staged;
+        out->moved  = out->moved  || s.moved;
+        if (s.tape == Ctx::kStepTapeRecord) out->replay = DraftReplay::Record;
+        else if (s.tape == Ctx::kStepTapeAudit && out->replay != DraftReplay::Record)
+            out->replay = DraftReplay::Audit;
+        else if (s.tape == Ctx::kStepTapePlay &&
+                 (out->replay == DraftReplay::Unknown || out->replay == DraftReplay::None))
+            out->replay = DraftReplay::Play;
+        else if (s.tape == Ctx::kStepTapeNone && out->replay == DraftReplay::Unknown)
+            out->replay = DraftReplay::None;
+    }
+    out->replay_known = known;
+    return known;
+}
+
 int Engine::prepare_release(const RadBatch* b) {
+    /* The placement counters when this step's window opens, before the arena level's recall can
+     * move a unit: the rank thread reports `moved` for the step from here (Rank::ev_moves_before),
+     * so a later step's reclaim cannot stand in for this one. */
+    for (auto& rk : ranks_) {
+        const HeatStats hs = rk->heat.stats();
+        rk->ev_moves_before = (int64_t)hs.promotions + (int64_t)hs.demotions;
+    }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -440,16 +499,6 @@ int Engine::step_loop() {
     pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
                   (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
-    /* The replay state and placement activity a cost cycle is keyed by (DraftStepEvidence). The
-     * counters are cumulative and only this thread reads them here, so the delta across a step is
-     * what that step's bracket did. */
-    std::vector<Ctx::PassCounts> prev_pc(ranks_.size());
-    std::vector<int64_t>         prev_moves(ranks_.size(), 0);
-    for (size_t i = 0; i < ranks_.size(); ++i) {
-        prev_pc[(size_t)i]    = ranks_[i]->ctx.pass_counts();
-        const HeatStats hs    = ranks_[i]->heat.stats();
-        prev_moves[(size_t)i] = (int64_t)hs.promotions + (int64_t)hs.demotions;
-    }
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
@@ -829,27 +878,17 @@ int Engine::step_loop() {
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). What the tape and the placement engines did inside that
          * bracket goes with it: the scheduler cannot see either, and a state nobody established
-         * must reach A as Unknown, not as a measured None. */
+         * must reach A as Unknown, not as a measured None. The evidence is the one the rank
+         * threads froze for this exact step (note_evidence), not a counter delta read now -- the
+         * next step's ahead pass has been released since. A step no rank reported is Unknown. */
         DraftStepEvidence ev;
-        ev.replay_known = true;
-        bool recorded = false, audited = false, played = false;
-        for (size_t i = 0; i < ranks_.size(); ++i) {
-            const Ctx::PassCounts pc = ranks_[i]->ctx.pass_counts();
-            recorded = recorded || pc.recorded > prev_pc[i].recorded;
-            audited  = audited  || pc.audited  > prev_pc[i].audited;
-            played   = played   || pc.played   > prev_pc[i].played;
-            prev_pc[i] = pc;
-            const HeatStats hs = ranks_[i]->heat.stats();
-            const int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions;
-            ev.moved = ev.moved || moves > prev_moves[i];
-            prev_moves[i] = moves;
-            ev.staged = ev.staged || ranks_[i]->stager.staged();
-        }
-        /* Audited and recorded are rarer than played, and a cycle that both recorded and played
-         * is still a recording for the price's key. */
-        ev.replay = recorded ? DraftReplay::Record
-                  : audited  ? DraftReplay::Audit
-                  : played   ? DraftReplay::Play : DraftReplay::None;
+        /* No rank ran a pass for this step (a sampler-only release with nothing issued ahead):
+         * Unknown, so A excludes the sample instead of pricing it as undisturbed. */
+        if (!step_evidence(b->step, &ev)) ev = DraftStepEvidence{};
+#ifdef RAD_TEST_HOOKS
+        rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,
+                               (int)ev.moved);
+#endif
         sched_.step_finished(ev);
         tier_tick();
         loan_tick(/*idle=*/false);

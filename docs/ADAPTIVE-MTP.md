@@ -224,6 +224,30 @@ prediction and sample.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.
+- **Evidence belongs to the step that produced it, not to the collector's window.** The cycle is
+  closed when the next plan opens, but `step_loop` issues the next step's ahead pass before it
+  collects the current one, so a counter read at collect time describes the ahead pass: its tape
+  branch and its stager answer are in the delta, and a step with no pass at all is indistinguishable
+  from an undisturbed one. `Ctx::run_step` freezes `{step, tape, staged}` on the rank thread as the
+  pass returns (`Ctx::StepEvidence`), and that snapshot is merged per rank into a slot keyed by step
+  number (`Rank::StepSnap`); a draft pass shares the step number and keeps the trunk pass's slot
+  untouched. `Engine::step_evidence(step)` merges the ranks -- Record > Audit > Play > None -- and
+  a step no rank ran a pass for yields `replay_known = false`, which the sample treats as
+  `Unknown` and excludes. A per-step placement fact (`staged`) and heat movement inside the step's
+  own window (`moved`, bounded by the counters `prepare_release` snapshots) travel the same way.
+- **A measurement is filed under the class the planner priced.** `draft_cost_observe` derives the
+  shape's `ctx_class` as the deepest frozen row's, exactly `DraftPlanner::shape_of`; a constant
+  (class 0, or the plan's per-row field) would file a long-context sample where no class-1 estimate
+  can look it up.
+- **An inactive table and an absorbed sample are counted apart.** `DraftCostTable::observe` on a
+  table that was never configured (or was cleared) increments `inactive()` -- surfaced as
+  `SchedMetrics::draft_obs_inactive` -- and returns `RAD_OK`; it is neither a refusal (the sample
+  was well formed) nor an absorption, so "nothing was learned" is never reported as "nothing was
+  offered".
+- **The host backend cannot exercise the tape branches.** Only `core/device/aql.cpp` implements
+  `tape_begin`; on the host every pass is unkeyed, so a host regression can prove the step binding
+  of the frozen snapshot and the placement bit, not a Play/Record/Audit transition. Those are
+  covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.

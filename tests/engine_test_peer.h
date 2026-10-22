@@ -51,6 +51,10 @@ struct EngineTestPeer {
     static void barrier(Engine& e, int parties) { e.barrier_ = std::make_unique<RankBarrier>(parties); }
     static void drafter(Engine& e, const RadDrafterDecl& d) { e.drafter_ = d; }
 
+    /* The stager the engine's own Ctx would use for a pass (Engine::test_set_stager). A fixture
+     * whose deployment stages nothing attaches one to check the step's placement evidence. */
+    static void stager(Engine& e, OpStager* s) { e.test_set_stager(s); }
+
     /* The engine's own scheduler, for a fixture that declares its program itself (sched_program.h)
      * instead of loading one through a plugin. init() is the call start() makes after bringup
      * (core/engine.cpp:1641); fini() is what ~Engine does not do for a scheduler the test started. */

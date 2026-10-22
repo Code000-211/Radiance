@@ -126,7 +126,10 @@ struct SchedReq {
 /* What the executing path did inside one step's cycle bracket. The engine sees the tape and the
  * placement engines; the scheduler does not. `replay_known` stays false unless a caller that
  * actually knows reports, so a state nobody established is Unknown rather than a measured None
- * (draft_cost.h: the replay state is part of a sample's key). */
+ * (draft_cost.h: the replay state is part of a sample's key). The engine freezes each field on the
+ * rank thread as the step's own pass returns (Engine::step_evidence), because the next step's ahead
+ * pass is released before this step is collected: a counter delta read here would describe that
+ * pass. */
 struct DraftStepEvidence {
     bool        replay_known = false;
     DraftReplay replay       = DraftReplay::Unknown;

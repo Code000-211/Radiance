@@ -144,6 +144,10 @@ struct SchedMetrics {
     int64_t draft_obs_applied = 0;     /* rows whose labels moved a request's estimate */
     int64_t draft_obs_skipped = 0;     /* rows that taught nothing */
     int64_t draft_obs_discarded = 0;   /* cycles not delivered: incomplete or refused */
+    /* Valid observations handed to an inactive cost table: the deployment is observing, not
+     * learning. Zero while a profile is installed, so "nothing was absorbed" and "nothing was
+     * offered" cannot be read as the same fact. */
+    int64_t draft_obs_inactive = 0;
 };
 
 

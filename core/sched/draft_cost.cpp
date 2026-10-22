@@ -676,7 +676,7 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     if (!executed_within_plan(sample, *plan)) return RAD_E_INVAL;
 
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
-    if (!active_) return RAD_OK;   /* no usable profile: nothing to learn into */
+    if (!active_) { ++inactive_; return RAD_OK; }   /* no usable profile: nothing to learn into */
 
     if (draft_sample_storable(sample) && sample.rounds < plan->max_k) {
         /* The plan's deepest round never ran: the bracket is a verify window plus a draft phase
