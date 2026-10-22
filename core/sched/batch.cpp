@@ -10,10 +10,12 @@
 #include <cstdlib>
 
 #ifdef RAD_TEST_HOOKS
-/* Test-build-only seam (core/CMakeLists.txt sets RAD_TEST_HOOKS with RAD_BUILD_TESTS):
- * tests/sched_fakes.h defines it strongly and returns true once, so the scheduler's "a pass was
- * owed and could not be built" path is reachable from a test without a runtime fault-injection
- * switch. A build configured without tests has neither this definition nor the call below. */
+/* Test-build-only seam: tests/CMakeLists.txt compiles this file a second time, for the test
+ * binaries alone, with RAD_TEST_HOOKS. tests/sched_fakes.h defines the hook strongly and returns
+ * true once, so the scheduler's "a pass was owed and could not be built" path is reachable from a
+ * test without a runtime fault-injection switch. rad_core is never compiled with RAD_TEST_HOOKS,
+ * so the production library carries neither this definition nor the call below in any
+ * configuration, tests enabled or not. */
 extern "C" __attribute__((weak)) bool rad_test_fail_batch_build() { return false; }
 #endif
 

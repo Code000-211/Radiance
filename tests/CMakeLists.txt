@@ -58,7 +58,21 @@ set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
 # shared library's imports too: ROCm 10.1's libamdhip64 imports std::string::reserve, which g++-14
 # emits weak in rad_graph.cpp.o, and that object pulls in dispatch.cpp.o, whose strong device calls
 # silently replace the weak fakes sched_test, ref_test and runtime_test rely on.
-set(RAD_TEST_CORE stdc++ rad_core)
+#
+# rad_test_hooks is core/sched/batch.cpp compiled a second time, for tests only, with
+# RAD_TEST_HOOKS. rad_core itself is never compiled with it: the production library carries neither
+# the hook call nor the weak default, whether or not the test suite is configured. The copy sits
+# before rad_core and is linked whole, so BatchBuilder resolves to it even in a test that never
+# names the class -- otherwise the linker would take rad_core's object and the hook would silently
+# be absent.
+add_library(rad_test_hooks STATIC ${CMAKE_SOURCE_DIR}/core/sched/batch.cpp)
+target_compile_definitions(rad_test_hooks PRIVATE RAD_TEST_HOOKS=1 RAD_VERSION="${PROJECT_VERSION}")
+target_include_directories(rad_test_hooks PRIVATE
+  ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/vendor
+  ${CMAKE_BINARY_DIR}/rad_include)
+target_link_libraries(rad_test_hooks PRIVATE rad_abi Threads::Threads)
+
+set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
