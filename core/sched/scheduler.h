@@ -159,6 +159,16 @@ public:
         const int32_t*       first_row = nullptr;  /* [n_seq] */
     };
 
+    /* What commit left a sequence at: the length it was committed at and whether it was still
+     * Running when its entry was retired. Copied under the lock in commit because reap() may
+     * destroy the Request before the serial bind reads it; the plan's StepEntry::req must not be
+     * dereferenced after commit. */
+    struct CommittedSeq {
+        uint64_t seq = 0;
+        uint64_t n_out = 0;
+        bool     live = false;
+    };
+
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
      * PrefixCache::configure runs first and needs its checkpoint interval; pass nullptr to
      * resolve one here. */
@@ -191,6 +201,12 @@ public:
      * id is not live. The watermark is otherwise only visible through the next history pass, which
      * for a history-only row starts where the watermark already is. */
     int64_t  draft_watermark(uint64_t id) const;
+    /* Whether the request is still admitted and Running, read under the lock. For an evidence
+     * line written after a step's wait, where the staging that named it is older than the wait. */
+    bool     running(uint64_t id) const;
+    /* What the step just committed left for `seq`, copied by commit under the lock. False when
+     * that step carried no such sequence. */
+    bool     committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const;
 
     /* Requests that reached a terminal state since the last call, oldest first, swapped into
      * `out` under the lock (old contents discarded). Only the engine consumes it, to drop
@@ -850,6 +866,8 @@ private:
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
     bool    step_open_ = false;
+    /* The step just committed: its sequences' committed length and liveness, in plan order. */
+    std::vector<CommittedSeq> committed_;
     /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
     DecodeFloor decode_floor_;
 

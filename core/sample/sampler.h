@@ -71,6 +71,7 @@
  */
 #pragma once
 #include "rad_sample.h"
+#include "rad_spechub.h"
 
 #include "../rad_core.h"
 #include "grammar.h"
@@ -80,6 +81,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -160,13 +162,18 @@ public:
     /* Whether allows_speculation's answer can no longer change. It changes only when a grammar
      * whose backend cannot rewind starts to constrain (on a commit). */
     bool speculation_fixed(uint64_t req_id) const;
+    /* RADIANCE_MTP_COUPLED: bind the per-round states of the linear draft just published, `n` of
+     * them (0 clears). Each must name this request, the round it belongs to, and a `draw.mode` the
+     * row actually ran. RAD_E_NOTFOUND for a request already ended here. */
+    int set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n);
 
     /* ---------------------------------------------------------- step path */
 
     /* Stage this step's parameter rows, penalty history and grammar bitmasks into pinned memory.
      * Scheduler thread, before the rank threads are released at the barrier. Allocates nothing;
-     * every buffer was sized at declare against max_seqs (spec §3.1). */
-    int build_step(const std::vector<Request*>& reqs);
+     * every buffer was sized at declare against max_seqs (spec §3.1). `step` is the engine's step
+     * the build stages for, carried into the coupling snapshot. */
+    int build_step(const std::vector<Request*>& reqs, int64_t step = -1);
 
     /* Stage `n` greedy rows for a drafter: no penalties, mask or history, and no RNG use, so
      * only the argmax runs. Draft output is a proposal checked by a greedy verifier
@@ -200,6 +207,29 @@ public:
      * meaningful only where the row carries RAD_SP_MASK. */
     const uint32_t* staged_mask(int64_t row) const { return mask_stage_ + row * mask_words_; }
     int64_t         mask_words() const { return mask_words_; }
+    /* Staged row `row`'s bound coupled state, as `run` uploads it: all-zero where the row carries
+     * none (bonus row, greedy row, uncoupled step). Lets a build be checked without a device. */
+    const RadMtpCoupleState& staged_couple(int64_t row) const { return couple_stage_[row]; }
+    /* Whether any row of the last build carries a bound state, i.e. whether `run` issues the
+     * verify op at all. Cleared by build_greedy: a gate for run(), not for evidence. */
+    bool staged_any_couple() const { return any_couple_; }
+    /* The verify op the last build resolved, for naming its kernel in a log line. */
+    rad_op staged_couple_op() const { return op_couple_; }
+
+    /* What build_step staged for the coupled verify, frozen there: build_greedy (the drafter's
+     * greedy passes, issued between that build and the step's wait) clears any_couple_ and
+     * replaces cur_stage_/n_seq_, but must not make the evidence unreadable. */
+    struct CoupleBuild {
+        int64_t step = -1;   /* the engine step this build staged */
+        int64_t rows = 0;    /* bound rows */
+        /* The distinct sequences among them, with their bound rows. */
+        std::vector<std::pair<uint64_t, int64_t>> seqs;
+    };
+    const CoupleBuild& couple_build() const { return couple_build_; }
+    /* The engine step whose build this sampler's run() last issued the verify op for, or -1. The
+     * op and the build it belongs to are recorded together, so an evidence read can tell an
+     * actually issued verify from a staged row set. */
+    int64_t staged_couple_issued_step() const { return couple_issued_step_; }
 
 private:
     /* Whether the vocabulary is split, judged by this rank's logit width rather than the rank
@@ -218,6 +248,11 @@ private:
          * newly committed tokens only. Read only when the request carries a thinking budget. */
         ReasoningCount                  think;
         size_t                          think_seen = 0;
+        /* RADIANCE_MTP_COUPLED: the linear draft's per-round states for the window the scheduler
+         * published, bound by set_mtp_couple and consumed by build_step. `couple_n` is how many of
+         * `couple` are live; 0 for a request whose drafts carry no coupled proposal. */
+        RadMtpCoupleState couple[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+        int               couple_n = 0;
     };
 
     /* Mask staged row `row` to the reasoning block's close token, once the budget is spent
@@ -244,6 +279,7 @@ private:
     rad_op op_argmax_    = RAD_NULL_HANDLE;
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
+    rad_op op_couple_    = RAD_NULL_HANDLE;   /* RADIANCE_MTP_COUPLED only */
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 
@@ -259,6 +295,12 @@ private:
     rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
     rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
     rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
+    rad_buf buf_couple_  = RAD_NULL_HANDLE;   /* [rows, RAD_MTP_COUPLE_STATE_WORDS], flag only */
+    RadMtpCoupleState* couple_stage_ = nullptr;   /* pinned, one row per sampled position */
+    bool    couple_      = false;   /* RADIANCE_MTP_COUPLED */
+    bool    any_couple_  = false;   /* does any row this step carry a bound state? */
+    CoupleBuild couple_build_{};    /* what the last build_step staged, for the evidence line */
+    int64_t couple_issued_step_ = -1;   /* step whose verify op run() last issued */
 
     /* Pinned staging, allocated once at declare. */
     DeviceSampleParams* params_stage_ = nullptr;

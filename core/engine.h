@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
 #include "cvec.h"
 #include <map>
 #include <set>
@@ -474,6 +475,25 @@ private:
     int  step_state_init();
     void step_state_fini();
     StepSlot*            slots_host_ = nullptr;
+
+    /* RADIANCE_MTP_COUPLED (engine_draft.cpp). The head declares `mtp_couple_draws` and
+     * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
+     * reads the states back once, then binds each to the verify row it will be coupled at. */
+    bool     mtp_couple_ = false;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
+    RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
+    RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
+    std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
+    RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
+    bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
+    int  stage_couple_draws(int n);
+    /* One INFO line at the first coupled verify that completed: the step, the live requests whose
+     * rows carried a bound state, the kernel and its domain. Read off the sampler's build snapshot
+     * after collect_step's wait, so it reports an issued, finished verify -- not an enqueue, not a
+     * LIVE flag, and not a host row read as a device one. */
+    void couple_verify_evidence(int step);
 
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
      * The nine phases sum to the whole step, including the readback, commit and drafter after the

@@ -4,6 +4,7 @@
 #include "rad_test.h"
 
 #include "mm/processor.h"
+#include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -1448,6 +1449,204 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     CHECK(b2 != nullptr);
     int32_t W = 4 - 1 + 4 + 1;
     CHECK_EQ(f.sch.plan().e[0].conv_cursor, (cursor_before + 3) % W);
+}
+
+/* THE COUPLED BIND AFTER A REAL COMMIT.
+ *
+ * Engine::finish_serial_drafter binds each round at the request's committed output length, read
+ * from the plan after commit -- the value the next Sampler::build_step stages that row at. This
+ * drives the same rule (sched/mtp_couple_bind.h) against the real Scheduler::commit: a live
+ * commit, a max_tokens cut, and a card reused by a new request afterwards.
+ *
+ * The old engine formula (the draw's pre-commit base + the slot's one-based n_acc) agrees on every
+ * commit of a request that is still running, and drifts by exactly the tokens a cut withheld. A
+ * commit that emits fewer than the card accepted has closed the request; its plan entry is carried
+ * for the bind, but the request will never sample again. Binding it would put a coupled verify on
+ * a terminal row, which reads as a live round in the log without being one. */
+TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    const int64_t vocab = f.prog.meta.n_vocab;
+
+    int32_t draft[3] = { 21, 22, 23 };
+    auto readback = [&](uint64_t seq, uint64_t base, int rounds) {
+        RadMtpCoupleDraw d{};
+        d.seq  = seq;
+        d.base = base;
+        d.mode = 1;
+        std::vector<RadMtpCoupleState> rb((size_t)rounds);
+        for (int rd = 1; rd <= rounds; ++rd) {
+            RadMtpCoupleState& s = rb[(size_t)(rd - 1)];
+            s.draw   = d;
+            s.round  = rd;
+            s.status = 1;
+            s.count  = 1;
+            s.x      = draft[rd - 1];       /* what the card holds for that round */
+            for (int i = 0; i < 8; ++i) s.ids[i] = -1;
+            s.ids[0] = s.x;
+            s.q[0]   = 1.0;
+        }
+        return rb;
+    };
+    auto slot = [&]() {
+        StepSlot S{};
+        S.acc = 3;
+        S.n_acc = 4;
+        for (int rd = 1; rd <= 3; ++rd) S.tok[rd] = draft[rd - 1];
+        return S;
+    };
+
+    /* ---- a live commit: three drafts accepted, the request keeps running. */
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t a_base = f.sch.find(a)->output.size();   /* the draw's pre-commit coordinate */
+    CHECK_OK(f.commit(9, 0, [](const StepEntry&) { return 3; }));
+    REQUIRE(f.sch.find(a) != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), (int)a_base + 4);
+
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
+    CHECK(pa.found);
+    CHECK(pa.live);
+    CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
+
+    const std::vector<RadMtpCoupleState> rba = readback(a, a_base, 3);
+    const StepSlot Sa = slot();
+    RadMtpCoupleState bound[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_rounds(pa, rba[0].draw, rba.data(), 1, 3, Sa, vocab, bound,
+                                    &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 3);
+    for (int k = 0; k < 3; ++k) {
+        /* The next build stages row k at n_out + k. */
+        CHECK_EQ(bound[k].pos, pa.n_out + (uint64_t)k);
+        CHECK(rad_mtp_couple_binds(bound[k], a, rba[0].draw.seed, pa.n_out, k, draft[k], vocab));
+    }
+    /* The old formula on the same data: identical, because this commit emitted its whole
+     * acceptance. */
+    for (int k = 0; k < 3; ++k)
+        CHECK_EQ(a_base + 4 + (uint64_t)k, pa.n_out + (uint64_t)k);
+
+    /* ---- a cut commit: the card accepted three drafts, the budget lets two through. */
+    const uint64_t b = f.submit(160, /*max_tokens=*/3);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);                                     /* b's first output token */
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t b_base = f.sch.find(b)->output.size();
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? 3 : 0; }));
+    REQUIRE(f.sch.find(b) != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->output.size(), 3);          /* 1 + 2, not 1 + 4 */
+
+    /* The commit snapshot still names b -- the terminal step is carried into the bind -- but it is
+     * not live: nothing binds, so no coupled verify is staged for a request that is gone. */
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
+    CHECK(pb.found);
+    CHECK(!pb.live);
+    CHECK_EQ(pb.n_out, (uint64_t)f.sch.find(b)->output.size());
+
+    const std::vector<RadMtpCoupleState> rbb = readback(b, b_base, 3);
+    const StepSlot Sb = slot();
+    CHECK_EQ(mtp_couple_bind_rounds(pb, rbb[0].draw, rbb.data(), 1, 3, Sb, vocab, bound,
+                                    &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
+    /* THE OLD FORMULA would have bound b's rounds at base + n_acc + k -- two past the length it
+     * actually committed, on a row no build will stage. */
+    for (int k = 0; k < 3; ++k) {
+        const uint64_t old_pos = b_base + 4 + (uint64_t)k;
+        CHECK(old_pos != pb.n_out + (uint64_t)k);
+        RadMtpCoupleState stale = rbb[(size_t)k];
+        stale.pos = old_pos;
+        CHECK(!rad_mtp_couple_binds(stale, b, rbb[0].draw.seed, pb.n_out, k, draft[k], vocab));
+    }
+
+    /* ---- reuse: the next request on a card binds at its own length, and the closed request's
+     * rounds are not accepted by it. */
+    const uint64_t c = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(c, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    const uint64_t c_base = f.sch.find(c)->output.size();
+    CHECK_OK(f.commit(9, 0, [](const StepEntry&) { return 3; }));
+    MtpCoupleBindPoint pc;
+    pc.found = f.sch.committed_seq(c, &pc.n_out, &pc.live);
+    CHECK(pc.found);
+    CHECK(pc.live);
+    CHECK_EQ(pc.n_out, (uint64_t)f.sch.find(c)->output.size());
+    CHECK_EQ(pc.n_out, c_base + 4);
+    CHECK(!rad_mtp_couple_binds(rbb[0], c, rbb[0].draw.seed, pc.n_out, 0, draft[0], vocab));
+    RadMtpCoupleState own = readback(c, c_base, 1)[0];
+    own.pos = rad_mtp_couple_verify_pos(pc.n_out, 1);
+    CHECK(rad_mtp_couple_binds(own, c, own.draw.seed, pc.n_out, 0, draft[0], vocab));
+}
+
+/* THE BIND POINT OUTLIVES A REAP.
+ *
+ * commit() retires the step, and a request it finished that the next step does not carry is pinned
+ * by nothing any more. The server calls reap() from an HTTP thread as soon as it sees the finish,
+ * and reap() destroys the Request -- while Engine::finish_serial_drafter still has to bind that
+ * row. The bind point is therefore copied by commit under the scheduler lock
+ * (Scheduler::committed_seq), not read off the plan's StepEntry::req, which is dangling by then.
+ * This reaps a non-carried terminal request between commit and bind: the plan-pointer version
+ * could only answer by reading freed memory, and the snapshot answers from the copy.
+ */
+TEST(the_committed_bind_point_outlives_a_reap) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    const int64_t vocab = f.prog.meta.n_vocab;
+
+    int32_t draft[3] = { 21, 22, 23 };
+    const uint64_t a = f.submit(160, 64);                  /* live through the commit */
+    const uint64_t b = f.submit(160, /*max_tokens=*/3);    /* closed on it by the cut */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? 3 : 0; }));
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    /* The server's reap lands between commit and bind: b's Request is destroyed here. */
+    CHECK_OK(f.sch.reap(b));
+    CHECK(f.sch.find(b) == nullptr);
+
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
+    CHECK(pb.found);
+    CHECK(!pb.live);                                       /* terminal: nothing binds */
+    CHECK_EQ(pb.n_out, (uint64_t)3);
+
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
+    CHECK(pa.found);
+    CHECK(pa.live);
+    CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
+
+    RadMtpCoupleState rb[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    RadMtpCoupleState out[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    StepSlot S{};
+    S.acc = 3;
+    S.n_acc = 4;
+    for (int rd = 1; rd <= 3; ++rd) S.tok[rd] = draft[rd - 1];
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_rounds(pb, RadMtpCoupleDraw{}, rb, 1, 3, S, vocab, out, &n_bound,
+                                    &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
 }
 
 /* A decode benchmark needs the request to last as long as asked, not as long as the model

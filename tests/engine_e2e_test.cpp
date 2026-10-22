@@ -727,6 +727,74 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* RADIANCE_MTP_COUPLED is the coupling's only switch, and these are the engine's answers to it
+ * before any request: a value that is not 0/1 refuses the start (never a silent uncoupled run),
+ * and so does a model whose drafter has no per-round draw to couple. Both are checked through the
+ * real binary because both are bringup paths, not helper functions; the drafter shape is the
+ * declaration the engine has in hand, which no environment variable describes. The same model with
+ * the flag off is the control: it starts, which is what makes the two refusals attributable to the
+ * switch and not to the fixture. */
+TEST(the_coupling_switch_refuses_what_it_cannot_serve_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    /* qwen35's tiny checkpoint declares no draft head: no serial chain to couple. The spechub
+     * kernels are loaded beside libref, so the refusal is the drafter's shape and not a missing
+     * coupling kernel. */
+    const Ran on = radiance(w.qwen35, { "--kernels", "libref,spechub" },
+                            { "RADIANCE_MTP_COUPLED=1" }, 120);
+    const std::string want = "RADIANCE_MTP_COUPLED requires the linear serial draft chain "
+                             "(RAD_DRAFT_SERIAL with depth > 0)";
+    if (on.status == 0 || on.status == 124 || !has(on.log, want))
+        fprintf(stderr, "    RADIANCE_MTP_COUPLED=1 exited %d:\n%s\n", on.status,
+                tail(on.log, 20).c_str());
+    CHECK(on.status != 0);
+    CHECK(on.status != 124);
+    CHECK(has(on.log, want));
+    CHECK(has(on.log, "declares drafter '(none)'"));
+
+    /* THE GATE IS NOT RELAXED EITHER WAY: the same start as a deployment runs it (no
+     * --debug-accept-reference-kernels), with a production library for the model's ops and the
+     * spechub library beside it. On this card-less machine the plugin's device rows are left out
+     * of selection (no card is visible), so the only coupled row left is the host oracle -- and
+     * the gate must still refuse it, naming the coupled op. Marking the library, or the oracle
+     * rows, production would pass this start on a machine that cannot run the coupling at all. */
+    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+        std::string gate_log;
+        const int gate = tiny::run(serving_argv(w.qwen35, { "--kernels", "libavx,spechub" }),
+                                   engine_env({ "RADIANCE_MTP_COUPLED=1" }), &gate_log, 120);
+        const std::string gate_ref = "1 declared op(s) resolve only to a reference implementation "
+                                     "(spechub)";
+        if (gate == 0 || gate == 124 || !has(gate_log, gate_ref) ||
+            !has(gate_log, "1 distinct op(s): mtp_couple_verify"))
+            fprintf(stderr, "    serving start exited %d:\n%s\n", gate,
+                    tail(gate_log, 20).c_str());
+        CHECK(gate != 0);
+        CHECK(gate != 124);
+        CHECK(has(gate_log, gate_ref));
+        CHECK(has(gate_log, "distinct op(s): mtp_couple_verify"));
+    }
+
+    /* A typo is refused, not read as off. */
+    const Ran typo = radiance(w.qwen35, {}, { "RADIANCE_MTP_COUPLED=yes" }, 120);
+    const std::string refused = "RADIANCE_MTP_COUPLED accepts 0|1 (or unset)";
+    if (typo.status == 0 || typo.status == 124 || !has(typo.log, refused))
+        fprintf(stderr, "    RADIANCE_MTP_COUPLED=yes exited %d:\n%s\n", typo.status,
+                tail(typo.log, 20).c_str());
+    CHECK(typo.status != 0);
+    CHECK(typo.status != 124);
+    CHECK(has(typo.log, refused));
+
+    /* The control on the same checkpoint: flag off starts and declares, so both refusals above are
+     * the switch's answer and not the fixture's. --debug-graph runs declare and plan and exits, so
+     * it is a start, not a serve. */
+    const Ran off = radiance(w.qwen35, { "--debug-graph" }, { "RADIANCE_MTP_COUPLED=0" }, 120);
+    if (off.status != 0)
+        fprintf(stderr, "    RADIANCE_MTP_COUPLED=0 exited %d:\n%s\n", off.status,
+                tail(off.log, 20).c_str());
+    CHECK_EQ(off.status, 0);
+    CHECK(!has(off.log, "MTP coupled LIVE"));
+}
+
 /* Two ranks split heads, the FFN and the vocabulary, and sum partial products in an all-reduce,
  * so the rounding differs from one rank's; anything more than rounding is a wrong column or row
  * (a rank's logits read at another rank's vocabulary offset score near chance). */

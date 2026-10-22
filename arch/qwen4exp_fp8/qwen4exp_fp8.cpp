@@ -174,6 +174,10 @@ struct Model {
     rad_buf     b_mtp_hin = 0, b_mtp_hw = 0, b_mtp_e = 0, b_mtp_hout = 0;
     rad_buf     b_mtp_dq = 0, b_mtp_ds = 0, b_mtp_dsum = 0;
     rad_buf     b_mtp_dlog = 0, b_mtp_didx = 0, b_mtp_dval = 0;
+    /* RADIANCE_MTP_COUPLED: [max_seqs] draws staged before the serial passes and [max_spec,
+     * max_seqs] states read back after them. PERSIST: the engine writes them from the host and the
+     * head writes the states on the card, across a step boundary. */
+    rad_buf     b_mtp_couple_draws = 0, b_mtp_couple_state = 0;
     rad_buf     b_mtp_dpair = 0, b_mtp_dgath = 0;
 
     HcEnter   enter;
@@ -1261,6 +1265,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * vocab-parallel all-gather a 16-byte row (rad_block_mtp_hc.h, kDraftTopR). */
             m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_logit_rows, kDraftTopR});
             m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_logit_rows, kDraftTopR});
+
+            /* RADIANCE_MTP_COUPLED. The coupling needs the 2-bit candidate head's reranked top-8,
+             * because Q is that shortlist's own law; a plain bf16 head leaves one candidate and
+             * there is nothing to couple over. The drafter SHAPE (a linear serial chain, never a
+             * block drafter) is checked by the engine, which is where the declaration is in hand:
+             * the switches that once named tree drafters do not exist in this tree, and testing
+             * their environment variables here enforced nothing. */
+            if (!rad::mtp_coupled_config_valid()) {
+                rad_note(b, "RADIANCE_MTP_COUPLED accepts 0|1 (or unset); any other value is "
+                            "refused, not treated as off");
+                return RAD_E_INVAL;
+            }
+            if (rad::mtp_coupled_enabled()) {
+                if (!m.b_mtp_didx || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS) {
+                    rad_note(b, "RADIANCE_MTP_COUPLED requires the 2-bit candidate head's reranked "
+                                "top8 and max_spec 1..%d",
+                             RAD_MTP_COUPLE_MAX_ROUNDS);
+                    return RAD_E_UNSUPPORTED;
+                }
+                m.b_mtp_couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                              {g.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS},
+                                              RAD_BUF_PERSIST);
+                m.b_mtp_couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                              {g.max_spec, g.max_seqs,
+                                               RAD_MTP_COUPLE_STATE_WORDS},
+                                              RAD_BUF_PERSIST);
+                if (!m.b_mtp_couple_draws || !m.b_mtp_couple_state) return RAD_E_INVAL;
+                rad_note(b, "MTP coupled: the head samples x~Q from its reranked top8 each round "
+                            "(FP64), and the sampler couples the target's own draw to it; %lld "
+                            "round(s), fixed-seed tokens are NOT preserved",
+                         (long long)g.max_spec);
+            }
         }
 
         MtpHcBlock::Wire tw{};
@@ -1270,6 +1306,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq   = m.b_mtp_dq;   tw.ds = m.b_mtp_ds;    tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.dpair = m.b_mtp_dpair; tw.dgath = m.b_mtp_dgath;
+        tw.couple_draws = m.b_mtp_couple_draws; tw.couple_state = m.b_mtp_couple_state;
         /* The head reuses the trunk's working buffers, all dead by the time a draft round runs (a
          * second set would be 150 MiB). Only the wide stream and the carry are its own, since
          * they must survive the round that produced them. */

@@ -2461,6 +2461,30 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
+| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
+| `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
+
+`mtp_couple_propose` and `mtp_couple_verify` are the linear-MTP coupling (`RADIANCE_MTP_COUPLED=1`),
+and nothing else in the engine knows about coupling. The switch takes `1`, `0` or nothing; any other
+value refuses the start rather than serving the uncoupled path. Turning coupling on requires the
+linear serial draft chain: a block drafter (`RAD_DRAFT_BLOCK`) or no drafter at all is refused at
+bringup, because neither has a per-round draw to couple. The `spechub` plugin ships both rows and
+their host oracle in one library and marks them per row, so the device rows count as production
+kernels while the oracle is what the reference gate knows about — on a machine with no card only
+the oracle is left, and the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
+if it is set, it must name `spechub` or the coupled ops are not loaded at all.
+
+`mtp_couple_propose` runs on a draft round's
+final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
+scores at temperature 1; it writes `x` into column 0 of `idx` and one state row per round. A row
+whose `seq_ids` does not name the card its draw was staged for, or whose shortlist is malformed,
+leaves column 0 alone with `status = -1`. `mtp_couple_verify` runs after `sample_pick`, over the same
+final candidate plane, and applies the maximal coupling: the draft is accepted when it equals the
+token the target itself drew at that position, and otherwise the token is a draw from the FP64
+residual `(P - Q)+`. Both use 53-bit uniforms at `params.pos`; a row whose state is not bound to
+that seed and position keeps the ordinary token. `P` is FP64-normalised where `sample_pick` is
+FP32/24-bit, so a coupled row realizes the ideal filtered target law and is **not** seed-identical
+to the ordinary pick.
 
 `sample_mask` is where a GBNF grammar lands: the state machine stays on the host, and what crosses
 is a token bitmask per sequence (~19 KB at a 151K vocab), cheap enough to upload every step. A set

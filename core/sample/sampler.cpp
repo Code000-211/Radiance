@@ -4,6 +4,8 @@
 #include "sampler.h"
 #include "gbnf.h"
 
+#include "../../arch/common/rad_spechub_config.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -133,6 +135,14 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     }
 
     cfg_ = cfg;
+    /* A value other than unset/0/1 is refused, not read as off: a deployment that asked for the
+     * coupling and got a typo must not be served the uncoupled path while believing otherwise. */
+    if (!mtp_coupled_config_valid()) {
+        RAD_ERR("RADIANCE_MTP_COUPLED accepts 0|1 (or unset); refusing the start rather than "
+                "serving the uncoupled path");
+        return RAD_E_INVAL;
+    }
+    couple_ = mtp_coupled_enabled();
     if (cfg_.n_vocab_local <= 0) cfg_.n_vocab_local = cfg_.n_vocab / cfg_.world_size;
 
     /* The staged mask covers this rank's shard; the grammar's covers the whole vocabulary.
@@ -179,6 +189,14 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
      * penalised). Resolved on the host, which has the vocabulary. */
     buf_brk_    = decl("sampler.dry_breakers", RAD_U8, rows, cfg_.max_hist, RAD_BUF_PERSIST);
     buf_mask_   = decl("sampler.mask", RAD_U32, rows, mask_words_, RAD_BUF_PERSIST);
+    /* THE COUPLED STATE PLANE, one row per sampled position PERSIST because it is filled by an upload
+     * before the run phase issues anything. A draft round's state is bound to the verify row that
+     * follows it, not to the request, which is why it rides the sampler's own row array. */
+    if (couple_) {
+        buf_couple_ = decl("sampler.mtp_couple", RAD_U32, rows, RAD_MTP_COUPLE_STATE_WORDS,
+                           RAD_BUF_PERSIST);
+        if (!buf_couple_) return RAD_E_NOMEM;
+    }
     buf_cand_i_ = decl("sampler.cand_idx", RAD_I32, rows, ncand, RAD_BUF_TRANSIENT);
     buf_cand_v_ = decl("sampler.cand_val", RAD_F32, rows, ncand, RAD_BUF_TRANSIENT);
     if (vocab_parallel()) {
@@ -249,6 +267,22 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     op_typical_   = op_cand("sample_typical");
     op_xtc_       = op_cand("sample_xtc");
     op_pick_      = op_cand("sample_pick");
+    /* THE COUPLING'S VERIFY, over the SAME candidate plane the pick just read. A row whose state is
+     * not bound keeps the pick's token, so an uncoupled batch issues nothing and pays nothing; a
+     * coupled one pays one more launch over its candidate width, not its vocabulary. */
+    if (couple_) {
+        RadParam pc[3] = {
+            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+            RadParam{ "n_cand", RAD_P_INT, (long long)ncand, 0, nullptr },
+            RadParam{ "n_vocab", RAD_P_INT, (long long)cfg_.n_vocab, 0, nullptr },
+        };
+        op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
+        if (!op_couple_) return RAD_E_NOKERNEL;
+        /* No rad_op_reads here: the sampler's buffers are shared by ops that declare no lists
+         * (topk, topp, pick), so declaring only this one would narrow the candidate planes to
+         * its own op and the first sample_topk issue would be refused as outside their
+         * lifetime. They stay live for the whole program, as before the coupling. */
+    }
     /* The temperature kernel again, over the candidate plane: `n_vocab` is only a row length to
      * it, so the candidate width works. */
     {
@@ -308,6 +342,8 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
 int Sampler::stage_alloc() {
     const int64_t rows = rows_for(cfg_);
+    /* At most one entry per request; reserved here so a coupled step never allocates. */
+    couple_build_.seqs.reserve((size_t)cfg_.max_seqs);
 
     /* Pinned: uploaded every step, and a pageable source turns the async copy into a staged one
      * with a host bounce (spec §8). */
@@ -321,6 +357,11 @@ int Sampler::stage_alloc() {
     hist_stage_   = (int32_t*)rad_dev_alloc(rows * cfg_.max_hist * 4, RAD_MEM_HOST_PINNED);
     brk_stage_    = (uint8_t*)rad_dev_alloc(rows * cfg_.max_hist, RAD_MEM_HOST_PINNED);
     mask_stage_   = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
+    /* The coupled rows, pinned: uploaded every coupled step, and a pageable source would turn the
+     * async copy into a staged one with a host bounce (spec §8). */
+    if (couple_)
+        couple_stage_ = (RadMtpCoupleState*)rad_dev_alloc(
+            rows * (int64_t)sizeof(RadMtpCoupleState), RAD_MEM_HOST_PINNED);
 
     /* Logprobs readback; only rank 0 reads it. */
     if (cfg_.rank == 0) {
@@ -337,7 +378,7 @@ int Sampler::stage_alloc() {
     }
 
     if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
-        !mask_stage_) {
+        !mask_stage_ || (couple_ && !couple_stage_)) {
         RAD_ERR("sampler: could not pin %s of staging",
                 humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
                                mask_words_ * 4)).c_str());
@@ -354,6 +395,8 @@ void Sampler::stage_free() {
     if (hist_stage_)   rad_dev_free(hist_stage_,   RAD_MEM_HOST_PINNED);
     if (brk_stage_)    rad_dev_free(brk_stage_,    RAD_MEM_HOST_PINNED);
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
+    if (couple_stage_) rad_dev_free(couple_stage_, RAD_MEM_HOST_PINNED);
+    couple_stage_ = nullptr;
     if (lp_host_)      rad_dev_free(lp_host_,      RAD_MEM_HOST_PINNED);
     if (lp_ci_host_)   rad_dev_free(lp_ci_host_,   RAD_MEM_HOST_PINNED);
     if (lp_cv_host_)   rad_dev_free(lp_cv_host_,   RAD_MEM_HOST_PINNED);
@@ -573,7 +616,22 @@ bool Sampler::speculation_fixed(uint64_t req_id) const {
 
 /* ================================================================== the step path */
 
-int Sampler::build_step(const std::vector<Request*>& reqs) {
+/* BIND THE DRAFT'S OWN STATES. Every row must name this request and the round it belongs to: a state
+ * that arrived under another request's id, or at another round, would be coupled against a law this
+ * step never drew, and the verify would silently apply the wrong Q. */
+int Sampler::set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n) {
+    if (!couple_ || n < 0 || n > RAD_MTP_COUPLE_MAX_ROUNDS || (n && !states)) return RAD_E_STATE;
+    const auto it = seqs_.find(req_id);
+    if (it == seqs_.end()) return RAD_E_NOTFOUND;
+    for (int i = 0; i < n; ++i)
+        if (states[i].draw.seq != req_id || states[i].round != i + 1) return RAD_E_STATE;
+    SeqState& s = it->second;
+    for (int i = 0; i < n; ++i) s.couple[i] = states[i];
+    s.couple_n = n;
+    return RAD_OK;
+}
+
+int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
     if (!declared_) return RAD_E_STATE;
 
     const auto t_build = std::chrono::steady_clock::now();
@@ -581,8 +639,13 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
     n_seq_ = 0;
     any_brk_ = false;
     any_late_ = false;
+    any_couple_ = false;
     cur_stage_ = params_stage_;
     lp_rows_.clear();
+    /* The evidence snapshot this build owns; build_greedy never touches it. */
+    couple_build_.step = step;
+    couple_build_.rows = 0;
+    couple_build_.seqs.clear();
 
     /* DRY's host half for one row whose history `h[0, take)` is staged. Over the window the
      * kernel uses (the tail of the row, `dry_penalty_last_n` long when positive) it computes the
@@ -669,6 +732,35 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             if (walk && k > 0 && !dead && gr->accept_token(r->draft[k - 1]) < 0) dead = true;
             if (budget && k > 0) think.push(sp.reasoning, r->draft[k - 1]);
             const int64_t row = n_seq_++;
+            /* THE COUPLED ROW. `k` is this sampled position's index in the window, so draft row k
+             * verifies against the state the draft that produced it left behind. A row with no
+             * bound state -- the bonus row, a greedy row, an uncoupled step -- gets a zeroed one,
+             * and the verify leaves the pick's token alone. */
+            if (couple_) {
+                couple_stage_[row] = RadMtpCoupleState{};
+                const auto sit = seqs_.find(r->id);
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
+                    k < sit->second.couple_n) {
+                    const RadMtpCoupleState& c = sit->second.couple[k];
+                    /* BIND TO THIS ROW: same request and seed, the round this row's draft came
+                     * from, the position it samples, and the very token it proposes. Anything else
+                     * is a stale state from another step, and coupling against it would apply a law
+                     * this step never drew. The rule is rad_mtp_couple_binds (abi/rad_spechub.h);
+                     * its position term is rad_mtp_couple_verify_pos, the formula the engine binds
+                     * by (core/sched/mtp_couple_bind.h). */
+                    if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k, r->draft[k],
+                                             cfg_.n_vocab)) {
+                        couple_stage_[row] = c;
+                        any_couple_ = true;
+                        ++couple_build_.rows;
+                        auto& q = couple_build_.seqs;
+                        size_t j = 0;
+                        while (j < q.size() && q[j].first != r->id) ++j;
+                        if (j == q.size()) q.emplace_back(r->id, 1);
+                        else               ++q[j].second;
+                    }
+                }
+            }
 
             DeviceSampleParams& p = params_stage_[row];
             std::memset(&p, 0, sizeof p);
@@ -881,6 +973,7 @@ int Sampler::build_greedy(int64_t n) {
     n_seq_ = n;
     any_brk_ = false;
     any_late_ = false;
+    any_couple_ = false;
     cur_stage_ = greedy_stage_;
     if (greedy_ready_) return RAD_OK;
     for (int64_t i = 0; i < cap; ++i) {
@@ -951,6 +1044,9 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (any_mask)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_mask_), mask_stage_,
                                  n_seq_ * mask_words_ * 4, s));
+    if (any_couple_)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_couple_), couple_stage_,
+                                 n_seq_ * (int64_t)sizeof(RadMtpCoupleState), s));
 
     const RadOperand o_logits = opd_rows(logits, n_seq_);
     const RadOperand o_params = opd_rows(buf_params_, n_seq_);
@@ -1027,6 +1123,14 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         RAD_TRY(issue(op_temp_late_, { o_cv, opd_rows(buf_params_late_, n_seq_) }));
 
     RAD_TRY(issue(op_pick_, { o_ci, o_cv, o_params, o_tok }));
+    /* AFTER the pick, over the same plane: a coupled row replaces the pick's token with the
+     * coupling's, and an unbound row leaves it. The issue is what the evidence line reads: the op
+     * and the build step it belongs to are recorded together, so a staged row set is never
+     * mistaken for an issued verify. */
+    if (any_couple_) {
+        RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
+        couple_issued_step_ = couple_build_.step;
+    }
 
     /* Copy the logprobs rows to the host behind the pick, on rank 0 only (collect_step asks
      * it): the summary and the candidate planes, which logprobs_for reads when the summary lacks
