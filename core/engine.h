@@ -394,6 +394,11 @@ private:
     std::vector<Scheduler::SerialRow> serial_row_;
     std::vector<int32_t> serial_k_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
+    /* Whether round 0 -- the history pass -- is confirmed to have run on every participating rank,
+     * which is what serial_end's `history_ran` asks for. The step's one wait fences rank 0's
+     * stream only, so a multi-rank engine reports false and pays a repeated history pass rather
+     * than moving a watermark nobody executed. */
+    bool serial_hist_ran_ = false;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
     int  step_state_init();

@@ -125,6 +125,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    serial_hist_ran_ = false;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -230,6 +231,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             serial_k_[(size_t)i] = rd == 0 ? 1 : rd;
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
+        /* Round 0 is the history pass. Its watermark may move only once it has run on every
+         * participating rank, and the host can only confirm rank 0: collect_step's one wait
+         * fences step_end_, recorded on rank 0's stream after these passes, while another rank's
+         * stream is never waited on here. A second rank therefore leaves the word false, which
+         * costs a repeated history pass and no watermark (scheduler.cpp). */
+        if (rd == 0) serial_hist_ran_ = ranks_.size() == 1;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
@@ -264,16 +271,15 @@ namespace {
  * after the last set_draft: the hold is what keeps reap() from dropping a row between the cycle
  * and its publication. A refused cycle ends it here instead of leaving that to
  * Scheduler::shutdown, and does so with 0 rounds, which suppresses the draft rows' verified
- * positions -- the cycle's work is thrown away. It does not suppress a history-only row:
- * serial_end counts one wherever rounds_done is (counts = m.dev ? ... : true), i.e. it assumes the
- * history pass ran. That holds here, where the cycle has rows (issue refuses a nullptr batch), and
- * is the scheduler's to prove for a cycle that had none. */
+ * positions -- the cycle's work is thrown away -- while a history-only row still moves if round 0
+ * really ran (`history_ran`, which the driver sets only on proof). */
 struct SerialHold {
     Scheduler& sched;
+    const bool hist_ran;
     bool held = true;
-    explicit SerialHold(Scheduler& s) : sched(s) {}
-    ~SerialHold() { if (held) sched.serial_end(0); }
-    void release(int rounds) { held = false; sched.serial_end(rounds); }
+    SerialHold(Scheduler& s, bool h) : sched(s), hist_ran(h) {}
+    ~SerialHold() { if (held) sched.serial_end(0, hist_ran); }
+    void release(int rounds) { held = false; sched.serial_end(rounds, hist_ran); }
 };
 
 /* The block host driver's snapshot, armed once the context pass has run: block_end() moves the
@@ -294,7 +300,7 @@ struct BlockHold {
  * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
-    SerialHold hold(sched_);
+    SerialHold hold(sched_, serial_hist_ran_);
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
