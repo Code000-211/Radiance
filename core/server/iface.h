@@ -107,6 +107,14 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     double  draft_depth_adaptive = 0.0;
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
+    /* The cost policy's observation ledger (rad::SchedMetrics::draft_obs_*), cumulative. The
+     * first three count observation ROWS -- one per draft row of a delivered cycle, so a wider
+     * window contributes more of them -- and the last counts whole CYCLES dropped before
+     * delivery. The two units are not a sum. */
+    int64_t draft_obs_rows_attempted = 0;
+    int64_t draft_obs_rows_applied = 0;
+    int64_t draft_obs_rows_skipped = 0;
+    int64_t draft_obs_cycles_discarded = 0;
     int64_t preemptions = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step

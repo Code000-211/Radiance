@@ -149,6 +149,9 @@ private:
     /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
     Counter c_draft_refills_, c_draft_refill_tokens_;
+    /* The draft-observation delivery ledger; rows and cycles are separate units, see render(). */
+    Counter c_draft_obs_rows_attempted_, c_draft_obs_rows_applied_, c_draft_obs_rows_skipped_;
+    Counter c_draft_obs_cycles_discarded_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;

@@ -182,6 +182,12 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_accepted_.advance_to(m.draft_accepted);
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
+    /* The observation ledger, cumulative in the scheduler like the rest. Rows and cycles are
+     * different units; they are never summed. */
+    c_draft_obs_rows_attempted_.advance_to(m.draft_obs_rows_attempted);
+    c_draft_obs_rows_applied_.advance_to(m.draft_obs_rows_applied);
+    c_draft_obs_rows_skipped_.advance_to(m.draft_obs_rows_skipped);
+    c_draft_obs_cycles_discarded_.advance_to(m.draft_obs_cycles_discarded);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_checkpoints_.advance_to(m.checkpoints_written);
@@ -404,6 +410,24 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_refill_tokens_total",
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
+
+    /* The adaptive-window observation ledger. The names carry the unit because the two do not
+     * mix: the first three count rows of a delivered cycle (a wider window contributes more
+     * rows), the last counts whole cycles dropped before they delivered anything. A rising
+     * `attempted` with `applied` flat is a policy whose rows teach nothing; a non-zero
+     * `discarded` is evidence lost before it taught, which no row counter can show. */
+    w.counter("radiance:draft_observation_rows_attempted_total",
+              "Draft-observation rows offered to the predictor: one per row of a delivered "
+              "cycle, not one per cycle.", L, c_draft_obs_rows_attempted_.get());
+    w.counter("radiance:draft_observation_rows_applied_total",
+              "Draft-observation rows whose labels moved a request's window estimate.",
+              L, c_draft_obs_rows_applied_.get());
+    w.counter("radiance:draft_observation_rows_skipped_total",
+              "Draft-observation rows that taught nothing: no teachable label, or a recycled "
+              "(request, slot) identity.", L, c_draft_obs_rows_skipped_.get());
+    w.counter("radiance:draft_observation_cycles_discarded_total",
+              "Draft-observation cycles dropped before delivery, incomplete or refused: whole "
+              "cycles, not rows.", L, c_draft_obs_cycles_discarded_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not
