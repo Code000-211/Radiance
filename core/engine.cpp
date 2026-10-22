@@ -491,6 +491,9 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+        /* StepOut outlives the step (it is the loop's), so last step's completion must not be
+         * readable as this one's before any wait has run. */
+        so.complete = false;
         if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
@@ -887,6 +890,7 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     so.eos.assign(plan.e.size(), 1);
     if (plan.e.empty()) return RAD_OK;
     RAD_TRY(await_step_end());
+    so.complete = true;
     if ((int64_t)plan.e.size() != (int64_t)b->n_seq) {
         RAD_ERR("an embedding step planned %zu sequences and its batch carries %lld",
                 plan.e.size(), (long long)b->n_seq);
@@ -994,14 +998,22 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
-    /* A step with no sampled rows has nothing to read back, so the host does not wait here and can
-     * run ahead. That is not completion evidence: a caller that advances state on this path -- a
-     * history-only pass, a water level -- must call await_step_end() itself first. */
-    if (so.n_rows <= 0) return RAD_OK;
+    /* A step with no sampled rows has nothing to read back, so the host does not wait for a readback
+     * here and can run ahead. That is not completion evidence, and a history-only or mid-prompt
+     * pass still has to be proven before anything advances on it -- so wait when the step actually
+     * issued one, and only then. A pure prefill step issues no draft pass and keeps running ahead.
+     * Either way the fact is `so.complete`, never the row count or the batch pointer. */
+    if (so.n_rows <= 0) {
+        if (!serial_hist_issued_) return RAD_OK;
+        RAD_TRY(await_step_end());
+        so.complete = true;
+        return RAD_OK;
+    }
 
     so.rows.resize((size_t)so.n_rows);
     /* Wait on the step-end events, not the streams: a step issued ahead is queued behind them. */
     RAD_TRY(await_step_end());
+    so.complete = true;
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());

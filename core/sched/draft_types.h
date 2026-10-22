@@ -368,7 +368,12 @@ struct DraftSeqObservation {
     uint8_t  published = 0;  /* tokens actually published to the proposal buffer */
     uint8_t  verified = 0;   /* draft positions the target computed (never the bonus token) */
     uint8_t  checked = 0;    /* positions with a label: accepted prefix plus the first rejection */
-    uint8_t  accepted = 0;   /* drafts committed (the emitted prefix) */
+    /* Drafts the step committed, i.e. the drafts whose token the target accepted. Not the number
+     * of tokens the step emitted: the emitted prefix is those drafts plus the target's own token at
+     * the next position, which is a draft too when `accepted == verified` and the end-of-generation
+     * cut otherwise. So a step emits `accepted + 1` tokens, and reading `accepted` as a token count
+     * understates every step by one. */
+    uint8_t  accepted = 0;
     DraftSeqEnd end = DraftSeqEnd::Unset;
     DraftOrigin origin = DraftOrigin::None;
     DraftCensor censor = DraftCensor::None;

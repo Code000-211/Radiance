@@ -75,11 +75,15 @@ prediction and sample.
   each rank's *enqueue*, and `step_end_` is a card-local event recorded on rank 0: neither says
   another rank's stream has finished. `Engine::await_step_end()` is therefore the step's one
   completion point -- it waits on rank 0's event and on every other rank's own end event, all
-  recorded at the same place, before the step issued ahead -- and `collect_step` uses it wherever
-  it already waits. The no-rows path keeps its run-ahead and proves nothing: a caller that
-  advances state there (a history-only pass, a water level) calls `await_step_end()` itself
-  first. A water level advances only past work whose completion this evidence covers; a failed,
-  rejected or history-only batch has a distinct outcome from a completed one and never advances it.
+  recorded at the same place, before the step issued ahead. `collect_step` uses it wherever it
+  already waits and, on the no-rows path, waits whenever the step issued a history pass: a
+  row-less pass is enqueued but read back by nothing, so returning without that wait would leave
+  "no row to collect" indistinguishable from "the pass completed". A step that owes no pass keeps
+  its run-ahead. The outcome is one flag, `StepOut::complete` -- set only after the wait, cleared
+  when the next step is prepared, and never set when the wait fails -- so a driver reads
+  `history_ran = serial_hist_issued_ && so.complete` and never derives completion from `n_rows`, a
+  non-null batch, a single rank or an enqueue. A failed, rejected or history-only batch has a
+  distinct outcome from a completed one and never advances a water level.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
   handed came from the plan they name — the observation carries both the identity arrays and the
@@ -130,7 +134,11 @@ prediction and sample.
   `max_tokens`, cancellation and the context end remain the `DraftCensor` reason; a censor does not
   erase a rejection measured before it. Raw match length, commit length, and the censor reason are
   separate fields, which is what lets F assert a correctly hit but uncommitted EOG without
-  inventing a reject label. The tally is still bounded where it protects a label:
+  inventing a reject label. `accepted` is the committed draft count, not the emitted token count:
+  the step emits those drafts plus the target's own token at the next position (`accepted + 1`
+  tokens), which is the EOG when the cut hits one. Reading `accepted` as an emitted length
+  understates every step by one and makes a hit EOG look like a lost token. The tally is still
+  bounded where it protects a label:
   `draft_seq_observation_valid` requires `raw_match == accepted` for `Rejected` (otherwise the 0 at
   `accepted` would deny a token the drafter got right) and for `AllAccepted` (the row claims all it
   checked was committed), and `raw_match <= verified` always -- the paired verify window, not this
@@ -288,6 +296,15 @@ refused by name, not reinterpreted under the current keys.
   distributions are the same execution, and a shape carrying an `unknown` dimension.
 - **`ctx_class`.** 0 = below 4K, 1 = 4K–32K, 2 = 32K–128K, 3 = 128K and above
   (`draft_ctx_class`). Profiles only carry the classes the configured capacity can reach.
+- **Finite table, exact keys.** The table has a fixed capacity and neither grows nor evicts: a shape
+  that finds no room is dropped and counted, which the policy sees as a missing bucket and prices
+  through the fallback, never as a fabricated number. Admission may be made stricter to protect
+  those finite slots from one-off shapes, but only by refusing to admit a shape -- never by
+  coarsening the key. `ctx_class` buckets the context length alone; `history_tokens` and
+  `prefill_tokens` are compared exactly, as `anchor_class_matches` now does (A, `2c1a01d`). Two
+  prompts carrying a different amount of history or prefill did a different amount of work, and
+  filing them as one bucket makes one of them a bound on another measurement. Prefill work is the
+  tokens actually processed, not the prompt's cap.
 - **Coverage and uncertainty.** Each bucket carries its sample count and uncertainty. A missing
   bucket is priced by one documented interpolation step (a neighbouring context class or the
   documented N_j scaling) with `DraftCostSource::Interpolated` and the propagated uncertainty;
@@ -397,10 +414,11 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
 
 - The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
   pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
-  CEST, last artifact of that run 02:17:52). `e0a053c` and `9bc94cd` add checks and are
-  **unexecuted** -- the tree now carries 369/29, none of them run. The run rebuilt 17 objects on
-  the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the older libavx
-  objects are not part of these binaries.
+  CEST, last artifact of that run 02:17:52). `e0a053c`, `9bc94cd` and `8c91876`, and the
+  completion/bench change after them, add checks and are **unexecuted** -- the tree now carries
+  369/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
+  objects on the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the
+  older libavx objects are not part of these binaries.
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
   baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
   five failures below fail on both.

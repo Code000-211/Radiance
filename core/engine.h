@@ -245,6 +245,13 @@ private:
         /* Leading logits rows the sampler reads. RadBatch::n_out also counts the KL mode's scored
          * rows after them (Request::score). */
         int32_t               n_rows = 0;
+        /* This step's work on every rank has provably finished: the host waited on all of this
+         * step's end events. Set only after that wait, cleared when the next step is prepared, so
+         * a step issued ahead reads false while its wait is still pending. A failed wait returns
+         * the error and never sets it. It is the only completion fact the step carries; a non-null
+         * batch, a positive n_rows or a single rank are not substitutes, because a pass with no
+         * sampled row is enqueued but never waited on by collect_step's readback path. */
+        bool                  complete = false;
         std::vector<int32_t>  rows;       /* [n_out] the device's answer, copied back */
         int32_t*              rb = nullptr;   /* the pinned readback collect_issue filled */
         std::vector<float>    lg;         /* the first row's logits, at -vv */
@@ -396,6 +403,11 @@ private:
      * asked for, and the rounds that ran. */
     std::vector<Scheduler::SerialRow> serial_row_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
+    /* A history pass (serial round 0) was built and enqueued for the current step. It is the
+     * engine's own record of what it issued, not a claim that anything ran: the pass proves itself
+     * only through StepOut::complete. Cleared at every issue_serial_drafter, so a previous step's
+     * history pass cannot be read as this one's. */
+    bool serial_hist_issued_ = false;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
     int  step_state_init();
