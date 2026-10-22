@@ -1691,6 +1691,53 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
 }
 
+/* The turnover slots are part of the start placement. A production balance keeps them free for
+ * swaps and calls the loan settled that way, so serve()'s complete_start_fill() holds turnover and
+ * repeats the balance: the second wave covers the reserve. Both waves are at zero dispatches, so
+ * the whole lent range is the plan's own slots; left to the first steps, the reserve would fill at
+ * heat and every such promotion would be a move away from the profile's identity. */
+TEST(the_start_fill_includes_the_turnover_slots) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_EQ(r.m.turnover_slots(), (int64_t)2);
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    const int64_t slots = r.m.flex_capacity() / stride;
+    const int64_t expect = std::min<int64_t>(slots, r.pooled());
+    CHECK(r.pooled() > slots);
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+
+    /* Wave one: the production balance reserves the two turnover slots and issues the rest. */
+    CHECK_OK(r.m.idle_tick(&r.h));
+    int64_t issued = 0;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) if (r.h.busy(u)) ++issued;
+    CHECK_EQ(issued, slots - 2);
+    for (Deadline dl; !r.m.fill_settled() && !dl.passed();) {
+        rad_stream_sync(r.m.transfer_stream());
+        CHECK_OK(r.m.idle_tick(&r.h));
+    }
+    /* Settled with the reserve still empty: the mover's own answer does not ask for the turnover
+     * slots, so the startup fill cannot stop at this call. */
+    CHECK(r.m.fill_settled());
+    CHECK_EQ((int64_t)r.h.stats().promotions, slots - 2);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 2) * stride);
+
+    /* Wave two: complete_start_fill holds turnover and repeats; the reserve is filled too. */
+    r.m.hold_turnover(true);
+    CHECK_OK(r.m.idle_tick(&r.h));
+    for (Deadline dl; !r.m.fill_settled() && !dl.passed();) {
+        rad_stream_sync(r.m.transfer_stream());
+        CHECK_OK(r.m.idle_tick(&r.h));
+    }
+    CHECK(r.m.fill_settled());
+    /* The whole lent range, reserve included, and all of it initial. */
+    CHECK_EQ(r.m.flex_used_bytes(), expect * stride);
+    CHECK_EQ(resident_count(r.h, r.hf.plan), r.planned + (int32_t)expect);
+    CHECK_EQ(r.h.stats().fill_promotions, r.h.stats().promotions);
+    CHECK_EQ(r.h.stats().initial_fill_promotions, r.h.stats().promotions);
+    CHECK_EQ(r.h.stats().moves(r.h.stats().initial_fill_promotions), (int64_t)0);
+}
+
 /* The cost profile's drift baseline is taken when the loop starts; a dynamic plan's first fill is
  * issued there and its copies retire over the dispatches after it. That is the start placement
  * being materialised into memory the plan lent -- not a move away from it -- so the count the

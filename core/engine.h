@@ -382,6 +382,12 @@ private:
      * step_finished, so a move between two brackets would otherwise never reach the bracket
      * measured after it. Compared against draft_moves_baseline_. */
     int64_t residency_moves() const;
+    /* The promotions of one rank's snapshot `initial` that the move count leaves out as its share
+     * of the start placement's fill: the live initial fill promotions while the resolve is open,
+     * and the count frozen at settle_start_placement after it. One rule for residency_moves, the
+     * step's snapshot and the bracket's own count, so a fill that lands after the resolve is a move
+     * in all three. */
+    int64_t rank_fill_exempt(const Rank& r, uint64_t initial) const;
     /* Whether every rank's fill has nothing left to issue and no copy still landing -- the start
      * placement is materialised. True from the start for a plan that never fills. */
     bool start_placement_settled() const;
@@ -389,6 +395,12 @@ private:
      * it. Not a baseline reset: the non-fill moves stay counted, and a drift already noted stays
      * noted (Scheduler::draft_drift_note). */
     void settle_start_placement();
+    /* Complete the start loan's fill before anything is measured: the production balance keeps the
+     * turnover slots free and calls the loan settled that way, so they are only filled while
+     * turnover is held, and a wave cut short (a drain before the fill, records still held by moves
+     * in flight) repeats. Every wave lands at zero dispatches, where each promotion is the plan's
+     * own lent slot, not a later heat decision. See serve()'s call. */
+    void complete_start_fill();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */
@@ -468,11 +480,10 @@ private:
     /* residency_moves() when the run started: the profile's fingerprint names the residency at
      * that point, so every later bracket is measured against it (DraftStepEvidence). */
     int64_t draft_moves_baseline_ = 0;
-    /* The start placement's resolve (one-way), and how many of residency_moves()' promotions it
-     * accounted for when it resolved. Before the resolve every initial fill promotion is exempt;
-     * after it the count is frozen, so a fill issued later is a move. */
-    bool    draft_placement_resolved_ = true;
-    int64_t draft_fill_exempt_ = 0;
+    /* The start placement's resolve (one-way). Before it every initial fill promotion is exempt;
+     * after it each rank's count is frozen (Rank::fill_exempt), so a fill issued later is a move.
+     * Atomic: the step loop settles it while a rank thread may still be noting its own step. */
+    std::atomic<bool> draft_placement_resolved_{true};
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round

@@ -413,8 +413,8 @@ void Engine::rank_loop(int index) {
                 const HeatStats hs = r.heat.stats();
                 /* The same count prepare_release snapshots: a bracket in which the initial fill
                  * retires is the start placement being materialised, not left, so it is not
-                 * stamped `moved` either (HeatStats::moves, Engine::residency_moves). */
-                int64_t moves = hs.moves((int64_t)hs.initial_fill_promotions) + injected;
+                 * stamped `moved` either (HeatStats::moves, Engine::rank_fill_exempt). */
+                int64_t moves = hs.moves(rank_fill_exempt(r, hs.initial_fill_promotions)) + injected;
                 r.note_evidence(rec, r.ctx.last_pass_tape(), moves > moves_before);
             }
 
@@ -446,21 +446,23 @@ bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
     return known;
 }
 
-int64_t Engine::residency_moves() const {
-    int64_t promotions = 0, demotions = 0, initial = 0;
-    for (const auto& r : ranks_) {
-        const HeatStats hs = r->heat.stats();
-        promotions += (int64_t)hs.promotions;
-        demotions  += (int64_t)hs.demotions;
-        initial    += (int64_t)hs.initial_fill_promotions;
-    }
+int64_t Engine::rank_fill_exempt(const Rank& r, uint64_t initial) const {
     /* A fill before the first observation is the plan's own free lent slots -- zero heat, so by
      * layer -- being materialised into memory the plan left free: the start placement being
-     * reached, not left. Every other promotion and every demotion is a move, and so is any fill
-     * once the start placement is resolved (the exemption is frozen at settle_start_placement).
-     * Nothing here is re-baselined: a move before the resolve keeps counting. */
-    const int64_t exempt = draft_placement_resolved_ ? draft_fill_exempt_ : initial;
-    int64_t moves = promotions - exempt + demotions;
+     * reached, not left. Once the resolve closes, each rank's count is frozen there
+     * (settle_start_placement), so a fill issued later is a move. Nothing is re-baselined: a move
+     * before the resolve keeps counting. */
+    return draft_placement_resolved_.load(std::memory_order_relaxed)
+               ? r.fill_exempt.load(std::memory_order_relaxed)
+               : (int64_t)initial;
+}
+
+int64_t Engine::residency_moves() const {
+    int64_t moves = 0;
+    for (const auto& r : ranks_) {
+        const HeatStats hs = r->heat.stats();
+        moves += hs.moves(rank_fill_exempt(*r, hs.initial_fill_promotions));
+    }
 #ifdef RAD_TEST_HOOKS
     moves += rad_test_residency_moves();
 #endif
@@ -477,14 +479,44 @@ bool Engine::start_placement_settled() const {
 }
 
 void Engine::settle_start_placement() {
-    draft_placement_resolved_ = true;
-    draft_fill_exempt_ = 0;
+    draft_placement_resolved_.store(true, std::memory_order_relaxed);
     for (const auto& r : ranks_)
-        draft_fill_exempt_ += (int64_t)r->heat.stats().initial_fill_promotions;
+        r->fill_exempt.store((int64_t)r->heat.stats().initial_fill_promotions,
+                             std::memory_order_relaxed);
     /* The loaded profile is a measurement of the residency that is now in place; from here on a
      * cycle may be priced by it. Nothing was priced before. */
     const auto lk = sched_.hold();
     sched_.draft_costs().hold_prices(false);
+}
+
+void Engine::complete_start_fill() {
+    /* One idle tick is one wave. The production balance keeps the turnover slots free and calls
+     * the loan settled that way, so with turnover held the same call fills the reserve; a wave a
+     * drain cut short, or one whose records moves in flight still hold, repeats. Serve completes
+     * that here, at zero dispatches and before the first observation, so every promotion is the
+     * plan's own lent slot (HeatStats::initial_fill_promotions) and the residency the profile is
+     * bound to is the materialised one. Left for a later step the reserve would be a heat decision
+     * and read as a move (Mover::balance). Bounded: a fill that still cannot settle is left to the
+     * loop's resolve, which keeps the prices held until it can. */
+    constexpr int kWaves = 256;
+    for (auto& r : ranks_) {
+        if (rad_dev_set(r->device) < 0) continue;
+        r->mover.hold_turnover(true);
+        int wave = 0;
+        for (; wave < kWaves && !r->mover.fill_settled(); ++wave) {
+            (void)rad_stream_sync(r->mover.transfer_stream());
+            const int st = r->mover.idle_tick(&r->heat);
+            if (st < 0) {
+                RAD_WARN("rank %d: completing the start placement's fill: %s", r->index,
+                         rad_strerror(st));
+                break;
+            }
+        }
+        if (!r->mover.fill_settled())
+            RAD_WARN("rank %d: the start placement's fill did not settle in %d waves; a cost run "
+                     "stays unpriced until it does", r->index, kWaves);
+    }
+    if (!ranks_.empty()) (void)rad_dev_set(ranks_[0]->device);
 }
 
 int Engine::prepare_release(const RadBatch* b) {
@@ -493,7 +525,7 @@ int Engine::prepare_release(const RadBatch* b) {
      * so a later step's reclaim cannot stand in for this one. */
     for (auto& rk : ranks_) {
         const HeatStats hs = rk->heat.stats();
-        rk->ev_moves_before = hs.moves((int64_t)hs.initial_fill_promotions);
+        rk->ev_moves_before = hs.moves(rank_fill_exempt(*rk, hs.initial_fill_promotions));
     }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
@@ -570,9 +602,8 @@ int Engine::step_loop() {
      * (residency_moves), so it may retire after this baseline without reading as a move. A plan
      * that fills nothing is settled here; one that does stays unresolved -- and unpriced -- until
      * its fill has landed (settle_start_placement). */
-    draft_placement_resolved_ = start_placement_settled();
-    draft_fill_exempt_ = 0;
-    if (draft_placement_resolved_) {
+    draft_placement_resolved_.store(start_placement_settled(), std::memory_order_relaxed);
+    if (draft_placement_resolved_.load(std::memory_order_relaxed)) {
         settle_start_placement();
     } else {
         const auto lk = sched_.hold();
@@ -643,7 +674,9 @@ int Engine::step_loop() {
              * every copy it issued has retired. Only here, where no bracket is open: a resolve
              * that flipped inside a bracket would stamp that bracket with a placement it ran
              * without, and the evidence is consumed brackets later. */
-            if (!draft_placement_resolved_ && start_placement_settled()) settle_start_placement();
+            if (!draft_placement_resolved_.load(std::memory_order_relaxed) &&
+                start_placement_settled())
+                settle_start_placement();
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -1001,7 +1034,7 @@ int Engine::step_loop() {
          * the scheduler's own ticks made between two brackets still reaches the bracket measured
          * after it. Fills are not moves (residency_moves). */
         ev.moves_since_bind = residency_moves() - draft_moves_baseline_;
-        ev.placement_unresolved = !draft_placement_resolved_;
+        ev.placement_unresolved = !draft_placement_resolved_.load(std::memory_order_relaxed);
 #ifdef RAD_TEST_HOOKS
         rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,
                                (int)ev.moved);
@@ -1014,6 +1047,14 @@ int Engine::step_loop() {
         expire_tick(now);
         drain_completed();
         sched_.publish(/*idle=*/false);
+        /* A run under continuous load may never reach the idle branch above, so the resolve is
+         * read here too: this bracket is closed (step_finished consumed its evidence) and the
+         * rank threads are parked, so the next one opens on the placement the resolve names.
+         * Without this, a fill that landed under load would keep the prices held for as long as
+         * requests kept arriving. */
+        if (!draft_placement_resolved_.load(std::memory_order_relaxed) &&
+            start_placement_settled())
+            settle_start_placement();
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
          * shows up in `collect`, the step's only host synchronisation. */
@@ -2088,6 +2129,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * names this loan and the slots it covers -- the two facts that make the fill a function of
      * the identity. */
     loan_tick(/*idle=*/true);
+    /* Complete the fill before anything is measured. The identity derived below and the profile
+     * read against it name the residency this materialises; a wave left for later would land at
+     * heat, after the first observation, and be a move away from that identity. Only a run bound
+     * to an identity has that stake; a legacy run keeps its startup behaviour. */
+    if (cfg_.draft_policy == DraftPolicyKind::Cost || !cfg_.draft_profile.empty() ||
+        !cfg_.draft_profile_out.empty())
+        complete_start_fill();
     /* Validated before any path starts serving: a calibration run that cannot export must say so
      * now, not after a complete run. */
     RAD_TRY(begin_draft_calibration());

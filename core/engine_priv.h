@@ -96,6 +96,10 @@ struct Engine::Rank {
     /* Promotions + demotions on this rank when prepare_release armed the step, so the rank thread
      * can bound `moved` to that step's window (arena reclaim runs on the scheduler thread). */
     int64_t  ev_moves_before = 0;
+    /* initial_fill_promotions on this rank when the start placement resolved; a fill after that is
+     * a move (Engine::rank_fill_exempt). Atomic: the step loop freezes it while a rank thread may
+     * still be noting its own step. */
+    std::atomic<int64_t> fill_exempt{0};
     void note_evidence(const Ctx::StepEvidence& e, uint8_t pass_tape, bool moved) {
         if (e.step < 0) return;
         StepSnap& s = ev[(uint32_t)e.step & 3u];

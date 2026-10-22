@@ -292,23 +292,33 @@ prediction and sample.
   a placement it ran without: until the resolve, every record carries
   `DraftStepEvidence::placement_unresolved` and is marked, and `DraftCostTable::hold_prices` makes
   `estimate()` answer nothing, so the run executes its named baseline instead of pricing a
-  residency it has not reached. That mark is per bracket, not sticky -- the first clean bracket
-  after the fill has landed is a measurement of the start placement again.
+  residency it has not reached. The idle branch is not the only read: a run under continuous load
+  may never take it, so `step_loop` reads the same predicate again after `publish(false)`, when the
+  bracket is closed and the rank threads are parked -- otherwise a fill that landed under load
+  would keep the prices held for as long as requests kept arriving. That mark is per bracket, not
+  sticky -- the first clean bracket after the fill has landed is a measurement of the start
+  placement again.
 - **The initial fill is provably the plan's, not a heat decision.** `Mover::fill()` marks a
   promotion `initial` when it is issued before the first observation (`HeatStats::
   initial_fill_promotions`); at zero dispatches every heat is zero, so the units are taken by layer
   and the amount is a function of the plan and the lent slots. The loan that bounds it is settled
-  before serving (`Engine::serve` runs one `loan_tick` with the cache still empty), so the first
-  fill is issued there, not after the first step -- an engine that idled only under load would
-  otherwise fill by heat and call it initial. The fingerprint names the loan and the slots it
-  covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A
+  before serving, and the fill is completed there: `Engine::serve` runs one `loan_tick` with the
+  cache still empty and then `Engine::complete_start_fill`, which holds turnover -- the production
+  balance keeps those slots free and calls the loan settled that way -- and repeats the balance
+  until `Mover::fill_settled()`. Every wave stays at zero dispatches, so the reserve is
+  materialised as part of the start placement instead of being filled by heat in the first steps.
+  The mover sizes one record per lent slot (`Mover::lend_from`), so the wave split is the reserve,
+  or a wave a drain cut short, not record exhaustion. The fingerprint names the loan and the slots
+  it covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A
   fill issued after one observation, or any fill after the resolve (a loan growing again), is not
-  initial: `Engine::residency_moves()` exempts the initial promotions only up to the count frozen
-  at the resolve, so a later fill counts as a move even though it promotes rather than evicts.
-  There is no re-baselining: a move made before the resolve keeps counting. That covers every way
-  a lent slot changes hands after the start placement: a loan that grows back after a shrink, a
-  loan that follows freed KV blocks, and a donor a migration moved out of a lent slot -- the slot
-  it freed is refilled by a later `Mover::fill`, whose promotions are no longer initial.
+  initial: `Engine::residency_moves()` exempts the initial promotions only up to the per-rank count
+  frozen at the resolve (`Engine::rank_fill_exempt`), so a later fill counts as a move even though
+  it promotes rather than evicts. The same rule feeds the step's own snapshot and the bracket's
+  count, so a fill that lands after the resolve is a move in all three. There is no re-baselining:
+  a move made before the resolve keeps counting. That covers every way a lent slot changes hands
+  after the start placement: a loan that grows back after a shrink, a loan that follows freed KV
+  blocks, and a donor a migration moved out of a lent slot -- the slot it freed is refilled by a
+  later `Mover::fill`, whose promotions are no longer initial.
 - **Both abort gates distinguish a calibration.** In the online policy a divergence deactivates
   the loaded table (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's
   start placement"): it stops pricing and stops learning, and it does not `admit_fallback()` --
