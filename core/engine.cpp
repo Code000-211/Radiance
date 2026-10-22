@@ -1522,14 +1522,37 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+namespace {
+/* FNV-1a over the plan's tier/site per weight: two runs that resolved the same strategy and the
+ * same budgets but keep a different set of experts resident are different deployments, and the
+ * strategy name alone would not tell them apart. Index 0 is the sentinel. */
+uint64_t plan_residency_digest(const Plan& p) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 1; i < p.weight.size(); ++i) {
+        const uint8_t b[2] = { (uint8_t)p.weight[i].tier, (uint8_t)p.weight[i].site };
+        for (uint8_t x : b) {
+            h ^= x;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+}  /* namespace */
+
 int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
     if (!out) return RAD_E_INVAL;
+    if (ranks_.empty()) {
+        RAD_ERR("draft cost runtime: no rank has been planned, so this deployment has no "
+                "identity a cost profile could be bound to");
+        return RAD_E_STATE;
+    }
     DraftCostFingerprint& fp = out->fingerprint;
     /* Every field is what this deployment is, not what a flag asked for: the profile is refused
      * on any difference (DraftCostTable::configure names the first). The gpus string is the
-     * ranks' device names and arch ids in order; kernels is the loaded libraries, the arch plugin
-     * and the device arch; the model name falls back to the container's arch id where a container
-     * carries no model_name (the checkpoint path already does the same). */
+     * ranks' devices in order -- product name, arch and the equipment a same-named SKU can
+     * differ in; kernels is the loaded libraries, the arch plugin and the device arch; the model
+     * name falls back to the container's arch id where a container carries no model_name (the
+     * checkpoint path already does the same). */
     fp.model   = meta_.name ? meta_.name : "";
     if (fp.model.empty() && meta_.arch_id) fp.model = meta_.arch_id;
     fp.quant   = meta_.quant && *meta_.quant ? meta_.quant : "bf16";
@@ -1545,10 +1568,13 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
             RAD_ERR("draft cost runtime: device %d: %s", rk->device, rad_dev_last_error());
             return prc;
         }
-        /* The product name alone collides across steppings; the arch id does not (rad_device.h). */
-        gpus.push_back(p.arch[0] ? std::string(p.name) + " (" + p.arch + ")"
-                                 : std::string(p.name));
-        if (arch.empty()) arch = p.arch;
+        /* The product name alone collides across SKUs and steppings; the arch id and the
+         * equipment do not (rad_device.h names the name field "for logs and the tuning cache"). */
+        std::string g = p.name;
+        if (p.arch[0]) { g += " ("; g += p.arch; g += ")"; }
+        g += fmt(" dev=%d cu=%d vram=%lld", p.device_id, p.n_cu, (long long)p.vram_bytes);
+        gpus.push_back(std::move(g));
+        if (arch.empty()) arch = p.arch[0] ? p.arch : "";
     }
     fp.gpus      = draft_cost_gpus(gpus);
     /* The arch plugin is part of the kernel identity: two plugins over the same kernel libraries
@@ -1561,7 +1587,28 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
     }
     if (!arch.empty()) fp.kernels += " " + arch;
     fp.kv_format = cfg_.kv_cache_dtype;
-    fp.placement = cfg_.placement;
+
+    /* `placement` is the resolved plan, not the flag: `auto` resolves against a budget that
+     * depends on the free VRAM at this start (place/planner.cpp, mem/vram_budget.cpp), so two
+     * runs asking for `auto` can land on different strategies and different expert residency.
+     * Each rank contributes its strategy, its resolved budgets and a digest of its residency. A
+     * rank whose plan is still `auto` -- or has no weights -- makes the identity unknowable; the
+     * profile is refused then rather than matched against a guess. */
+    std::string placement;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const Plan& pl = ranks_[i]->plan;
+        if (pl.strategy == Strategy::Auto || pl.weight.size() <= 1) {
+            RAD_ERR("draft cost runtime: rank %zu has no resolved placement plan, so a cost "
+                    "profile cannot be bound to it", i);
+            return RAD_E_STATE;
+        }
+        if (!placement.empty()) placement += ';';
+        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx",
+                         strategy_name(pl.strategy), (long long)pl.vram_budget,
+                         (long long)pl.host_budget, (long long)pl.file_stage_reserve,
+                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl));
+    }
+    fp.placement = std::move(placement);
 
     /* The backend's round model, not this cycle's distribution: the serial head runs one round per
      * row, so it is shrinking even when a cycle's K are uniform. A block drafter, no drafter, or
@@ -1571,7 +1618,7 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
     return RAD_OK;
 }
 
-int Engine::load_draft_cost_profile() {
+int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
     if (cfg_.draft_profile.empty()) return RAD_OK;
     DraftCostProfile profile;
     std::string err;
@@ -1582,8 +1629,6 @@ int Engine::load_draft_cost_profile() {
         return rc;
     }
 
-    DraftCostRuntime runtime;
-    RAD_TRY(draft_cost_runtime(&runtime));
     RAD_TRY(sched_.draft_costs().configure(profile, runtime));
 
     if (!sched_.draft_costs().active())
@@ -1670,6 +1715,18 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
+    /* The profile flags configure speculative decoding's cost table. A generator or an embedding
+     * model never initialises the scheduler that owns it, so both flags would be read by nobody.
+     * Refused here, where every path still returns before serving: silently ignoring a flag that
+     * asks for a calibration file or a cost baseline is worse than not starting. */
+    if ((generator || embedding_) &&
+        (!cfg_.draft_profile.empty() || !cfg_.draft_profile_out.empty())) {
+        RAD_ERR("--draft-profile/--draft-profile-out configure speculative decoding, but the '%s' "
+                "plugin makes %s: the scheduler is never initialised there, so the flag would be "
+                "ignored", plugins_.arch_plugin.c_str(),
+                generator ? "a generator" : "an embedding model");
+        return RAD_E_UNSUPPORTED;
+    }
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
@@ -1871,7 +1928,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
-        RAD_TRY(load_draft_cost_profile());
+        /* The runtime is derived before the read: when the deployment's identity cannot be
+         * established, a profile is refused at this one race-free point instead of being loaded
+         * and left inactive with a warning. No profile, no derivation. */
+        if (!cfg_.draft_profile.empty()) {
+            DraftCostRuntime runtime;
+            RAD_TRY(draft_cost_runtime(&runtime));
+            RAD_TRY(load_draft_cost_profile(runtime));
+        }
         RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio,
                             &geo_));
 #ifdef RAD_TEST_HOOKS

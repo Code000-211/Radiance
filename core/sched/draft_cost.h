@@ -63,7 +63,13 @@ namespace rad {
 
 /* The profile's identity. A profile is used only when every field matches the running
  * deployment; a mismatch disables it (the caller logs the first difference and names
- * DraftFallback::NoProfile) rather than rescaling a file measured on other hardware. */
+ * DraftFallback::NoProfile) rather than rescaling a file measured on other hardware.
+ *
+ * `placement` is the resolved plan, not the flag: `auto` is resolved against a budget that depends
+ * on the free VRAM at start, so the flag value would let two differently placed deployments share
+ * a profile. It carries, per rank in rank order, the strategy, the resolved budgets and a digest
+ * of the plan's tier/site per weight -- the expert residency a strategy name alone does not name.
+ * The engine refuses to derive a runtime from a plan that is still `auto`. */
 struct DraftCostFingerprint {
     std::string model;
     std::string quant;

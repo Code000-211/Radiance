@@ -167,11 +167,13 @@ static const Flag g_flags[] = {
     { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
     { "--draft-profile",      "PATH",   "a rad-draft-profile/2 file measured on this deployment,\n"
     "                                    read before the scheduler starts; a fingerprint or\n"
-    "                                    execution mismatch disables it and is named in the log" },
+    "                                    execution mismatch disables it and is named in the log.\n"
+    "                                    Not accepted on a generator or embedding model" },
     { "--draft-profile-out",  "PATH",   "write the cost profile this run measured to PATH when the\n"
     "                                    engine exits, with this deployment's fingerprint and\n"
     "                                    execution; refused if PATH exists. Calibrate under\n"
-    "                                    --draft-policy legacy, not cost" },
+    "                                    --draft-policy legacy, not cost. Not accepted on a\n"
+    "                                    generator or embedding model" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },

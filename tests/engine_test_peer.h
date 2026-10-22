@@ -70,6 +70,14 @@ struct EngineTestPeer {
     }
     static void fini_sched(Engine& e) { e.sched_.fini(); }
 
+    /* --draft-profile's production reader, the call serve() makes immediately before
+     * Scheduler::init. `runtime` is what the caller derived; passing it in is what lets a fixture
+     * without a started engine reach the mismatch and admission branches, which a default
+     * fingerprint would otherwise hide behind a refused derivation. */
+    static int load_profile(Engine& e, const DraftCostRuntime& runtime) {
+        return e.load_draft_cost_profile(runtime);
+    }
+
     /* One step's commit, as the engine does after collect_step: every entry committed the same
      * token with no accepted draft, which is what a prefill chunk's step reports. */
     static int  commit(Engine& e, int32_t token = 0, uint8_t eos = 0) {

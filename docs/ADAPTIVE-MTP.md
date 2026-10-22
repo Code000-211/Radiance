@@ -318,7 +318,7 @@ fabricated success the contracts forbid.
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
 | `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; with a matched profile A's table prices the shapes, otherwise every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
-| `--draft-profile` | path | none | accepted; read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference |
+| `--draft-profile` | path | none | accepted; read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | must start at 0 if K0 is allowed, end ≤ ceiling |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
@@ -348,10 +348,10 @@ refused by name, not reinterpreted under the current keys.
     "quant": "gguf-q4_k_m",
     "tp": 2,
     "tp_wire": "wht6",
-    "gpus": "2x Radeon AI PRO R9700",
+    "gpus": "2x Radeon AI PRO R9700 (gfx1201) dev=0 cu=96 vram=25757220864",
     "kernels": "libr4d <commit>+gfx1201",
     "kv_format": "bf16",
-    "placement": "all_vram"
+    "placement": "all_vram vram=17179869184 host=0 file=0 dyn=1 res=9f2c41ab7e0d3355"
   },
   "execution": "shrinking",
   "buckets": [
@@ -384,30 +384,39 @@ refused by name, not reinterpreted under the current keys.
 ```
 
 - **Fingerprint.** A profile is valid only when model, quantisation, TP wire and rank count, GPUs,
-  kernel/build stamp and KV format/placement match. `configure()` does not fail on a mismatch: it
-  leaves the table inactive and names the first differing field in `reason()`. That is a visible
-  fallback on a running `legacy` deployment, not a start abort -- `Cost` was never admitted. With
+  kernel/plugin stamp and KV format/placement match. The `kernels` stamp is the loaded libraries'
+  `name@version`, the arch plugin's and the device arch; the engine carries no build id of its own,
+  so a rebuild that changes no plugin version is not distinguished. `configure()` does not fail on
+  a mismatch: it leaves the table inactive and names the first differing field in `reason()`. That
+  is a visible fallback on a running `legacy` deployment, not a start abort -- `Cost` was never
+  admitted. With
   `--draft-policy cost` the same mismatch is a start abort: `Scheduler::init` refuses by name (see
   below), so a Cost deployment never runs on the fixed baseline because its profile silently did
   not match.
   The runtime fields are derived from the deployment, never typed by the user: `model` is the
   container's name (its arch id when unnamed), `quant` its quantisation (`bf16` when none), `tp`
   the rank count, `tp_wire` what `engine_info` reports for `--tp-wire` (`exact`/`wht6`, `n/a` at
-  TP1), `gpus` the ranks' device names with their arch ids in order (`Nx NAME (ARCH)` when all are
-  identical, comma-separated otherwise), `kernels` the loaded libraries (`name@version`, selection
-  order) plus the arch plugin and the device architecture, `kv_format` `--kv-cache-dtype` and
-  `placement` `--placement` (an `auto` deployment records `auto`, so a profile generated under an
-  explicit placement will not match it). `execution` is the backend's round model: `shrinking` for
-  the serial head that runs one round per row (also in a cycle whose K are uniform), `rectangular`
-  for a block drafter, a disabled drafter or drafting switched off. The reader derives it and the
-  `--draft-profile-out` writer derives it from the same function, so read and write cannot drift.
-  A `rectangular`-stamped profile for a serial deployment is refused by name and must be
-  recalibrated, not restamped.
+  TP1), `gpus` the ranks' devices in order -- product name, arch id and the equipment a same-named
+  SKU can differ in (`dev=`, `cu=`, `vram=`; `Nx S` when all are identical, comma-separated
+  otherwise), `kernels` the loaded libraries (`name@version`, selection order) plus the arch plugin
+  and the device architecture, `kv_format` `--kv-cache-dtype`, and `placement` the **resolved**
+  plan, not the flag: per rank in rank order, `strategy vram= host= file= dyn= res=`, where `res`
+  is a digest of the plan's tier/site per weight. `auto` resolves against a budget that depends on
+  the free VRAM at this start, so two runs that asked for `auto` can land on different strategies
+  and different expert residency; the flag value alone would let both load the same profile. If a
+  rank has no resolved plan (still `auto`, or no weights), the runtime is not derivable and the
+  reader refuses the start instead of matching against a guess. `execution` is the backend's round
+  model: `shrinking` for the serial head that runs one round per row (also in a cycle whose K are
+  uniform), `rectangular` for a block drafter, a disabled drafter or drafting switched off. The
+  reader derives it and the `--draft-profile-out` writer derives it from the same function, so
+  read and write cannot drift. A `rectangular`-stamped profile for a serial deployment is refused
+  by name and must be recalibrated, not restamped.
 - **Writing a profile (`--draft-profile-out`).** A calibration run names an output path; when the
   engine exits, after the observation ring is flushed, it writes the buckets it measured with the
   same fingerprint and execution the reader derives. It refuses `--draft-profile` (a calibration
   does not read its own input), refuses `--draft-policy cost` (the table would price with the
-  numbers it is recording), and refuses a path that already exists -- the file is written to a
+  numbers it is recording), refuses a generator or embedding deployment (no scheduler, so no
+  cycle would ever be recorded) and refuses a path that already exists -- the file is written to a
   temporary in the same directory and published with `link()`, so it appears whole or not at all
   and an existing file is never replaced. A bucket whose origin mix was not captured, or whose
   rows do not fit its drafter, is not written at all: the serializer refuses rather than inventing
