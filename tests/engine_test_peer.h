@@ -44,14 +44,11 @@ struct EngineTestPeer {
      * caller of Scheduler::serial_end on the step path. */
     static int  finish(Engine& e, const StepOut& so) { return e.finish_serial_drafter(so); }
 
-    /* A step's issue-time facts, as issue_serial_drafter records them from serial_begin()'s
-     * answer and round 0's batch. Set here only by a fixture with no ranks: the real function
-     * builds a batch per round and enqueues it, which needs a started engine. */
-    static void issued(Engine& e, int rounds, int rows, bool history) {
-        e.serial_rounds_     = rounds;
-        e.serial_rows_       = rows;
-        e.serial_hist_issued_ = history;
-    }
+    /* The issue half, as the step path calls it. A fixture with no ranks runs the function itself:
+     * advance_all() and collect_issue() see an empty rank list, and the barrier has one party, so
+     * what it builds and records is the real thing on the host side even though no card runs it. */
+    static int  issue(Engine& e, int step, StepOut& so) { return e.issue_serial_drafter(step, so); }
+    static void barrier(Engine& e, int parties) { e.barrier_ = std::make_unique<RankBarrier>(parties); }
     static void drafter(Engine& e, const RadDrafterDecl& d) { e.drafter_ = d; }
 
     /* The engine's own scheduler, for a fixture that declares its program itself (sched_program.h)

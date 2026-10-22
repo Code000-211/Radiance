@@ -1,5 +1,5 @@
-/* engine_history_test.cpp -- the row-less history pass, through the Engine's own collect and
- * finish, on a serial head that keeps its own KV.
+/* engine_history_test.cpp -- the row-less history pass, through the Engine's own issue, collect
+ * and finish, on a serial head that keeps its own KV.
  *
  * Why a second fixture. engine_loop_test's Gemma 4 assistant head declares itself cache-less
  * (rad_drafter_shared_kv, arch/gemma4_bf16/gemma4_bf16.cpp:1937), so Scheduler::serial_begin
@@ -14,25 +14,29 @@
  * Host only, no model file, no plugin. The program is the minimal deployment the scheduler tests
  * run against (sched_program.h); the KV manager and prefix cache are that header's fakes; the
  * engine is a default-constructed one whose scheduler this case initialises directly, with the
- * same call Engine::start makes after bringup (core/engine.cpp:1642). What runs is real:
- * Scheduler::step's plan, serial_begin's round-0 build, Engine::collect_step's row-less branch,
+ * same call Engine::start makes after bringup (core/engine.cpp:1641). What runs is real:
+ * Scheduler::step's plan, Engine::issue_serial_drafter (serial_begin's round-0 build, the batch,
+ * and the record that a pass was issued), Engine::collect_step's row-less branch,
  * Scheduler::commit, and Engine::finish_serial_drafter's SerialHold -- the only caller of
  * Scheduler::serial_end on the step path, and the only place a watermark moves.
  *
- * What it does not reach, and why. Engine::issue_serial_drafter builds a RadBatch per round and
- * enqueues it on every rank through the barrier, which needs a started engine. So the issuance
- * record is set here exactly as that function sets it once round 0's batch came back non-null
- * (core/engine_draft.cpp:192), and the batch it would have read is asserted from the scheduler
- * just above. The scheduler half of that claim -- that a mid-prompt chunk with an own-KV head
- * builds a history pass and that only a reported pass moves the watermark -- is
+ * The issue function needs no ranks for this: advance_all() and collect_issue() loop over an
+ * empty rank list, and the barrier is given one party, so both of its releases return at once.
+ * What that leaves unexercised is the card side -- no batch is enqueued, no kernel runs -- which
+ * is the truth this fixture claims and no more. The batch it builds is the scheduler's, and the
+ * record it sets is its own; the test only reads both.
+ *
+ * The scheduler half of the same claim -- that a mid-prompt chunk with an own-KV head builds a
+ * history pass and that only a reported pass moves the watermark -- is
  * a_history_only_rows_watermark_needs_its_pass in sched_draft_test.cpp; this file is the engine
  * half. The Gemma 4/shared-KV case stays its own, in engine_loop_test.cpp, unchanged.
  *
- * Also open, and not to be read as covered: an issued pass whose wait did not complete. The
- * engine's loop never finishes a step whose wait failed (collect_step's error goes to fail_loop
- * first), and the host backend completes an unrecorded event immediately, so neither this
- * fixture nor the loop's can produce that state without inventing a sequence the engine cannot
- * enter. engine_step_test.cpp carries the same note.
+ * Also open, and not to be read as covered: an issued pass whose wait did not complete, and a
+ * step with a second participating rank. The engine's loop never finishes a step whose wait
+ * failed (collect_step's error goes to fail_loop first), and the host backend completes an
+ * unrecorded event immediately, so neither this fixture nor the loop's can produce that state
+ * without inventing a sequence the engine cannot enter. engine_step_test.cpp carries the same
+ * note.
  */
 #include "rad_test.h"
 
@@ -48,7 +52,6 @@ namespace {
 
 using rad::Engine;
 using rad::EngineTestPeer;
-using rad::Scheduler;
 using rad::StepEntry;
 using rad::StepPlan;
 
@@ -65,11 +68,10 @@ struct HostProgram {
 };
 
 /* A mid-prompt chunk with an own-KV serial head: no logit row, and a round-0 pass built anyway.
- * The two facts the finish needs are the two this case supplies on both sides of the seam -- the
- * issuance record from the batch just built, the completion fact from the engine's own wait --
- * and the watermark it moves is the chunk's end, exactly what the pass covered. Two chunks in a
- * row then show the progression: the second starts at the first one's watermark, and no pass
- * redoes what the first one recorded.
+ * The two facts the finish reads are the real function's -- the issuance record from the batch it
+ * built, the completion fact from the engine's own wait -- and the watermark it moves is the
+ * chunk's end, exactly what the pass covered. Two chunks in a row then show the progression: the
+ * second starts where the first ended, and no pass redoes what the first one recorded.
  *
  * 192 tokens against 64 a step: chunks [0,64) and [64,128) are the two the case runs, both short
  * of the prompt end. The tail is not needed here; it has a logit row and engine_loop_test covers
@@ -97,6 +99,7 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
     Engine e(h.cfg);
     REQUIRE_EQ(EngineTestPeer::init_sched(e, h.prog, h.cfg, &h.kv, &h.pc), RAD_OK);
     EngineTestPeer::drafter(e, h.prog.drafter);
+    EngineTestPeer::barrier(e, 1);
 
     auto req = std::make_unique<rad::Request>();
     req->id         = 1;
@@ -122,28 +125,29 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
         CHECK_EQ(en.ctx_len, from);
         CHECK_EQ(en.ctx_len + en.n_tokens, to);
 
-        /* What issue_serial_drafter's serial_begin() call produces: nobody drafts, one round is
-         * still asked for because round 0 is the history pass, and that pass is built. */
-        int rounds = h.prog.drafter.depth;
-        Scheduler::SerialRow rows[3];
-        CHECK_EQ(EngineTestPeer::sched(e).serial_begin(&rounds, rows, 3), 0);
-        CHECK_EQ(rounds, 1);
-        const RadBatch* hb = EngineTestPeer::sched(e).serial_batch(0, b->step);
+        EngineTestPeer::StepOut so;
+        so.n_rows = 0;                      /* the chunk produced no logit row */
+        REQUIRE_EQ(EngineTestPeer::issue(e, b->step, so), RAD_OK);
+
+        /* What the real issue made of serial_begin()'s answer: nobody drafts, one round is still
+         * asked for because round 0 is the history pass -- and that pass was built. A round count
+         * alone would not say so; the record does, and it is set only for a non-null round-0
+         * batch. */
+        CHECK(EngineTestPeer::history_issued(e));
+        CHECK_EQ(EngineTestPeer::rounds(e), 1);
+        CHECK_EQ(EngineTestPeer::rows_of(e), 0);
+        CHECK_EQ(EngineTestPeer::done_rows(e), 0);
+        const RadBatch* hb = EngineTestPeer::sched(e).batch_for(0);
         REQUIRE(hb != nullptr);
         CHECK(!EngineTestPeer::sched(e).serial_batch_failed());
         CHECK_EQ(hb->n_draft_out, 0);
         CHECK_EQ(hb->n_tok, to - from);
         CHECK_EQ(hb->ctx_lens[0], from);     /* it starts at the watermark, not at the chunk head */
 
-        /* The issue-time facts, set as the step path sets them from that build. */
-        EngineTestPeer::issued(e, rounds, /*rows*/ 0, /*history*/ true);
-
         RadEvent ev = nullptr;
         REQUIRE_EQ(rad_event_create(&ev), RAD_OK);
         EngineTestPeer::step_end(e, ev);
 
-        EngineTestPeer::StepOut so;
-        so.n_rows = 0;                       /* the chunk produced no logit row */
         CHECK_EQ(EngineTestPeer::collect(e, b, so), RAD_OK);
         CHECK(so.complete);                 /* the wait over the issued pass ran */
 

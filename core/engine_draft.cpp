@@ -316,9 +316,10 @@ int Engine::finish_serial_drafter(const StepOut& so) {
     /* The history watermark may move only on the step's own completion proof: round 0 was built
      * for this step (serial_hist_issued_, set by the step path when the round-0 batch came back
      * non-null) and the step's wait covered every participating rank's stream (StepOut::complete,
-     * true only after that wait). An enqueue, a rank count or a row count is none of that -- a
-     * row-less mid-prompt step returns before the wait and has no proof to offer. Without both, the
-     * pass is repeated rather than recorded. */
+     * true only after that wait). An enqueue, a rank count or a row count is none of that. A step
+     * with no logit row still waits when it issued a history pass; a head with no cache of its own
+     * issues none on a mid-prompt chunk, so that step returns before the wait and offers neither
+     * fact. Without both, the pass is repeated rather than recorded. */
     const bool hist_ran = serial_hist_issued_ && so.complete;
     SerialHold hold(sched_, hist_ran);
     const StepPlan& plan = sched_.plan();
