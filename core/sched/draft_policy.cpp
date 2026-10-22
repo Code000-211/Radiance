@@ -284,11 +284,38 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
 
     int evals = 0;
 
-    /* Stage 1: the homogeneous baselines, one estimate call each. */
+    /* Stage 1: the homogeneous baselines. The deepest offered plan is the coverage gate: if it
+     * cannot be priced, the batch takes the named baseline -- never a shallower tier that happens
+     * to be priced. A missing measurement for the deeper alternative is not evidence that the
+     * shallow one is cheaper, and letting the shallow tier decide would present an uncovered
+     * depth as a cost decision. The deepest candidate is the last tier clamped to each row's own
+     * cap; every other tier must be priced on its own to beat it. */
+    const int32_t deepest = c_.tiers[c_.n_tiers - 1];
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+        out->k[i] = deepest < c ? deepest : c;
+    }
     Priced  best_p;
-    int32_t best_tier = 0;
-    bool    any = false;
-    for (int32_t t = 0; t < c_.n_tiers; ++t) {
+    int32_t best_tier = deepest;
+    {
+        const int rc = price(view, pred, costs, out->k, -1, &evals, &best_p);
+        if (rc < 0) return rc;
+    }
+
+    if (!best_p.valid) {
+        /* The deepest offered plan has no measurement: a named baseline, not an invented price --
+         * and specifically not the price of a shallower plan this batch did not offer as deep. */
+        for (int32_t i = 0; i < view.n_seq; ++i) {
+            const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+            out->k[i] = c_.fallback_k < c ? c_.fallback_k : c;
+        }
+        int32_t top = 0;
+        for (int32_t i = 0; i < view.n_seq; ++i)
+            if (out->k[i] > top) top = out->k[i];
+        return finish(view, top, DraftPlanSource::Fallback, DraftFallback::UnknownShape, out);
+    }
+
+    for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
             out->k[i] = c_.tiers[t] < c ? c_.tiers[t] : c;
@@ -296,22 +323,10 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         Priced p;
         const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
         if (rc < 0) return rc;
-        if (p.valid && (!any || p.yield / p.ms > best_p.yield / best_p.ms)) {
+        if (p.valid && p.yield / p.ms > best_p.yield / best_p.ms) {
             best_p    = p;
             best_tier = c_.tiers[t];
-            any       = true;
         }
-    }
-
-    if (!any) {
-        /* No shape could be priced: a named baseline, not an invented price. */
-        int32_t top = 0;
-        for (int32_t i = 0; i < view.n_seq; ++i) {
-            const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
-            out->k[i] = c_.fallback_k < c ? c_.fallback_k : c;
-            if (out->k[i] > top) top = out->k[i];
-        }
-        return finish(view, top, DraftPlanSource::Fallback, DraftFallback::UnknownShape, out);
     }
 
     /* Take the winning baseline as the search's starting assignment. */
@@ -401,7 +416,9 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
 
     /* Hysteresis and hold: a raise waits, a reduction is immediate. A raise is judged
      * pessimistically (`ms + unc`), the incumbent at its known cost; with no price for the
-     * incumbent it is refused. */
+     * incumbent it is refused. `ms + unc` is a heuristic ordering of two measured means, not a
+     * bound on a future cycle: at n=1 `unc` is 0, and the brackets behind a bucket cover only the
+     * shapes that ran, so it neither proves dominance nor justifies a raise on its own. */
     if (chosen_ && top > last_k_) {
         Priced incumbent;
         const int rc = price(view, pred, costs, out->k, last_k_, &evals, &incumbent);

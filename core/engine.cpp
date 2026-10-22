@@ -1599,6 +1599,9 @@ int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_
  * step's size. */
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
+    /* The reference calibration keeps both lenders at zero for the whole run: the levels are its
+     * identity, not a loan it may take. */
+    if (cfg_.draft_reference) return;
     if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
@@ -1823,13 +1826,13 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
      * rank whose plan is still `auto` -- or has no weights -- makes the identity unknowable; the
      * profile is refused then rather than matched against a guess.
      *
-     * `flex` and `lend` are the memory the KV cache lends the expert slab: the carved slots and
-     * the tokens the start loan covers. The start placement is the plan plus the free lent slots
-     * it fills before the first observation, and that fill is bounded by the loan -- two runs
-     * that lend different amounts reach different placements on the same plan. Naming both is
-     * what makes the resolved start placement a function of this identity rather than an
-     * assumption about the run's free memory. The loan is set before this is derived
-     * (serve's start loan), so it is not a snapshot of something still moving. */
+     * What the plan does not name is where the expert slab's memory comes from over the run: the
+     * arena's level rows (which step sizes lend part of the slab), and, for a live profile, the
+     * loan the KV cache held at start. Those are fields of their own: a no-loan reference has no
+     * live loan to compare, and the arena levels are what make two otherwise identical plans
+     * different placements. The loan is set before this is derived (serve's start loan), so it is
+     * not a snapshot of something still moving. */
+    fp.basis = cfg_.draft_reference ? DraftCostBasis::NoLoan : DraftCostBasis::Live;
     std::string placement;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         const Plan& pl = ranks_[i]->plan;
@@ -1839,14 +1842,35 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
             return RAD_E_STATE;
         }
         if (!placement.empty()) placement += ';';
-        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx flex=%lld lend=%lld",
+        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx",
                          strategy_name(pl.strategy), (long long)pl.vram_budget,
                          (long long)pl.host_budget, (long long)pl.file_stage_reserve,
-                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl),
-                         (long long)ranks_[i]->mover.flex_offered_bytes(),
-                         (long long)ranks_[i]->kv.loan_tokens());
+                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl));
     }
     fp.placement = std::move(placement);
+
+    /* The arena's identity is the level rows the arena motion actually uses -- the top level
+     * (max_tok) and the smaller steps below it (Engine::arena_rows_, built in start()), not the
+     * plan's depth: a level is the step size up to which the arena past the level's end is lent,
+     * so two runs with different levels lend at different points on the same plan. No level (no
+     * heat, nothing lent) is named "none", not left empty. */
+    std::string arena;
+    for (size_t i = 0; i < arena_rows_.size(); ++i)
+        arena += fmt("%s%lld", i ? "," : "", (long long)arena_rows_[i]);
+    fp.arena = arena.empty() ? "none" : std::move(arena);
+    /* The live loan is part of a live profile's identity only: two runs that lend different
+     * amounts fill different start placements. A no-loan reference measured with both lenders off
+     * has none, and the reader compares it under the no-loan rule. */
+    if (fp.basis == DraftCostBasis::Live) {
+        std::string loan;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            if (!loan.empty()) loan += ';';
+            loan += fmt("flex=%lld lend=%lld",
+                        (long long)ranks_[i]->mover.flex_offered_bytes(),
+                        (long long)ranks_[i]->kv.loan_tokens());
+        }
+        fp.live_loan = std::move(loan);
+    }
 
     /* The backend's round model, not this cycle's distribution: the serial head runs one round per
      * row, so it is shrinking even when a cycle's K are uniform. A block drafter, no drafter, or
@@ -1872,6 +1896,11 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
     if (!sched_.draft_costs().active())
         RAD_WARN("--draft-profile '%s' is not used for this deployment: %s",
                  cfg_.draft_profile.c_str(), sched_.draft_costs().reason().c_str());
+    else if (sched_.draft_costs().reference())
+        RAD_INFO("--draft-profile '%s': %zu buckets, basis no-loan -- an optimisation basis for "
+                 "the plan's start placement without borrowed copies, not a latency bound; it is "
+                 "kept immutable and only exact measured buckets price",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
     else
         RAD_INFO("--draft-profile '%s': %zu buckets match this deployment",
                  cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
@@ -1889,7 +1918,21 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
  * is put in record-only mode for it: the run measures the fallback baseline it really runs and
  * prices nothing from the buckets it is still filling. */
 int Engine::begin_draft_calibration() {
-    if (cfg_.draft_profile_out.empty()) return RAD_OK;
+    if (cfg_.draft_profile_out.empty()) {
+        if (cfg_.draft_reference) {
+            RAD_ERR("--draft-reference runs a calibration and needs --draft-profile-out: a serving "
+                    "run keeps its loans dynamic and does not measure a reference");
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    if (cfg_.draft_reference && cfg_.draft_policy != DraftPolicyKind::Cost) {
+        /* The reference is the cost planner's price basis. A legacy calibration would measure the
+         * fixed window, a plan the cost policy never asks for. */
+        RAD_ERR("--draft-reference needs --draft-policy cost: the reference prices the cost "
+                "planner's plans, not a fixed window");
+        return RAD_E_INVAL;
+    }
     if (!cfg_.draft_profile.empty()) {
         RAD_ERR("--draft-profile-out with --draft-profile: a calibration run measures its own "
                 "profile and does not read one; pass only one of the two");
@@ -1930,6 +1973,10 @@ int Engine::begin_draft_calibration() {
      * nothing can be priced from it, and a cost calibration admits the fallback baseline it
      * measures and never prices at all (record_only). */
     RAD_TRY(draft_cost_runtime(&draft_calib_runtime_));
+    /* The calibration's own table carries the file's basis (a no-loan fingerprint when
+     * --draft-reference), but it is the writer, not a loaded reference: it must stay mutable so
+     * buckets can be recorded into it. */
+    draft_calib_runtime_.recording = true;
     DraftCostProfile empty;
     empty.fingerprint = draft_calib_runtime_.fingerprint;
     empty.execution   = draft_calib_runtime_.execution;
@@ -1951,6 +1998,28 @@ int Engine::begin_draft_calibration() {
 
 int Engine::export_draft_cost_profile() {
     if (!draft_calibrating_) return RAD_OK;
+    /* A no-loan reference was measured with both lenders off, and the file says so. The carve and
+     * the loans are checked where they really are -- what the mover holds, not the target it was
+     * given: set_loan writes its target even where no strip is registered, and reclaim() returns
+     * at once when loan_held is 0, so `loan` would prove nothing. A run that lent anything is not
+     * a reference and must not write a file that claims it was. */
+    if (cfg_.draft_reference) {
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const auto& r = *ranks_[i];
+            if (r.mover.flex_capacity() != 0 || r.mover.flex_used_bytes() != 0 ||
+                r.kv.loan_tokens() != 0 || r.mover.loan_held(Mover::kLendKV) != 0 ||
+                r.mover.loan_held(Mover::kLendArena) != 0) {
+                RAD_ERR("--draft-reference: rank %zu lent memory (flex capacity %lld, in use %lld, "
+                        "kv loan %lld, held kv %lld, held arena %lld), so this run did not measure "
+                        "the plan's start placement without borrowed copies and no file is written",
+                        i, (long long)r.mover.flex_capacity(),
+                        (long long)r.mover.flex_used_bytes(), (long long)r.kv.loan_tokens(),
+                        (long long)r.mover.loan_held(Mover::kLendKV),
+                        (long long)r.mover.loan_held(Mover::kLendArena));
+                return RAD_E_STATE;
+            }
+        }
+    }
     /* Everything the step loop measured has to reach the table before the table is read. */
     sched_.flush_draft_observations();
 

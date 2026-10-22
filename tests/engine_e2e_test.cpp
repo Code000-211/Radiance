@@ -1817,11 +1817,15 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
  * verify, so its shape is keyed verify_k = 0 -- a cycle legacy drafting, which verifies what it
  * drafts in the same step, never executes.
  *
- * The reload keeps the default tier ladder and a ceiling of 6. Its first cycle finds the measured
- * start bucket (verify_k = 0 at draft_k = 2) and takes it; every later cycle verifies the 2-token
- * window it published, which the calibration also measured. Nothing can name 2 but the loaded
- * profile -- the fallback would draft 6 -- so the executed window is the proof. The export lists one
- * position per drafted slot, so the priced depth 2 is two of them and the fallback would be six. */
+ * The reload runs a ceiling of 6 but offers tiers 0,2: the deepest plan of its batch must be the
+ * one the profile prices. With the default ladder the deepest tier would be 6, which the file
+ * cannot price, and Stage 1's coverage rule would take the named baseline at the executable depth
+ * (6) rather than let the priced 2 win -- a missing measurement is not a price advantage. So the
+ * reload's first cycle finds the measured start bucket (verify_k = 0 at draft_k = 2) and takes it;
+ * every later cycle verifies the 2-token window it published, which the calibration also measured.
+ * Nothing can name 2 but the loaded profile -- the fallback would draft 6 -- so the executed window
+ * is the proof. The export lists one position per drafted slot, so the priced depth 2 is two of
+ * them and the fallback would be six. */
 TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_them) {
     /* A calibration run needs its own checkpoint (the assistant head lives in draft/), and the
      * shared World has none with a drafter. */
@@ -1883,6 +1887,7 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
     Server cost;
     {
         const std::vector<std::string> a = { "--num-speculative-tokens", "6",
+                                             "--draft-depth-tiers", "0,2",
                                              "--draft-window", "fixed",
                                              "--draft-policy", "cost",
                                              "--draft-profile", out };

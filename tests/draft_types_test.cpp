@@ -21,7 +21,7 @@ using namespace rad;
 
 static_assert(RAD_SCHED_MAX_SPEC == 64, "the verify kernel band is the array bound");
 static_assert(RAD_DRAFT_CTX_CLASSES == 4, "the profile's context classes");
-static_assert(RAD_DRAFT_PROFILE_VERSION == 3, "the key grew: an older profile is refused by name");
+static_assert(RAD_DRAFT_PROFILE_VERSION == 4, "the key grew: an older profile is refused by name");
 
 TEST(plan_rows_count_the_requests_that_reach_each_round) {
     draft_fake::Fixture f;

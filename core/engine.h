@@ -174,17 +174,19 @@ private:
      * rather than derived here so the caller has to produce it before the read -- and so a test
      * can reach the mismatch branch without a started engine. */
     int load_draft_cost_profile(const DraftCostRuntime& runtime);
-    /* The one derivation of "what this deployment is" for a cost profile -- fingerprint and
+    /* The one derivation of "what this deployment is" for a cost profile -- fingerprint, basis and
      * execution. Read by load_draft_cost_profile() and by the --draft-profile-out export, so the
-     * reader and the writer cannot drift. The execution is the backend's round model: the serial
-     * head runs one round per row (shrinking), even in a cycle whose K are uniform; a block
-     * drafter or no drafter at all is rectangular, as is disabled drafting. RAD_E_INVAL when a
-     * device property cannot be read; RAD_E_STATE when a rank carries no resolved placement plan,
-     * because a profile bound to "auto" would match a deployment that resolved differently. */
+     * reader and the writer cannot drift. The basis is NoLoan under --draft-reference and Live
+     * otherwise; a no-loan runtime names the arena levels and no live loan. The execution is the
+     * backend's round model: the serial head runs one round per row (shrinking), even in a cycle
+     * whose K are uniform; a block drafter or no drafter at all is rectangular, as is disabled
+     * drafting. RAD_E_INVAL when a device property cannot be read; RAD_E_STATE when a rank carries
+     * no resolved placement plan, because a profile bound to "auto" would match a deployment that
+     * resolved differently. */
     int draft_cost_runtime(DraftCostRuntime* out) const;
     /* --draft-profile-out: validates once at startup (output path free, no --draft-profile) and
-     * names the mode. Refuses under --draft-policy cost: the table would price with the numbers
-     * the run is recording. */
+     * names the mode. --draft-reference is a calibration flag and needs both an output path and
+     * --draft-policy cost. */
     int begin_draft_calibration();
     /* Flushes the observation ring and writes the profile. Called by serve() after the step and
      * rank threads are joined; a failure is logged and returned, never swallowed. */

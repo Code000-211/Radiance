@@ -32,11 +32,12 @@ using rad::EngineTestPeer;
 /* A profile whose fingerprint is the runtime below, with no buckets: enough to reach configure()
  * and the admission branch without repeating the bucket fixture from draft_cost_test. */
 const char* kProfile = R"({
-  "format": "rad-draft-profile/3",
+  "format": "rad-draft-profile/4",
   "fingerprint": {
     "model": "tiny", "quant": "bf16", "tp": 1, "tp_wire": "n/a",
     "gpus": "1x host dev=0 cu=1 vram=0", "kernels": "none", "kv_format": "bf16",
-    "placement": "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000"
+    "placement": "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000",
+    "basis": "live", "arena": "none", "live_loan": "flex=0 lend=0"
   },
   "execution": "rectangular",
   "buckets": []
@@ -52,6 +53,9 @@ DraftCostRuntime matching_runtime() {
     r.fingerprint.kernels   = "none";
     r.fingerprint.kv_format = "bf16";
     r.fingerprint.placement = "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000";
+    r.fingerprint.basis     = rad::DraftCostBasis::Live;
+    r.fingerprint.arena     = "none";
+    r.fingerprint.live_loan = "flex=0 lend=0";
     return r;
 }
 
@@ -222,11 +226,12 @@ std::string bucket_json(int ctx, const std::string& flags) {
 
 std::string calibrated_profile(const std::string& buckets) {
     return std::string(R"({
-      "format": "rad-draft-profile/3",
+      "format": "rad-draft-profile/4",
       "fingerprint": {
         "model": "tiny", "quant": "bf16", "tp": 1, "tp_wire": "n/a",
         "gpus": "1x host dev=0 cu=1 vram=0", "kernels": "none", "kv_format": "bf16",
-        "placement": "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000"
+        "placement": "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000",
+        "basis": "live", "arena": "none", "live_loan": "flex=0 lend=0"
       },
       "execution": "rectangular",
       "buckets": [)") + buckets + R"(]

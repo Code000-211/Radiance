@@ -54,8 +54,11 @@ enum { RAD_SCHED_MAX_SPEC = 64 };
  * refused by name, never reinterpreted under the current keys. Version 3 is the first whose
  * fingerprint carries the resolved placement (strategy, budgets, residency digest) and the device
  * equipment; a version-2 file was written before those were required, so it cannot be bound to a
- * deployment and is regenerated rather than rescaled. */
-enum { RAD_DRAFT_PROFILE_VERSION = 3 };
+ * deployment and is regenerated rather than rescaled. Version 4 adds the measurement basis (a
+ * no-loan reference versus a live profile), the arena-level identity and the live loan as a
+ * field of its own; a version-3 file cannot say whether its numbers were measured with the
+ * lenders off, so it is refused by name and regenerated. */
+enum { RAD_DRAFT_PROFILE_VERSION = 4 };
 
 /* Context-length buckets of the profile key. A bucket is a property of the text, not of the
  * deployment: profiles only carry the buckets the configured capacity can reach. */
@@ -149,6 +152,13 @@ enum class DraftOrigin : uint8_t { None = 0, Head = 1, Lookup = 2 };
 /* Where a cost estimate came from. A prior that is not a duration is ConservativeFallback (with
  * invalid set when it cannot even bound the cost), never Measured. */
 enum class DraftCostSource : uint8_t { Measured = 0, Interpolated = 1, ConservativeFallback = 2 };
+
+/* How a v4 profile's numbers were measured. `Live` is the deployment's own lending as it runs;
+ * `NoLoan` is the reference calibration: both lenders off, the plan's start placement without
+ * borrowed copies. The basis is a property of the file, not of the run that loads it -- a serving
+ * run loads a `NoLoan` reference while its loans stay dynamic -- and it selects which parts of
+ * the fingerprint are binding. */
+enum class DraftCostBasis : uint8_t { Live = 0, NoLoan = 1 };
 
 /* The cycle's replay state as the executing path saw it, so a sample taken while recording or
  * auditing never updates the profile that prices normal operation. `None` is a claim ("provably

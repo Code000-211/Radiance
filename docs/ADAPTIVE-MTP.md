@@ -321,8 +321,10 @@ prediction and sample.
   turnover reserve free, so it does not resolve before the first step: only a post-step balance
   that holds turnover fills the reserve. Nothing is priced there either way.
   The mover sizes one record per lent slot (`Mover::lend_from`), so the wave split is the reserve,
-  or a wave a drain cut short, not record exhaustion. The fingerprint names the loan and the slots
-  it covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A
+  or a wave a drain cut short, not record exhaustion. A live profile's fingerprint names the loan
+  and the slots it covers (`live_loan`, per rank `flex=`/`lend=`), which is what binds the resolved
+  start placement to the identity; a no-loan reference has no loan to name and carries the arena
+  levels instead. A
   fill issued after one observation, or any fill after the resolve (a loan growing again), is not
   initial: `Engine::residency_moves()` exempts the initial promotions only up to the per-rank count
   frozen at the resolve (`Engine::rank_fill_exempt`), so a later fill counts as a move even though
@@ -350,6 +352,13 @@ prediction and sample.
   post-move baseline it exists to record. There is no blanket drift exception: a loaded profile
   that does price keeps the fail-closed rule above, and a record-only table never gains a price it
   did not measure.
+- **A loaded reference is not a recording of the live placement.** A `no-loan` reference
+  describes the plan's start placement without borrowed copies. A serving run that loads it keeps
+  its loans, flex moves, arena level and recall: those are operation, not a change to what the file
+  measured, so `draft_drift_note` returns before marking or deactivating anything
+  (`DraftCostTable::reference()`). The reference stays immutable and exact-measured-only; nothing
+  is learned from the live placement and nothing is invalidated by it. That exemption is specific
+  to the reference basis -- a live profile keeps the fail-closed rule above unchanged.
 - **The online policy fails closed before the next planning, not inside the step it affects.**
   `step_finished` is not the only place the count is read: the engine reports the same cumulative
   evidence at the top of every `step_loop` iteration (`Scheduler::draft_residency`), before
@@ -363,7 +372,8 @@ prediction and sample.
   committed. The engine then ends the run on its existing error path
   (`Engine::fail_loop`), which stops the loop, aborts the barrier and calls `Scheduler::shutdown`
   for the work already in flight. It does **not** fall back to the ceiling: with the table inactive
-  every price is "not priced", the planner's named fallback would draft at `cfg.n_spec`, and that
+  every price is "not priced", the planner's named fallback would draft at the executable head
+  depth, and that
   is the implicit baseline the admission rule refuses (docs above, `admit_fallback()`). Drift is a
   stopped cost run, not a new policy and not a silent legacy run.
 - **A measurement is filed under the class the planner priced.** `draft_cost_observe` derives the
@@ -440,8 +450,9 @@ parses and does nothing would be the fabricated success the contracts forbid.
 | `--draft-window` | `fixed` / `adaptive` | `fixed` | existing |
 | `--draft-policy` | `legacy` / `cost` | `legacy` | accepted; `cost` needs a serial head, a positive ceiling and, for this runtime's fingerprint, an active profile with a measured bucket or an explicitly admitted fallback baseline (refused with `RAD_E_UNSUPPORTED` otherwise). B's predictor runs every cycle; with a matched profile A's table prices the shapes, otherwise every cycle is the named fallback at the configured depth |
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
-| `--draft-profile` | path | none | accepted; read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
-| `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. Each must be ≤ the ceiling (auto resolves it, so the range check is `DraftPlanner::configure`'s) and a list is never silently trimmed. A cost deployment whose ceiling is below a tier is refused by name |
+| `--draft-profile` | path | none | accepted; a `rad-draft-profile/4` file, read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. A `no-loan` file is a reference: it loads on a serving run whose loans stay dynamic, is immutable and prices only exact measured buckets. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
+| `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. The bound is the executable head depth (`min(ceiling, drafter depth)`), not the ceiling alone: a plan above it would execute fewer rounds than it planned and record a shortened bucket. An explicit list above that depth is refused by name; the default ladder is trimmed to it (its deepest value replaced by the depth), so a shallow head does not lock out valid tiers |
+| `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall), so the written profile is the plan's start placement without borrowed copies. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
 `cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
@@ -455,18 +466,19 @@ drafter. Initialisation is explicitly not depth 0. A speculation-off plan is nev
 n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
 "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
 
-## Draft profile format, version 3
+## Draft profile format, version 4
 
 `core/sched/draft_cost.cpp` (A) reads and validates this; the parser never runs on the step path.
-The format id is `rad-draft-profile/3` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id is
+The format id is `rad-draft-profile/4` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id is
 refused by name, not reinterpreted under the current keys: `rad-draft-profile/1` had no draft
-distribution, origin or pipeline depth, and `rad-draft-profile/2` had no resolved placement or
-device equipment in its fingerprint, so it cannot be bound to a deployment. Older profiles are
-regenerated, never rescaled.
+distribution, origin or pipeline depth, `rad-draft-profile/2` had no resolved placement or device
+equipment in its fingerprint, and `rad-draft-profile/3` has no measurement basis and no arena-level
+identity -- it cannot say whether its numbers were measured with the lenders off. Older profiles
+are regenerated, never rescaled.
 
 ```json
 {
-  "format": "rad-draft-profile/3",
+  "format": "rad-draft-profile/4",
   "fingerprint": {
     "model": "Qwen3.8-Flash-Next",
     "quant": "gguf-q4_k_m",
@@ -475,7 +487,9 @@ regenerated, never rescaled.
     "gpus": "2x Radeon AI PRO R9700 (gfx1201) dev=0 cu=96 vram=25757220864",
     "kernels": "libr4d <commit>+gfx1201",
     "kv_format": "bf16",
-    "placement": "all_vram vram=17179869184 host=0 file=0 dyn=1 res=9f2c41ab7e0d3355 flex=12582912 lend=98304"
+    "placement": "all_vram vram=17179869184 host=0 file=0 dyn=1 res=9f2c41ab7e0d3355",
+    "basis": "no-loan",
+    "arena": "512,2048,8192"
   },
   "execution": "shrinking",
   "buckets": [
@@ -507,8 +521,11 @@ regenerated, never rescaled.
 }
 ```
 
+`live_loan` is written only for a `live` basis; a `no-loan` file has no loan to name.
+
 - **Fingerprint.** A profile is valid only when model, quantisation, TP wire and rank count, GPUs,
-  kernel/plugin stamp and KV format/placement match. The `kernels` stamp is the loaded libraries'
+  kernel/plugin stamp, KV format, placement, arena levels and (for a live basis) the start loan
+  match. The `kernels` stamp is the loaded libraries'
   `name@version`, the arch plugin's and the device arch; the engine carries no build id of its own,
   so a rebuild that changes no plugin version is not distinguished. `configure()` does not fail on
   a mismatch: it leaves the table inactive and names the first differing field in `reason()`. That
@@ -524,13 +541,9 @@ regenerated, never rescaled.
   SKU can differ in (`dev=`, `cu=`, `vram=`; `Nx S` when all are identical, comma-separated
   otherwise), `kernels` the loaded libraries (`name@version`, selection order) plus the arch plugin
   and the device architecture, `kv_format` `--kv-cache-dtype`, and `placement` the **resolved**
-  plan, not the flag: per rank in rank order, `strategy vram= host= file= dyn= res= flex= lend=`,
-  where `res` is a digest of the plan's tier/site per weight, `flex` the bytes of the carved lent
-  slots the start loan covers and `lend` that loan in tokens. The last two bind the start
-  placement: a dynamic plan's fill promotes pooled units into exactly those slots, so two runs
-  that lend differently reach different placements on the same plan. The loan is settled before
-  serving's first step, so both fields are facts of the start, not a snapshot of something still
-  moving. `auto` resolves against a budget that depends on
+  plan, not the flag: per rank in rank order, `strategy vram= host= file= dyn= res=`,
+  where `res` is a digest of the plan's tier/site per weight. `auto` resolves against a budget that
+  depends on
   the free VRAM at this start, so two runs that asked for `auto` can land on different strategies
   and different expert residency; the flag value alone would let both load the same profile. If a
   rank has no resolved plan (still `auto`, or no weights), the runtime is not derivable and the
@@ -540,6 +553,42 @@ regenerated, never rescaled.
   reader derives it and the `--draft-profile-out` writer derives it from the same function, so
   read and write cannot drift. A `rectangular`-stamped profile for a serial deployment is refused
   by name and must be recalibrated, not restamped.
+- **Basis, arena and loan are separate fields.** `basis` is how the numbers were measured:
+  `live` (the deployment's own lending as it runs) or `no-loan` (the reference calibration: both
+  lenders off, the plan's start placement without borrowed copies). The basis belongs to the file,
+  not to the run that loads it, and it selects the comparison rule: a `no-loan` reference compares
+  the plan, budgets and arena levels and ignores `live_loan`, so it loads on a serving run that
+  lends; a `live` profile compares `live_loan` as well. `arena` is the level-row identity of the
+  start's arena plan -- the top level (`max_tok`) followed by the smaller step sizes, as
+  `Engine::arena_rows_` holds it (`none` when the arena lends nothing): the level determines which
+  step sizes lend part of the slab, so two plans with different levels are different placements.
+  `live_loan` is the per-rank `flex=` (carved bytes the start loan covers) and `lend=`
+  (`kv.loan_tokens()`) at start.
+- **What the reference is and is not.** The no-loan reference is an **optimisation model** for
+  the cost choice: the price basis the planner compares plans on, measured once with the lenders
+  off. It is **not** a latency bound, not an upper bound, and carries no conservativeness claim:
+  before the first budgeted move live residency is a superset of the reference (the loans add
+  capacity), afterwards it is not, so a plan the reference priced cheap can be slower live and vice
+  versa. The run does not act on that difference -- the reference is not a guard, and there is no
+  additional conservativeness layer.
+- **A loaded reference is immutable and Measured-only.** `DraftCostTable::configure()` marks a
+  `no-loan` profile as the reference (unless it is the calibration's own recording table). Its
+  `observe()` counts the bracket (`reference_skipped()`) and drops it before any `record()` path
+  could create or move a bucket; its `estimate()` answers only from exact `Measured` buckets --
+  no interpolation and no conservative fallback. Live placement, occupancy and loans are not a
+  reason to update it.
+- **Depth rule R: the deepest offered plan is the coverage gate.** In the planner's Stage 1 the
+  deepest tier of the batch (`min(max(tiers), cap_of(...))`) is priced first. If that candidate is
+  not `Measured` in the table, the batch takes the named baseline (`Fallback`, `UnknownShape`) at
+  the executable depth; it does **not** continue with a shallower tier that happens to be priced.
+  An unpriced depth is not evidence that a shallower one is cheaper, and issuing the shallower
+  plan would present a coverage hole as a cost decision. If the deepest candidate is priced, the
+  search continues as before: a shallower tier wins only if it is itself priced and has a higher
+  `yield/ms`. There is no high-water mark, no only-lower gate and no monotonicity claim. The same
+  rule applies to every later planner stage: a candidate that is not priced never becomes a
+  measurement indirectly (the coordinate passes and the budget-cut re-price both require
+  `valid`). With a one-depth reference the depth choice is empty: the calibration measured the
+  fallback depth, and an unpriced batch stays on the named baseline.
 - **Writing a profile (`--draft-profile-out`).** A calibration run decodes under whichever policy
   the deployment really runs -- `legacy`, `adaptive` or `cost` -- with the recording armed. Under
   legacy/adaptive the controller's plan is never set, so `draft_cap()`/`bars_fill()` and the rest of
@@ -548,9 +597,15 @@ regenerated, never rescaled.
   is the one no legacy run can execute, because it verifies a window it did not draft -- issues the
   admitted fallback baseline, and prices nothing from the buckets it is still filling. That is the
   mode that measures the shape a later cost deployment prices first (`verify_k = 0`); without it a
-  reload can price no request's first cycle. The depth a calibration measures is its ceiling, so a
-  calibration below the default ladder passes the tiers it fits (`--draft-depth-tiers 0,2` at a
-  ceiling of 2); the reload may then run a deeper ceiling and choose the measured tier by its price.
+  reload can price no request's first cycle. The depth a calibration measures is the executable
+  head depth (`min(ceiling, drafter depth)`), not the ceiling: a cost calibration's tiers are
+  bounded by that depth (an explicit tier above it is refused by name, the default ladder is
+  trimmed to it) and its fallback baseline is that depth, so every bucket describes rounds the head
+  can really publish. A calibration below the default ladder passes the tiers it fits
+  (`--draft-depth-tiers 0,2` at a depth of 2); the reload may then run a deeper ceiling with a
+  ladder ending at the measured depth and choose the measured tier by its price. Offering a tier
+  deeper than the file covers is not a way to run deeper: rule R makes the unpriced deepest plan
+  take the named baseline instead.
   Each cycle's record names the depth the step really
   caps each row at (the head's own depth, the adaptive window, 0 for a row that may not speculate),
   so a bucket describes a shape the run could execute. A cycle with more decode rows than
@@ -590,6 +645,25 @@ regenerated, never rescaled.
   the affected buckets go -- a clean cycle before the first
   move still measured the plan and is exported -- and a run whose every bucket was placement-
   affected refuses the export instead of publishing a file that prices nothing.
+- **The no-loan reference calibration (`--draft-reference`).** The reference is measured, not
+  simulated: both lenders are switched off for the whole run. `Engine::start` registers neither the
+  KV strips nor the arena strips (`lend_from` is skipped), the arena's level plan is still built --
+  it is part of the identity -- but `arena_tick` never grows a loan, so nothing is carved, filled,
+  donated or recalled. The written file is stamped `basis: "no-loan"` and carries the arena level
+  rows; it has no `live_loan`. A serving run loads it while its own loans stay dynamic, because the
+  basis selects the comparison rule (a `no-loan` file ignores the run's loan). The flag needs an
+  output path and `--draft-policy cost`; a serving run that passes it without `--draft-profile-out`
+  is refused by name, not silently ignored.
+  At export the writer verifies the claim where it really lives -- what the mover holds, not the
+  target it was given (`set_loan` writes a target even where no strip is registered, and
+  `reclaim()` returns at once when `loan_held()` is 0): `flex_capacity() == 0`,
+  `flex_used_bytes() == 0`, `kv.loan_tokens() == 0` and `loan_held()` zero for both lenders on
+  every rank. A run that lent anything fails the export with `RAD_E_STATE` rather than writing a
+  file that claims a reference it did not measure.
+  In a calibration the first budgeted move ends the exported set: `kDraftSamplePlacement` marks
+  every later cycle and the export leaves them out. That is the calibration's rule. On a serving
+  run a budgeted move is inconsequential instead -- nothing is learned from it, and the loaded
+  reference is not a recording of the live placement.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually

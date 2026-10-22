@@ -216,6 +216,27 @@ int parse_fingerprint(const json& j, DraftCostFingerprint* f, std::string* err) 
                           std::string("fingerprint.") + keys[i] + ": missing or not a non-empty string");
     if (!get_int(j, "tp", &f->tp) || f->tp < 1)
         return refuse(err, RAD_E_INVAL, "fingerprint.tp: missing or not a positive integer");
+
+    /* The basis is required, not defaulted: a v4 file that does not say whether its numbers were
+     * measured with the lenders off cannot be used as a reference, and guessing `live` would
+     * silently bind a no-loan measurement as if it described a loaned run. */
+    std::string basis;
+    if (!get_string(j, "basis", &basis))
+        return refuse(err, RAD_E_INVAL,
+                      "fingerprint.basis: missing (expected \"live\" or \"no-loan\")");
+    if (basis == "live") f->basis = DraftCostBasis::Live;
+    else if (basis == "no-loan") f->basis = DraftCostBasis::NoLoan;
+    else return refuse(err, RAD_E_INVAL,
+                       "fingerprint.basis: \"" + basis + "\" is not \"live\" or \"no-loan\"");
+    /* The level rows, not the ceiling: two ceilings that resolve the same level set execute the
+     * same arena geometry. `none` is a deployment with no level plan and is a real identity. */
+    if (!get_string(j, "arena", &f->arena))
+        return refuse(err, RAD_E_INVAL, "fingerprint.arena: missing or not a non-empty string");
+    /* Only a live profile names a loan. A no-loan reference ignores the field even if a hand-
+     * edited file carries one: the basis already says the numbers were measured without it. */
+    if (f->basis == DraftCostBasis::Live && !get_string(j, "live_loan", &f->live_loan))
+        return refuse(err, RAD_E_INVAL,
+                      "fingerprint.live_loan: missing or not a non-empty string for a live basis");
     return RAD_OK;
 }
 
@@ -436,10 +457,16 @@ bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostF
                             " runtime=" + std::to_string(y);
         return false;
     };
+    /* The profile's basis selects the rule: a no-loan reference was measured without the loan and
+     * must load on a serving run that lends, so its basis is not compared against the runtime's.
+     * The live loan is compared only for a live profile; for a reference it is ignored. */
+    const bool live = a.basis == DraftCostBasis::Live;
     return str("model", a.model, b.model) && str("quant", a.quant, b.quant) &&
            num("tp", a.tp, b.tp) && str("tp_wire", a.tp_wire, b.tp_wire) &&
            str("gpus", a.gpus, b.gpus) && str("kernels", a.kernels, b.kernels) &&
-           str("kv_format", a.kv_format, b.kv_format) && str("placement", a.placement, b.placement);
+           str("kv_format", a.kv_format, b.kv_format) && str("placement", a.placement, b.placement) &&
+           str("arena", a.arena, b.arena) &&
+           (!live || str("live_loan", a.live_loan, b.live_loan));
 }
 
 std::string draft_cost_gpus(const std::vector<std::string>& names) {
@@ -469,8 +496,9 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
                       "format: \"" + format + "\" is not " + expected +
                           " (version 1 has no draft distribution, pipeline depth or origin mix; "
                           "version 2 has no resolved placement or device equipment in its "
-                          "fingerprint, so it cannot be bound to a deployment; a profile is "
-                          "regenerated, not rescaled)");
+                          "fingerprint; version 3 has no measurement basis and does not say "
+                          "whether the numbers were measured with the lenders off, nor carries "
+                          "the arena-level identity; a profile is regenerated, not rescaled)");
 
     const auto fp = j.find("fingerprint");
     if (fp == j.end()) return refuse(err, RAD_E_INVAL, "fingerprint: missing");
@@ -537,7 +565,9 @@ const char* const kOriginNames[] = { "none", "head", "lookup" };
 
 bool fingerprint_writable(const DraftCostFingerprint& f) {
     return !f.model.empty() && !f.quant.empty() && !f.tp_wire.empty() && !f.gpus.empty() &&
-           !f.kernels.empty() && !f.kv_format.empty() && !f.placement.empty() && f.tp >= 1;
+           !f.kernels.empty() && !f.kv_format.empty() && !f.placement.empty() &&
+           !f.arena.empty() && (f.basis == DraftCostBasis::NoLoan || !f.live_loan.empty()) &&
+           f.tp >= 1;
 }
 
 json rows_json(const int32_t* rows, int32_t len) {
@@ -660,7 +690,13 @@ int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_
                          { "gpus", p.fingerprint.gpus },
                          { "kernels", p.fingerprint.kernels },
                          { "kv_format", p.fingerprint.kv_format },
-                         { "placement", p.fingerprint.placement } };
+                         { "placement", p.fingerprint.placement },
+                         { "basis", p.fingerprint.basis == DraftCostBasis::NoLoan ? "no-loan"
+                                                                                  : "live" },
+                         { "arena", p.fingerprint.arena } };
+    /* A reference has no loan to name; the field exists only for a live basis. */
+    if (p.fingerprint.basis == DraftCostBasis::Live)
+        j["fingerprint"]["live_loan"] = p.fingerprint.live_loan;
     j["execution"] = p.execution == DraftCostExecution::Shrinking ? "shrinking" : "rectangular";
 
     json buckets = json::array();
@@ -775,11 +811,13 @@ void DraftCostTable::clear() {
     reason_.clear();
     dropped_ = 0;
     ignored_ = 0;
+    reference_skipped_ = 0;
     capacity_ = 0;
     active_ = false;
     fallback_admitted_ = false;
     record_only_ = false;
     hold_prices_ = false;
+    reference_ = false;
 }
 
 int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRuntime& runtime,
@@ -804,6 +842,10 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
     buckets_ = profile.buckets;
     capacity_ = capacity;
     buckets_.reserve((size_t)capacity);
+    /* A loaded no-loan profile is the reference: immutable and Measured-only. The calibration's
+     * own recording table can carry the same basis (the file it writes is a reference), but
+     * `runtime.recording` says it is the writer, not a loaded reference. */
+    reference_ = profile.fingerprint.basis == DraftCostBasis::NoLoan && !runtime.recording;
     active_ = true;
     return RAD_OK;
 }
@@ -844,7 +886,10 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     /* 2. The one documented interpolation step: the neighbouring context class, same shape
      * otherwise -- the verify distribution, the pipeline depth and the drafter included -- and the
      * same executed extent. The result is a real measurement; only its uncertainty is widened, and
-     * ties go to the larger class (more context, higher cost). */
+     * ties go to the larger class (more context, higher cost). A reference stops after step 1:
+     * interpolation and the heuristic fallback are not measurements, and a reference is
+     * Measured-only. */
+    if (reference_) return RAD_OK;
     const DraftCostBucket* near = nullptr;
     for (const DraftCostBucket& b : buckets_) {
         if (!draft_bucket_usable(b) || !shape_same_except_ctx(b.shape, s)) continue;
@@ -983,6 +1028,10 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
 
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
     if (!active_) { ++inactive_; return RAD_OK; }   /* no usable profile: nothing to learn into */
+    /* A loaded reference is immutable: the bracket is counted and dropped, before any record()
+     * path can create or move a bucket. Live occupancy is not a reason to update it -- the
+     * reference describes the no-loan start placement for the whole run, not the current one. */
+    if (reference_) { ++reference_skipped_; return RAD_OK; }
 
     if (draft_sample_storable(sample) && sample.rounds < plan->max_k) {
         /* The plan's deepest round never ran: the bracket is a verify window plus a draft phase

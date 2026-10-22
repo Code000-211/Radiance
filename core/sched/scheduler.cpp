@@ -183,14 +183,52 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * arrays are sized at. */
     dp.policy.mode = cfg.draft_policy == DraftPolicyKind::Cost ? DraftPolicyMode::Cost
                                                            : DraftPolicyMode::Legacy;
-    /* --draft-depth-tiers: what the cost choice weighs. A tier above the ceiling is refused by
-     * DraftPlanner::configure below, by name. */
-    dp.policy.n_tiers = cfg.draft_n_tiers < (int)RAD_DRAFT_MAX_TIERS ? cfg.draft_n_tiers
-                                                                    : (int)RAD_DRAFT_MAX_TIERS;
-    for (int i = 0; i < dp.policy.n_tiers; ++i) dp.policy.tiers[i] = cfg.draft_tiers[i];
+    /* --draft-depth-tiers: what the cost choice weighs. The executable head depth is the bound, not
+     * the ceiling: cap_of() bounds a plan only by the request's remaining output and the ceiling, so
+     * a tier above the head's own depth would be planned there, execute fewer rounds, and be filed
+     * as kDraftSampleShortened -- a bucket no reader may use. An explicit list above that depth is
+     * refused by name; the default ladder is trimmed to it (and its deepest value replaced by the
+     * depth itself), so a deployment whose head is shallower than the tuned ladder still runs the
+     * tiers it can execute. */
+    int32_t exec_depth = cfg.n_spec;
+    if (cfg.draft_policy == DraftPolicyKind::Cost) {
+        exec_depth = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
+        if (cfg.draft_tiers_set) {
+            for (int i = 0; i < cfg.draft_n_tiers; ++i) {
+                if (cfg.draft_tiers[i] > exec_depth) {
+                    RAD_ERR("--draft-depth-tiers: tier %d is above the executable head depth %d "
+                            "(ceiling %d, drafter depth %d)", (int)cfg.draft_tiers[i],
+                            (int)exec_depth, (int)cfg.n_spec, (int)prog.drafter.depth);
+                    return RAD_E_UNSUPPORTED;
+                }
+            }
+        }
+    }
+    dp.policy.n_tiers = 0;
+    for (int i = 0; i < cfg.draft_n_tiers && dp.policy.n_tiers < (int)RAD_DRAFT_MAX_TIERS; ++i) {
+        int32_t t = cfg.draft_tiers[i];
+        if (cfg.draft_policy == DraftPolicyKind::Cost && t > exec_depth) t = exec_depth;
+        if (dp.policy.n_tiers > 0 && t <= dp.policy.tiers[dp.policy.n_tiers - 1]) continue;
+        dp.policy.tiers[dp.policy.n_tiers++] = t;
+    }
+    if (cfg.draft_policy == DraftPolicyKind::Cost && !cfg.draft_tiers_set) {
+        int32_t top = dp.policy.tiers[dp.policy.n_tiers - 1];
+        if (top < exec_depth) {
+            /* The ladder ended below what the head can execute: offer the executable depth as the
+             * batch's deepest plan, so the coverage gate (the last tier) is the real choice. */
+            if (dp.policy.n_tiers < (int)RAD_DRAFT_MAX_TIERS)
+                dp.policy.tiers[dp.policy.n_tiers++] = exec_depth;
+            else
+                dp.policy.tiers[dp.policy.n_tiers - 1] = exec_depth;
+        }
+        if (dp.policy.tiers[dp.policy.n_tiers - 1] != cfg.draft_tiers[cfg.draft_n_tiers - 1])
+            RAD_INFO("--draft-depth-tiers: default ladder trimmed to the executable head depth %d "
+                     "(deepest tier %d)", (int)exec_depth,
+                     (int)dp.policy.tiers[dp.policy.n_tiers - 1]);
+    }
     /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
-     * depth is the configured one, or a cost deployment would draft nothing at all. */
-    dp.policy.fallback_k = cfg.n_spec;
+     * depth is the executable one, or a cost deployment would plan past what the head can run. */
+    dp.policy.fallback_k = exec_depth;
     if (cfg.max_seqs > 0) {
         draft_predict_state_.assign((size_t)cfg.max_seqs, DraftPredictState{});
         DraftPredictModel::Params pp;
@@ -2750,6 +2788,11 @@ int Scheduler::commit(const StepResult& res) {
  * cycle opens (draft_residency). Requires mu_. */
 void Scheduler::draft_drift_note(int64_t moves_since_bind) {
     if (moves_since_bind <= 0 || draft_drift_) return;
+    /* A loaded reference is an optimisation basis, not a recording of this run's placement. The
+     * live run keeps its loans, flex moves, arena level and recall -- that is operation, not a
+     * change to what the file measured (the plan's start placement with no borrowed copies), and
+     * it neither invalidates the file nor teaches it. Nothing is deactivated or marked. */
+    if (draft_costs_.reference()) return;
     if (!draft_.cost_policy() && !draft_record_) return;
     /* Sticky, because the run cannot move back to it: every later bracket is marked, and no
      * measurement after the move describes the start residency however clean it looks. */

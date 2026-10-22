@@ -33,7 +33,8 @@ json fingerprint_json() {
     return json{ { "model", "Qwen3.8-Flash-Next" }, { "quant", "gguf-q4_k_m" }, { "tp", 2 },
                  { "tp_wire", "wht6" }, { "gpus", "2x Radeon AI PRO R9700" },
                  { "kernels", "libr4d test+gfx1201" }, { "kv_format", "bf16" },
-                 { "placement", "all_vram" } };
+                 { "placement", "all_vram" }, { "basis", "live" }, { "arena", "none" },
+                 { "live_loan", "flex=0 lend=0;flex=0 lend=0" } };
 }
 
 DraftCostFingerprint runtime_fingerprint() {
@@ -46,6 +47,9 @@ DraftCostFingerprint runtime_fingerprint() {
     f.kernels = "libr4d test+gfx1201";
     f.kv_format = "bf16";
     f.placement = "all_vram";
+    f.basis = DraftCostBasis::Live;
+    f.arena = "none";
+    f.live_loan = "flex=0 lend=0;flex=0 lend=0";
     return f;
 }
 
@@ -91,7 +95,7 @@ json bucket_json(int32_t ctx, int32_t n_rows, int32_t k, std::vector<int32_t> ro
 }
 
 std::string profile_text(const std::vector<json>& buckets) {
-    json j{ { "format", "rad-draft-profile/3" }, { "fingerprint", fingerprint_json() },
+    json j{ { "format", "rad-draft-profile/4" }, { "fingerprint", fingerprint_json() },
             { "execution", "rectangular" }, { "buckets", json::array() } };
     for (const json& b : buckets) j["buckets"].push_back(b);
     return j.dump();
@@ -266,11 +270,12 @@ TEST(the_reader_accepts_the_documented_profile) {
      * C8 numbers are replayed in the_documented_c8_gradient_is_reproduced_without_a_new_measurement
      * and the two must not be conflated. */
     const std::string text = R"({
-      "format": "rad-draft-profile/3",
+      "format": "rad-draft-profile/4",
       "fingerprint": {
         "model": "Qwen3.8-Flash-Next", "quant": "gguf-q4_k_m", "tp": 2, "tp_wire": "wht6",
         "gpus": "2x Radeon AI PRO R9700", "kernels": "libr4d test+gfx1201",
-        "kv_format": "bf16", "placement": "all_vram"
+        "kv_format": "bf16", "placement": "all_vram", "basis": "live", "arena": "none",
+        "live_loan": "flex=0 lend=0;flex=0 lend=0"
       },
       "execution": "rectangular",
       "buckets": [{
@@ -310,9 +315,10 @@ TEST(the_reader_accepts_the_documented_profile) {
 
 TEST(an_older_profile_is_refused_by_name) {
     /* v1 has no draft distribution, no pipeline depth and no origin mix; v2 has no resolved
-     * placement or device equipment in its fingerprint, so it cannot be bound to a deployment.
-     * Neither can be mapped onto the current key by assuming zeros: the reader refuses the id and
-     * names the version it will read. It never rescales. */
+     * placement or device equipment in its fingerprint; v3 has neither a measurement basis nor an
+     * arena-level identity, so a v3 file cannot say whether its numbers were measured with the
+     * lenders off. None can be mapped onto the current key by assuming values: the reader refuses
+     * the id and names the version it will read. It never rescales. */
     std::string err;
     DraftCostProfile p;
 
@@ -320,7 +326,7 @@ TEST(an_older_profile_is_refused_by_name) {
     v1["format"] = "rad-draft-profile/1";
     CHECK_EQ(draft_cost_profile_parse(v1.dump(), &p, &err), RAD_E_UNSUPPORTED);
     CHECK(has(err, "rad-draft-profile/1"));
-    CHECK(has(err, "rad-draft-profile/3"));
+    CHECK(has(err, "rad-draft-profile/4"));
 
     json v2 = json::parse(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
     v2["format"] = "rad-draft-profile/2";
@@ -328,9 +334,18 @@ TEST(an_older_profile_is_refused_by_name) {
     CHECK(has(err, "rad-draft-profile/2"));
     CHECK(has(err, "placement"));
 
-    const std::string v4 = R"({"format":"rad-draft-profile/4","fingerprint":{},"execution":"rectangular","buckets":[]})";
-    CHECK_EQ(draft_cost_profile_parse(v4, &p, &err), RAD_E_UNSUPPORTED);
-    CHECK(has(err, "rad-draft-profile/4"));
+    json v3 = json::parse(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
+    v3["format"] = "rad-draft-profile/3";
+    CHECK_EQ(draft_cost_profile_parse(v3.dump(), &p, &err), RAD_E_UNSUPPORTED);
+    CHECK(has(err, "rad-draft-profile/3"));
+    CHECK(has(err, "basis"));
+
+    /* The basis is required, not defaulted: a file that does not say how its numbers were
+     * measured would be read under a rule it never claimed. */
+    json no_basis = json::parse(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
+    no_basis["fingerprint"].erase("basis");
+    CHECK_EQ(draft_cost_profile_parse(no_basis.dump(), &p, &err), RAD_E_INVAL);
+    CHECK(has(err, "basis"));
 
     /* A bucket that lost a current field is malformed, not an older file to be guessed at. */
     json missing = bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0);

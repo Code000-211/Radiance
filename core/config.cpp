@@ -166,9 +166,9 @@ static const Flag g_flags[] = {
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
     { "--draft-depth-tiers",  "LIST",   "the K values the cost policy chooses between, ascending\n"
-    "                                    and unique, e.g. 0,2,3,4,6; each must be <= the ceiling.\n"
-    "                                    Default 0,2,3,4,6" },
-    { "--draft-profile",      "PATH",   "a rad-draft-profile/3 file measured on this deployment,\n"
+    "                                    and unique, e.g. 0,2,3,4,6; each must be <= the executable\n"
+    "                                    head depth. Default 0,2,3,4,6 (trimmed to that depth)" },
+    { "--draft-profile",      "PATH",   "a rad-draft-profile/4 file measured on this deployment,\n"
     "                                    read before the scheduler starts; a fingerprint or\n"
     "                                    execution mismatch disables it and is named in the log.\n"
     "                                    Not accepted on a generator or embedding model" },
@@ -179,6 +179,12 @@ static const Flag g_flags[] = {
     "                                    issues the fallback baseline and prices nothing from what\n"
     "                                    it records. Needs a serial draft head. Not accepted on a\n"
     "                                    generator or embedding model" },
+    { "--draft-reference",    "",       "calibrate the no-loan reference: both lenders off for the\n"
+    "                                    whole run (no borrowed KV, no borrowed arena capacity), so\n"
+    "                                    the file is the plan's start placement without loans. Needs\n"
+    "                                    --draft-profile-out; the loaded reference is an optimisation\n"
+    "                                    basis, not a latency bound. Not accepted on a generator or\n"
+    "                                    embedding model" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -695,6 +701,13 @@ int config_parse(int argc, char** argv, Config* c) {
                 at = end + 1;
             }
             c->draft_n_tiers = n;
+            c->draft_tiers_set = true;
+        }
+        else if (S("--draft-reference")) {
+            /* A flag, not a mode: it says how this calibration measures, and the writer stamps
+             * the file with that basis. Whether the run may use it (a profile out, a policy that
+             * opens the cycle) is checked where both are known. */
+            c->draft_reference = true;
         }
         else if (S("--draft-profile")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1135,6 +1148,8 @@ const ShowRow kShow[] = {
     } },
     { "--draft-profile",      [](const Config& c) { return or_none(c.draft_profile, "none"); } },
     { "--draft-profile-out",  [](const Config& c) { return or_none(c.draft_profile_out, "none"); } },
+    { "--draft-reference",    [](const Config& c) {
+          return std::string(c.draft_reference ? "on: both lenders off" : "off"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

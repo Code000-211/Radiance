@@ -898,12 +898,19 @@ struct Config {
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
     /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
-     * The default is the ladder the policy was tuned with. A tier above the ceiling is refused by
-     * DraftPlanner::configure, which is where the ceiling is known (auto resolves it); a list is
-     * never silently trimmed. */
+     * The default is the ladder the policy was tuned with. An explicit tier above the executable
+     * head depth is refused by Scheduler::init, which is where that depth is known (auto resolves
+     * it); the default ladder is trimmed to it instead, so a valid deployment is not refused for
+     * the ladder's deeper end. */
     int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
     int     draft_n_tiers = 5;
-    /* --draft-profile: a rad-draft-profile/3 file measured on this deployment. Read once before
+    bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */
+    /* --draft-reference: this run calibrates the no-loan reference. Both lenders stay off for the
+     * whole run, so the buckets are the plan's start placement without borrowed copies; the file
+     * is stamped with that basis and a serving run may load it while its own loans stay dynamic.
+     * Not a switch a serving run sets, and not a bound: see docs/ADAPTIVE-MTP.md. */
+    bool    draft_reference = false;
+    /* --draft-profile: a rad-draft-profile/4 file measured on this deployment. Read once before
      * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
      * inactive and names the difference, and Cost is then refused by Scheduler::init. An older
      * format is refused by name: it cannot be bound to this deployment. */

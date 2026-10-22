@@ -2,7 +2,7 @@
  *
  * The policy (C) compares candidate plans by their expected batch time, so it asks the
  * DraftCostModel seam for a price in milliseconds for a DraftVerifyShape. This is that price: a
- * versioned profile of measured buckets (`rad-draft-profile/3`, docs/ADAPTIVE-MTP.md), keyed by
+ * versioned profile of measured buckets (`rad-draft-profile/4`, docs/ADAPTIVE-MTP.md), keyed by
  * the verify shape -- verify tokens and N_j, pipeline depth, context class, history and prefill
  * tokens, sampling, replay state and the loaded drafter -- paired with the draft distribution that
  * actually ran, never by (rows, max K) alone.
@@ -69,7 +69,16 @@ namespace rad {
  * on the free VRAM at start, so the flag value would let two differently placed deployments share
  * a profile. It carries, per rank in rank order, the strategy, the resolved budgets and a digest
  * of the plan's tier/site per weight -- the expert residency a strategy name alone does not name.
- * The engine refuses to derive a runtime from a plan that is still `auto`. */
+ * The engine refuses to derive a runtime from a plan that is still `auto`.
+ *
+ * `basis` says how the numbers were measured and selects the comparison rule: a `NoLoan`
+ * reference compares the plan, the budgets and the arena levels and ignores `live_loan`; a `Live`
+ * profile compares the loan as well. `arena` is the level-row identity from the start's arena
+ * plan (`Engine::arena_rows_`): the level a step runs at changes the activation geometry, and two
+ * ceilings that resolve the same level set execute the same geometry while two different sets do
+ * not. `live_loan` is the per-rank `flex=`/`lend=` the start loan covers -- the old part of
+ * `placement`, now a field of its own so a no-loan reference does not have to name a loan of
+ * zero. */
 struct DraftCostFingerprint {
     std::string model;
     std::string quant;
@@ -78,6 +87,9 @@ struct DraftCostFingerprint {
     std::string kernels;
     std::string kv_format;
     std::string placement;
+    DraftCostBasis basis = DraftCostBasis::Live;
+    std::string arena;
+    std::string live_loan;
     int32_t     tp = 0;
 };
 
@@ -107,6 +119,9 @@ inline DraftCostExecution draft_cost_execution(bool serial_head, int32_t n_spec)
 struct DraftCostRuntime {
     DraftCostFingerprint fingerprint;
     DraftCostExecution   execution = DraftCostExecution::Rectangular;
+    /* The table is a calibration's recording target, not a loaded reference. Both can carry a
+     * no-loan fingerprint; only the loaded one must stay immutable. */
+    bool recording = false;
 };
 
 /* One measured bucket. Its price is the cost of the executed distribution: the lookup key is the
@@ -144,7 +159,7 @@ struct DraftCostBucket {
     int32_t  draft_round_rows[RAD_SCHED_MAX_SPEC + 1] = {};  /* actual N_j, index 0 unused */
     int32_t  draft_rows_total = -1;                          /* sum_j draft_round_rows[j] */
     double   mean_ms = 0.0;     /* the amortised batch time at the same pipeline depth */
-    double   unc_ms = 0.0;      /* half-width of mean_ms */
+    double   unc_ms = 0.0;      /* half-width of mean_ms; a heuristic, not a bound on a future run */
     int32_t  n = 0;             /* samples behind the mean */
     int32_t  n_ahead = 0;       /* of them issued ahead; online only -- a profile keeps the flag, not the count */
     /* Split timings, -1 when not timed. Under overlap they do not add up to mean_ms. */
@@ -174,7 +189,7 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
 /* Reads `path` and parses it. The file is not on the step path. */
 int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std::string* err);
 
-/* The inverse reader: `p` as a rad-draft-profile/3 file, in `*out`. Refuses (RAD_E_INVAL with
+/* The inverse reader: `p` as a rad-draft-profile/4 file, in `*out`. Refuses (RAD_E_INVAL with
  * `err` naming the bucket) rather than inventing what it cannot state: a bucket whose origin mix
  * was not captured, or whose origins do not fit its drafter, is not written. Buckets carrying a
  * flag the file cannot name -- the runtime-only kDraftSampleShortened / kDraftBucketUnpriced -- are
@@ -225,7 +240,9 @@ public:
     /* Installs a validated profile for this deployment. Returns RAD_OK even when the fingerprint
      * or the execution does not match: the table then stays empty and reason() names the
      * mismatch, so a refused profile is a visible fallback, not a parse error. RAD_E_INVAL for a
-     * malformed profile (no fingerprint field, a bucket with an invalid shape). */
+     * malformed profile (no fingerprint field, a bucket with an invalid shape). A `NoLoan`
+     * profile becomes an immutable reference unless this table is a calibration's recording
+     * target (`runtime.recording`). */
     int configure(const DraftCostProfile& profile, const DraftCostRuntime& runtime,
                   int32_t capacity = kDraftCostDefaultBuckets);
 
@@ -247,6 +264,14 @@ public:
      * them. The fallback baseline is what such a run executes, and exactly what it measures. */
     void record_only() { record_only_ = true; }
     bool records_only() const { return record_only_; }
+
+    /* The loaded profile is a no-loan reference (DraftCostBasis::NoLoan): it is an optimisation
+     * basis, not a bound, and it is immutable. estimate() answers only from exact Measured
+     * buckets -- no interpolation, no conservative fallback -- and observe() counts the cycle
+     * (`reference_skipped()`) without touching a bucket. Configured from the file's basis; a
+     * calibration's recording table (`DraftCostRuntime::recording`) is never a reference. */
+    bool reference() const { return reference_; }
+    int64_t reference_skipped() const { return reference_skipped_; }
 
     /* The start placement is not materialised yet (Engine::start_placement_settled): a profile
      * measured on it would price a residency the run has not reached, so estimate() answers
@@ -283,8 +308,9 @@ public:
      * no measurement, however close the bucket's plan was; so does one with no anchor that ran its
      * own distribution with the same history and prefill. Measured from an exact bucket,
      * Interpolated from the neighbouring context class, or a heuristic fallback scaled from the
-     * nearest anchor that ran the same distribution, history and prefill. valid = false when there
-     * is no such anchor at all. Allocation-free. */
+     * nearest anchor that ran the same distribution, history and prefill. A reference table
+     * returns only the exact Measured bucket; every other query is invalid. valid = false when
+     * there is no such anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
     /* Learns from one completed cycle. Refuses an incomplete observation, one that does not
@@ -297,7 +323,9 @@ public:
      * it is a bracket with no evidence and is counted in ignored(). Only an attributable sample
      * updates a measured bucket; the rest are kept as diagnostics, and a truncation -- the plan's
      * deepest round never ran, so the bracket carries abort cost -- is stored with
-     * kDraftBucketUnpriced instead of seeding a measured bucket. */
+     * kDraftBucketUnpriced instead of seeding a measured bucket. A reference table records
+     * nothing: a valid observation is only counted (`reference_skipped()`), because the loaded
+     * reference may not be overwritten by the run it prices. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */
@@ -311,10 +339,12 @@ private:
     int64_t dropped_ = 0;
     int64_t ignored_ = 0;
     int64_t inactive_ = 0;
+    int64_t reference_skipped_ = 0;
     bool active_ = false;
     bool fallback_admitted_ = false;
     bool record_only_ = false;
     bool hold_prices_ = false;
+    bool reference_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
                                   const int32_t* round_rows);

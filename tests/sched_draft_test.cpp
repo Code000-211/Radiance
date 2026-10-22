@@ -127,6 +127,9 @@ void activate_costs(Fixture& f, bool priced = false) {
     p.fingerprint.kv_format = "bf16";
     p.fingerprint.placement = "all_vram";
     p.fingerprint.tp        = 1;
+    p.fingerprint.basis     = DraftCostBasis::Live;
+    p.fingerprint.arena     = "none";
+    p.fingerprint.live_loan = "flex=0 lend=0";
     if (priced) {
         DraftCostBucket b;
         b.shape.n_rows        = 1;
@@ -1526,6 +1529,24 @@ TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
     CHECK_EQ(first->history_tokens[0], first_hist);
 }
 
+/* One bucket keyed the way this fixture runs: publish-then-verify at pipeline depth 1, one row,
+ * the previous cycle's window still empty on the first cycle. */
+std::string seam_bucket(int cls, int k, double ms) {
+    std::string draft = "0";
+    for (int j = 1; j <= k; ++j) draft += ",1";
+    return "{\"ctx_class\": " + std::to_string(cls) +
+           ", \"shape\": {\"n_rows\": 1, \"verify_k\": 0, \"verify_tokens\": 1"
+           ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"pipeline_depth\": 1"
+           ", \"rows\": [0], \"draft_k\": " + std::to_string(k) +
+           ", \"draft_rows\": [" + draft + "]"
+           ", \"origins\": [\"head\"], \"sampling\": \"greedy\", \"replay\": \"none\""
+           ", \"drafter\": \"serial\"},"
+           " \"extent\": {\"rounds\": " + std::to_string(k) +
+           ", \"draft_rows_total\": " + std::to_string(k) +
+           ", \"draft_round_rows\": [" + draft + "]},"
+           " \"time_ms\": {\"mean\": " + std::to_string(ms) + ", \"unc\": 0.01, \"n\": 9}}";
+}
+
 /* The A/C seam against the real model: a version-3 profile measured for this deployment, read by
  * A's table, sees the shape the planner prices.
  *
@@ -1549,26 +1570,13 @@ TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     pred.set(id, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
 
     const int cls = draft_ctx_class(8);
-    auto bucket = [&](int k, double ms) {
-        std::string draft = "0";
-        for (int j = 1; j <= k; ++j) draft += ",1";
-        return "{\"ctx_class\": " + std::to_string(cls) +
-               ", \"shape\": {\"n_rows\": 1, \"verify_k\": 0, \"verify_tokens\": 1"
-               ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"pipeline_depth\": 1"
-               ", \"rows\": [0], \"draft_k\": " + std::to_string(k) +
-               ", \"draft_rows\": [" + draft + "]"
-               ", \"origins\": [\"head\"], \"sampling\": \"greedy\", \"replay\": \"none\""
-               ", \"drafter\": \"serial\"},"
-               " \"extent\": {\"rounds\": " + std::to_string(k) +
-               ", \"draft_rows_total\": " + std::to_string(k) +
-               ", \"draft_round_rows\": [" + draft + "]},"
-               " \"time_ms\": {\"mean\": " + std::to_string(ms) + ", \"unc\": 0.01, \"n\": 9}}";
-    };
+    auto bucket = [&](int k, double ms) { return seam_bucket(cls, k, ms); };
     /* 1 token / 2.0 ms, 3 / 1.3, 7 / 5.0: K=2 pays, K=6 does not. */
     const std::string profile =
-        "{\"format\": \"rad-draft-profile/3\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
+        "{\"format\": \"rad-draft-profile/4\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
         "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
-        "\"placement\": \"vram\"}, \"execution\": \"rectangular\", \"buckets\": [" +
+        "\"placement\": \"vram\", \"basis\": \"live\", \"arena\": \"none\", "
+        "\"live_loan\": \"flex=0 lend=0\"}, \"execution\": \"rectangular\", \"buckets\": [" +
         bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "]}";
 
     DraftCostProfile parsed;
@@ -1653,6 +1661,62 @@ TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     CHECK_EQ(pg->k[0], 2);
     CHECK_EQ(pg->verify_k, 0);   /* still the first cycle: nothing published before it */
     CHECK_EQ(draft_plan_valid(*pg), RAD_OK);
+}
+
+/* The deepest offered plan is the coverage gate. A batch whose ladder is 0/2/6 against a profile
+ * that priced only 0 and 2 does not take K2 because it happens to be priced: the deeper
+ * alternative was not measured, and a shallower price is not evidence about it. The plan is the
+ * named baseline, at the baseline depth -- not a cost decision. */
+TEST(an_unpriced_deepest_tier_falls_back_instead_of_choosing_a_shallower_price) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    CHECK_OK(f.start(DraftReplay::None));
+
+    Predictions pred;
+    const uint64_t id = f.submit(8);
+    pred.set(id, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
+
+    const int cls = draft_ctx_class(8);
+    const std::string profile =
+        "{\"format\": \"rad-draft-profile/4\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
+        "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
+        "\"placement\": \"vram\", \"basis\": \"live\", \"arena\": \"none\", "
+        "\"live_loan\": \"flex=0 lend=0\"}, \"execution\": \"rectangular\", \"buckets\": [" +
+        seam_bucket(cls, 0, 2.0) + "," + seam_bucket(cls, 2, 1.3) + "]}";
+    DraftCostProfile parsed;
+    std::string err;
+    CHECK_OK(draft_cost_profile_parse(profile, &parsed, &err));
+    DraftCostRuntime rt;
+    rt.fingerprint = parsed.fingerprint;
+    rt.execution   = DraftCostExecution::Rectangular;
+    DraftCostTable table;
+    CHECK_OK(table.configure(parsed, rt));
+    CHECK(table.active());
+
+    RealPrice real{ &table, nullptr };
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 6;
+    dp.policy.n_tiers  = 3;
+    dp.policy.fallback_k = 5;   /* distinguishable from every tier */
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = DraftCostModel{ &real, real_price };
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    f.sch.find(id)->sp.temp = 0.0f;
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    CHECK(p->source == DraftPlanSource::Fallback);
+    CHECK(p->fallback == DraftFallback::UnknownShape);
+    CHECK_EQ(p->k[0], 5);
+    CHECK_EQ(draft_plan_valid(*p), RAD_OK);
 }
 
 /* ================================================================== the production wiring */
@@ -2167,6 +2231,9 @@ TEST(a_usable_bucket_admits_the_cost_policy_without_a_fallback_admission) {
     p.fingerprint.kv_format = "bf16";
     p.fingerprint.placement = "all_vram";
     p.fingerprint.tp        = 1;
+    p.fingerprint.basis     = DraftCostBasis::Live;
+    p.fingerprint.arena     = "none";
+    p.fingerprint.live_loan = "flex=0 lend=0";
     DraftCostBucket b;
     b.shape.n_rows        = 1;
     b.shape.verify_k      = 1;
