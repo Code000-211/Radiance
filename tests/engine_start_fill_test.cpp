@@ -11,8 +11,11 @@
  *    drives the real mover into the state place_test pins: the idle balance filled everything the
  *    loan covers except the turnover reserve. The engine has to finish it, so the reserve is
  *    initial and the resolve has nothing to move.
- *  - The same call on an already settled mover is the zero-iteration path exactly: the wave runs,
- *    nothing is left to fill, and the proof is unchanged -- no promotion, no move.
+ *  - The same call must not depend on fill_settled() at entry. A settled mover sends the old loop
+ *    through zero iterations, so the reserve proof was whatever the predicate happened to say.
+ *    The completion now runs its wave from that entry too: it holds turnover, finds nothing left
+ *    (fill_settled() is reserve-aware since the predicate fix, so a settled mover has no free
+ *    reserve), and leaves the proof unchanged (Review 2, finding 1).
  *  - A failing fill must reach serve. The completion returns the status and prepare_serving()
  *    returns it before begin_draft_calibration(), so the run never gets a fingerprint, a profile
  *    or a price for a placement it did not reach (Review 2, finding 2).
@@ -237,10 +240,10 @@ TEST(complete_start_fill_fills_the_reserve_the_idle_balance_left_free) {
     CHECK_EQ(h.stats().moves((int64_t)h.stats().initial_fill_promotions), (int64_t)0);
 }
 
-/* The zero-iteration case: the mover is already settled at entry, so the old loop condition
- * (fill_settled()) would never enter its body. The fixed completion runs its wave regardless --
- * the completion proves the reserve by holding turnover and balancing, it does not infer it from
- * the predicate. On a settled mover that wave finds nothing to fill and changes nothing. */
+/* The zero-iteration case: settled before the call, so the old loop condition (fill_settled())
+ * never entered its body. The completion runs its held-turnover wave regardless -- it proves the
+ * placement by balancing, it does not infer it from the predicate -- and on a settled mover that
+ * wave finds nothing left. The proof and the accounting must be unchanged. */
 TEST(complete_start_fill_holds_turnover_from_an_already_settled_mover) {
     Rig r(/*n_expert*/ 24, /*strips*/ 8, /*turnover*/ 2);
     Engine e(r.cfg);
