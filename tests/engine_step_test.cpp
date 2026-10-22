@@ -10,7 +10,8 @@
  * and Engine exposes no per-step entry point (start/serve/dump only):
  *   - a pending end event. The host backend completes an unrecorded event immediately
  *     (core/device/host.cpp), so there is no deterministic way to hold a wait in flight.
- *   - a second participating rank, its success and its failure. ranks_ is filled by start().
+ *   - a second participating rank, its success and its failure. ranks_ is filled by start(), and
+ *     the cases below create a rank only for its evidence slot: no pass of theirs runs.
  *   - the reset of `complete` at the issue site, and the publishing half of the finish/watermark
  *     path (Engine::finish_serial_drafter with serial_done_ > 0): that one also needs slots_host_
  *     and draft_out_, which only a run fills. The row-less half of the same function -- a
@@ -85,5 +86,71 @@ TEST(engine_step_does_not_clear_a_previous_completion) {
 }
 
 }  /* namespace */
+
+/* The scheduler reads one DraftStepEvidence per step from the ranks' evidence slots. The rank
+ * thread notes every pass of the step's bracket into the same slot, so this is the aggregation the
+ * reader depends on: a draft pass's tape must count as the step's, repeated notes must not lose the
+ * strongest class, and the next step must not inherit anything. No card is involved -- the notes
+ * are the exact calls the rank thread makes (Rank::note_evidence) and the read is
+ * Engine::step_evidence. */
+TEST(engine_step_evidence_merges_a_steps_passes_and_isolates_the_next) {
+    Engine e(rad::Config{});
+    using Ctx = rad::Ctx;
+
+    Ctx::StepEvidence trunk{};
+    trunk.step = 5;
+    trunk.tape = Ctx::kStepTapePlay;
+    trunk.staged = true;
+
+    EngineTestPeer::note_evidence(e, 0, trunk, Ctx::kStepTapeNone, /*moved=*/false);
+    /* A draft pass ran inside the same bracket and recorded: the slot keeps Record, not Play. */
+    EngineTestPeer::note_evidence(e, 0, trunk, Ctx::kStepTapeRecord, /*moved=*/true);
+
+    rad::DraftStepEvidence ev;
+    REQUIRE(EngineTestPeer::step_evidence(e, 5, &ev));
+    CHECK(ev.replay_known);
+    CHECK(ev.replay == rad::DraftReplay::Record);
+    CHECK(ev.staged);
+    CHECK(ev.moved);
+
+    /* Repeating the trunk pass's note does not downgrade what the draft pass filed. */
+    EngineTestPeer::note_evidence(e, 0, trunk, Ctx::kStepTapeNone, /*moved=*/false);
+    REQUIRE(EngineTestPeer::step_evidence(e, 5, &ev));
+    CHECK(ev.replay == rad::DraftReplay::Record);
+    CHECK(ev.staged);
+    CHECK(ev.moved);
+
+    /* The next step has its own slot: a trunk pass with no tape and nothing staged inherits none
+     * of the previous step's facts, and step 5 keeps its own. */
+    Ctx::StepEvidence next{};
+    next.step = 6;
+    next.tape = Ctx::kStepTapeNone;
+    EngineTestPeer::note_evidence(e, 0, next, Ctx::kStepTapeNone, /*moved=*/false);
+    rad::DraftStepEvidence ev6;
+    REQUIRE(EngineTestPeer::step_evidence(e, 6, &ev6));
+    CHECK(ev6.replay_known);
+    CHECK(ev6.replay == rad::DraftReplay::None);
+    CHECK(!ev6.staged);
+    CHECK(!ev6.moved);
+    REQUIRE(EngineTestPeer::step_evidence(e, 5, &ev));
+    CHECK(ev.replay == rad::DraftReplay::Record);
+    CHECK(ev.staged);
+    CHECK(ev.moved);
+
+    /* Across ranks too: one rank's None never overrides another's Record, and a rank that never
+     * ran the step is a miss, not a measured None. */
+    Ctx::StepEvidence s7{};
+    s7.step = 7;
+    s7.tape = Ctx::kStepTapePlay;
+    EngineTestPeer::note_evidence(e, 0, s7, Ctx::kStepTapeNone, /*moved=*/false);
+    EngineTestPeer::note_evidence(e, 1, s7, Ctx::kStepTapeRecord, /*moved=*/true);
+    rad::DraftStepEvidence ev7;
+    REQUIRE(EngineTestPeer::step_evidence(e, 7, &ev7));
+    CHECK(ev7.replay == rad::DraftReplay::Record);
+    CHECK(ev7.moved);
+    REQUIRE(EngineTestPeer::step_evidence(e, 6, &ev6));
+    CHECK(ev6.replay == rad::DraftReplay::None);
+    CHECK(!ev6.staged);
+}
 
 RAD_TEST_MAIN()

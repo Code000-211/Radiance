@@ -9,6 +9,9 @@
 #pragma once
 
 #include "engine.h"
+/* Engine::Rank is complete here only for its evidence slots: a host fixture has no rank thread,
+ * and the aggregation those slots perform is what the peer has to reach. */
+#include "engine_priv.h"
 
 #include <cstdint>
 #include <memory>
@@ -93,6 +96,19 @@ struct EngineTestPeer {
 
     /* The release kind a fixture's tiering hook answers for (Engine::issue_what_). */
     static constexpr int kIssueSampler = Engine::kIssueSampler;
+
+    /* One note into a rank's evidence slot, exactly as the rank thread files it after a pass
+     * (Rank::note_evidence), and the scheduler's cross-rank read (Engine::step_evidence). The rank
+     * exists for its slots alone: nothing here starts a device or a thread. */
+    static void note_evidence(Engine& e, int32_t rank, const Ctx::StepEvidence& ev,
+                              uint8_t pass_tape, bool moved) {
+        if ((int32_t)e.ranks_.size() <= rank) e.ranks_.resize((size_t)rank + 1);
+        if (!e.ranks_[(size_t)rank]) e.ranks_[(size_t)rank] = std::make_unique<Engine::Rank>();
+        e.ranks_[(size_t)rank]->note_evidence(ev, pass_tape, moved);
+    }
+    static bool step_evidence(Engine& e, int32_t step, DraftStepEvidence* out) {
+        return e.step_evidence(step, out);
+    }
 };
 
 }  /* namespace rad */
