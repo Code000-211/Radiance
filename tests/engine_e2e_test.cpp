@@ -33,6 +33,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <cerrno>
 #include <condition_variable>
@@ -480,6 +481,12 @@ struct Server {
 struct Call {
     int fd = -1;
     std::string why;
+    /* A read that makes no progress for this long fails instead of blocking (0 = wait forever),
+     * and `timed_out` says it did. A stream must end on its own, so the case that watches one
+     * gives up here rather than hanging the suite. */
+    int timeout_s = 0;
+    bool timed_out = false;
+    std::string head;   /* the response head, lowercased, once one arrived */
     bool fail(const char* what) {
         why = std::string(what) + ": " + std::strerror(errno);
         return false;
@@ -492,6 +499,11 @@ struct Call {
         a.sin_port = htons((uint16_t)port);
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(fd, (sockaddr*)&a, sizeof a) != 0) return fail("connect");
+        if (timeout_s > 0) {
+            timeval tv{};
+            tv.tv_sec = timeout_s;
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        }
         std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
                           "Connection: close\r\nContent-Type: application/json\r\n" +
                           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -510,6 +522,7 @@ struct Call {
         for (;;) {
             const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
             if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) timed_out = true;
             if (n < 0) err = errno;
             if (n <= 0) break;
             raw.append(buf, (size_t)n);
@@ -523,9 +536,10 @@ struct Call {
                        : std::string("closed it"));
             return -1;
         }
-        std::string head = raw.substr(0, h), rest = raw.substr(h + 4);
-        for (char& c : head) c = (char)std::tolower((unsigned char)c);
-        if (head.find("transfer-encoding: chunked") != std::string::npos) {
+        std::string hd = raw.substr(0, h), rest = raw.substr(h + 4);
+        for (char& c : hd) c = (char)std::tolower((unsigned char)c);
+        head = hd;
+        if (hd.find("transfer-encoding: chunked") != std::string::npos) {
             std::string out;
             for (size_t at = 0;;) {
                 const size_t eol = rest.find("\r\n", at);
@@ -551,6 +565,47 @@ json post(int port, const std::string& path, const json& body, int* status = nul
     if (status) *status = st;
     if (why) *why = c.why;
     return json::parse(out, nullptr, false);
+}
+
+/* One streamed `/v1/completions` request, read to the end of its stream. `timed_out` says the
+ * server left the stream open rather than ending it. */
+struct Streamed {
+    int status = -1;
+    bool timed_out = false;
+    std::string head;   /* the response head, lowercased */
+    std::string body;   /* the decoded chunked body */
+    std::string why;
+};
+
+Streamed stream_completion(int port, const std::vector<int32_t>& prompt, int n, double temp,
+                           int64_t seed) {
+    json b = { { "prompt", prompt }, { "max_tokens", n }, { "temperature", temp },
+               { "ignore_eos", true }, { "stream", true } };
+    if (seed) b["seed"] = seed;
+    Streamed s;
+    Call c;
+    c.timeout_s = 60;
+    s.status = c.send(port, "POST", "/v1/completions", b.dump()) ? c.read(&s.body) : -1;
+    s.head = c.head;
+    s.timed_out = c.timed_out;
+    s.why = c.why;
+    return s;
+}
+
+/* The `data:` payloads of an event stream, and whether every event was framed as one. */
+std::vector<std::string> stream_payloads(const std::string& body, bool* framed) {
+    std::vector<std::string> out;
+    *framed = true;
+    for (size_t i = 0; i < body.size();) {
+        const size_t end = body.find("\n\n", i);
+        if (end == std::string::npos || body.compare(i, 6, "data: ") != 0) {
+            *framed = false;
+            break;
+        }
+        out.push_back(body.substr(i + 6, end - i - 6));
+        i = end + 2;
+    }
+    return out;
 }
 
 /* A running server's /stats document (a GET route; `post` would be refused), or null. */
@@ -2057,6 +2112,161 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
                     status, why.c_str(), tail(log).c_str());
         CHECK(status >= 400);
         CHECK(status < 600);
+        CHECK(log.find("deepest offered tier K2") != std::string::npos);
+        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
+        CHECK(log.find("has no plan (") == std::string::npos);
+        const int reader_exit = reader.stop();
+        if (reader_exit == 0)
+            fprintf(stderr, "    the run did not stop on the refused later cycle:\n%s\n",
+                    tail(log).c_str());
+        CHECK(reader_exit != 0);
+    }
+}
+
+/* The coverage gap on the streaming path. `stream: true` puts 200 and the event-stream headers on
+ * the wire before the first token, so a refused cycle can no longer become an HTTP status: the
+ * failed choice has to become an error event, and the stream has to end by itself. A silent close
+ * would pass a truncated answer off as complete, and a stream the run never ends would hang its
+ * client. The same two cases as the buffered test above: a first request whose shape the reference
+ * never measured, and a run that serves one priced request before the gap. The reader is given 60 s
+ * without progress, so a stream that never ends fails the case instead of the suite. */
+TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
+    tiny::TempDir dir("ref_gap_stream");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "reference.json";
+
+    /* The writer, as in the buffered case: a real no-loan reference export. */
+    Server writer;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile-out", out,
+                                             "--draft-reference" };
+        REQUIRE(writer.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt, 24), &status, &why);
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the reference writer exited %d:\n%s\n", writer_exit,
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+
+    const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
+                                                   "--draft-depth-tiers", "0,2",
+                                                   "--draft-window", "fixed",
+                                                   "--draft-policy", "cost",
+                                                   "--draft-profile", out };
+
+    /* What a stream that ended on the gap has to look like: the committed 200 and event-stream
+     * headers, well-framed events, exactly one error event naming the engine failure, and no choice
+     * that claims a normal finish. */
+    auto check_gap_stream = [](const Streamed& r, const char* which) {
+        if (r.timed_out)
+            fprintf(stderr, "    the %s stream never ended: no progress for 60 s\n", which);
+        CHECK(!r.timed_out);
+        if (r.status != 200)
+            fprintf(stderr, "    the %s stream was answered with status %d instead of the "
+                            "committed 200 (%s)\n", which, r.status, r.why.c_str());
+        CHECK_EQ(r.status, 200);
+        CHECK(r.head.find("content-type: text/event-stream") != std::string::npos);
+
+        bool framed = true;
+        const std::vector<std::string> payloads = stream_payloads(r.body, &framed);
+        if (!framed)
+            fprintf(stderr, "    the %s stream is not well framed:\n%s\n", which, r.body.c_str());
+        CHECK(framed);
+
+        int errors = 0, last_error = -1;
+        std::string message;
+        bool finished = false;
+        for (size_t i = 0; i < payloads.size(); ++i) {
+            if (payloads[i] == "[DONE]") continue;
+            const json j = json::parse(payloads[i], nullptr, false);
+            if (!j.is_object()) { framed = false; continue; }
+            if (j.contains("error")) {
+                ++errors;
+                last_error = (int)i;
+                message = j["error"].value("message", std::string());
+                continue;
+            }
+            if (!j.contains("choices") || j["choices"].empty()) continue;
+            const json& f = j["choices"][0]["finish_reason"];
+            if (f.is_string() && (f.get<std::string>() == "stop" ||
+                                  f.get<std::string>() == "length"))
+                finished = true;
+        }
+        CHECK(framed);
+        if (errors != 1)
+            fprintf(stderr, "    the %s stream carried %d error event(s):\n%s\n", which, errors,
+                    r.body.c_str());
+        CHECK_EQ(errors, 1);
+        CHECK(message.find("the engine failed this request") != std::string::npos);
+        /* The abort is the stream's last word: no choice finished normally, and the only payload
+         * after the error is the terminator. */
+        CHECK(!finished);
+        if (last_error < 0 || (size_t)last_error + 2 < payloads.size())
+            fprintf(stderr, "    the %s stream did not end with the error and [DONE]:\n%s\n", which,
+                    r.body.c_str());
+        CHECK_EQ(last_error, (int)payloads.size() - 2);
+        CHECK(payloads.size() >= 2);
+        if (payloads.size() >= 2) CHECK_EQ(payloads.back(), std::string("[DONE]"));
+    };
+
+    /* First request, unmeasured shape: the very first cycle cannot be priced, after the 200 has
+     * gone out. */
+    {
+        Server reader;
+        REQUIRE(reader.start(dir.path, reader_args));
+        const Streamed r = stream_completion(reader.port, prompt, 24, 0.7, 7);
+        check_gap_stream(r, "first");
+        const std::string log = reader.output();
+        CHECK(log.find("deepest offered tier K2") != std::string::npos);
+        CHECK(log.find("named baseline would run at K6") != std::string::npos);
+        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
+        CHECK(log.find("has no plan (") == std::string::npos);
+        const int reader_exit = reader.stop();
+        if (reader_exit == 0)
+            fprintf(stderr, "    the run did not stop on the refused cycle:\n%s\n",
+                    tail(log).c_str());
+        CHECK(reader_exit != 0);
+    }
+
+    /* A priced streaming request is served whole, and the gap on the next one ends that stream. */
+    {
+        Server reader;
+        REQUIRE(reader.start(dir.path, reader_args));
+        const Streamed first = stream_completion(reader.port, prompt, 24, 0.0, 0);
+        if (first.status != 200 || first.timed_out)
+            fprintf(stderr, "    the priced stream failed (%d%s):\n%s\n", first.status,
+                    first.timed_out ? ", no end" : "", tail(reader.output()).c_str());
+        CHECK_EQ(first.status, 200);
+        CHECK(!first.timed_out);
+        bool framed = true;
+        const std::vector<std::string> payloads = stream_payloads(first.body, &framed);
+        int errors = 0;
+        for (const std::string& p : payloads) {
+            if (p == "[DONE]") continue;
+            const json j = json::parse(p, nullptr, false);
+            if (j.is_object() && j.contains("error")) ++errors;
+        }
+        CHECK(framed);
+        CHECK_EQ(errors, 0);
+        CHECK(!payloads.empty() && payloads.back() == "[DONE]");
+        CHECK_EQ(draft_positions(reader.port), 2);
+
+        const Streamed later = stream_completion(reader.port, prompt, 24, 0.7, 7);
+        check_gap_stream(later, "later");
+        const std::string log = reader.output();
         CHECK(log.find("deepest offered tier K2") != std::string::npos);
         CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
         CHECK(log.find("has no plan (") == std::string::npos);
