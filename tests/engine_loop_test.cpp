@@ -28,15 +28,16 @@
  * and collect_step set it (and only there). Rounds done and rows committed are neither; they are
  * recorded below as context and never asserted on.
  *
- * This case covers both halves of that rule, on the two paths this run produces:
+ * This case covers the shared head's half of that rule, and the issuance half:
  *
- *  - Mid-prompt, the row-less half. A chunk short of the prompt end commits no logit row, but its
- *    hidden states are history the head still needs, so round 0 is built for it anyway
- *    (Scheduler::serial_begin keeps one round when no row drafts, "because round 0 is the history
- *    pass the remaining rows still owe"). collect_step therefore takes the repaired
- *    `n_rows <= 0 && serial_hist_issued_` branch: it awaits the end and sets complete. The finish
- *    moves the watermark by exactly the chunk, and the next seam shows both facts -- prior_complete,
- *    and a watermark one chunk further on.
+ *  - Mid-prompt, the shared head's half. A chunk short of the prompt end commits no logit row and
+ *    issues no draft pass: the assistant head declares itself cache-less (`rad_drafter_shared_kv`),
+ *    so `serial_shared_` is true and Scheduler::serial_begin skips every row that cannot draft
+ *    (core/sched/scheduler.cpp:2266-2267). Round 0 has no batch, `serial_hist_issued_` stays false, and
+ *    collect_step returns before any wait. Neither fact is claimed, so the watermark must stand --
+ *    which the assertions below check. This fixture therefore cannot reach the row-less branch the
+ *    repair added; engine_history_test.cpp owns that branch, with a serial head that keeps its own
+ *    KV and so does owe a mid-prompt chunk its history.
  *  - The withheld step, the issuance half. Its row exists and its wait completes, but the record is
  *    withdrawn after the pass was built and before the finish reads it, so the finish leaves the
  *    watermark alone with the completion fact present (on the host backend every wait that ran ends
@@ -45,10 +46,10 @@
  * The seam runs after the step's draft passes were issued (`issue_serial_drafter`) and after
  * `issue_ahead`, immediately before `collect_step` -- the step's one wait. It therefore sees
  * `complete` as the reset left it (false, nothing has waited yet), the issuance record as the step
- * path set it, and the watermark *before* this step's finish. The row-less branch's wait is exactly
- * what the seam is in front of; it is read at the next seam, as prior_complete and as the watermark
- * step that wait made possible. The trace is thus a sequence of pre-finish values, and a step's own
- * finish is judged by comparing its value with the next one's.
+ * path set it, and the watermark *before* this step's finish. A step's own finish is judged by
+ * comparing its value with the next seam's: a wait that ran shows up there as prior_complete, and a
+ * watermark that moved shows up as a larger value. The trace is thus a sequence of pre-finish
+ * values.
  *
  * Not covered: a completion fact that is pending or has failed while the issuance record stands.
  * That needs an end event that stays unrecorded, which the host backend cannot produce; it stays
@@ -228,10 +229,10 @@ namespace {
 
 /* Both endpoints of the history watermark, on one engine started for real.
  *
- * Prompt 192 tokens against 64 a step: two mid-prompt chunks (no logit row, but each with the
- * history pass it owes), then the tail -- the third chunk, which commits the first row -- then
- * decode steps. Every chunk's finish moves the history watermark; the step after the tail is the
- * withheld one. */
+ * Prompt 192 tokens against 64 a step: two mid-prompt chunks (no logit row and, on this shared head,
+ * no draft pass to issue), then the tail -- the third chunk, which commits the first row and so
+ * issues one -- then decode steps. The tail's finish moves the history watermark; the step after
+ * the tail is the withheld one. */
 TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     /* Host execution has to hold *before* start(), not be checked after it: a HIP build probes the
@@ -253,8 +254,8 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     s.assistant = true;
     REQUIRE(tiny::write_gemma4(dir.path, s));
 
-    /* The chunk size the prefill assertions below rely on: a row-less chunk's finish moves the
-     * watermark by exactly the history it covered, which is this many tokens. */
+    /* The chunk size the prompt below is cut into: 192 tokens against this many a step gives the
+     * two row-less chunks the case asserts on, then the tail. */
     const int kChunk = 64;
 
     Argv argv({ "--model", dir.path,
@@ -385,18 +386,18 @@ TEST(engine_loop_watermark_does_not_move_when_the_issuance_record_is_withdrawn) 
     const Rec& tail = tr[iw - 1];
     REQUIRE(tail.rows > 0);
 
-    /* The mid-prompt chunks: no logit row, and yet round 0's pass was built -- the scheduler keeps
-     * one round when no row drafts because that round is the history pass the chunk still owes. At
-     * the seam the wait has not run (complete is the reset's false); the repaired row-less branch
-     * awaits the end, and the *next* seam is where that shows: prior_complete is the completion it
-     * set, and the watermark has moved by the chunk that pass covered. Asserting the flag without
-     * this pair would only restate the seam's own reading. */
+    /* The mid-prompt chunks: no logit row and no draft pass either. The assistant head keeps no
+     * cache of its own (rad_drafter_shared_kv), so serial_begin skips a row that cannot draft,
+     * round 0 has no batch, and the issuance record stays false; collect_step returns before any
+     * wait, so the completion fact stays false too. With neither fact claimed the watermark cannot
+     * move, and the next seam shows that (prior_complete false, the same watermark). */
     for (size_t i = 0; i + 1 < iw; ++i) {
         CHECK_EQ(tr[i].rows, 0);
-        CHECK(tr[i].hist_issued);
+        CHECK(!tr[i].hist_issued);
         CHECK(!tr[i].complete);
-        CHECK(tr[i + 1].prior_complete);
-        CHECK_EQ(tr[i + 1].watermark, tr[i].watermark + kChunk);
+        CHECK(!tr[i + 1].prior_complete);
+        CHECK_EQ(tr[i].watermark, tr[0].watermark);
+        CHECK_EQ(tr[i + 1].watermark, tr[0].watermark);
     }
 
     /* The tail step: its pass was built and its wait ran (`complete` after the wait is the

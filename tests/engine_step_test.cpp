@@ -11,9 +11,11 @@
  *   - a pending end event. The host backend completes an unrecorded event immediately
  *     (core/device/host.cpp), so there is no deterministic way to hold a wait in flight.
  *   - a second participating rank, its success and its failure. ranks_ is filled by start().
- *   - the reset of `complete` at the issue site, and the finish/watermark path
- *     (Engine::finish_serial_drafter): that one also needs serial_done_ > 0, slots_host_ and
- *     draft_out_, which only a run fills.
+ *   - the reset of `complete` at the issue site, and the publishing half of the finish/watermark
+ *     path (Engine::finish_serial_drafter with serial_done_ > 0): that one also needs slots_host_
+ *     and draft_out_, which only a run fills. The row-less half of the same function -- a
+ *     history-only step whose SerialHold ends the snapshot with history_ran -- is covered in
+ *     engine_history_test.cpp, on a scheduler a default-constructed engine can hold.
  */
 #include "rad_test.h"
 

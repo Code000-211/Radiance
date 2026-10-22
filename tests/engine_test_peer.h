@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace rad {
 
@@ -37,6 +38,47 @@ struct EngineTestPeer {
     static int  rows_of(const Engine& e) { return e.serial_rows_; }
     static int  rounds(const Engine& e) { return e.serial_rounds_; }
     static int  done_rows(const Engine& e) { return e.serial_done_; }
+
+    /* The finish half of the step path, for a fixture that supplies the facts a started engine's
+     * issue path would: this is Engine::finish_serial_drafter, and its SerialHold is the only
+     * caller of Scheduler::serial_end on the step path. */
+    static int  finish(Engine& e, const StepOut& so) { return e.finish_serial_drafter(so); }
+
+    /* A step's issue-time facts, as issue_serial_drafter records them from serial_begin()'s
+     * answer and round 0's batch. Set here only by a fixture with no ranks: the real function
+     * builds a batch per round and enqueues it, which needs a started engine. */
+    static void issued(Engine& e, int rounds, int rows, bool history) {
+        e.serial_rounds_     = rounds;
+        e.serial_rows_       = rows;
+        e.serial_hist_issued_ = history;
+    }
+    static void drafter(Engine& e, const RadDrafterDecl& d) { e.drafter_ = d; }
+
+    /* The engine's own scheduler, for a fixture that declares its program itself (sched_program.h)
+     * instead of loading one through a plugin. init() is the call start() makes after bringup
+     * (core/engine.cpp:1641); fini() is what ~Engine does not do for a scheduler the test started. */
+    static Scheduler& sched(Engine& e) { return e.sched_; }
+    static int init_sched(Engine& e, Program& prog, const Config& cfg, IKVManager* kv,
+                          IPrefixCache* pc) {
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &prog });
+        return e.sched_.init(prog, cfg, kv, pc, rio);
+    }
+    static void fini_sched(Engine& e) { e.sched_.fini(); }
+
+    /* One step's commit, as the engine does after collect_step: every entry committed the same
+     * token with no accepted draft, which is what a prefill chunk's step reports. */
+    static int  commit(Engine& e, int32_t token = 0, uint8_t eos = 0) {
+        const StepPlan& p = e.sched_.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), token);
+        std::vector<uint8_t> end(p.e.size(), eos);
+        Scheduler::StepResult r{};
+        r.n_seq      = (int)p.e.size();
+        r.n_accepted = acc.data();
+        r.token      = tok.data();
+        r.eos        = end.data();
+        return e.sched_.commit(r);
+    }
 
     /* /server_info's engine half: what start() resolved, including the drafter it declared. */
     static std::string info(const Engine& e) { return e.engine_info(); }

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "sched_fakes.h"
+#include "sched_program.h"
 
 using namespace rad;
 using namespace sched_fake;
@@ -30,18 +31,8 @@ using namespace sched_fake;
 namespace {
 
 /* ------------------------------------------------------------------ a declared program */
-/* The same minimal deployment sched_test.cpp declares: a paged full group beside a linear one,
- * the op whose schema names the chunk parameter, and the derived buffers each group needs.
- * Everything below the scheduler is a fake. */
-static const RadParamSpec g_gdn_ps[] = {
-    { "M",     RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
-    { "chunk", RAD_P_INT, RAD_DERIVED,  RAD_PROLE_SEQ_CHUNK },
-};
-static const RadOpSchema g_gdn_schema = { "gdn_chunk_scan", g_gdn_ps, 2, nullptr, 0, "test" };
-static RadConstraint g_gdn_c[] = { RAD_CDIV("chunk", 64) };
-static RadKernelInfo g_gdn_ki;
-static KernelRow     g_gdn_row;
-
+/* The program is sched_program.h's: engine_history_test.cpp hands the same shape to a real
+ * Engine's scheduler, and one declaration serves both. */
 struct Fixture {
     Program prog;
     Config  cfg;
@@ -54,82 +45,7 @@ struct Fixture {
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
                int64_t max_ctx = 4096) {
-        g_gdn_ki = RadKernelInfo{};
-        g_gdn_ki.name = "gdn_fake";
-        g_gdn_ki.op = "gdn_chunked";
-        g_gdn_ki.constraints = g_gdn_c;
-        g_gdn_ki.n_constraints = 1;
-        g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
-
-        prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 512;
-
-        /* index 0 is the sentinel every handle table in Program carries */
-        prog.ops.emplace_back();
-        prog.buffers.emplace_back();
-
-        KVGroupInfo attn;
-        attn.name = "attn";
-        attn.decl.kind = RAD_KV_FULL;
-        attn.block_size = 16;
-        prog.kv_groups.push_back(attn);
-
-        KVGroupInfo lin;
-        lin.name = "gdn";
-        lin.decl.kind = RAD_KV_LINEAR;
-        lin.decl.state_dim[0] = 128;
-        lin.decl.state_dim[1] = 128;
-        prog.kv_groups.push_back(lin);
-
-        KVGroupInfo conv;
-        conv.name = "conv";
-        conv.decl.kind = RAD_KV_CONV;
-        conv.decl.conv_width = 4;
-        prog.kv_groups.push_back(conv);
-
-        OpInfo op;
-        op.op = "gdn_chunk_scan";
-        op.schema = &g_gdn_schema;
-        Band b;
-        b.hi = 4096;
-        b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
-        b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
-        op.bands.push_back(b);
-        prog.ops.push_back(op);
-
-        add_derived("seq_start", "seq_start_index", 257);
-        add_derived("chunk_bounds", "state_chunk_bounds", 4097);
-        add_derived("conv_idx", "conv_state_index", 256);
-
-        cfg.max_tok = max_tok;
-        cfg.max_seqs = 32;
-        cfg.max_ctx = max_ctx;
-        cfg.checkpoint_interval = 256;
-        cfg.prefix_cache = true;
-        /* Config::n_spec defaults to -1 (`auto`), which engine_bringup resolves; this fixture
-         * skips that, and DraftController::configure refuses a negative depth. */
-        cfg.n_spec = 0;
-
-        kv.setup(prog.kv_groups, cfg.max_ctx, blocks, states);
-        pc.kv = &kv;
-        pc.groups.clear();
-        for (size_t i = 0; i < prog.kv_groups.size(); ++i)
-            if (kv.geom.g[i].paged) pc.groups.push_back((int32_t)i);
-    }
-
-    void add_derived(const char* name, const char* derive, int64_t n) {
-        BufferInfo b;
-        b.name = name;
-        b.decl.dtype = RAD_I32;
-        b.decl.rank = 1;
-        b.decl.shape[0] = n;
-        b.decl.kind = RAD_BUF_DERIVED;
-        b.decl.derive = derive;
-        b.bytes = n * 4;
-        void* p = std::calloc(1, (size_t)b.bytes);
-        owned.push_back(p);
-        b.ptr = p;
-        prog.buffers.push_back(b);
+        build_program(prog, cfg, kv, pc, owned, blocks, states, max_tok, max_ctx);
     }
 
     int start() {
