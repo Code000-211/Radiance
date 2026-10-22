@@ -553,6 +553,11 @@ int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string
     const DraftVerifyShape& s = b.shape;
     if (!origins_fit_drafter(b.origin_set, s.n_rows, s.drafter))
         return refuse(err, RAD_E_INVAL, where + "its origins do not fit its drafter");
+    /* `Unknown` is not a file value: a cycle whose replay state nobody observed is refused here,
+     * named, rather than written as `none` by the shape's default. The file would then claim a
+     * plain run that was never evidenced. */
+    if (s.replay == DraftReplay::Unknown)
+        return refuse(err, RAD_E_INVAL, where + "its replay state was not observed");
     if (!draft_shape_priceable(s))
         return refuse(err, RAD_E_INVAL, where + "the shape is not a priceable key");
     if (!distributions_agree(s))
@@ -596,7 +601,7 @@ int bucket_to_json(const DraftCostBucket& b, int32_t idx, json* out, std::string
     }
     sh["origins"]  = std::move(origins);
     sh["sampling"] = s.sampling == DraftSampling::Sampled ? "sampled" : "greedy";
-    /* By name, like the reader: DraftReplay::Unknown is never a file value. */
+    /* By name, like the reader. `Unknown` was refused above, so only `None` falls through here. */
     const char* replay = s.replay == DraftReplay::Play     ? "play"
                          : s.replay == DraftReplay::Record ? "record"
                          : s.replay == DraftReplay::Audit  ? "audit"

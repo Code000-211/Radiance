@@ -161,6 +161,14 @@ enum class DraftCostSource : uint8_t { Measured = 0, Interpolated = 1, Conservat
  * measurement, so `unknown` is not a file value at all. */
 enum class DraftReplay : uint8_t { Unknown = 0, None = 1, Play = 2, Record = 3, Audit = 4 };
 
+/* What a deployment's ranks prove about a cycle it has not run yet. `None` is a claim about the
+ * pass, so it needs all of them: one rank that may record a pass makes the state unknowable until
+ * the pass runs, and no evidence at all (no rank asked) is not evidence of a plain run either. */
+inline DraftReplay draft_replay_evidence(int32_t n_ranks, int32_t n_recording) {
+    if (n_ranks <= 0 || n_recording > 0) return DraftReplay::Unknown;
+    return DraftReplay::None;
+}
+
 /* A cost sample's attribution. Only a sample with kDraftSampleValid and none of the disturbing
  * flags may update a measured bucket (draft_sample_attributable). */
 enum DraftSampleFlag : uint16_t {

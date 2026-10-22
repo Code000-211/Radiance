@@ -702,6 +702,17 @@ TEST(a_sample_without_replay_evidence_is_never_learned_from) {
     CHECK_EQ(e.ms, 41.0);
 }
 
+/* And the deployment's proof is the whole deployment's: the pass spans the ranks, so `None` needs
+ * every one of them to keep no tape. One recording rank -- or no rank asked at all -- leaves the
+ * cycle's state Unknown, which no bucket may be keyed on. */
+TEST(the_replay_evidence_is_the_whole_deployments) {
+    CHECK(draft_replay_evidence(1, 0) == DraftReplay::None);
+    CHECK(draft_replay_evidence(2, 0) == DraftReplay::None);
+    CHECK(draft_replay_evidence(2, 1) == DraftReplay::Unknown);   /* mixed evidence */
+    CHECK(draft_replay_evidence(2, 2) == DraftReplay::Unknown);
+    CHECK(draft_replay_evidence(0, 0) == DraftReplay::Unknown);   /* nobody asked: no evidence */
+}
+
 TEST(a_depth_change_under_overlap_lands_in_its_own_bucket) {
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
@@ -1183,6 +1194,31 @@ TEST(the_writer_round_trips_what_the_reader_understood) {
             CHECK_EQ(a.shape.draft_rows[j], b.shape.draft_rows[j]);
         }
     }
+}
+
+/* `unknown` is not a file value. A bucket whose cycle nobody observed the replay state of is
+ * refused by name, not written as `none` by the shape's default: the file would claim a plain run
+ * that was never evidenced. */
+TEST(the_writer_refuses_a_bucket_whose_replay_state_was_never_observed) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket b;
+    b.shape = query(0, 4, 2, { 0, 4, 4 });
+    b.shape.replay = DraftReplay::Unknown;
+    b.rounds = 2;
+    b.draft_round_rows[1] = 4;
+    b.draft_round_rows[2] = 4;
+    b.draft_rows_total = 8;
+    b.mean_ms = 10.0;
+    b.n = 3;
+    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origin_set[j] = ob(DraftOrigin::Head);
+    p.buckets.push_back(b);
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
+    CHECK(err.find("replay") != std::string::npos);
+    CHECK(text.empty());
 }
 
 /* No invented provenance: a bucket whose samples never captured an origin mix cannot be written.

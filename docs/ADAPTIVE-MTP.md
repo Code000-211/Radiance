@@ -240,16 +240,17 @@ prediction and sample.
   rather than pricing it at zero; nothing flips the field afterwards to force a sample through.
 - **The planner prices a replay state only where the deployment evidences it.** The estimate's
   key carries `replay`, and `DraftBatchView::replay` is how it enters the cycle: a runtime whose
-  backend cannot record a pass runs every pass live and unkeyed, so the engine reports `None` for
-  the whole deployment (`Ctx::records_passes()` false) and the cycle is priced against the buckets
-  that runtime measured. That is necessary, not sufficient: a cycle whose shape the file does not
-  hold still falls back -- a request's first cycle verifies nothing, so it is keyed `verify_k = 0`,
-  and a legacy calibration files only cycles that verify the window it already published; a `cost`
-  calibration (record-only) files the start cycle itself. A
-  recording
-  deployment stays `Unknown`, because which of play, record and audit a pass does exists only once
-  that pass runs, after its plan was issued; the shape is then unpriceable and the named fallback
-  is issued. The default is `Unknown`, so a caller that says nothing never asserts a plain run.
+  backend cannot record a pass runs every pass live and unkeyed, so the engine reports `None` --
+  but only when every rank proves it (`Ctx::records_passes()` false on all of them, see
+  `draft_replay_evidence`); one recording rank or no rank asked leaves the cycle `Unknown`. Then
+  the cycle is priced against the buckets that runtime measured. That is necessary, not
+  sufficient: a cycle whose shape the file does not hold still falls back -- a request's first
+  cycle verifies nothing, so it is keyed `verify_k = 0`, and a legacy calibration files only cycles
+  that verify the window it already published; a `cost` calibration (record-only) files the start
+  cycle itself. A recording deployment stays `Unknown`, because which of play, record and audit a
+  pass does exists only once that pass runs, after its plan was issued; the shape is then
+  unpriceable and the named fallback is issued. The default is `Unknown`, so a caller that says
+  nothing never asserts a plain run.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.
