@@ -352,7 +352,8 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
 `cb5a69a` plus the same prerequisite:
 
 - The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
-  pass 5/5 (`draft_types_test`: 310 checks over 23 cases).
+  pass 5/5 (`draft_types_test`: 364 checks over 29 cases after the review corrections, 310/23
+  before them).
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
   baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
   five failures below fail on both.
