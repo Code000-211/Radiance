@@ -50,9 +50,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
+
+/* Only FakeKV and FakePC: this binary runs on the real device layer, as the engine does. The
+ * declaration is the scheduler fixture program the export case plays its cycles on. */
+#define SCHED_FAKES_KV_ONLY
+#include "sched_fakes.h"
+#include "sched_program.h"
 
 using namespace rad;
 
@@ -624,6 +631,210 @@ TEST(a_reference_calibration_freezes_the_placement_bringup_settled) {
     CHECK(!live_rt.fingerprint.live_loan.empty());
     CHECK_EQ(ref_rt.fingerprint.placement, live_rt.fingerprint.placement);
     CHECK_EQ(ref_rt.fingerprint.arena, live_rt.fingerprint.arena);
+}
+
+/* The scheduler's declared program (tests/sched_program.h), owned beside the engine: the export
+ * reads the table the engine's own scheduler records into, so that scheduler has to run a real
+ * program while rank 0 keeps the Planner's plan and the Mover this file's cases use. */
+struct SchedProgram {
+    Program            prog;
+    Config             cfg;
+    sched_fake::FakeKV kv;
+    sched_fake::FakePC pc;
+    std::vector<void*> owned;
+    ~SchedProgram() { for (void* p : owned) std::free(p); }
+};
+
+/* One calibration run, played cycle by cycle on the declared fixture program: rank 0 is the real
+ * plan, heat engine and mover, so the histogram a serving run moves on is running; the scheduler is
+ * the engine's own and the export is serve()'s shutdown call. `reference` is --draft-reference:
+ * with it the placement is frozen, without it this is the serving arm the freeze is measured
+ * against. */
+struct PlayedExport {
+    static Config cfg_for(const Config& base, bool reference, const std::string& out) {
+        Config c = base;
+        c.draft_reference   = reference;
+        c.draft_profile_out = out;
+        return c;
+    }
+
+    int              experts;
+    Rig              rig;
+    Config           cfg;
+    Engine           eng;
+    SchedProgram     prog;
+    DraftCostRuntime rt;
+    int64_t          moves     = 0;       /* residency_moves() over the played cycles */
+    int              export_rc = RAD_OK;
+    int              played    = 0;       /* clean played cycles the exported file kept */
+    bool             inited    = false;
+
+    PlayedExport(int n_experts, bool reference)
+        : experts(n_experts),
+          rig(n_experts, /*strips*/ 4, /*turnover*/ 2),
+          cfg(cfg_for(rig.cfg, reference,
+                      radtest::tmp_path(reference ? "engine_reference_played_ref.json"
+                                                  : "engine_reference_played_live.json"))),
+          eng(cfg) {}
+
+    ~PlayedExport() { if (inited) EngineTestPeer::fini_sched(eng); }
+
+    /* Decode buckets with no disturbing flag, by the samples they hold. */
+    static int clean_played(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.good()) return 0;
+        nlohmann::json j;
+        in >> j;
+        int n = 0;
+        for (const auto& b : j["buckets"]) {
+            if (b["shape"]["prefill_tokens"].get<int>() != 0) continue;
+            if (!b["flags"].empty()) continue;
+            n += b["time_ms"]["n"].get<int>();
+        }
+        return n;
+    }
+
+    int run(int cycles) {
+        EngineTestPeer::drafter(eng, serial_head(6));
+        RAD_TRY(rig.build(eng, Lend::None));
+        /* serve()'s completion of the start fill, before the first bracket: the placement the
+         * reference measures is the one bringup settled. */
+        RAD_TRY(EngineTestPeer::complete_start_fill(eng));
+        /* serve()'s startup call: it derives the identity from the resolved plan and arms the
+         * calibration's recording table (record_only, the fallback baseline admitted). */
+        RAD_TRY(EngineTestPeer::begin_calibration(eng));
+        RAD_TRY(EngineTestPeer::runtime(eng, &rt));
+        /* The two names this fixture has no checkpoint and no plugin to give (name_the_deployment);
+         * every other identity field is the one the runtime derived. */
+        name_the_deployment(&rt);
+        EngineTestPeer::set_calibrating(eng, rt);
+
+        sched_fake::build_program(prog.prog, prog.cfg, prog.kv, prog.pc, prog.owned,
+                                  /*blocks*/ 4096, /*states*/ 64, /*max_tok*/ 64, /*max_ctx*/ 4096);
+        prog.cfg.n_spec            = 6;
+        prog.cfg.draft_policy      = DraftPolicyKind::Cost;
+        prog.cfg.draft_profile_out = cfg.draft_profile_out;
+        prog.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+        prog.prog.drafter.depth    = 6;
+        prog.prog.drafter.name     = "mtp-test";
+        RAD_TRY(EngineTestPeer::init_sched(eng, prog.prog, prog.cfg, &prog.kv, &prog.pc, rig.compute));
+        inited = true;
+
+        Scheduler& s = EngineTestPeer::sched(eng);
+        auto req = std::make_unique<Request>();
+        req->id         = 1;
+        req->prompt.resize(160);
+        for (size_t i = 0; i < req->prompt.size(); ++i) req->prompt[i] = (int32_t)(1000 + i);
+        req->max_tokens = 64;
+        req->ignore_eos = true;
+        req->sp.temp    = 0.0f;
+        RAD_TRY(EngineTestPeer::submit(eng, std::move(req)));
+
+        /* The prompt: chunks only, as the scheduler plays them (no decode row yet, so no ring
+         * record opens -- draft_fill_view has nothing to name). */
+        for (int guard = 0; guard < 16; ++guard) {
+            Request* q = s.find(1);
+            if (!q) return RAD_E_STATE;
+            if (q->n_computed >= (int32_t)q->prompt.size()) break;
+            if (!s.step()) return RAD_E_STATE;
+            RAD_TRY(EngineTestPeer::commit(eng, 11));
+        }
+        Request* q = s.find(1);
+        if (!q || q->n_computed < (int32_t)q->prompt.size()) return RAD_E_STATE;
+
+        /* The played cycles, in the order the step loop plays them: plan, commit, publish the
+         * head's rounds, the rank's heat and tiering dispatch, then the bracket's evidence. The
+         * histogram is the one the freeze case shows would promote a pooled unit on an unfrozen
+         * mover. */
+        HeatEngine& heat  = EngineTestPeer::heat_of(eng, 0);
+        Mover&      mover = EngineTestPeer::mover_of(eng, 0);
+        /* The unit this plan lets the heat move: pooled after the start fill, as in the freeze
+         * case's controls. Its expert is the one a landed histogram credits. */
+        const int32_t hot = pooled_candidate(eng, rig.plan);
+        if (hot < 0) return RAD_E_STATE;
+        std::vector<int32_t> counts((size_t)experts, 0);
+        counts[(size_t)rig.plan.units[(size_t)hot].expert] = 500;
+        int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+        const int64_t base = EngineTestPeer::residency_moves(eng);
+        for (int step = 0; step < cycles; ++step) {
+            if (!s.step()) return RAD_E_STATE;
+            const DraftPlan* dp = s.draft().plan();
+            if (!dp || dp->n_seq != 1) return RAD_E_STATE;
+            const int k_row = dp->k[0];
+            RAD_TRY(EngineTestPeer::commit(eng, 11));
+            RAD_TRY(s.set_draft(1, six, k_row));
+
+            heat.observe(0, counts.data(), experts, 1.0f);
+            EngineTestPeer::tiering_dispatch(eng, 0, step);
+            RAD_TRY(rad_stream_sync(mover.transfer_stream()));
+
+            /* The rank's own facts for this bracket, as step_evidence freezes them on a host
+             * backend: a pass that established no tape, nothing staged -- and the cumulative move
+             * count the engine actually derives, which is what Scheduler::step_finished marks on. */
+            DraftStepEvidence ev;
+            ev.replay_known     = true;
+            ev.replay           = DraftReplay::None;
+            ev.moves_since_bind = EngineTestPeer::residency_moves(eng) - base;
+            s.step_finished(ev);
+        }
+        moves = EngineTestPeer::residency_moves(eng) - base;
+
+        /* serve()'s shutdown call: it flushes the ring (the last cycle is still open, exactly as a
+         * run that ends here would leave it) and writes the file. */
+        export_rc = EngineTestPeer::export_calibration(eng);
+        played    = clean_played(cfg.draft_profile_out);
+        return RAD_OK;
+    }
+};
+
+TEST(a_reference_calibration_exports_the_cycles_the_run_played) {
+    constexpr int kExperts = 48;   /* the freeze case's plan: a pooled unit the heat promotes */
+    constexpr int kCycles  = 10;   /* long enough for that promotion to land inside a bracket */
+
+    {
+        PlayedExport ref(kExperts, /*reference*/ true);
+        REQUIRE_EQ(ref.run(kCycles), RAD_OK);
+        REQUIRE_EQ(ref.export_rc, RAD_OK);
+        CHECK_EQ(ref.moves, (int64_t)0);   /* the freeze: the placement never moved */
+        CHECK_EQ(ref.played, kCycles);
+
+        std::ifstream in(ref.cfg.draft_profile_out, std::ios::binary);
+        REQUIRE(in.good());
+        nlohmann::json j;
+        in >> j;
+        CHECK_EQ(j["format"].get<std::string>(),
+                 std::string("rad-draft-profile/") + std::to_string(RAD_DRAFT_PROFILE_VERSION));
+
+        /* The file's identity is the armed runtime's: the plan's placement, the level set, no
+         * loan. The freeze changes none of it. */
+        const auto& fp = j["fingerprint"];
+        CHECK_EQ(fp["basis"].get<std::string>(), std::string("no-loan"));
+        CHECK(!fp.contains("live_loan"));
+        CHECK_EQ(fp["model"].get<std::string>(), std::string("fixture"));
+        CHECK_EQ(fp["placement"].get<std::string>(), ref.rt.fingerprint.placement);
+        CHECK_EQ(fp["arena"].get<std::string>(), ref.rt.fingerprint.arena);
+        CHECK_EQ(fp["arena"].get<std::string>(), std::string("none"));
+
+        /* Every played decode cycle is in the file, none carrying a placement flag: the samples
+         * fold by shape (the first cycle verified nothing, the following ones the window the cycle
+         * before published). */
+        for (const auto& b : j["buckets"]) {
+            if (b["shape"]["prefill_tokens"].get<int>() != 0) continue;
+            CHECK(b["flags"].empty());
+            CHECK_EQ(b["shape"]["n_rows"].get<int>(), 1);
+            CHECK_EQ(b["extent"]["rounds"].get<int>(), 6);
+        }
+    }
+
+    /* The same cycles serving: the heat does move the placement there, and the export drops the
+     * brackets it disturbed -- which is what makes the case above a regression and not a
+     * tautology. */
+    {
+        PlayedExport srv(kExperts, /*reference*/ false);
+        REQUIRE_EQ(srv.run(kCycles), RAD_OK);
+        CHECK(srv.moves > 0);
+        CHECK(srv.played < kCycles);
+    }
 }
 
 RAD_TEST_MAIN()
