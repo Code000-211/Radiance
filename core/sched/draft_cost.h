@@ -248,6 +248,13 @@ public:
     void record_only() { record_only_ = true; }
     bool records_only() const { return record_only_; }
 
+    /* The start placement is not materialised yet (Engine::start_placement_settled): a profile
+     * measured on it would price a residency the run has not reached, so estimate() answers
+     * nothing until the fill has settled and the policy runs its named baseline. Not
+     * deactivation -- the profile is still the one this deployment will run on. */
+    void hold_prices(bool hold) { hold_prices_ = hold; }
+    bool prices_held() const { return hold_prices_; }
+
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
     /* Stops pricing and learning, naming why, while keeping the loaded buckets visible: the run's
@@ -307,6 +314,7 @@ private:
     bool active_ = false;
     bool fallback_admitted_ = false;
     bool record_only_ = false;
+    bool hold_prices_ = false;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
                                   const int32_t* round_rows);

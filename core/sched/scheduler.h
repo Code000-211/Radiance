@@ -141,6 +141,11 @@ struct DraftStepEvidence {
      * bracket measured after it. > 0 means this run's residency is no longer the one the
      * fingerprint names. */
     int64_t     moves_since_bind = 0;
+    /* The start placement is not materialised yet: the plan's lent slots are still being filled
+     * (Engine::start_placement_settled). A bracket that ran while that fill was in flight measured
+     * a residency no profile names, even when nothing retired inside it -- the mover's own
+     * evidence only covers the bracket, and the fill's copies retire over many. */
+    bool        placement_unresolved = false;
 };
 
 class Scheduler {

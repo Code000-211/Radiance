@@ -2824,7 +2824,11 @@ void Scheduler::step_finished(const DraftStepEvidence& ev) {
             r->total_ms       = (double)ns / 1e6;
             r->plan.timing_valid = r->timed;
             r->replay         = ev.replay_known ? ev.replay : DraftReplay::Unknown;
-            r->placed         = (ev.staged || ev.moved || draft_drift_) ? 1 : 0;
+            /* `moved` covers the bracket; `placement_unresolved` is the engine's state for it --
+             * the start placement's fill had not landed, so the bracket measured a residency the
+             * fingerprint does not name even when nothing retired inside it (the fill's copies
+             * land over many, before and after this bracket). */
+            r->placed         = (ev.staged || ev.moved || draft_drift_ || ev.placement_unresolved) ? 1 : 0;
             r->prefill_tokens = 0;
             for (const StepEntry& e : plan_.e)
                 if (e.is_prefill) r->prefill_tokens += e.n_tokens;

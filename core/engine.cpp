@@ -439,16 +439,41 @@ bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
 }
 
 int64_t Engine::residency_moves() const {
-    int64_t moves = 0;
-    /* HeatStats::moves() leaves the fill's promotions out: a fill is the plan's start placement
-     * being materialised into lent spare slots, not a change to it. It evicts nothing and every
-     * slot it can take was free at the start or came back from a demotion counted here, so the
-     * first fill -- however late its copies land -- is not a drift. */
-    for (const auto& r : ranks_) moves += r->heat.stats().moves();
+    int64_t promotions = 0, demotions = 0, initial = 0;
+    for (const auto& r : ranks_) {
+        const HeatStats hs = r->heat.stats();
+        promotions += (int64_t)hs.promotions;
+        demotions  += (int64_t)hs.demotions;
+        initial    += (int64_t)hs.initial_fill_promotions;
+    }
+    /* A fill before the first observation is the plan's own free lent slots -- zero heat, so by
+     * layer -- being materialised into memory the plan left free: the start placement being
+     * reached, not left. Every other promotion and every demotion is a move, and so is any fill
+     * once the start placement is resolved (the exemption is frozen at settle_start_placement).
+     * Nothing here is re-baselined: a move before the resolve keeps counting. */
+    const int64_t exempt = draft_placement_resolved_ ? draft_fill_exempt_ : initial;
+    int64_t moves = promotions - exempt + demotions;
 #ifdef RAD_TEST_HOOKS
     moves += rad_test_residency_moves();
 #endif
     return moves;
+}
+
+bool Engine::start_placement_settled() const {
+    for (const auto& r : ranks_)
+        if (!r->mover.fill_settled()) return false;
+    return true;
+}
+
+void Engine::settle_start_placement() {
+    draft_placement_resolved_ = true;
+    draft_fill_exempt_ = 0;
+    for (const auto& r : ranks_)
+        draft_fill_exempt_ += (int64_t)r->heat.stats().initial_fill_promotions;
+    /* The loaded profile is a measurement of the residency that is now in place; from here on a
+     * cycle may be priced by it. Nothing was priced before. */
+    const auto lk = sched_.hold();
+    sched_.draft_costs().hold_prices(false);
 }
 
 int Engine::prepare_release(const RadBatch* b) {
@@ -531,7 +556,17 @@ int Engine::step_loop() {
     /* The cost profile's fingerprint names the residency at start. Every cycle's move evidence is
      * reported against this count, so a move between two brackets still invalidates what follows
      * it (Scheduler::step_finished). The start placement's own fill is not part of the count
-     * (residency_moves), so it may retire after this baseline without reading as a move. */
+     * (residency_moves), so it may retire after this baseline without reading as a move. A plan
+     * that fills nothing is settled here; one that does stays unresolved -- and unpriced -- until
+     * its fill has landed (settle_start_placement). */
+    draft_placement_resolved_ = start_placement_settled();
+    draft_fill_exempt_ = 0;
+    if (draft_placement_resolved_) {
+        settle_start_placement();
+    } else {
+        const auto lk = sched_.hold();
+        sched_.draft_costs().hold_prices(true);
+    }
     draft_moves_baseline_ = residency_moves();
     StepOut so;
     int idle = 0;
@@ -593,6 +628,11 @@ int Engine::step_loop() {
             tier_tick();
             expire_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
+            /* The start placement is materialised once the fill has nothing left to issue and
+             * every copy it issued has retired. Only here, where no bracket is open: a resolve
+             * that flipped inside a bracket would stamp that bracket with a placement it ran
+             * without, and the evidence is consumed brackets later. */
+            if (!draft_placement_resolved_ && start_placement_settled()) settle_start_placement();
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -950,6 +990,7 @@ int Engine::step_loop() {
          * the scheduler's own ticks made between two brackets still reaches the bracket measured
          * after it. Fills are not moves (residency_moves). */
         ev.moves_since_bind = residency_moves() - draft_moves_baseline_;
+        ev.placement_unresolved = !draft_placement_resolved_;
 #ifdef RAD_TEST_HOOKS
         rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,
                                (int)ev.moved);
@@ -1637,7 +1678,15 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
      * runs asking for `auto` can land on different strategies and different expert residency.
      * Each rank contributes its strategy, its resolved budgets and a digest of its residency. A
      * rank whose plan is still `auto` -- or has no weights -- makes the identity unknowable; the
-     * profile is refused then rather than matched against a guess. */
+     * profile is refused then rather than matched against a guess.
+     *
+     * `flex` and `lend` are the memory the KV cache lends the expert slab: the carved slots and
+     * the tokens the start loan covers. The start placement is the plan plus the free lent slots
+     * it fills before the first observation, and that fill is bounded by the loan -- two runs
+     * that lend different amounts reach different placements on the same plan. Naming both is
+     * what makes the resolved start placement a function of this identity rather than an
+     * assumption about the run's free memory. The loan is set before this is derived
+     * (serve's start loan), so it is not a snapshot of something still moving. */
     std::string placement;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         const Plan& pl = ranks_[i]->plan;
@@ -1647,10 +1696,12 @@ int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
             return RAD_E_STATE;
         }
         if (!placement.empty()) placement += ';';
-        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx",
+        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx flex=%lld lend=%lld",
                          strategy_name(pl.strategy), (long long)pl.vram_budget,
                          (long long)pl.host_budget, (long long)pl.file_stage_reserve,
-                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl));
+                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl),
+                         (long long)ranks_[i]->mover.flex_offered_bytes(),
+                         (long long)ranks_[i]->kv.loan_tokens());
     }
     fp.placement = std::move(placement);
 
@@ -2016,6 +2067,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    /* The start placement's loan, before anything is measured. With no request yet, the cache's
+     * spare is its whole carve minus one prefill chunk, so this offer is a function of the plan,
+     * the KV carve and max_tok -- not of request timing. Settling it now is what makes the fill
+     * that follows the plan's own free lent slots: it is issued here, before the first
+     * observation, so it orders by layer at zero heat instead of by what the run has routed. A
+     * first fill issued only after the first step would be a heat decision and never the start
+     * placement (Mover::fill, HeatStats::initial_fill_promotions), and the fingerprint below
+     * names this loan and the slots it covers -- the two facts that make the fill a function of
+     * the identity. */
+    loan_tick(/*idle=*/true);
     /* Validated before any path starts serving: a calibration run that cannot export must say so
      * now, not after a complete run. */
     RAD_TRY(begin_draft_calibration());

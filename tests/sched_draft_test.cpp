@@ -2513,9 +2513,110 @@ TEST(a_record_only_calibration_keeps_recording_after_a_move) {
     CHECK_EQ(drifted, 2);
 }
 
-/* The online policy under a moved residency: the loaded profile was measured on the start
- * placement, so it stops pricing and stops learning. Fail closed and visibly, on the name -- not
- * admit_fallback(), which would let the policy price without a measurement it was admitted on. */
+/* The start placement is the plan plus the fill, and the fill retires over several dispatches.
+ * A bracket that ran while it was still landing measured a residency the fingerprint does not
+ * name -- even when nothing retired inside it -- so the engine reports the state with the bracket
+ * (DraftStepEvidence::placement_unresolved) and every such record is marked. The mark is per
+ * bracket, not sticky: once the fill has landed, a clean cycle is a measurement of the start
+ * placement and may be exported and priced. */
+TEST(cycles_measured_during_the_initial_fill_are_marked_and_a_later_clean_one_is_not) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_unresolved_fill.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    f.sch.draft_costs().record_only();   /* --draft-profile-out under cost */
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    auto cycle = [&](bool unresolved, int64_t moves_since_bind) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+        DraftStepEvidence live;
+        live.replay_known        = true;
+        live.replay              = DraftReplay::None;
+        live.moves_since_bind    = moves_since_bind;
+        live.placement_unresolved = unresolved;
+        f.sch.step_finished(live);
+    };
+    cycle(/*unresolved=*/true, 0);    /* the fill's copies are still landing */
+    cycle(/*unresolved=*/true, 0);    /* still nothing retired in this bracket, still unresolved */
+    cycle(/*unresolved=*/false, 0);   /* the fill settled between the brackets */
+
+    REQUIRE(f.sch.step() != nullptr);   /* closes the last record */
+    int64_t clean = 0, pending = 0;
+    const DraftCostBucket* first_clean = nullptr;
+    bool saw_pending = false;
+    for (const DraftCostBucket& x : f.sch.draft_costs().buckets()) {
+        if (x.flags & kDraftSamplePlacement) { pending += x.n; saw_pending = true; continue; }
+        clean += x.n;
+        if (!first_clean) first_clean = &x;
+    }
+    CHECK(saw_pending);
+    CHECK_EQ(pending, 2);            /* both pre-resolve cycles, though neither moved a unit */
+    CHECK_EQ(clean, 1);              /* the first bracket on the materialised placement */
+    /* This is not drift: the table still prices, and a calibration keeps measuring. */
+    CHECK(f.sch.draft_costs().active());
+    CHECK(f.sch.draft_costs().records_only());
+    CHECK(!f.sch.draft_cost_aborted());
+    /* And the clean cycle is a bucket the export may write and the policy may price from. */
+    REQUIRE(first_clean != nullptr);
+    CHECK(draft_bucket_usable(*first_clean));
+}
+
+/* A move during the fill is sticky even after the placement resolves: the run cannot move back to
+ * the start placement, and a clean-looking bracket after it is still not a measurement of it. The
+ * scheduler must not re-baseline on the resolve -- the resolve is not a reset. */
+TEST(a_move_during_the_fill_stays_marked_after_the_placement_resolves) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_move_during_fill.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    auto cycle = [&](bool unresolved, bool moved, int64_t moves_since_bind) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+        DraftStepEvidence live;
+        live.replay_known         = true;
+        live.replay               = DraftReplay::None;
+        live.moved                = moved;
+        live.moves_since_bind     = moves_since_bind;
+        live.placement_unresolved = unresolved;
+        f.sch.step_finished(live);
+    };
+    cycle(/*unresolved=*/true, /*moved=*/true, 1);    /* a swap published during the fill */
+    cycle(/*unresolved=*/false, /*moved=*/false, 0);  /* resolved and clean by its own evidence */
+
+    REQUIRE(f.sch.step() != nullptr);
+    int64_t clean = 0, drifted = 0;
+    for (const DraftCostBucket& x : f.sch.draft_costs().buckets()) {
+        if (x.flags & kDraftSamplePlacement) drifted += x.n;
+        else clean += x.n;
+    }
+    CHECK_EQ(clean, 0);
+    CHECK_EQ(drifted, 2);
+    /* A calibration keeps recording and is not aborted; the export leaves all of it out. */
+    CHECK(f.sch.draft_costs().active());
+    CHECK(!f.sch.draft_cost_aborted());
+}
+
 TEST(a_drifted_residency_stops_the_cost_policy_from_pricing_the_loaded_profile) {
     Fixture f;
     f.build();

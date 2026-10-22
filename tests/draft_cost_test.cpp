@@ -669,6 +669,47 @@ TEST(a_record_only_table_learns_without_pricing_anything) {
     CHECK(e.valid);
 }
 
+/* The start placement is not materialised yet (Engine::start_placement_settled): the table prices
+ * nothing, so the planner runs its named baseline instead of a measurement of a residency the run
+ * has not reached. Unlike drift, this is not a deactivation -- the profile is still the one this
+ * deployment will run on, and once the fill has landed the same bucket prices again. */
+TEST(held_prices_answer_nothing_without_disabling_the_profile) {
+    DraftCostTable t;
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 },
+                                                                  43.0, 0.6, 7) })),
+                         runtime()),
+             RAD_OK);
+    const DraftVerifyShape k3 = query(0, 8, 3, { 0, 8, 8, 8 });
+    DraftCostEstimate e;
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(e.valid);
+    CHECK_EQ(e.ms, 43.0);
+
+    t.hold_prices(true);
+    CHECK(t.prices_held());
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(!e.valid);                 /* not priced, not refused */
+    CHECK_EQ(e.ms, 0.0);
+    CHECK(t.active());               /* still this deployment's profile */
+    CHECK(t.reason().empty());      /* no drift reason: nothing diverged */
+
+    t.hold_prices(false);
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(e.valid);
+    CHECK_EQ(e.ms, 43.0);
+
+    /* A cleared table does not inherit the hold, like the record-only mode. */
+    t.hold_prices(true);
+    t.clear();
+    CHECK_EQ(t.configure(parse_or_fail(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 },
+                                                                  43.0, 0.6, 7) })),
+                         runtime()),
+             RAD_OK);
+    CHECK(!t.prices_held());
+    CHECK_EQ(t.estimate(k3, &e), RAD_OK);
+    CHECK(e.valid);
+}
+
 TEST(a_sample_without_replay_evidence_is_never_learned_from) {
     /* The bucket key is the replay state the run established, so the sample has to carry one and it
      * has to be the state its shape names. Neither case may fall through as "no replay" -- a None

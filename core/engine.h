@@ -373,14 +373,22 @@ private:
      * when no rank ran a pass for it, which the caller must treat as Unknown, not as a measured
      * None -- a step issued ahead is collected after its pass, so a miss means no pass at all. */
     bool step_evidence(int32_t step, DraftStepEvidence* out) const;
-    /* Placement moves (swap promotions + demotions) over every rank, cumulative. Cumulative on
-     * purpose: the per-step evidence covers one bracket, but the scheduler's tier and arena ticks
-     * move units after step_finished, so a move between two brackets would otherwise never reach
-     * the bracket measured after it. The fill's promotions are not moves: they materialise the
-     * plan's start placement into lent spare slots and evict nothing (HeatStats::fill_promotions),
-     * so the first fill is not a drift however late its copies land. Compared against
-     * draft_moves_baseline_. */
+    /* Placement moves (swap promotions + demotions) over every rank, cumulative, leaving out the
+     * fill's initial promotions: a fill before the first observation materialises the plan's own
+     * free lent slots (zero heat, by layer) into memory the plan left free, so it is the start
+     * placement being reached, not left. Any fill after the start placement is resolved, and
+     * every fill after an observation, counts. Cumulative on purpose: the per-step evidence
+     * covers one bracket, but the scheduler's tier and arena ticks move units after
+     * step_finished, so a move between two brackets would otherwise never reach the bracket
+     * measured after it. Compared against draft_moves_baseline_. */
     int64_t residency_moves() const;
+    /* Whether every rank's fill has nothing left to issue and no copy still landing -- the start
+     * placement is materialised. True from the start for a plan that never fills. */
+    bool start_placement_settled() const;
+    /* Latches start_placement_settled() and freezes the exemption at the promotions that reached
+     * it. Not a baseline reset: the non-fill moves stay counted, and a drift already noted stays
+     * noted (Scheduler::draft_drift_note). */
+    void settle_start_placement();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */
@@ -460,6 +468,11 @@ private:
     /* residency_moves() when the run started: the profile's fingerprint names the residency at
      * that point, so every later bracket is measured against it (DraftStepEvidence). */
     int64_t draft_moves_baseline_ = 0;
+    /* The start placement's resolve (one-way), and how many of residency_moves()' promotions it
+     * accounted for when it resolved. Before the resolve every initial fill promotion is exempt;
+     * after it the count is frozen, so a fill issued later is a move. */
+    bool    draft_placement_resolved_ = true;
+    int64_t draft_fill_exempt_ = 0;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round

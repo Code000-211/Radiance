@@ -274,25 +274,48 @@ prediction and sample.
   bracket, but the scheduler's own tier and arena ticks run after `step_finished()` and move units
   with no step to stamp. The engine therefore reports `DraftStepEvidence::moves_since_bind`, the
   cumulative moves over every rank since the profile was bound -- swap promotions plus every
-  demotion -- and compares it with the count at the loop's start. A fill promotion is not a move:
-  `Mover::fill()` copies pooled units into slots the plan left free (the memory is lent until the
-  owner needs it back), it evicts nothing and it changes no planned resident, so it materialises
-  the start placement rather than leaving it; `HeatStats::fill_promotions` carries that subset and
-  `Engine::residency_moves()` leaves it out. The first fill may issue before the baseline and
-  retire many brackets after it, and it is still not a drift. Once the count is non-zero the
+  demotion -- and compares it with the count at the loop's start. Once the count is non-zero the
   record's `placed` is sticky: every later cycle is marked placement-affected, including one whose
   own bracket saw no move, because the run cannot move back to the start placement. Dropping only
   the bucket the mover directly marked would leave a later clean-looking bracket to be priced as
-  the start residency. In the online policy the same divergence deactivates the loaded table
-  (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's start
-  placement"): it stops pricing and stops learning, and it does not `admit_fallback()` -- drift is
-  no admission to price without the measurement the deployment was admitted on. An explicit
-  record-only calibration (`DraftCostTable::record_only`, `--draft-policy cost` with
+  the start residency.
+- **The start placement resolves once, and the fill that materialises it is exempt only before
+  that.** A dynamic plan's fill promotes pooled units into slots the KV cache lends; the start
+  placement is the plan plus that fill, so the profile may only be priced once the fill has
+  landed. `Mover::fill_settled()` says so: the fill has run since the loan and had nothing left to
+  issue, and no copy it issued is still landing. A plan that never fills is settled from the
+  start. The engine latches it (`Engine::start_placement_settled`,
+  `Engine::settle_start_placement`) only between two brackets, so a bracket is never stamped with
+  a placement it ran without: until the resolve, every record carries
+  `DraftStepEvidence::placement_unresolved` and is marked, and `DraftCostTable::hold_prices` makes
+  `estimate()` answer nothing, so the run executes its named baseline instead of pricing a
+  residency it has not reached. That mark is per bracket, not sticky -- the first clean bracket
+  after the fill has landed is a measurement of the start placement again.
+- **The initial fill is provably the plan's, not a heat decision.** `Mover::fill()` marks a
+  promotion `initial` when it is issued before the first observation (`HeatStats::
+  initial_fill_promotions`); at zero dispatches every heat is zero, so the units are taken by layer
+  and the amount is a function of the plan and the lent slots. The loan that bounds it is settled
+  before serving (`Engine::serve` runs one `loan_tick` with the cache still empty), so the first
+  fill is issued there, not after the first step -- an engine that idled only under load would
+  otherwise fill by heat and call it initial. The fingerprint names the loan and the slots it
+  covers (`flex=`/`lend=`), which is what binds the resolved start placement to the identity. A
+  fill issued after one observation, or any fill after the resolve (a loan growing again), is not
+  initial: `Engine::residency_moves()` exempts the initial promotions only up to the count frozen
+  at the resolve, so a later fill counts as a move even though it promotes rather than evicts.
+  There is no re-baselining: a move made before the resolve keeps counting.
+- **Both abort gates distinguish a calibration.** In the online policy a divergence deactivates
+  the loaded table (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's
+  start placement"): it stops pricing and stops learning, and it does not `admit_fallback()` --
+  drift is no admission to price without the measurement the deployment was admitted on. An
+  explicit record-only calibration (`DraftCostTable::record_only`, `--draft-policy cost` with
   `--draft-profile-out`) prices nothing by construction, so a move ends neither its recording nor
   the run: it keeps measuring the named baseline, marks every record after the move, and the
-  export leaves those cycles out. There is no blanket drift exception: a loaded profile that does
-  price keeps the fail-closed rule above, and a record-only table never gains a price it did not
-  measure.
+  export leaves those cycles out. Both gates read `records_only()` explicitly -- `draft_drift_note`
+  does not deactivate it, `draft_cost_cycle` refuses no cycle for it, and `draft_cost_aborted()`
+  stays false -- because a calibration that stopped at the first move would never see the
+  post-move baseline it exists to record. There is no blanket drift exception: a loaded profile
+  that does price keeps the fail-closed rule above, and a record-only table never gains a price it
+  did not measure.
 - **The online policy fails closed before the next planning, not inside the step it affects.**
   `step_finished` is not the only place the count is read: the engine reports the same cumulative
   evidence at the top of every `step_loop` iteration (`Scheduler::draft_residency`), before
@@ -418,7 +441,7 @@ regenerated, never rescaled.
     "gpus": "2x Radeon AI PRO R9700 (gfx1201) dev=0 cu=96 vram=25757220864",
     "kernels": "libr4d <commit>+gfx1201",
     "kv_format": "bf16",
-    "placement": "all_vram vram=17179869184 host=0 file=0 dyn=1 res=9f2c41ab7e0d3355"
+    "placement": "all_vram vram=17179869184 host=0 file=0 dyn=1 res=9f2c41ab7e0d3355 flex=12582912 lend=98304"
   },
   "execution": "shrinking",
   "buckets": [
@@ -467,8 +490,13 @@ regenerated, never rescaled.
   SKU can differ in (`dev=`, `cu=`, `vram=`; `Nx S` when all are identical, comma-separated
   otherwise), `kernels` the loaded libraries (`name@version`, selection order) plus the arch plugin
   and the device architecture, `kv_format` `--kv-cache-dtype`, and `placement` the **resolved**
-  plan, not the flag: per rank in rank order, `strategy vram= host= file= dyn= res=`, where `res`
-  is a digest of the plan's tier/site per weight. `auto` resolves against a budget that depends on
+  plan, not the flag: per rank in rank order, `strategy vram= host= file= dyn= res= flex= lend=`,
+  where `res` is a digest of the plan's tier/site per weight, `flex` the bytes of the carved lent
+  slots the start loan covers and `lend` that loan in tokens. The last two bind the start
+  placement: a dynamic plan's fill promotes pooled units into exactly those slots, so two runs
+  that lend differently reach different placements on the same plan. The loan is settled before
+  serving's first step, so both fields are facts of the start, not a snapshot of something still
+  moving. `auto` resolves against a budget that depends on
   the free VRAM at this start, so two runs that asked for `auto` can land on different strategies
   and different expert residency; the flag value alone would let both load the same profile. If a
   rank has no resolved plan (still `auto`, or no weights), the runtime is not derivable and the
