@@ -74,6 +74,36 @@ target_link_libraries(rad_test_hooks PRIVATE rad_abi Threads::Threads)
 
 set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core)
 
+# The engine's completion cases reach collect_step through the EngineTestPeer friend, which
+# core/engine.h declares only under RAD_TEST_HOOKS. A friend is part of the class definition, so
+# the test unit and every engine unit in that link have to be compiled with the macro together --
+# that is why these units are built a second time here instead of defining it on the test alone.
+# rad_core keeps its own, hook-free copies and is never asked for them: this archive goes in whole
+# and before it. Only engine_step_test links it, so no other test pays for the engine.
+set(RAD_ENGINE_SRC
+  ${CMAKE_SOURCE_DIR}/core/engine.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_bringup.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_diag.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_draft.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_gen.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_kld.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_lora.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_mm.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_probe.cpp)
+add_library(rad_test_engine STATIC ${RAD_ENGINE_SRC})
+# rad_core's PUBLIC usage requirements (include paths, RAD_VERSION, RAD_HAVE_HIP) are what these
+# units are compiled against in the library, so they must be the same here.
+target_link_libraries(rad_test_engine PRIVATE rad_core)
+target_compile_definitions(rad_test_engine PRIVATE RAD_TEST_HOOKS=1)
+if(RAD_FFMPEG_FOUND)
+  # PRIVATE on rad_core, so not inherited, and the engine units must not be built without it
+  # where the library was built with it.
+  target_compile_definitions(rad_test_engine PRIVATE RAD_HAVE_FFMPEG=1)
+  target_link_libraries(rad_test_engine PRIVATE PkgConfig::RAD_FFMPEG)
+endif()
+
+set(RAD_TESTS_WITH_ENGINE engine_step_test)
+
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
 add_executable(harness_fixture ${CMAKE_CURRENT_SOURCE_DIR}/harness_fixture.cpp)
@@ -191,6 +221,11 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
+  elseif(n IN_LIST RAD_TESTS_WITH_ENGINE)
+    add_executable(${n} ${t})
+    target_compile_definitions(${n} PRIVATE RAD_TEST_HOOKS=1)
+    target_link_libraries(${n} PRIVATE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_engine>"
+                                     ${RAD_TEST_CORE})
   elseif(n IN_LIST RAD_TESTS_WITH_GBNF_ORACLE)
     add_executable(${n} ${t} ${CMAKE_CURRENT_SOURCE_DIR}/gbnf_oracle.cpp)
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
