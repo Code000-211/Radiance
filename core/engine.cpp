@@ -518,18 +518,18 @@ void Engine::settle_start_placement() {
 }
 
 int Engine::complete_start_fill() {
-    /* One idle tick is one wave. The production balance keeps the turnover slots free and calls
-     * the loan settled that way, so with turnover held the same call fills the reserve; a wave a
-     * drain cut short, or one whose records moves in flight still hold, repeats. Serve completes
-     * that here, at zero dispatches and before the first observation, so every promotion is the
-     * plan's own lent slot (HeatStats::initial_fill_promotions) and the residency the profile is
-     * bound to is the materialised one. Left for a later step the reserve would be a heat decision
-     * and read as a move (Mover::balance).
+    /* One idle tick is one wave. The idle balance keeps the turnover slots free (hold_turnover_
+     * false), so only a balance that holds turnover fills them; held, the same call fills the
+     * reserve. A wave a drain cut short, or one whose records moves in flight still hold, repeats.
+     * Serve completes that here, at zero dispatches and before the first observation, so every
+     * promotion is the plan's own lent slot (HeatStats::initial_fill_promotions) and the residency
+     * the profile is bound to is the materialised one. Left for a later step the reserve would be a
+     * heat decision and read as a move (Mover::balance).
      *
-     * The first wave runs whatever fill_settled() answers: a mover with nothing lent yet, or one
-     * whose last balance kept turnover free, can answer "settled" without a balance that held the
-     * reserve. Completion is only proven after one, and a fill that cannot settle within the wave
-     * bound is an error -- serve reports it instead of measuring a placement it never reached. */
+     * The first wave runs whatever fill_settled() answers: a mover with nothing lent yet answers
+     * settled without a balance that held the reserve. Completion is only proven after one, and a
+     * fill that cannot settle within the wave bound is an error -- serve reports it instead of
+     * measuring a placement it never reached. */
     constexpr int kWaves = 256;
 #ifdef RAD_TEST_HOOKS
     if (const int injected = rad_test_start_fill_error(); injected < 0) return injected;
@@ -580,8 +580,9 @@ int Engine::prepare_serving() {
      * heat, after the first observation, and be a move away from that identity. Only an
      * identity-bound run takes that stake: a legacy run without a profile runs no completion and
      * keeps its startup tick, so nothing is priced or profiled for it. The predicate it shares
-     * (`Mover::fill_settled`) is reserve-aware for every dynamic plan all the same, so a legacy
-     * run's resolve waits for the idle balance to fill the reserve too.
+     * (`Mover::fill_settled`) is reserve-aware for every dynamic plan, and its idle balance keeps
+     * the reserve free, so it does not resolve before the first step: only a post-step balance that
+     * holds turnover fills the reserve.
      *
      * The fill's own error is serve's: a start placement that did not materialise must not fall
      * through to a fingerprint, a profile or a price. */

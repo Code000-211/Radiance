@@ -395,14 +395,14 @@ private:
      * it. Not a baseline reset: the non-fill moves stay counted, and a drift already noted stays
      * noted (Scheduler::draft_drift_note). */
     void settle_start_placement();
-    /* Complete the start loan's fill before anything is measured: the production balance keeps the
-     * turnover slots free and calls the loan settled that way, so they are only filled while
-     * turnover is held, and a wave cut short (a drain before the fill, records still held by moves
-     * in flight) repeats. Every wave lands at zero dispatches, where each promotion is the plan's
-     * own lent slot, not a later heat decision. The first wave runs even when fill_settled() reads
-     * true, so the reserve is proven by a balance that held it; RAD_E_FULL when it cannot settle
-     * in the wave bound, and the first device, stream or mover error otherwise. See
-     * prepare_serving(). */
+    /* Complete the start loan's fill before anything is measured: the idle balance keeps the
+     * turnover slots free, and fill_settled() does not call the loan settled while they are empty,
+     * so only a balance that holds turnover fills them -- the wave this call runs. A wave cut short
+     * (a drain before the fill, records still held by moves in flight) repeats. Every wave lands at
+     * zero dispatches, where each promotion is the plan's own lent slot, not a later heat decision.
+     * The first wave runs even when fill_settled() reads true, so the reserve is proven by a
+     * balance that held it; RAD_E_FULL when it cannot settle in the wave bound, and the first
+     * device, stream or mover error otherwise. See prepare_serving(). */
     int  complete_start_fill();
     /* serve()'s startup before anything is measured: the start loan, the fill that materialises
      * it, and the calibration check that must refuse before a run rather than after one. Returns
@@ -577,8 +577,9 @@ private:
      * may only be driven while its rank thread is parked, which this thread knows. `idle` also
      * runs each mover's own fill, which a busy engine gets from the step. Returns the first error
      * (the cache refusing the offer, a device that cannot be selected, a mover that rejects its
-     * loan or a failed idle fill); the runtime callers keep their log-and-continue behaviour, and
-     * only serve's identity-bound start path turns it into an abort. */
+     * loan or a failed idle fill); the runtime callers ignore the result -- the paths that already
+     * ignored one (`rad_dev_set`, `Mover::set_loan`) stay unlogged -- and only serve's
+     * identity-bound start path turns it into an abort. */
     int loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;

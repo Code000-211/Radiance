@@ -1691,11 +1691,11 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
 }
 
-/* The turnover slots are part of the start placement. A production balance keeps them free for
- * swaps and calls the loan settled that way, so serve()'s complete_start_fill() holds turnover and
- * repeats the balance: the second wave covers the reserve. Both waves are at zero dispatches, so
- * the whole lent range is the plan's own slots; left to the first steps, the reserve would fill at
- * heat and every such promotion would be a move away from the profile's identity. */
+/* The turnover slots are part of the start placement. The idle balance keeps them free, so
+ * fill_settled() stays false until they are filled; serve()'s complete_start_fill() holds turnover
+ * and repeats the balance, and the held wave covers the reserve. Both waves are at zero dispatches,
+ * so the whole lent range is the plan's own slots; left to the first steps, the reserve would fill
+ * at heat and every such promotion would be a move away from the profile's identity. */
 TEST(the_start_fill_includes_the_turnover_slots) {
     LoanRig r(24);
     r.turnover = 2;
