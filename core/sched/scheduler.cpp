@@ -188,6 +188,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         free_cards_[(size_t)c] = (int32_t)(cfg.max_seqs - 1 - c);   /* 0 is taken first */
     reqs_.reserve((size_t)cfg.max_seqs);
     completed_.reserve((size_t)cfg.max_seqs);
+    committed_.reserve((size_t)cfg.max_seqs);
     by_id_.reserve((size_t)cfg.max_seqs * 2);
     hit_blocks_.resize(prog.kv_groups.size());
     for (auto& v : hit_blocks_) v.reserve(64);
@@ -305,6 +306,25 @@ Request* Scheduler::find(uint64_t id) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
     return it == by_id_.end() ? nullptr : reqs_[(size_t)it->second]->req.get();
+}
+
+bool Scheduler::running(uint64_t id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = by_id_.find(id);
+    if (it == by_id_.end()) return false;
+    const SchedReq& s = *reqs_[(size_t)it->second];
+    return s.req && s.req->state == ReqState::Running;
+}
+
+bool Scheduler::committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const CommittedSeq& c : committed_)
+        if (c.seq == seq) {
+            if (n_out) *n_out = c.n_out;
+            if (live) *live = c.live;
+            return true;
+        }
+    return false;
 }
 
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
@@ -1798,6 +1818,10 @@ int Scheduler::commit(const StepResult& res) {
     }
     step_open_ = false;
 
+    /* What the serial bind reads after commit, copied here while the Requests are still held:
+     * reap() may release a finished one before finish_serial_drafter runs. */
+    committed_.clear();
+
     const int32_t W = conv_window();
 
     /* A mixed step leaves decode rows the same replay factors as a decode step (recurrent path
@@ -1820,6 +1844,7 @@ int Scheduler::commit(const StepResult& res) {
                 s.pending_free = false;
                 --n_deferred_;
             }
+            committed_.push_back({e.seq, (uint64_t)r.output.size(), false});
             continue;
         }
 
@@ -1976,6 +2001,7 @@ int Scheduler::commit(const StepResult& res) {
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
         }
+        committed_.push_back({e.seq, (uint64_t)r.output.size(), r.state == ReqState::Running});
     }
 
     m_.prefill_tokens += step_prefill_tok_;

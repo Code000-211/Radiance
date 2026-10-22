@@ -7,6 +7,7 @@
 #include "engine_priv.h"
 
 #include "../arch/common/rad_spechub_config.h"
+#include "sample/mtp_couple_evidence.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
@@ -341,9 +342,15 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * step left, and for a request already gone from the sampler it is RAD_E_NOTFOUND.
          *
          * The position coordinate is the request's committed output length AFTER this commit -- the
-         * value the next build_step reads as its n_out. The rule is mtp_couple_bind_rounds
-         * (sched/mtp_couple_bind.h), where it is driven against a real commit without an Engine. */
-        const MtpCoupleBindPoint bp = mtp_couple_bind_point(plan, seq);
+         * value the next build_step reads as its n_out. It comes from the scheduler's commit
+         * snapshot, not from the plan's Request pointer: reap() may have destroyed that already.
+         * The rule is mtp_couple_bind_rounds (sched/mtp_couple_bind.h), where it is driven against
+         * a real commit without an Engine. */
+        MtpCoupleBindPoint bp;
+        bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
+        if (!bp.found)
+            RAD_WARN("MTP coupled: serial row for sequence %llu is not in the committed step; "
+                     "clearing its coupling", (unsigned long long)seq);
         int n_bound = 0;
         std::string why;
         const int bs = mtp_couple_bind_rounds(
@@ -360,35 +367,34 @@ int Engine::finish_serial_drafter(const StepOut& so) {
     return RAD_OK;
 }
 
-/* One line, once, at the first coupled verify that completed on the device. What makes it
- * evidence is where it reads: the sampler's staged rows AFTER collect_step's wait, so the op it
- * names was built with bound rows and its batch returned -- an executed verify, not an enqueue, a
- * LIVE flag or a terminal row bound for a request that will never sample again (those are skipped
- * at bind, sched/mtp_couple_bind.h). Request numbers and the kernel name only: no tokens, no keys,
- * no logits. */
+/* One line, once, at the first coupled verify that completed. What makes it evidence is where it
+ * reads: the snapshot build_step froze for the step whose wait just returned (sample/
+ * mtp_couple_evidence.h), the verify op run() actually issued for that build, and the op's domain.
+ * build_greedy -- the drafter's greedy passes, issued between that build and the wait -- clears
+ * any_couple_ but not the snapshot; gating on the former is why the line never appeared in the
+ * coupled path. Sequences are re-checked as Running after the wait under the scheduler's lock, so a
+ * request that left in between is not counted. Request numbers, the row count and the kernel name
+ * only: no tokens, no keys, no logits. A host-domain row prints the same line marked as not device
+ * evidence -- an oracle run must not be read as one. */
 void Engine::couple_verify_evidence(int step) {
     if (!mtp_couple_ || couple_evidence_) return;
     Sampler& smp = ranks_[0]->sampler;
-    if (!smp.staged_any_couple()) return;
-    int64_t n = 0;
-    smp.staged_params(&n);
-    std::vector<uint64_t> seqs;
-    int64_t rows = 0;
-    for (int64_t r = 0; r < n; ++r) {
-        const RadMtpCoupleState& c = smp.staged_couple(r);
-        if (c.round <= 0) continue;
-        ++rows;
-        if (std::find(seqs.begin(), seqs.end(), c.draw.seq) == seqs.end())
-            seqs.push_back(c.draw.seq);
+    const rad_op op = smp.staged_couple_op();
+    const MtpCoupleEvidence ev = mtp_couple_evidence(
+        smp.couple_build(), step, ranks_[0]->ctx.op_domain(op),
+        [this](uint64_t seq) { return sched_.running(seq); });
+    if (ev.rows <= 0 || smp.staged_couple_issued_step() != step) return;
+    const char* kernel = ranks_[0]->ctx.ip_kernel_name(op);
+    if (ev.device) {
+        couple_evidence_ = true;
+        RAD_INFO("MTP coupled verify completed: step %d, %lld bound row(s) over request(s) [%s], "
+                 "kernel %s, domain device", step, (long long)ev.rows, ev.seqs.c_str(), kernel);
+    } else if (!couple_host_note_) {
+        couple_host_note_ = true;
+        RAD_INFO("MTP coupled verify completed on the host domain: step %d, %lld bound row(s) over "
+                 "request(s) [%s], kernel %s -- not device evidence", step, (long long)ev.rows,
+                 ev.seqs.c_str(), kernel);
     }
-    if (rows <= 0) return;
-    std::string ids;
-    for (size_t i = 0; i < seqs.size(); ++i)
-        ids += fmt("%s%llu", i ? "," : "", (unsigned long long)seqs[i]);
-    couple_evidence_ = true;
-    RAD_INFO("MTP coupled verify completed: step %d, %lld bound row(s) over request(s) [%s], "
-             "kernel %s", step, (long long)rows, ids.c_str(),
-             ranks_[0]->ctx.ip_kernel_name(smp.staged_couple_op()));
 }
 
 /* RADIANCE_MTP_COUPLED: the draw for every drafting row, before any serial pass reads it.

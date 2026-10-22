@@ -530,7 +530,7 @@ int Engine::step_loop() {
             }
             if (t_on) phase_mark(PH_BEGIN);
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs);
+                const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
                 for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);

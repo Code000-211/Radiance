@@ -408,11 +408,12 @@ private:
     std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
     RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
+    bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     int  stage_couple_draws(int n);
-    /* One INFO line at the first coupled verify that completed on the device: the step, the
-     * requests whose rows actually carried a bound state, and the kernel the verify op resolved
-     * to. Read off the sampler's staged rows after collect_step's wait, so it reports an executed,
-     * finished verify -- not an enqueue and not a LIVE flag. */
+    /* One INFO line at the first coupled verify that completed: the step, the live requests whose
+     * rows carried a bound state, the kernel and its domain. Read off the sampler's build snapshot
+     * after collect_step's wait, so it reports an issued, finished verify -- not an enqueue, not a
+     * LIVE flag, and not a host row read as a device one. */
     void couple_verify_evidence(int step);
 
     /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.

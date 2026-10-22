@@ -11,6 +11,7 @@
 #include "gbnf_oracle.h"
 #include "sample/grammar.h"
 #include "sample/host_ref.h"
+#include "sample/mtp_couple_evidence.h"
 #include "sample/sampler.h"
 #include "sample/vocab_view.h"
 #include "text/tokenizer.h"
@@ -1496,6 +1497,7 @@ struct HostChain {
     int64_t  nv = 0;
     bool     ok = false;
     int      st = RAD_OK;
+    int64_t  step_no = 0;   /* the engine step the next step() stages for */
 
     static inline HostChain* cur = nullptr;
     static void trampoline(RadCtx* c, const RadBatch*) {
@@ -1573,7 +1575,7 @@ struct HostChain {
             const int b = s.begin_request(r->id, r->sp, &err);
             if (b < 0) return b;
         }
-        const int bs = s.build_step(reqs);
+        const int bs = s.build_step(reqs, step_no++);
         if (bs < 0) return bs;
         int64_t n = 0;
         s.staged_params(&n);
@@ -1611,6 +1613,27 @@ Request make_req(uint64_t id, std::vector<int32_t> prompt, const SamplingParams&
     r.prompt = std::move(prompt);
     r.sp = sp;
     return r;
+}
+
+/* The per-round states the engine binds after a live commit: `rounds` sampled states of `id`,
+ * each at `first_pos + rd - 1`, proposing the matching draft token. */
+void couple_states(uint64_t id, uint64_t seed, const int32_t* draft, int rounds,
+                   uint64_t first_pos, RadMtpCoupleState* out) {
+    for (int rd = 1; rd <= rounds; ++rd) {
+        RadMtpCoupleState& c = out[rd - 1];
+        c = RadMtpCoupleState{};
+        c.draw.seq  = id;
+        c.draw.seed = seed;
+        c.draw.mode = 1;
+        c.round     = rd;
+        c.status    = 1;
+        c.count     = 1;
+        c.x         = draft[rd - 1];
+        for (int i = 0; i < 8; ++i) c.ids[i] = -1;
+        c.ids[0]    = c.x;
+        c.q[0]      = 1.0;
+        c.pos       = first_pos + (uint64_t)(rd - 1);
+    }
 }
 
 SamplingParams greedy_params() {
@@ -3292,21 +3315,7 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
     /* The states the engine binds after a live commit, at the positions it writes them. */
     const uint64_t n_out = r.output.size();
     auto states_at = [&](uint64_t first_pos, RadMtpCoupleState* out) {
-        for (int rd = 1; rd <= 3; ++rd) {
-            RadMtpCoupleState& c = out[rd - 1];
-            c = RadMtpCoupleState{};
-            c.draw.seq  = r.id;
-            c.draw.seed = r.sp.seed;
-            c.draw.mode = 1;
-            c.round     = rd;
-            c.status    = 1;
-            c.count     = 1;
-            c.x         = draft[rd - 1];
-            for (int i = 0; i < 8; ++i) c.ids[i] = -1;
-            c.ids[0]    = c.x;
-            c.q[0]      = 1.0;
-            c.pos       = first_pos + (uint64_t)(rd - 1);
-        }
+        couple_states(r.id, r.sp.seed, draft, 3, first_pos, out);
     };
     RadMtpCoupleState bound[3];
     states_at(rad_mtp_couple_verify_pos(n_out, 1), bound);
@@ -3348,6 +3357,87 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
     CHECK_OK(ch.s.begin_request(r2.id, r2.sp, &err));
     CHECK_OK(ch.s.build_step({ &r2 }));
     CHECK(!ch.s.staged_any_couple());
+}
+
+/* THE SNAPSHOT THE EVIDENCE READS.
+ *
+ * In the coupled serial path build_step stages the bound rows, then the drafter's build_greedy
+ * clears any_couple_ and replaces the staged rows before collect_step's wait returns. An evidence
+ * line gated on staged_any_couple() therefore never fires -- and forced, it would list the greedy
+ * pass's rows. This drives the real chain for two requests: build_step, run() issuing the verify
+ * op, build_greedy (where issue_serial_drafter calls it), then the evidence decision over the
+ * frozen snapshot. The negatives are what the line must not count: a terminal request, another
+ * step's snapshot, and a host row. */
+TEST(the_coupled_evidence_survives_the_drafters_greedy_build) {
+    setenv("RADIANCE_MTP_COUPLED", "1", 1);
+    HostChain ch(64, 2, 3, nullptr, 8, "spechub.so");
+    unsetenv("RADIANCE_MTP_COUPLED");
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    const int32_t draft[3] = { 21, 22, 23 };
+    Request a = make_req(7, { 1, 2, 3 }, sp);
+    Request b = make_req(8, { 4, 5, 6 }, sp);
+    a.draft = b.draft = draft;
+    a.n_draft = b.n_draft = 3;
+    std::string err;
+    for (Request* r : { &a, &b }) {
+        CHECK_OK(ch.s.begin_request(r->id, r->sp, &err));
+        RadMtpCoupleState bound[3];
+        couple_states(r->id, r->sp.seed, draft, 3, rad_mtp_couple_verify_pos(r->output.size(), 1),
+                      bound);
+        CHECK_OK(ch.s.set_mtp_couple(r->id, bound, 3));
+    }
+
+    std::vector<float> lg(8 * 64, 0.0f);   /* two requests, 3 draft rows + bonus each */
+    for (int row = 0; row < 8; ++row) lg[(size_t)row * 64 + 5] = 5.0f;
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a, &b }, lg, &tok));
+    const int64_t step = ch.step_no - 1;
+
+    const Sampler::CoupleBuild& cb = ch.s.couple_build();
+    CHECK_EQ(cb.step, step);
+    CHECK_EQ(cb.rows, (int64_t)6);
+    REQUIRE_EQ(cb.seqs.size(), (size_t)2);
+    CHECK_EQ(cb.seqs[0].first, (uint64_t)7);
+    CHECK_EQ(cb.seqs[0].second, (int64_t)3);
+    CHECK_EQ(cb.seqs[1].first, (uint64_t)8);
+    CHECK_EQ(cb.seqs[1].second, (int64_t)3);
+    /* run() issued the verify op for THIS build, not merely staged rows for it. */
+    CHECK_EQ(ch.s.staged_couple_issued_step(), step);
+
+    /* The drafter's greedy passes, where issue_serial_drafter runs them: after the build, before
+     * the wait. The old gate is false now; the snapshot is not the greedy pass's. */
+    CHECK_OK(ch.s.build_greedy(4));
+    CHECK(!ch.s.staged_any_couple());
+    CHECK_EQ(ch.s.couple_build().step, step);
+    CHECK_EQ(ch.s.couple_build().rows, (int64_t)6);
+
+    auto all_live = [](uint64_t) { return true; };
+    MtpCoupleEvidence ev = mtp_couple_evidence(cb, step, RAD_DOMAIN_DEVICE, all_live);
+    CHECK_EQ(ev.rows, (int64_t)6);
+    CHECK(ev.device);
+    CHECK_EQ(ev.seqs, std::string("7,8"));
+
+    /* A terminal request is not counted: b finished while the step ran. */
+    ev = mtp_couple_evidence(cb, step, RAD_DOMAIN_DEVICE, [](uint64_t s) { return s == 7; });
+    CHECK_EQ(ev.rows, (int64_t)3);
+    CHECK_EQ(ev.seqs, std::string("7"));
+
+    /* Nothing live, or another step's snapshot: no evidence. */
+    CHECK_EQ(mtp_couple_evidence(cb, step, RAD_DOMAIN_DEVICE, [](uint64_t) { return false; }).rows,
+             (int64_t)0);
+    CHECK_EQ(mtp_couple_evidence(cb, step + 1, RAD_DOMAIN_DEVICE, all_live).rows, (int64_t)0);
+
+    /* A host row is reported as host, not read as a device verify. */
+    ev = mtp_couple_evidence(cb, step, RAD_DOMAIN_HOST, all_live);
+    CHECK(!ev.device);
+    CHECK_EQ(ev.rows, (int64_t)6);
 }
 
 RAD_TEST_MAIN()

@@ -342,6 +342,8 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
 int Sampler::stage_alloc() {
     const int64_t rows = rows_for(cfg_);
+    /* At most one entry per request; reserved here so a coupled step never allocates. */
+    couple_build_.seqs.reserve((size_t)cfg_.max_seqs);
 
     /* Pinned: uploaded every step, and a pageable source turns the async copy into a staged one
      * with a host bounce (spec §8). */
@@ -629,7 +631,7 @@ int Sampler::set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, in
     return RAD_OK;
 }
 
-int Sampler::build_step(const std::vector<Request*>& reqs) {
+int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
     if (!declared_) return RAD_E_STATE;
 
     const auto t_build = std::chrono::steady_clock::now();
@@ -640,6 +642,10 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
     any_couple_ = false;
     cur_stage_ = params_stage_;
     lp_rows_.clear();
+    /* The evidence snapshot this build owns; build_greedy never touches it. */
+    couple_build_.step = step;
+    couple_build_.rows = 0;
+    couple_build_.seqs.clear();
 
     /* DRY's host half for one row whose history `h[0, take)` is staged. Over the window the
      * kernel uses (the tail of the row, `dry_penalty_last_n` long when positive) it computes the
@@ -746,6 +752,12 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                                              cfg_.n_vocab)) {
                         couple_stage_[row] = c;
                         any_couple_ = true;
+                        ++couple_build_.rows;
+                        auto& q = couple_build_.seqs;
+                        size_t j = 0;
+                        while (j < q.size() && q[j].first != r->id) ++j;
+                        if (j == q.size()) q.emplace_back(r->id, 1);
+                        else               ++q[j].second;
                     }
                 }
             }
@@ -1112,9 +1124,13 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
 
     RAD_TRY(issue(op_pick_, { o_ci, o_cv, o_params, o_tok }));
     /* AFTER the pick, over the same plane: a coupled row replaces the pick's token with the
-     * coupling's, and an unbound row leaves it. */
-    if (any_couple_)
+     * coupling's, and an unbound row leaves it. The issue is what the evidence line reads: the op
+     * and the build step it belongs to are recorded together, so a staged row set is never
+     * mistaken for an issued verify. */
+    if (any_couple_) {
         RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
+        couple_issued_step_ = couple_build_.step;
+    }
 
     /* Copy the logprobs rows to the host behind the pick, on rank 0 only (collect_step asks
      * it): the summary and the candidate planes, which logprobs_for reads when the summary lacks

@@ -14,12 +14,17 @@
  *     for a request that has already left the sampler, which reads as a live coupled round in any
  *     log and is not one.
  *
+ * The answer comes from Scheduler::committed_seq(), which commit fills under the scheduler lock.
+ * It is deliberately NOT read off the plan's StepEntry::req: after commit that Request may already
+ * have been reaped (release_locked destroys it), and a serial bind that dereferenced it would read
+ * freed memory.
+ *
  * Here rather than in engine_draft.cpp so the rule can be driven against a real scheduler commit
  * and the sampler's own build (tests/sched_test.cpp, tests/sample_test.cpp) without an Engine.
  */
 #pragma once
 
-#include "batch.h"
+#include "advance.h"
 #include "rad_spechub.h"
 
 #include <cstring>
@@ -29,22 +34,10 @@ namespace rad {
 
 /* Where the next build will sample this sequence, after the current step's commit. */
 struct MtpCoupleBindPoint {
-    bool     found = false;   /* the step's plan still names the sequence */
-    bool     live  = false;   /* and its request is still Running (not finished/cancelled/failed) */
+    bool     found = false;   /* the committed step carried the sequence */
+    bool     live  = false;   /* and its request was still Running (not finished/cancelled/failed) */
     uint64_t n_out = 0;       /* its committed output length: what the next build reads as n_out */
 };
-
-inline MtpCoupleBindPoint mtp_couple_bind_point(const StepPlan& plan, uint64_t seq) {
-    MtpCoupleBindPoint p;
-    for (const StepEntry& e : plan.e)
-        if (e.req && e.seq == seq) {
-            p.found = true;
-            p.live  = e.req->state == ReqState::Running;
-            p.n_out = (uint64_t)e.req->output.size();
-            break;
-        }
-    return p;
-}
 
 /* Bind `done` rounds of this row's draw to the positions the next build samples. `rb` is round 1
  * of this row in the engine's readback (stride `rb_stride` states), `tok[rd]` the card's token for

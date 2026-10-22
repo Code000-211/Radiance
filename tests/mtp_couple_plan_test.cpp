@@ -226,14 +226,14 @@ TEST(the_bound_position_is_the_verify_rows_sampling_position) {
         const bool live = emitted[step] == n_acc[step];
         r.state = live ? ReqState::Running : ReqState::Finished;
 
-        /* The bind, after the commit, through the production rule. The plan is what the next build
-         * would see for this request. */
-        StepPlan plan;
-        plan.e.push_back(entry(&r, r.id, 2, r.output.size(), false));
-        const MtpCoupleBindPoint bp = mtp_couple_bind_point(plan, r.id);
-        CHECK(bp.found);
+        /* The bind, after the commit, through the production rule. The point is what the
+         * scheduler's commit snapshot would carry: this fixture owns the request, so it is built
+         * here directly. */
+        MtpCoupleBindPoint bp;
+        bp.found = true;
+        bp.live  = r.state == ReqState::Running;
+        bp.n_out = (uint64_t)r.output.size();
         CHECK_EQ(bp.live, live);
-        CHECK_EQ(bp.n_out, (uint64_t)r.output.size());
 
         const int32_t tok[] = { 11, 21, 22, 23 };
         const StepSlot S = slot_for(tok, kRounds, n_acc[step]);

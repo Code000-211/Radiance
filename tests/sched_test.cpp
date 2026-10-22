@@ -1510,7 +1510,8 @@ TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
     CHECK_EQ((int)f.sch.find(a)->output.size(), (int)a_base + 4);
 
-    const MtpCoupleBindPoint pa = mtp_couple_bind_point(f.sch.plan(), a);
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
     CHECK(pa.found);
     CHECK(pa.live);
     CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
@@ -1546,9 +1547,10 @@ TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
     CHECK_EQ((int)f.sch.find(b)->output.size(), 3);          /* 1 + 2, not 1 + 4 */
 
-    /* The plan still names b -- the terminal step is carried into the bind -- but it is not live:
-     * nothing binds, so no coupled verify is staged for a request that is gone. */
-    const MtpCoupleBindPoint pb = mtp_couple_bind_point(f.sch.plan(), b);
+    /* The commit snapshot still names b -- the terminal step is carried into the bind -- but it is
+     * not live: nothing binds, so no coupled verify is staged for a request that is gone. */
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
     CHECK(pb.found);
     CHECK(!pb.live);
     CHECK_EQ(pb.n_out, (uint64_t)f.sch.find(b)->output.size());
@@ -1577,7 +1579,8 @@ TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
     REQUIRE(f.sch.step() != nullptr);
     const uint64_t c_base = f.sch.find(c)->output.size();
     CHECK_OK(f.commit(9, 0, [](const StepEntry&) { return 3; }));
-    const MtpCoupleBindPoint pc = mtp_couple_bind_point(f.sch.plan(), c);
+    MtpCoupleBindPoint pc;
+    pc.found = f.sch.committed_seq(c, &pc.n_out, &pc.live);
     CHECK(pc.found);
     CHECK(pc.live);
     CHECK_EQ(pc.n_out, (uint64_t)f.sch.find(c)->output.size());
@@ -1586,6 +1589,64 @@ TEST(the_coupled_bind_skips_a_request_the_commit_closed) {
     RadMtpCoupleState own = readback(c, c_base, 1)[0];
     own.pos = rad_mtp_couple_verify_pos(pc.n_out, 1);
     CHECK(rad_mtp_couple_binds(own, c, own.draw.seed, pc.n_out, 0, draft[0], vocab));
+}
+
+/* THE BIND POINT OUTLIVES A REAP.
+ *
+ * commit() retires the step, and a request it finished that the next step does not carry is pinned
+ * by nothing any more. The server calls reap() from an HTTP thread as soon as it sees the finish,
+ * and reap() destroys the Request -- while Engine::finish_serial_drafter still has to bind that
+ * row. The bind point is therefore copied by commit under the scheduler lock
+ * (Scheduler::committed_seq), not read off the plan's StepEntry::req, which is dangling by then.
+ * This reaps a non-carried terminal request between commit and bind: the plan-pointer version
+ * could only answer by reading freed memory, and the snapshot answers from the copy.
+ */
+TEST(the_committed_bind_point_outlives_a_reap) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    const int64_t vocab = f.prog.meta.n_vocab;
+
+    int32_t draft[3] = { 21, 22, 23 };
+    const uint64_t a = f.submit(160, 64);                  /* live through the commit */
+    const uint64_t b = f.submit(160, /*max_tokens=*/3);    /* closed on it by the cut */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    CHECK_OK(f.sch.set_draft(b, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? 3 : 0; }));
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    /* The server's reap lands between commit and bind: b's Request is destroyed here. */
+    CHECK_OK(f.sch.reap(b));
+    CHECK(f.sch.find(b) == nullptr);
+
+    MtpCoupleBindPoint pb;
+    pb.found = f.sch.committed_seq(b, &pb.n_out, &pb.live);
+    CHECK(pb.found);
+    CHECK(!pb.live);                                       /* terminal: nothing binds */
+    CHECK_EQ(pb.n_out, (uint64_t)3);
+
+    MtpCoupleBindPoint pa;
+    pa.found = f.sch.committed_seq(a, &pa.n_out, &pa.live);
+    CHECK(pa.found);
+    CHECK(pa.live);
+    CHECK_EQ(pa.n_out, (uint64_t)f.sch.find(a)->output.size());
+
+    RadMtpCoupleState rb[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    RadMtpCoupleState out[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+    StepSlot S{};
+    S.acc = 3;
+    S.n_acc = 4;
+    for (int rd = 1; rd <= 3; ++rd) S.tok[rd] = draft[rd - 1];
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_rounds(pb, RadMtpCoupleDraw{}, rb, 1, 3, S, vocab, out, &n_bound,
+                                    &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
 }
 
 /* A decode benchmark needs the request to last as long as asked, not as long as the model
