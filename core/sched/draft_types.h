@@ -151,7 +151,11 @@ enum class DraftCostSource : uint8_t { Measured = 0, Interpolated = 1, Conservat
  * auditing never updates the profile that prices normal operation. `None` is a claim ("provably
  * no replay" -- a plain run), so it may only be written from evidence; a caller that cannot tell
  * leaves `Unknown`, which is never read as a measurement. `plan.replay` is what was decided at
- * issue time and is not proof of what ran. */
+ * issue time and is not proof of what ran.
+ *
+ * The profile file stores these states by name, never by number: a reader that casts the file's
+ * index would read a measured `none` as `Unknown` now that `Unknown` sits at 0. A profile is a
+ * measurement, so `unknown` is not a file value at all. */
 enum class DraftReplay : uint8_t { Unknown = 0, None = 1, Play = 2, Record = 3, Audit = 4 };
 
 /* A cost sample's attribution. Only a sample with kDraftSampleValid and none of the disturbing

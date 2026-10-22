@@ -75,11 +75,13 @@ __attribute__((weak)) int  rad_event_sync(RadEvent) { return RAD_OK; }
 
 /* ================================================================== the one-shot build failure */
 /* core/sched/batch.cpp calls this weak hook once per BatchBuilder::build, after the empty-plan
- * check. The definition here is strong and replaces the always-false default, so a test can make
- * exactly one build of a plan that has work to do return null: the builder's own refusal path,
- * which is what C's serial_batch_failed() and E's driver must handle, reached without a runtime
- * switch in production code. One shot on purpose -- a permanently failing builder would only prove
- * that the engine stops, not that a later pass recovers. */
+ * check. The call and the always-false default exist only in a core built with RAD_BUILD_TESTS
+ * (RAD_TEST_HOOKS); this strong definition replaces the default, so a test can make exactly one
+ * build of a plan that has work to do return null: the builder's own refusal path, which is what
+ * C's serial_batch_failed() and E's driver must handle, reached without a runtime switch and
+ * without compiling the seam into a build configured without tests. One shot on purpose -- a
+ * permanently failing builder would only prove that the engine stops, not that a later pass
+ * recovers. */
 static bool g_fail_next_batch_build = false;
 
 extern "C" bool rad_test_fail_batch_build() {

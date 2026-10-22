@@ -180,9 +180,12 @@ prediction and sample.
   (`sample.shape.replay == sample.replay`), so a plan's declared `None` cannot key a sample the
   execution did not evidence. `kDraftSampleShortened` marks a cycle that ended before its planned
   extent (fewer rounds than `plan.max_k`, or a cancelled row): its bracket times less work than the
-  shape it would be filed under, so it is stored, never folded into the bucket it would otherwise
-  name. The plan itself is not rewritten afterwards to make `timing_valid` true; that field says
-  the executing
+  shape it would be filed under, so it is kept as an online diagnostic, never folded into the
+  bucket it would otherwise name. `shortened` and the unpriced bucket (`kDraftBucketUnpriced`)
+  stay **online diagnosis**: the profile format gets no name for either — a new format for
+  diagnostic buckets is not needed — and neither is fed back as a regular measurement or used as
+  a fallback anchor. A truncated bracket prices nothing, not even another shape. The plan itself
+  is not rewritten afterwards to make `timing_valid` true; that field says the executing
   path opened the bracket before the cycle's first work and closed it after its last.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
@@ -301,6 +304,10 @@ refused by name, not reinterpreted under the current keys.
   distributions than a synchronous one. Origins name the mix of rows (`head`, `lookup`); a head
   row does not price a lookup row. `T(B, maxK)` alone is not a key, and K0 with the head loaded is
   not the same bucket as K0 with no drafter process.
+- **`replay` is stored by name, never by enum number.** `DraftReplay` carries `Unknown` at 0 in
+  front of `None`, so a reader that cast the file's index would read a measured `none` as no
+  evidence. The four file names (`none`, `play`, `record`, `audit`) are mapped one by one, and
+  `unknown` is not a file value: a profile is a measurement.
 - **Version 2 is not version 1 with new fields.** A version-1 file has no `draft_k`/`draft_rows`,
   no `pipeline_depth` and no origin mix, so its buckets cannot be mapped onto the current key by
   assuming zeros. The reader refuses it by format id; a profile is regenerated, never rescaled.
