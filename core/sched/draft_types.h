@@ -540,12 +540,18 @@ inline bool draft_predictions_current(const DraftBatchView& view, const DraftPre
 }
 
 /* A row that may be learned from: the counts are ordered (generated >= published >= verified >=
- * checked >= accepted), `raw_match` counts matches among the rows the drafter generated and covers
- * the committed prefix, and `end` classifies the cut. An unclassified row is refused instead of
- * guessed. `end` and `raw_match` are one statement, not two: a rejection is exactly one position
- * past the accepted prefix and that position did not match, a matched stop is the one position past
- * the prefix and carries no label, and a fully accepted row matched everything it accepted. A row
- * that reports a match at the rejection position would teach the head a 0 for a token it got right. */
+ * checked >= accepted), `raw_match` counts matches among what the drafter generated and covers the
+ * committed prefix, and `end` classifies the cut. An unclassified row is refused instead of
+ * guessed.
+ *
+ * `raw_match` is bounded where it protects a label and nowhere else. `Rejected` writes a 0 at
+ * position `accepted` (draft_label), so the tally must agree that this position did not match:
+ * `raw_match == accepted`. `AllAccepted` claims everything it checked was committed, so a taller
+ * tally contradicts it. `Stopped` carries no label at `accepted` at all, and the censor -- not the
+ * tally -- decides where commitment stopped: `DraftController::observe` takes the committed count
+ * from the card, and a budget or cancellation censor can stop it below the compared span. An upper
+ * bound there would refuse a legitimate row and lose every label in that cycle, so `Stopped` keeps
+ * only the general `raw_match >= accepted`. */
 inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     const int a = (int)o.accepted, c = (int)o.checked, v = (int)o.verified;
     if (o.generated > RAD_SCHED_MAX_SPEC || o.published > RAD_SCHED_MAX_SPEC) return false;
@@ -558,7 +564,7 @@ inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     switch (o.end) {
         case DraftSeqEnd::AllAccepted: return c == a && o.raw_match == (uint64_t)a;
         case DraftSeqEnd::Rejected:    return c == a + 1 && o.raw_match == (uint64_t)a;
-        case DraftSeqEnd::Stopped:     return c == a && o.raw_match <= (uint64_t)a + 1;
+        case DraftSeqEnd::Stopped:     return c == a;   /* no label at `accepted`, so no tally bound */
         case DraftSeqEnd::Unset:       return false;
     }
     return false;

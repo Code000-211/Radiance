@@ -923,8 +923,10 @@ TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
     wrong_reject.raw_match = 2;
     CHECK(!draft_seq_observation_valid(wrong_reject));
 
-    /* A matched stop is the one position past the prefix; two compared matches are neither a
-     * rejection nor a stop. */
+    /* A matched stop is the one position past the prefix, and the censor -- not the tally --
+     * decides where commitment stopped. `DraftController::observe` takes the committed count from
+     * the card, so a budget or cancellation censor can stop it below the compared span: a taller
+     * raw match is a real row and must keep its labels, and it still gets none at `accepted`. */
     DraftSeqObservation stopped;
     stopped.generated = 3; stopped.published = 3; stopped.verified = 3;
     stopped.accepted = 1; stopped.checked = 1; stopped.raw_match = 1;
@@ -934,6 +936,12 @@ TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
     CHECK(draft_seq_observation_valid(stopped));   /* the EOG the target chose */
     CHECK(!draft_label(stopped, 1, nullptr));       /* matched, not committed: no label */
     stopped.raw_match = 3;
+    CHECK(draft_seq_observation_valid(stopped));   /* a censor stopped commitment below the span */
+    CHECK(!draft_label(stopped, 1, nullptr));
+    CHECK(draft_label(stopped, 0, nullptr));       /* the committed prefix keeps its 1 */
+
+    /* The tally still may not invent matches the drafter never produced. */
+    stopped.raw_match = 4;
     CHECK(!draft_seq_observation_valid(stopped));
 
     /* raw_match counts matches among what was generated, not an independent tally. */
