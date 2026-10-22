@@ -384,6 +384,27 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
 }
 
+/* Chunk-to-chunk staging overlap is on, and --no-prefill-overlap is the way to say off: the flag
+ * is the control arm of the A/B issue #7 asks for, so the startup report has to show which of the
+ * two a run is. */
+TEST(prefill_overlap_is_on_until_told_otherwise) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.prefill_overlap);
+    Config c;
+    CHECK_EQ(parse({ "--no-prefill-overlap" }, &c), RAD_OK);
+    CHECK(!c.prefill_overlap);
+    auto row = [](const Config& cfg) {
+        for (const diag::ConfigRow& r : diag::config_rows(cfg))
+            if (r.flag == std::string("--no-prefill-overlap")) return r;
+        return diag::ConfigRow{};
+    };
+    CHECK(row(d).value.find("not given") != std::string::npos);
+    CHECK_EQ(row(d).source, std::string("default"));
+    CHECK(row(c).value.find("stage their own") != std::string::npos);
+    CHECK(row(c).source != std::string("default"));
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs

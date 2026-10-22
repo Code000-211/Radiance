@@ -66,6 +66,9 @@ static const Flag g_flags[] = {
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
                                         "sequences decode, at most 64; 0 (default) lets every step\n"
                                         "carry a chunk" },
+    { "--no-prefill-overlap", nullptr,  "do not stage a prefill chunk's first experts while the\n"
+                                        "chunk before it finishes: every chunk copies its own\n"
+                                        "ahead, so the link is idle across the gap between them" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
@@ -453,6 +456,7 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
         else if (S("--prefill-interleave"))    { if (!num(0, 64, &c->prefill_interleave)) return RAD_E_INVAL; }
+        else if (S("--no-prefill-overlap"))    { c->prefill_overlap = false; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
         else if (S("--rope-scaling")) {
@@ -1018,6 +1022,10 @@ const ShowRow kShow[] = {
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
           return c.prefill_interleave > 0 ? num(c.prefill_interleave) : std::string("off"); } },
+    { "--no-prefill-overlap", [](const Config& c) {
+          return c.prefill_overlap ? std::string("not given: a chunk's first experts are staged by "
+                                                 "the chunk before it")
+                                   : std::string("chunks stage their own first experts"); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },

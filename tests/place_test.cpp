@@ -2696,6 +2696,218 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     rad_stream_destroy(compute);
 }
 
+/* The wrap at a chunk boundary, and what it waits on.
+ *
+ * Four trunk layers and one op past them: the first op a pass issues after its last routed layer
+ * is where the next chunk's first layers go out, while the pass is still open. The card is held at
+ * a gate behind the second layer's last op, so the `free` events of that layer and of the two
+ * after it stay pending, and the ring is three layers wide, which is room enough for the three
+ * early places and means the first of them laps a place this pass has already given back. So:
+ *
+ *   while the card is held, none of the three copies has landed -- the wrap ordered them behind
+ *   the reads of the bytes it is taking, not behind anything it invented, and a copy waiting on a
+ *   read the card has not retired blocks the transfer stream it shares with the other two; and
+ *   opening the gate lands all three with end_pass still to be called, which is the whole point:
+ *   the next chunk's weights crossed the link before this chunk's pass was retired.
+ *
+ * The next chunk adopts all three without staging a byte again. */
+TEST(the_stager_wraps_the_ring_at_the_chunk_boundary_behind_the_reads_it_laps) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 4, kE = 8;
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    const int h_tail = 1 + 2 * kL;               /* the pass's op past the last routed layer */
+    f.op("read_state", {}, false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 16;
+    cfg.host_pool_mib = 128;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+    std::vector<std::vector<rad_weight>> pw(kL);
+    int64_t most = 0;
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        REQUIRE(!pw[(size_t)l].empty());
+        most = std::max(most, each * (int64_t)pw[(size_t)l].size());
+    }
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    /* Three of the heaviest layer: enough that the wrap stages all lead() early layers, and little
+     * enough that the first of them wraps past the region's end and onto bytes this pass used. */
+    const int64_t ring = most * 3;
+    std::vector<char> region((size_t)ring);
+    /* Stamp the pool, so a copy's bytes say which layer they came from, and clear the region, so
+     * "has this copy run" is something the test can read back rather than infer. */
+    for (int l = 0; l < kL; ++l)
+        for (size_t i = 0; i < pw[(size_t)l].size(); ++i)
+            std::memset(home[pw[(size_t)l][i]], (int)(0x40 + 7 * l + i),
+                        (size_t)f.prog.weights[pw[(size_t)l][i]].logical_bytes);
+    std::memset(region.data(), 0, (size_t)ring);
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), nullptr, ring, 64));
+    REQUIRE(st.enabled());
+    REQUIRE(st.n_layers() == (size_t)kL);
+    REQUIRE(st.ring_bytes() == ring);
+    const int lead = (int)PrefillStager::lead();
+    REQUIRE(lead == kL - 1);                     /* so every early layer has a gate to wait on */
+
+    auto in_ring = [&](int l) {
+        for (rad_weight w : pw[(size_t)l]) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p < region.data() || p >= region.data() + ring) return false;
+        }
+        return true;
+    };
+    auto at_home = [&](int l) {
+        for (rad_weight w : pw[(size_t)l]) if (m.residency()->lookup(w)->ptr != home[w]) return false;
+        return true;
+    };
+    auto copies_hold_the_pool = [&](int l) {
+        for (rad_weight w : pw[(size_t)l])
+            if (std::memcmp(m.residency()->lookup(w)->ptr, home[w],
+                            (size_t)f.prog.weights[w].logical_bytes) != 0) return false;
+        return true;
+    };
+
+    RadBatch b{};
+    b.n_tok = 128;
+    void* gate = nullptr;                        /* holds the card behind layer 1's last op */
+    st.set_ring(st.ring_full());
+    st.set_next_prefill(true);
+    CHECK(st.begin_pass(&b));
+
+    bool resync = false;
+    for (int h = 0; h <= 2 * kL; ++h) {
+        resync = false;
+        CHECK_OK(st.before_op(h, compute, &resync));
+        if (h >= 2 && h % 2 == 0) {
+            const int l = (h - 2) / 2;
+            CHECK(in_ring(l));                   /* staged ahead, and read where it was copied */
+            CHECK_OK(rad_stream_sync(m.transfer_stream()));
+            CHECK(copies_hold_the_pool(l));
+        }
+        if (h == 4) {
+            /* Behind this point the card does not reach, until the test opens the gate: every free
+             * event recorded from here on, and every copy that waits on one, stays pending. */
+            CHECK_OK(rad_stream_gate(compute, &gate));
+            REQUIRE(gate);
+        }
+        CHECK_OK(st.after_op(h, compute));
+    }
+
+    /* Poison the region: the only writes it can take from here are the wrap's, since every copy
+     * this pass issued has landed and the card is held behind the reads. Whatever is at the early
+     * layers' addresses when the wrap returns was written by the wrap or not at all. */
+    std::memset(region.data(), 0xAB, (size_t)ring);
+
+    /* The op past the last routed layer: the wrap goes out here, and it gives the last layer's
+     * place back rather than carry it to the end of the pass, so the tables change. */
+    const uint64_t staged_before = m.stats().stage_layers;
+    resync = false;
+    CHECK_OK(st.before_op(h_tail, compute, &resync));
+    CHECK(resync);
+    int n_early = 0;
+    while (n_early < kL && in_ring(n_early)) ++n_early;
+    CHECK_EQ(n_early, lead);
+    CHECK_EQ(m.stats().stage_layers, staged_before + (uint64_t)n_early);
+    CHECK(at_home(kL - 1));                      /* the last layer's place went back early */
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+
+    /* Nothing the wrap staged has landed: its first copy waits on a read the held card has not
+     * retired, and the other two queue behind it on the mover's stream, in order. An event recorded
+     * on that stream now stays pending for as long as the card is held -- and the only way it stops
+     * pending is a copy that waited on nothing and landed at once, which is what this waits for.
+     * The region says the same thing in the copies' own bytes. */
+    RadEvent probe = nullptr;
+    CHECK_OK(rad_event_create(&probe));
+    CHECK_OK(rad_event_record(probe, m.transfer_stream()));
+    const auto stop = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (rad_event_query(probe) == 0 && std::chrono::steady_clock::now() < stop)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK_EQ(rad_event_query(probe), 0);
+    rad_event_destroy(probe);
+    for (int l = 0; l < n_early; ++l) CHECK(!copies_hold_the_pool(l));
+
+    /* The card reaches the reads, and the three layers land -- with end_pass still to be called.
+     * If the wrap had waited on the pass's end instead, none of this would hold yet. */
+    CHECK_OK(rad_gate_open(gate));
+    gate = nullptr;
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    for (int l = 0; l < n_early; ++l) {
+        CHECK(in_ring(l));
+        CHECK(copies_hold_the_pool(l));
+    }
+
+    /* The end retires what the pass staged and leaves the next chunk's layers published. */
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < n_early; ++l) CHECK(in_ring(l));
+    for (int l = n_early; l < kL; ++l) CHECK(at_home(l));
+
+    /* The next chunk adopts them: its first op stages none of them again. */
+    const uint64_t adopted = m.stats().stage_layers;
+    st.set_next_prefill(true);
+    CHECK(st.begin_pass(&b));
+    resync = false;
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK_EQ(m.stats().stage_layers, adopted);
+    for (int l = 0; l < n_early; ++l) CHECK(in_ring(l));
+
+    /* And the same boundary with the last layer issued on the other lane. Only the join before
+     * end_pass says what is behind a read on that stream, so the wrap leaves that place published
+     * and stages what fits around it -- and end_pass, which runs behind the join, takes it home. */
+    RadStream lane = nullptr;
+    CHECK_OK(rad_stream_create(&lane, 0));
+    for (int h = 1; h <= 2 * kL; ++h) {
+        const RadStream s = h >= 2 * kL - 1 ? lane : compute;    /* the last layer on lane 1 */
+        CHECK_OK(st.before_op(h, s, &resync));
+        CHECK_OK(st.after_op(h, s));
+    }
+    CHECK(in_ring(kL - 1));
+    resync = false;
+    CHECK_OK(st.before_op(h_tail, compute, &resync));
+    CHECK(in_ring(kL - 1));
+    CHECK_OK(st.end_pass(compute));
+    CHECK(at_home(kL - 1));
+    CHECK_OK(rad_stream_sync(lane));
+    rad_stream_destroy(lane);
+
+    /* A pass too small to arm takes the early layers home with it: nothing the wrap published for
+     * a pass that never comes stays at a copy. */
+    b.n_tok = 8;
+    CHECK(!st.begin_pass(&b));
+    for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    if (gate) rad_gate_open(gate);
+    rad_stream_destroy(compute);
+}
+
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     /* The production path. Pools has already allocated the weights pool as one block; allocating
      * beside it would spend the budget twice and surface later as an unrelated out-of-memory.
