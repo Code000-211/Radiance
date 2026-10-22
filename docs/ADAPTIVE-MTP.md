@@ -662,14 +662,24 @@ tree cannot be mistaken for this one:
 ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
-**Build prerequisite, separate from P00.** A whole-tree clang 23 build needs branch
-`build/clang23-libavx` (from `cb5a69a`), which P00 does not contain:
+**Build prerequisite, separate from P00.** The clang 23 prerequisite lives on branch
+`build/clang23-libavx` (from `cb5a69a`) as three separately reviewable commits; this tree already
+carries two of them by content:
 
-| Commit | What |
-|--------|------|
-| `dcb4e6f` | libavx: a duplicated `target` attribute, and a bf16 intrinsic in an OpenMP-outlined loop |
-| `c04006e` | `-Wl,--build-id`: kbench names a plugin by its ELF build-id note, which clang does not add itself |
-| `1ef93d2` | `core/device/aql.cpp`: prefer ROCm's `kfd_ioctl.h` (1.16) over the host kernel's 1.11 |
+| Commit | What | Here |
+|--------|------|------|
+| `dcb4e6f` | libavx: a duplicated `target` attribute, and a bf16 intrinsic in an OpenMP-outlined loop | present (`733e6f7`, `29e21bb`) |
+| `c04006e` | `-Wl,--build-id`: kbench names a plugin by its ELF build-id note, which clang does not add itself | deliberately absent (`b6a9f1c`) |
+| `1ef93d2` | `core/device/aql.cpp`: prefer ROCm's `kfd_ioctl.h` (1.16) over the host kernel's 1.11 | present (`f271478`) |
+
+The two libavx hunks and the aql include are here byte for byte (`git diff 1ef93d2 HEAD -- libavx
+core/device/aql.cpp` is empty), so clang 23's two compile breaks are fixed in this tree. The
+`--build-id` line is not, and P00 stays contract-only: compile and link do not depend on it, but a
+clang-linked library then carries no ELF build-id, `kb::code_identity()` names it 0 and caches
+nothing (`tools/kbench_core.cpp`), and `kbench_test`'s `the_code_identity_follows_build_ids` check
+(`build_id_of(...).size() >= 16`) cannot pass. Take the branch where a clang-linked tree must be
+cachable. This table is a source comparison, not a build result: no device build has been run
+against this tree.
 
 That branch is reconciled with the `eval-main` handoff, not a parallel repair variant:
 `git diff dcb4e6f <eval-main> -- libavx` is empty, so the two libavx commits carry exactly
