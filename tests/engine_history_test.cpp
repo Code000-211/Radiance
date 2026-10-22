@@ -98,8 +98,22 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
 
     Engine e(h.cfg);
     REQUIRE_EQ(EngineTestPeer::init_sched(e, h.prog, h.cfg, &h.kv, &h.pc), RAD_OK);
+    /* The scheduler is this fixture's, not one the engine started, so ~Engine does not fini it.
+     * The guard runs that on every exit, including the `return` a REQUIRE takes. Declared after
+     * `e`, so it runs before ~Engine. */
+    struct SchedGuard {
+        Engine& e;
+        ~SchedGuard() { EngineTestPeer::fini_sched(e); }
+    } sched_guard{e};
     EngineTestPeer::drafter(e, h.prog.drafter);
     EngineTestPeer::barrier(e, 1);
+
+    /* One end event for both chunks, as step_state_init leaves one for the engine's life: the step
+     * path records the same handle every step and step_state_fini frees it. A second
+     * rad_event_create would overwrite the live handle and leak the first. */
+    RadEvent ev = nullptr;
+    REQUIRE_EQ(rad_event_create(&ev), RAD_OK);
+    EngineTestPeer::step_end(e, ev);
 
     auto req = std::make_unique<rad::Request>();
     req->id         = 1;
@@ -113,7 +127,10 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
     REQUIRE_EQ(EngineTestPeer::submit(e, std::move(req)), RAD_OK);
 
     /* One chunk, in the engine's own order: plan, issue the passes, mark the end, collect, commit,
-     * finish. `from` is where the chunk starts, `to` where it ends. */
+     * finish. `from` is where the chunk starts, `to` where it ends. Returns through REQUIRE on the
+     * first fact it cannot continue without, which is why the caller gates the second chunk on
+     * `chunk_done`: a REQUIRE leaves the lambda, not the case. */
+    bool chunk_done = false;
     auto chunk = [&](int64_t from, int64_t to) {
         const RadBatch* b = EngineTestPeer::sched(e).step();
         REQUIRE(b != nullptr);
@@ -142,11 +159,10 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
         CHECK(!EngineTestPeer::sched(e).serial_batch_failed());
         CHECK_EQ(hb->n_draft_out, 0);
         CHECK_EQ(hb->n_tok, to - from);
-        CHECK_EQ(hb->ctx_lens[0], from);     /* it starts at the watermark, not at the chunk head */
-
-        RadEvent ev = nullptr;
-        REQUIRE_EQ(rad_event_create(&ev), RAD_OK);
-        EngineTestPeer::step_end(e, ev);
+        CHECK_EQ(hb->ctx_lens[0], from);     /* the pass covers this chunk's context. Not proof it
+                                             * started at the watermark: with ctx_len == from that
+                                             * holds either way, so the watermark check below is
+                                             * what carries the progression. */
 
         CHECK_EQ(EngineTestPeer::collect(e, b, so), RAD_OK);
         CHECK(so.complete);                 /* the wait over the issued pass ran */
@@ -158,12 +174,11 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
         /* The finish's SerialHold reported history_ran, and serial_end moved the watermark over
          * exactly the history the pass wrote. */
         CHECK_EQ(EngineTestPeer::watermark(e, 1), to);
+        chunk_done = true;                  /* last line: only a chunk that ran to its end counts */
     };
 
     chunk(0, 64);
-    chunk(64, 128);
-
-    EngineTestPeer::fini_sched(e);
+    if (chunk_done) chunk(64, 128);         /* a failed first chunk leaves nothing to compare */
 }
 
 }  /* namespace */
