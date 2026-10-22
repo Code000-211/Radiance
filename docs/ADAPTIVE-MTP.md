@@ -269,7 +269,10 @@ prediction and sample.
   counters `prepare_release` snapshots) travel the same way. `moved` is also frozen by a
   sampler-only release when its record still names the step: that release carries the tiering
   dispatch of a step issued ahead, and a step with no draft pass (a shared-KV head that drew K=0)
-  has no later release to report it before the next step re-bases the counter.
+  has no later release to report it before the next step re-bases the counter. Both the snapshot
+  and the comparison use `HeatStats::moves()`, so the initial fill retires into a bracket without
+  stamping it: that bracket is the start placement being reached, and marking it would throw away
+  the only clean bracket a calibration has.
 - **A move between two brackets belongs to the bracket after it.** The per-step facts cover one
   bracket, but the scheduler's own tier and arena ticks run after `step_finished()` and move units
   with no step to stamp. The engine therefore reports `DraftStepEvidence::moves_since_bind`, the
@@ -302,7 +305,10 @@ prediction and sample.
   fill issued after one observation, or any fill after the resolve (a loan growing again), is not
   initial: `Engine::residency_moves()` exempts the initial promotions only up to the count frozen
   at the resolve, so a later fill counts as a move even though it promotes rather than evicts.
-  There is no re-baselining: a move made before the resolve keeps counting.
+  There is no re-baselining: a move made before the resolve keeps counting. That covers every way
+  a lent slot changes hands after the start placement: a loan that grows back after a shrink, a
+  loan that follows freed KV blocks, and a donor a migration moved out of a lent slot -- the slot
+  it freed is refilled by a later `Mover::fill`, whose promotions are no longer initial.
 - **Both abort gates distinguish a calibration.** In the online policy a divergence deactivates
   the loaded table (`DraftCostTable::deactivate`, reason "residency drifted from the fingerprint's
   start placement"): it stops pricing and stops learning, and it does not `admit_fallback()` --
@@ -550,7 +556,10 @@ regenerated, never rescaled.
   log. A bucket measured while the mover was moving a unit (`kDraftSamplePlacement`) is left out
   as well: the fingerprint names the plan resolved at start, the file has no field that could
   name the residency the mover drifted to, and writing that bracket anyway would present it as a
-  price of the start placement. Only the affected buckets go -- a clean cycle before the first
+  price of the start placement. The same flag marks a bracket measured before the start placement
+  resolved, so a calibration whose fill had not landed when it measured writes nothing for those
+  cycles either -- the exclusion follows the record's `placed`, not the reason it was set. Only
+  the affected buckets go -- a clean cycle before the first
   move still measured the plan and is exported -- and a run whose every bucket was placement-
   affected refuses the export instead of publishing a file that prices nothing.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses

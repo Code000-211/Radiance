@@ -89,6 +89,11 @@ extern "C" __attribute__((weak)) void rad_test_serving_ready(int port) { (void)p
  * host plan can raise the heat counters: the engine's cumulative count adds it, so the move
  * between two brackets can be replayed. tests/engine_cost_drift_test.cpp defines it strongly. */
 extern "C" __attribute__((weak)) int64_t rad_test_residency_moves() { return 0; }
+
+/* The start placement's resolve, forced by a fixture whose rank has no mover to fill: 0 leaves
+ * Engine::start_placement_settled() alone, > 0 keeps it unresolved. tests/engine_cost_drift_test.cpp
+ * defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_placement_unresolved() { return 0; }
 #endif
 
 namespace rad {
@@ -406,7 +411,10 @@ void Engine::rank_loop(int index) {
             const Ctx::StepEvidence rec = r.ctx.last_step_evidence();
             if (s >= 0 && (what != kIssueSampler || rec.step == b->step)) {
                 const HeatStats hs = r.heat.stats();
-                int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions + injected;
+                /* The same count prepare_release snapshots: a bracket in which the initial fill
+                 * retires is the start placement being materialised, not left, so it is not
+                 * stamped `moved` either (HeatStats::moves, Engine::residency_moves). */
+                int64_t moves = hs.moves((int64_t)hs.initial_fill_promotions) + injected;
                 r.note_evidence(rec, r.ctx.last_pass_tape(), moves > moves_before);
             }
 
@@ -460,6 +468,9 @@ int64_t Engine::residency_moves() const {
 }
 
 bool Engine::start_placement_settled() const {
+#ifdef RAD_TEST_HOOKS
+    if (rad_test_placement_unresolved() > 0) return false;
+#endif
     for (const auto& r : ranks_)
         if (!r->mover.fill_settled()) return false;
     return true;
@@ -482,7 +493,7 @@ int Engine::prepare_release(const RadBatch* b) {
      * so a later step's reclaim cannot stand in for this one. */
     for (auto& rk : ranks_) {
         const HeatStats hs = rk->heat.stats();
-        rk->ev_moves_before = (int64_t)hs.promotions + (int64_t)hs.demotions;
+        rk->ev_moves_before = hs.moves((int64_t)hs.initial_fill_promotions);
     }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
