@@ -22,6 +22,7 @@
 #include "rad_test.h"
 #include "tiny_golden.h"
 #include "tiny_model.h"
+#include "tiny_moe.h"
 
 #include "mm/media.h"
 #include "server/oai.h"
@@ -549,6 +550,14 @@ json post(int port, const std::string& path, const json& body, int* status = nul
     const int st = c.send(port, "POST", path, body.dump()) ? c.read(&out) : -1;
     if (status) *status = st;
     if (why) *why = c.why;
+    return json::parse(out, nullptr, false);
+}
+
+/* A running server's /stats document (a GET route; `post` would be refused), or null. */
+json stats(int port) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/stats", "") || c.read(&out) != 200) return json();
     return json::parse(out, nullptr, false);
 }
 
@@ -1932,6 +1941,75 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
                 positions, tail(cost.output()).c_str());
     CHECK_EQ(positions, 2);
     CHECK_EQ(cost.stop(), 0);
+}
+
+/* The start path's lender registration, on a model that can lend at all. A model that can lend
+ * needs conditional units: only MoE experts are RAD_ACCESS_CONDITIONAL, and only those the planner
+ * tiers into the pinned host pool are movable -- that is what enables the heat engine and what
+ * makes `Mover::lend_from` carve slots out of the KV cache. tests/tiny_moe.h adds that routed arm
+ * to the dense Gemma4 trunk; the device is sized so that not every expert fits and --host-pool-mib
+ * holds the rest, so the start has slots to offer.
+ *
+ * Observed where it acts, not through the export and not through a loan a request holds: `/stats`
+ * reports the mover's own count (experts.flex_capacity, Mover::count_flex) and the startup line
+ * names the slots it carved. Both are facts about the registration this start made.
+ *
+ * The reference twin that would show the same start registering nothing cannot be run today, so
+ * this case pins the precondition it needs: --draft-reference requires --draft-profile-out
+ * (core/engine.cpp:1922), which requires a serial draft head (core/engine.cpp:1951); the only arch
+ * that declares conditional experts reaches at most a DFlash block drafter
+ * (arch/common/rad_gemma4_dflash.h:628), and the plugin that has the serial head refuses any
+ * checkpoint with experts (arch/gemma4_bf16/gemma4_bf16.cpp:1632). The discriminating pair stays
+ * open until some deployment is both. */
+TEST(the_live_start_offers_its_experts_a_positive_loan) {
+    tiny::TempDir dir("moe");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.layers          = 2;
+    s.hidden          = 128;
+    s.heads           = 4;
+    s.kv_heads        = 2;
+    s.head_dim        = 32;
+    s.ffn             = 256;
+    s.global_head_dim = 64;
+    s.global_kv_heads = 1;
+    s.window          = 32;
+    s.vocab           = 320;
+    s.ctx             = 4096;
+    REQUIRE(tiny::write_gemma4_moe(dir.path, s, /*experts*/ 8, /*top_k*/ 2, /*moe_ffn*/ 1024));
+
+    /* 4096 tokens of context so one layer's stripe of the full-attention group (1 MiB) can hold an
+     * expert slot (768 KiB); a shorter context leaves a stripe no slot fits in, and the start
+     * would offer nothing even though the model can lend. */
+    const std::vector<std::string> args = { "--placement", "expert_tiered",
+                                            "--host-pool-mib", "96",
+                                            "--gpu-headroom-mib", "0",
+                                            "--max-model-len", "4096",
+                                            "--max-num-seqs", "1",
+                                            "--max-num-batched-tokens", "32",
+                                            "--no-prefix-cache" };
+    Server live;
+    REQUIRE(live.start(dir.path, args, device_env(32)));
+    const json st = stats(live.port);
+    const int live_exit = live.stop();
+    const std::string log = live.output();
+    REQUIRE(st.is_object() && st.contains("experts"));
+    const json& e = st["experts"];
+
+    /* The model is one that can lend: movable conditional experts, some of them in the pinned
+     * pool, with the heat engine on. */
+    CHECK_EQ(e.value("heat", false), true);
+    CHECK(e.value("movable", 0) > 0);
+    int pinned = 0;
+    for (const json& t : e.value("tiers", json::array()))
+        if (t.value("name", "") == "pinned") pinned = t.value("units", 0);
+    CHECK(pinned > 0);
+
+    /* The registration: the cache's two lendable stripes offer one expert slot each, and the start
+     * says so. A run that carved nothing reports 0 here and "nothing is lent" in its log. */
+    CHECK_EQ(e.value("flex_capacity", -1.0), 2.0 * 768.0 * 1024.0);
+    CHECK(log.find("is lent to the experts while no request holds it") != std::string::npos);
+    CHECK_EQ(live_exit, 0);
 }
 
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones
