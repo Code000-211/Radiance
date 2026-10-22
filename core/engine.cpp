@@ -99,6 +99,12 @@ extern "C" __attribute__((weak)) int rad_test_placement_unresolved() { return 0;
  * host: < 0 makes Engine::complete_start_fill return it before the first wave. 0 leaves the fill
  * alone. tests/engine_start_fill_test.cpp defines it strongly. */
 extern "C" __attribute__((weak)) int rad_test_start_fill_error() { return RAD_OK; }
+
+/* The destructor's drain seam, called twice: stage 0 after the compute streams are drained and
+ * before the buffers a pass may still read are freed, stage 1 after those frees. A driver asks
+ * the device allocator whether each allocation is still live at both points, so the case observes
+ * the order itself instead of restating it. tests/engine_dtor_order_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) void rad_test_dtor_stage(int stage) { (void)stage; }
 #endif
 
 namespace rad {
@@ -120,24 +126,9 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
-     * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
-     * allocator is per device. */
-    for (const auto& r : ranks_) {
-        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
-        const float* d = cvec_views_[(size_t) r->index].dir;
-        if (!d) continue;
-        if (rad_dev_set(r->device) < 0) continue;
-        rad_dev_free((void*) d, RAD_MEM_DEVICE);
-        cvec_views_[(size_t) r->index].dir = nullptr;
-    }
-    cvec_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
-    for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
-    if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
-    for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
     /* The tiering summary, here for the same reason, and only for a dynamic plan. Its per-layer
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */
@@ -158,6 +149,33 @@ Engine::~Engine() {
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
+#ifdef RAD_TEST_HOOKS
+    rad_test_dtor_stage(0);
+#endif
+    /* Only now, after the drain, free what a pass may still be reading. The control vector's
+     * per-rank direction copies are kernel operands uploaded at declare, outside any arena, so
+     * nothing else frees them; each is freed with its rank's device bound, since the allocator
+     * is per device. The pinned host targets are copy destinations of the compute streams.
+     * Ctx::shutdown waits on both streams (and destroys the ones it owns) before returning, so
+     * the frees are ordered behind the wait; freed before it, a step aborted between an async
+     * copy and its sync unpinned memory the card was still writing. The sync's result is still
+     * dropped, as it was before: a failed drain is reported and then stepped over, so a failed
+     * wait still reaches these frees. That gap is unchanged here. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
+        const float* d = cvec_views_[(size_t) r->index].dir;
+        if (!d) continue;
+        if (rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        cvec_views_[(size_t) r->index].dir = nullptr;
+    }
+    cvec_views_.clear();
+    for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
+    for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
+#ifdef RAD_TEST_HOOKS
+    rad_test_dtor_stage(1);
+#endif
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
