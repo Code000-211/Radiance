@@ -1872,7 +1872,8 @@ int Scheduler::commit(const StepResult& res) {
             if (a < 0) a = 0;
             if (a > e.n_spec) a = e.n_spec;
             /* The raw tally is the comparison behind `a`, never below it: the EOG cut shortens what
-             * was committed, not what matched. Clamped to the same window it was compared over. */
+             * was committed, not what matched. Clamped to the paired verify window this row was
+             * compared over (`e.n_spec`), never to `a` or to the next cycle's draft K. */
             int32_t raw = res.n_raw ? res.n_raw[i] : a;
             if (raw < a) raw = a;
             if (raw > e.n_spec) raw = e.n_spec;
