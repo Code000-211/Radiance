@@ -17,7 +17,9 @@
  * Budgets: a `token_budget` or `kv_budget` that is <= 0 is not a constraint (the view's
  * default); a positive one caps the summed draft tokens of the plan. When it does, every K is
  * scaled down proportionally and marked `DraftFallback::Resources` -- the plan never silently
- * spends more than it was given.
+ * spends more than it was given. A reduced plan that cannot itself be priced is issued as a
+ * `Resources` fallback, not as a `Cost` plan: the price of the uncut plan is not evidence for a
+ * distribution it does not describe, and a raise is refused rather than argued from it.
  *
  * Two windows, not one. The plan's `k[]`/`max_k`/`rows[]` are the cycle's draft window; the pass
  * the paired step verifies is the previous, frozen plan's distribution, and under issue_ahead()

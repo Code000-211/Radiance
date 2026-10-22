@@ -374,11 +374,17 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     total_k(out->k, view.n_seq, &top);
 
     /* The cut changed the assignment `best_p` priced: price the plan as it stands, so the
-     * hysteresis below compares the plan that will actually be issued. */
-    if (cut && evals < c_.max_evals) {
+     * hysteresis below compares the plan that will actually be issued. A reduced plan its own
+     * shape cannot price is issued unpriced: the uncut plan's cost and yield are not its evidence,
+     * and the raise below is refused rather than argued from them. */
+    bool issued_priced = true;
+    if (cut) {
         Priced p;
-        const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
-        if (rc < 0) return rc;
+        if (evals < c_.max_evals) {
+            const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
+            if (rc < 0) return rc;
+        }
+        issued_priced = p.valid;
         if (p.valid) best_p = p;
     }
 
@@ -399,8 +405,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         Priced incumbent;
         const int rc = price(view, pred, costs, out->k, last_k_, &evals, &incumbent);
         if (rc < 0) return rc;
-        const double raised = best_p.yield / (best_p.ms + best_p.unc);
-        if (held_ < c_.hold || !incumbent.valid ||
+        const double raised = issued_priced ? best_p.yield / (best_p.ms + best_p.unc) : 0.0;
+        if (!issued_priced || held_ < c_.hold || !incumbent.valid ||
             !(raised > incumbent.yield / incumbent.ms * (1.0 + c_.hyst))) {
             for (int32_t i = 0; i < view.n_seq; ++i)
                 if (out->k[i] > last_k_) out->k[i] = last_k_;
@@ -411,7 +417,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     last_k_ = top;
     chosen_ = true;
 
-    return finish(view, top, DraftPlanSource::Cost, DraftFallback::None, out);
+    return finish(view, top, issued_priced ? DraftPlanSource::Cost : DraftPlanSource::Fallback,
+                  issued_priced ? DraftFallback::None : DraftFallback::Resources, out);
 }
 
 }  /* namespace rad */

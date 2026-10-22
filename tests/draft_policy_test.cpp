@@ -283,6 +283,32 @@ TEST(a_positive_budget_cuts_the_plan_and_says_so) {
     CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
 }
 
+TEST(a_cut_plan_its_own_shape_cannot_price_is_issued_unpriced) {
+    Cycle c;
+    c.pred.a = 0.95f;
+    for (int i = 0; i < 4; ++i) c.add(i, (uint64_t)(i + 1));
+    c.measure(1.0, 0.2);
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK(c.f.plan.fallback == DraftFallback::None);
+
+    /* Every window is priced except the shallow one the cut will leave: the plan is priceable
+     * before the cut and not after it. */
+    c.costs.ms[1] = 0.0;
+    c.f.view.token_budget = 4;
+    CHECK_EQ(c.choose(), RAD_OK);
+    int32_t sum = 0;
+    for (int i = 0; i < 4; ++i) sum += c.f.plan.k[i];
+    CHECK(sum <= c.f.view.token_budget);          /* the resource limit stands */
+    CHECK(c.f.plan.max_k < 6);
+    /* Issued unpriced, not as a Cost plan carrying the uncut plan's price. */
+    CHECK(c.f.plan.source == DraftPlanSource::Fallback);
+    CHECK(c.f.plan.fallback == DraftFallback::Resources);
+    CHECK(c.f.plan.why[0] == DraftFallback::Resources);
+    CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
+}
+
 TEST(a_raise_waits_for_the_hold_and_a_reduction_does_not) {
     Cycle c;
     c.pred.a = 0.95f;
