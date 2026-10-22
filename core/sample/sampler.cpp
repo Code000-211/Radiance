@@ -278,8 +278,10 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         };
         op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
         if (!op_couple_) return RAD_E_NOKERNEL;
-        const rad_buf reads[] = { buf_cand_i_, buf_cand_v_, buf_params_, buf_couple_ };
-        RAD_TRY(rad_op_reads(b, op_couple_, reads, 4));
+        /* No rad_op_reads here: the sampler's buffers are shared by ops that declare no lists
+         * (topk, topp, pick), so declaring only this one would narrow the candidate planes to
+         * its own op and the first sample_topk issue would be refused as outside their
+         * lifetime. They stay live for the whole program, as before the coupling. */
     }
     /* The temperature kernel again, over the candidate plane: `n_vocab` is only a row length to
      * it, so the candidate width works. */

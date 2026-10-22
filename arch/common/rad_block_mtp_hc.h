@@ -444,7 +444,9 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                 return RAD_E_UNSUPPORTED;
             for (int round = 1; round <= depth; ++round) {
                 op_couple[round - 1] = rw(b, RAD_OP(b, "mtp_couple_propose",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab),
+                    /* The WHOLE vocabulary: `row_topk` reports global ids (its `vocab_off`) and
+                     * the merge keeps them, while `g.n_vocab` is this rank's shard. */
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
                                RAD_INT("round", round), RAD_INT("max_rounds", depth)),
                     RAD_NOWEIGHTS),
                     { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state });
