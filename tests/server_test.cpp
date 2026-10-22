@@ -2456,11 +2456,12 @@ TEST(each_draft_position_counts_its_acceptances) {
                5.0 / 7.0, 1e-9);
 }
 
-/* The observation ledger reaches /metrics with its units apart: a cycle hands the predictor
- * one row per draft position, so `rows_*` scale with the window while `cycles_discarded` counts
- * whole cycles that never delivered, and `cost_observations_inactive` counts valid observations
- * that reached a table with no profile -- neither rows nor dropped cycles. Summing them would
- * price the policy by the wrong denominator; the names and the help text say which is which. */
+/* The observation ledger reaches /metrics with its units apart: a cycle hands the predictor one
+ * row per request/sequence, not one per draft position, so `rows_*` do not scale with the window
+ * while `cycles_discarded` counts whole cycles that never delivered, and
+ * `cost_observations_inactive` counts valid observations that reached a table with no profile --
+ * neither rows nor dropped cycles. Summing them would price the policy by the wrong denominator;
+ * the names and the help text say which is which. */
 TEST(draft_observation_rows_and_cycles_stay_apart_on_the_wire) {
     Metrics m("m", 1024);
     server::SchedMetrics s;
@@ -2480,7 +2481,9 @@ TEST(draft_observation_rows_and_cycles_stay_apart_on_the_wire) {
     CHECK_EQ(d.type["radiance:draft_observation_rows_skipped_total"], std::string("counter"));
     CHECK_EQ(d.type[cycles], std::string("counter"));
     CHECK_EQ(d.type[inactive], std::string("counter"));
-    CHECK(d.help[rows].find("not one per cycle") != std::string::npos);
+    CHECK(d.help[rows].find("not one per token position") != std::string::npos);
+    CHECK(d.help["radiance:draft_observation_rows_applied_total"].find("learning update") !=
+          std::string::npos);
     CHECK(d.help[cycles].find("not rows") != std::string::npos);
     CHECK(d.help[inactive].find("not per row or cycle") != std::string::npos);
     auto value = [&d](const std::string& name) {

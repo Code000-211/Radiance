@@ -413,15 +413,17 @@ std::string Metrics::render() const {
               L, c_draft_refill_tokens_.get());
 
     /* The adaptive-window observation ledger. The names carry the unit because the two do not
-     * mix: the first three count rows of a delivered cycle (a wider window contributes more
-     * rows), the last counts whole cycles dropped before they delivered anything. A rising
-     * `attempted` with `applied` flat is a policy whose rows teach nothing; a non-zero
-     * `discarded` is evidence lost before it taught, which no row counter can show. */
+     * mix: the first three count rows of a delivered cycle -- one per request/sequence row, not one
+     * per token position, so a wider window adds labels inside a row and not rows -- the last
+     * counts whole cycles dropped before they delivered anything. A rising `attempted` with
+     * `applied` flat is a policy whose rows teach nothing; a non-zero `discarded` is evidence lost
+     * before it taught, which no row counter can show. */
     w.counter("radiance:draft_observation_rows_attempted_total",
-              "Draft-observation rows offered to the predictor: one per row of a delivered "
-              "cycle, not one per cycle.", L, c_draft_obs_rows_attempted_.get());
+              "Draft-observation rows offered to the predictor: one per request/sequence row of "
+              "a delivered cycle, not one per token position.", L, c_draft_obs_rows_attempted_.get());
     w.counter("radiance:draft_observation_rows_applied_total",
-              "Draft-observation rows whose labels moved a request's window estimate.",
+              "Draft-observation rows that applied a learning update: at least one position's "
+              "learning state moved, which does not promise the numeric estimate changed.",
               L, c_draft_obs_rows_applied_.get());
     w.counter("radiance:draft_observation_rows_skipped_total",
               "Draft-observation rows that taught nothing: no teachable label, or a recycled "

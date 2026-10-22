@@ -100,8 +100,11 @@ public:
      * (req_id, slot_gen) and the call still returns OK. The scheduler publishes these as
      * SchedMetrics::draft_obs_*. */
     struct Counts {
-        uint64_t rows_attempted = 0;  /* rows of deliverable observations handed to the loop */
-        uint64_t rows_applied = 0;    /* rows whose labels moved this request's estimate */
+        uint64_t rows_attempted = 0;  /* request/sequence rows handed to the loop: one per row,
+                                       * not per token position of a wider window */
+        uint64_t rows_applied = 0;    /* rows that applied a learning update -- at least one
+                                       * position's state moved; the numeric estimate need not
+                                       * change */
         uint64_t rows_skipped = 0;    /* rows that taught nothing: recycled identity, other
                                        * origin, or K0 */
     };

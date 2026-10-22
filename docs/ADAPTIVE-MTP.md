@@ -9,9 +9,9 @@ exist and are tested on the host: B's predictor and A's cost table are both fed 
 ring, and the cost policy is opt-in (`--draft-policy cost`; the default stays `legacy`). Cost is
 still inactive without a configured profile: `DraftCostTable::configure` is called by no
 deployment path yet, so `--draft-policy cost` is refused at `Scheduler::init` by name (the
-baseline lock: an active table **and** either a measured bucket or an explicit
-`admit_fallback()`) and every estimate takes its named fallback. The sample path only measures: it
-activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
+baseline lock: an active table **and** either a bucket usable by the rule `estimate()` applies or
+an explicit `admit_fallback()`) and every estimate takes its named fallback. The sample path only
+measures: it activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
 
 ## The seam
 
@@ -67,11 +67,14 @@ prediction and sample.
 - **Delivery and application are two acts, and application is per row and counted.** The
   scheduler delivers a completed cycle once (at the next cycle's open, or at shutdown); the
   observer answers `RAD_OK` even when it applied nothing, so that return value is not evidence of
-  application. `DraftPredictModel::observe` counts the rows apart: `attempted` (every row of a
-  deliverable cycle), `applied` (a row whose labels moved a request's estimate) and `skipped` (a
-  row with no teachable label, or one whose `(req_id, slot_gen)` no longer binds). A cycle the
-  predictor refuses, and one that never completed, are `discarded` by the scheduler -- a refused
-  observation is a dropped cycle, not a retried one. `SchedMetrics` exposes all four
+  application. `DraftPredictModel::observe` counts the rows apart: `attempted` (every
+  request/sequence row of a deliverable cycle -- one per row, not one per token position, so a
+  wider verify window adds labels inside a row and does not raise this count), `applied` (a row
+  that applied a learning update -- at least one position's learning state moved, which is not a
+  promise that the numeric estimate changed) and `skipped` (a row with no teachable label, or one
+  whose `(req_id, slot_gen)` no longer binds). A cycle the predictor refuses, and one that never
+  completed, are `discarded` by the scheduler -- a refused observation is a dropped cycle, not a
+  retried one. `SchedMetrics` exposes all four
   (`draft_obs_attempted`, `_applied`, `_skipped`, `_discarded`): a rising `attempted` with
   `applied` flat is a policy whose rows teach nothing, and a non-zero `discarded` is a cycle lost
   before it taught. A row that cannot bind is skipped, never applied partially, so one cycle's
@@ -262,11 +265,13 @@ prediction and sample.
   covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly;
   a genuine tape run remains the missing proof that a Record/Audit draft pass reaches the bucket
   rule above.
-- **The last cycle does not wait for shutdown.** A cycle is delivered at the next cycle's open,
-  and an idle engine opens none -- its slots may even be recycled first. `Engine::step_loop`'s idle
-  branch therefore calls `Scheduler::draft_ring_idle()`, which closes the open record under the
-  step lock: a fully reported cycle reaches the learner there instead of at `shutdown()`/`fini()`,
-  and a record no later open can finish is counted as dropped rather than left in flight.
+- **The last cycle is delivered by the next `step()`, not by an extra idle close.** Every
+  `Scheduler::step()` and `promote_next()` opens by closing the current record
+  (`draft_cost_cycle()`), and `Engine::step_loop` calls one of them before its idle branch and
+  before `drain_completed()` recycles a slot -- so a fully reported cycle is delivered on the idle
+  step itself, and a record no later open can finish is counted as dropped there. There is no
+  separate idle flush to rely on. A cycle measured by the truly last step of a run has no step
+  after it, so `shutdown()`/`fini()` flush the ring before the requests' identities are released.
 - **No fabricated success.** An unimplemented mode returns `RAD_E_UNSUPPORTED`; an unpriced shape
   is a named fallback (`DraftFallback::NoProfile`/`UnknownShape`) with the fixed baseline still
   visible in the plan. A hook never invents a plan or a price to look successful.
@@ -379,7 +384,11 @@ refused by name, not reinterpreted under the current keys.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually
-  quote -- at least one measured bucket, or `DraftCostTable::admit_fallback()`. `active()` alone is
+  quote -- at least one bucket usable by the same predicate `estimate()` filters with
+  (`DraftCostTable::has_usable_bucket()`: no disturbing flag, a positive sample count, a finite
+  positive mean), or `DraftCostTable::admit_fallback()`. A non-empty `buckets()` list is not that
+  price: a profile of only warmup/record/audit/admission/placement records passes it and still
+  prices nothing. `active()` alone is
   not the admission: a matching profile with no bucket proves the reader ran, not that anyone
   accepted pricing every shape with the policy's named fixed baseline. The deployment must say so,
   in so many words, before `init`; otherwise `init` returns `RAD_E_UNSUPPORTED` with

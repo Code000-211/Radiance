@@ -516,6 +516,12 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
     return RAD_OK;
 }
 
+bool DraftCostTable::has_usable_bucket() const {
+    for (const DraftCostBucket& b : buckets_)
+        if (bucket_usable(b)) return true;
+    return false;
+}
+
 int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) const {
     if (!out) return RAD_E_INVAL;
     *out = DraftCostEstimate{};

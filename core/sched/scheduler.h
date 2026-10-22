@@ -313,12 +313,6 @@ public:
      * stay correct but there is no timing. `ev` is what only the caller can see: the replay state
      * the tape ran in and whether placement changed inside the bracket. */
     void            step_finished(const DraftStepEvidence& ev = DraftStepEvidence{});
-    /* An idle step loop opens no next cycle, so the last cycle it fully measured would wait for
-     * shutdown -- and the slots its rows name may be recycled first. The engine's idle branch calls
-     * this instead of waiting: a complete record delivers now, a row no later open can finish is
-     * counted as dropped. Idempotent, so the branch may call it every idle pass. */
-    void            draft_ring_idle();
-
     /* ---------------------------------------------------- the serial drafter (spec §10)
      *
      * A serial draft head (RAD_DRAFT_SERIAL) runs as extra steps after the trunk step that fed it,

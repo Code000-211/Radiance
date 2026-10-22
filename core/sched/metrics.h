@@ -140,8 +140,11 @@ struct SchedMetrics {
      * the call still succeeds -- and a cycle that never completed is never delivered at all. So
      * the three row outcomes are counted apart, plus the cycles that were dropped instead of
      * delivered (incomplete, evicted, or refused by the predictor). All zero while Cost is off. */
-    int64_t draft_obs_attempted = 0;   /* rows of deliverable cycles offered to the predictor */
-    int64_t draft_obs_applied = 0;     /* rows whose labels moved a request's estimate */
+    int64_t draft_obs_attempted = 0;   /* request/sequence rows of deliverable cycles offered to
+                                        * the predictor: one per row, not per token position */
+    int64_t draft_obs_applied = 0;     /* rows that applied a learning update (at least one
+                                        * position's state moved; not a promise the estimate
+                                        * changed numerically) */
     int64_t draft_obs_skipped = 0;     /* rows that taught nothing */
     int64_t draft_obs_discarded = 0;   /* cycles not delivered: incomplete or refused */
     /* Valid observations handed to an inactive cost table: the deployment is observing, not

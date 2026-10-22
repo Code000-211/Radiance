@@ -185,6 +185,11 @@ public:
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
     const std::vector<DraftCostBucket>& buckets() const { return buckets_; }
+    /* Whether any bucket may price a shape at all -- the same rule estimate() applies
+     * (bucket_usable): no disturbing flag, n > 0, a finite positive mean. The scheduler's baseline
+     * lock reads this: an unexamined buckets() list is not a measured baseline, since a profile of
+     * nothing but diagnostic buckets passes it and prices nothing. */
+    bool has_usable_bucket() const;
     int64_t dropped() const { return dropped_; }   /* buckets dropped at capacity */
     int64_t ignored() const { return ignored_; }   /* observations with no timing to learn from */
     /* A valid observation the table had no profile to learn into. Separate from ignored(): this

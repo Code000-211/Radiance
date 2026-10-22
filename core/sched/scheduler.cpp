@@ -134,15 +134,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     }
     /* ... and a baseline admitted for THIS runtime. DraftCostTable::configure() is the only way a
      * table becomes active, and it refuses every fingerprint but its own, so `active()` is the
-     * proof that a profile was loaded and matched. An empty matching profile is not yet a price:
-     * the policy would issue its named fallback for every shape, so the deployment has to say so
-     * with admit_fallback(). Without either, every price would be a guess and Cost is refused by
-     * name rather than run on unknowns (docs/ADAPTIVE-MTP.md). The table is configured before
-     * init; the conditional clear below keeps it, since it is the baseline this deployment was
-     * admitted with. */
+     * proof that a profile was loaded and matched. An empty matching profile -- or one whose
+     * buckets are all diagnostically disturbed -- is not yet a price: the policy would issue its
+     * named fallback for every shape, so the deployment has to say so with admit_fallback().
+     * has_usable_bucket() is the same rule estimate() applies, so a profile of warmup/record/audit
+     * buckets is refused here rather than admitted on a non-empty list. Without either, every
+     * price would be a guess and Cost is refused by name rather than run on unknowns
+     * (docs/ADAPTIVE-MTP.md). The table is configured before init; the conditional clear below
+     * keeps it, since it is the baseline this deployment was admitted with. */
     if (cfg.draft_policy == DraftPolicyKind::Cost &&
         !(draft_costs_.active() &&
-          (!draft_costs_.buckets().empty() || draft_costs_.fallback_admitted()))) {
+          (draft_costs_.has_usable_bucket() || draft_costs_.fallback_admitted()))) {
         if (!draft_costs_.active() && !draft_costs_.reason().empty())
             RAD_ERR("--draft-policy cost: no admissible cost baseline -- %s",
                     draft_costs_.reason().c_str());
@@ -2100,15 +2102,6 @@ void Scheduler::draft_ring_flush() {
     draft_ring_cur_ = 0;
     for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
         if (draft_ring_[i].active) draft_ring_close(draft_ring_[i].cycle_id);
-}
-
-/* The idle counterpart of the next open: with no step in flight, a record that is already fully
- * reported delivers here instead of waiting for shutdown, and one that can no longer report is
- * counted as dropped rather than left in flight while its slots are recycled. Same lock as step(),
- * because the ring is step state and the engine thread is not the only reader of the counters. */
-void Scheduler::draft_ring_idle() {
-    std::lock_guard<std::mutex> lk(mu_);
-    draft_ring_flush();
 }
 
 /* A's sample for one resolved cycle. The price is the cost of the distribution that RAN

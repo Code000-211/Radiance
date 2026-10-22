@@ -541,9 +541,6 @@ int Engine::step_loop() {
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
-            /* No next open will deliver the last cycle, and the request identities it carries may
-             * be recycled before shutdown: hand the fully measured one to the learner here. */
-            sched_.draft_ring_idle();
             sched_.publish(/*idle=*/true);
             /* Work is waiting only on the encoder: loop immediately. */
             if (sched_.encodes_pending()) { idle = 0; continue; }

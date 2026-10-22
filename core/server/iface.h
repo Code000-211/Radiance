@@ -109,8 +109,9 @@ struct SchedMetrics {
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
     /* The cost policy's observation ledger (rad::SchedMetrics::draft_obs_*), cumulative over the
      * server's lifetime like every source counter -- there is no reset. The first three count
-     * observation ROWS -- one per draft row of a delivered cycle, so a wider window contributes
-     * more of them -- and the cycle counter counts whole CYCLES dropped before delivery. The
+     * observation ROWS -- one per delivered request/sequence row of a cycle, not one per token
+     * position: a wider verify window adds labels inside a row, not rows, so only more delivered
+     * rows raise these -- and the cycle counter counts whole CYCLES dropped before delivery. The
      * cost-observation counter has its own unit again: one per valid observation handed to an
      * inactive table, which is neither a row nor a dropped cycle. The units are not a sum. */
     int64_t draft_obs_rows_attempted = 0;

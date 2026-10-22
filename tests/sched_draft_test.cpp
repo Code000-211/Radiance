@@ -1699,11 +1699,11 @@ TEST(the_cost_policy_is_wired_through_config_and_observes_each_cycle_exactly_onc
     CHECK_EQ(st->n[3], 0);
 }
 
-/* An idle step loop opens no next cycle: without a delivery at that point, the last cycle a running
- * server measured would wait for shutdown, and the slots its rows name may be recycled first. This
- * drives exactly that path -- a fully measured cycle, the engine's idle call, then the request
- * leaving -- and the second half shows a cycle no later open can finish is counted, not left in
- * flight. */
+/* An idle step loop opens no next cycle, but it still calls step(), and draft_cost_cycle() closes
+ * the open record at the start of every step -- before the loop knows there is no batch, and before
+ * drain_completed() recycles slots. This drives that real flow: a fully measured cycle, the request
+ * leaving, the idle step() delivering it, then the slot being reaped. A second idle step must not
+ * count it again. */
 TEST(an_idle_engine_delivers_its_last_measured_cycle_before_the_slot_is_recycled) {
     Fixture f;
     f.build();
@@ -1721,17 +1721,21 @@ TEST(an_idle_engine_delivers_its_last_measured_cycle_before_the_slot_is_recycled
     REQUIRE(f.sch.step() != nullptr);
     f.commit_plain(11);
     CHECK_OK(f.sch.set_draft(id, drafts, 6));
-    CHECK_EQ(f.sch.draft_cycles_done(), 0);   /* measured, but no next open has delivered it */
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);   /* measured; no step has closed it yet */
     const int64_t dropped0 = f.sch.draft_cycles_dropped();
 
-    f.sch.draft_ring_idle();
+    /* The request leaves with the cycle still open, then the engine's idle step runs: its own
+     * draft_cost_cycle() retires the record, before the slot is reaped. */
+    CHECK_OK(f.sch.cancel(id));
+    CHECK(f.sch.step() == nullptr);
     CHECK_EQ(f.sch.draft_cycles_done(), 1);
     CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
 
-    /* Before the slot is recycled: the request leaving after the delivery cannot retract it, and
-     * the retired record is not counted again. */
-    CHECK_OK(f.sch.cancel(id));
-    f.sch.draft_ring_idle();
+    CHECK_OK(f.sch.reap(id));                 /* the slot recycle, after the delivery */
+    CHECK_EQ(f.sch.draft_cycles_done(), 1);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
+
+    CHECK(f.sch.step() == nullptr);           /* retired: a later idle step adds nothing */
     CHECK_EQ(f.sch.draft_cycles_done(), 1);
     CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0);
 }
@@ -1750,13 +1754,14 @@ TEST(an_idle_engine_counts_a_cycle_no_later_open_can_finish_as_discarded) {
     f.prefill(id);
     const int64_t dropped0 = f.sch.draft_cycles_dropped();
 
-    /* Opened, but its verify never committed -- and no next open will come. */
+    /* Opened, then the request leaves before the verify commits: no later open can finish it. */
     REQUIRE(f.sch.step() != nullptr);
-    f.sch.draft_ring_idle();
+    CHECK_OK(f.sch.cancel(id));
+    CHECK(f.sch.step() == nullptr);
     CHECK_EQ(f.sch.draft_cycles_done(), 0);
     CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0 + 1);
 
-    f.sch.draft_ring_idle();   /* idempotent: the record is retired */
+    CHECK(f.sch.step() == nullptr);           /* retired: not counted twice */
     CHECK_EQ(f.sch.draft_cycles_dropped(), dropped0 + 1);
 }
 
@@ -2001,6 +2006,44 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
             stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
         CHECK(has(empty, "no measured bucket"));
 
+        /* A non-empty bucket list is not a baseline either: the gate asks the same question
+         * estimate() does (bucket_usable), so a profile of diagnostic buckets and one carrying no
+         * positive mean are still "no measured bucket". */
+        DraftCostBucket b;
+        b.shape.n_rows        = 1;
+        b.shape.verify_k      = 1;
+        b.shape.verify_tokens = 2;
+        b.shape.rows[1]       = 1;
+        b.shape.draft_k       = 1;
+        b.shape.draft_rows[1] = 1;
+        b.shape.drafter       = DraftDrafter::Serial;
+        b.flags               = kDraftSampleWarmup;
+        b.rounds              = 1;
+        b.draft_round_rows[1] = 1;
+        b.draft_rows_total    = 1;
+        b.mean_ms             = 12.0;
+        b.unc_ms              = 1.0;
+        b.n                   = 3;
+        p.buckets.assign(1, b);
+        CHECK_OK(f.sch.draft_costs().configure(p, rt));
+        REQUIRE(f.sch.draft_costs().buckets().size() == 1);
+        CHECK(!f.sch.draft_costs().has_usable_bucket());
+        const std::string warm =
+            stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+        CHECK(has(warm, "no measured bucket"));
+
+        p.buckets[0].flags = 0;
+        p.buckets[0].n = 0;                   /* no samples behind the mean */
+        CHECK_OK(f.sch.draft_costs().configure(p, rt));
+        CHECK(!f.sch.draft_costs().has_usable_bucket());
+        CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+
+        p.buckets[0].n = 3;
+        p.buckets[0].mean_ms = 0.0;           /* a missing timing, not a zero-cost bucket */
+        CHECK_OK(f.sch.draft_costs().configure(p, rt));
+        CHECK(!f.sch.draft_costs().has_usable_bucket());
+        CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+
         /* clear() resets the admission with the rest of the table, so an earlier deployment's
          * admission cannot reappear under a new profile. */
         f.sch.draft_costs().admit_fallback();
@@ -2010,6 +2053,51 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
     }
 
     activate_costs(f);
+    CHECK_OK(f.start());
+}
+
+/* The other side of the same gate: one bucket estimate() would price from (no disturbing flag, a
+ * positive sample count, a finite positive mean) is a measured baseline on its own -- Cost starts
+ * with no fallback admission, and the table's own predicate says so. */
+TEST(a_usable_bucket_admits_the_cost_policy_without_a_fallback_admission) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+
+    DraftCostProfile p;
+    p.fingerprint.model     = "test";
+    p.fingerprint.quant     = "q";
+    p.fingerprint.tp_wire   = "w";
+    p.fingerprint.gpus      = "g";
+    p.fingerprint.kernels   = "k";
+    p.fingerprint.kv_format = "bf16";
+    p.fingerprint.placement = "all_vram";
+    p.fingerprint.tp        = 1;
+    DraftCostBucket b;
+    b.shape.n_rows        = 1;
+    b.shape.verify_k      = 1;
+    b.shape.verify_tokens = 2;
+    b.shape.rows[1]       = 1;
+    b.shape.draft_k       = 1;
+    b.shape.draft_rows[1] = 1;
+    b.shape.drafter       = DraftDrafter::Serial;
+    b.rounds              = 1;
+    b.draft_round_rows[1] = 1;
+    b.draft_rows_total    = 1;
+    b.mean_ms             = 12.0;
+    b.unc_ms              = 1.0;
+    b.n                   = 3;
+    p.buckets.assign(1, b);
+
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    CHECK_OK(f.sch.draft_costs().configure(p, rt));
+    REQUIRE(f.sch.draft_costs().active());
+    CHECK(f.sch.draft_costs().has_usable_bucket());
+    CHECK(!f.sch.draft_costs().fallback_admitted());
     CHECK_OK(f.start());
 }
 RAD_TEST_MAIN()
