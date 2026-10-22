@@ -366,6 +366,17 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["stream_bytes"]   = s.link.stream_bytes;
             o["link"] = std::move(l);
         }
+        /* The activation arena's levels and the one the last step ran at (see LiveSnapshot): the
+         * level decides which step sizes the slab may borrow the arena's top for, so a reader
+         * polling during a request can see which one is in force. `rows` is 0 before a step. */
+        if (!s.arena_levels.empty()) {
+            json a;
+            a["level"]  = s.arena_level;
+            a["rows"]   = (double)s.arena_rows;
+            a["levels"] = s.arena_levels;
+            o["arena"] = std::move(a);
+        }
+
         if (s.passes.present) {
             json p;
             p["played"]         = s.passes.played;

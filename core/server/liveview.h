@@ -144,6 +144,14 @@ struct LiveSnapshot {
     ExpertPlane           experts;
     LinkStat              link;
     PassStat              passes;
+
+    /* The activation arena's levels (Engine::arena_rows_), largest step first, and the one the
+     * last step ran at: `arena_rows` is the step size that level serves and `arena_level` its
+     * index. Empty when the plan declared no level, which is a plugin that answers no sizing
+     * declare or a budget below the smallest level. */
+    std::vector<int64_t> arena_levels;
+    int64_t              arena_rows  = 0;
+    int                  arena_level = 0;
 };
 
 void snapshot_from(const SchedMetrics& m, LiveSnapshot* out);

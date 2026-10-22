@@ -2706,6 +2706,13 @@ int Engine::run_server() {
             s.cards.push_back(std::move(c));
         }
 
+        /* The arena level in force. `arena_rows_` is written once at start; `arena_last_` at each
+         * step boundary, so a read racing a step sees one step's value or the next. `arena_rows`
+         * stays 0 until a step has run, and the level with it. */
+        s.arena_levels = arena_rows_;
+        s.arena_rows   = arena_last_;
+        s.arena_level  = arena_last_ > 0 ? arena_level(arena_last_) : 0;
+
         /* The expert plane from rank 0's placement plan; empty for a dense model, and the
          * renderers then omit the panel. */
         s.experts = server::ExpertPlane{};

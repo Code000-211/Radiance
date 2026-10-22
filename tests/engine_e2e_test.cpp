@@ -2804,7 +2804,9 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
  *   wide      512 batched tokens, a no-loan reference with the profile out: the levels exist, the
  *             identity names them, and nothing is lent while the file is measured.
  *   reload    the same 512 budget in normal operation, loading that file: the arena identity is
- *             part of the fingerprint, so this bind is the file's level set matching a live one.
+ *             part of the fingerprint, so this bind is the file's level set matching a live one,
+ *             and a completion then runs at the level it names (/stats reports the level of the
+ *             step that ran).
  *   control   the same file with one field changed -- `arena` set to "none", the identity of a
  *             deployment with no level plan -- loaded on the same deployment. Every earlier field
  *             of the fingerprint still matches, so the refusal names the arena level set and
@@ -2906,7 +2908,7 @@ TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
     }
     CHECK(start_priced);
 
-    /* ---- reload: a live 512 run binds the file, arena included ---- */
+    /* ---- reload: a live 512 run binds the file, arena included, and serves a request ---- */
     std::vector<std::string> live = at_budget(512);
     live.insert(live.end(), { "--draft-policy", "cost", "--draft-profile", profile });
     Server run;
@@ -2918,6 +2920,27 @@ TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
     CHECK(run_log.find("basis no-loan -- an optimisation basis") != std::string::npos);
     CHECK(run_log.find("is not used for this deployment") == std::string::npos);
     CHECK(run_log.find("while steps are at most 256 tokens") != std::string::npos);
+
+    /* A real completion, so the levels are exercised and not only bound: the prompt and every
+     * decode step of it are far under 256 tokens, so the engine runs them at the 256-row level
+     * and may lend the arena above that level to the slab. /stats reports the level the last
+     * step ran at (Engine::arena_step, LiveSnapshot), which is the proof that this deployment
+     * actually ran at 256 -- a step that had needed the full plan would have said 512. */
+    int status_live = 0;
+    std::string why_live;
+    const json live_reply = post(run.port, "/completion", completion(prompt_ids(7, 24), 24),
+                                 &status_live, &why_live);
+    if (status_live != 200 || tokens_of(live_reply).size() != 24)
+        fprintf(stderr, "    the 512 reload answered status %d (%s): %s\n", status_live,
+                why_live.c_str(), live_reply.dump().c_str());
+    REQUIRE_EQ(status_live, 200);
+    REQUIRE_EQ(tokens_of(live_reply).size(), (size_t)24);
+    const json rst = stats(run.port);
+    REQUIRE(rst.is_object() && rst.contains("arena"));
+    if (rst["arena"].value("rows", 0.0) != 256.0)
+        fprintf(stderr, "    the reload's last step ran at %s\n", rst["arena"].dump().c_str());
+    CHECK_EQ(rst["arena"].value("rows", 0.0), 256.0);
+    CHECK_EQ(rst["arena"].value("level", -1), 1);
     CHECK_EQ(run.stop(), 0);
 
     /* ---- control: the same file, one field changed to a different level set ---- */

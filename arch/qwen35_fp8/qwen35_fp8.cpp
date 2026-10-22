@@ -1264,10 +1264,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
 #if QWEN35_MOE
-    /* The routed build declares the same graph at any step size: declare() reads the step's rows
-     * from the build context alone and writes them into its own Model, which is what lets
-     * Engine::probe_arena_levels hold a sizing declare against the real one. plan_level still
-     * decides per level -- a buffer set or an extent that differs refuses it there, not here. */
+    /* The routed build answers a sizing declare: declare() takes the step's rows from the build
+     * context alone and writes them into its own Model, so Engine::probe_arena_levels can hold the
+     * answer against the real declare. plan_level decides per level -- a buffer set or an extent
+     * that differs refuses it there, not here. Modes this build was not checked in are not claimed
+     * to hold: the graph equality is a host-side check of the declares the tests build. */
     out->shape_probe_ok = 1;
 #endif
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
