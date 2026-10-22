@@ -722,10 +722,12 @@ int Engine::step_loop() {
         ahead = nullptr;
         if (issued) sched_.promote_next();
         else        b = sched_.step();
-        /* A cycle whose policy ended on a residency drift is refused above; the run stops here,
-         * on the engine's existing error path, instead of drafting the rest of it at the ceiling. */
+        /* A cycle whose policy ended on a refused plan -- a residency drift, or a shape the
+         * ladder cannot price -- is refused above; the run stops here, on the engine's existing
+         * error path, instead of drafting the rest of it at the ceiling. */
         if (sched_.draft_cost_aborted()) {
-            RAD_ERR("draft cost: the residency no longer matches the profile; stopping instead of "
+            RAD_ERR("draft cost: no cycle can be priced on this run (the residency does not match "
+                    "the profile, or the ladder cannot price this shape); stopping instead of "
                     "drafting at the ceiling");
             return fail_loop(RAD_E_STATE);
         }

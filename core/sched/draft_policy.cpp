@@ -74,6 +74,7 @@ void DraftPlanner::reset() {
     held_   = 0;
     chosen_ = false;
     gap_reported_ = false;
+    gap_refused_  = false;
     fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
 }
 
@@ -249,6 +250,7 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
 
 int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pred,
                          const DraftCostModel& costs, DraftPlan* out) {
+    gap_refused_ = false;
     if (!out || !out->k || !out->rows || !out->req_id || !out->slot || !out->slot_gen ||
         !out->why || !out->fill || !out->ctx_class || !out->history_tokens)
         return RAD_E_INVAL;
@@ -327,6 +329,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                             (int)deepest, (int)c_.fallback_k, (int)c_.fallback_k, (int)deepest);
                     gap_reported_ = true;
                 }
+                gap_refused_ = true;
                 return RAD_E_UNSUPPORTED;
             }
         }

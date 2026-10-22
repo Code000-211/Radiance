@@ -455,9 +455,11 @@ public:
      * scheduler's own ticks publish between two brackets leaves no per-step stamp, and a cycle
      * priced after it would be priced on a placement the run has left. */
     void                  draft_residency(int64_t moves_since_bind);
-    /* Set when a cost cycle was refused because the residency drifted: the run has no profile it
-     * can price with, and the engine ends it on its error path rather than drafting at the ceiling.
-     * Not a fallback admission; the table stays inactive. */
+    /* Set when a cost cycle was refused because no plan can price the run: the residency drifted
+     * from the profile, or the ladder's coverage gap makes the offered top unpriced where the named
+     * baseline would run deeper. Either way the run has no profile it can price with, and the
+     * engine ends it on its error path rather than drafting at the ceiling. Not a fallback
+     * admission; the table stays inactive. */
     bool                  draft_cost_aborted() const { return draft_cost_aborted_; }
     const DraftPredictState* draft_predict_state(int32_t slot) const {
         if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;

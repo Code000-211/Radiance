@@ -2214,10 +2214,11 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
 /* An explicit ladder below the executable depth is a valid reload when the profile prices its
  * top; only an unpriced top is a coverage gap. Then the named baseline would run at exec_depth --
  * a depth the ladder never offers -- and its bucket could never be queried by this ladder, so the
- * run would stay in the fallback. Init accepts the ladder; the cycle is diagnosed and refused, and
- * nothing is learnt into the ladder. The list and the baseline are not changed behind the
- * operator's back. */
-TEST(an_unpriced_explicit_ladder_below_the_executable_depth_is_diagnosed_and_not_learned) {
+ * run would stay in the fallback. Init accepts the ladder; the cycle is refused, and the run stops
+ * on the existing fail-closed latch (draft_cost_aborted_ -> Engine::fail_loop) instead of drafting
+ * at the ceiling without a plan. Nothing is learnt into the ladder, and the list and the baseline
+ * are not changed behind the operator's back. */
+TEST(an_unpriced_explicit_ladder_below_the_executable_depth_stops_the_run) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
@@ -2231,14 +2232,106 @@ TEST(an_unpriced_explicit_ladder_below_the_executable_depth_is_diagnosed_and_not
     activate_costs(f);                    /* live, empty, fallback admitted */
 
     CHECK_OK(f.start(DraftReplay::None));  /* init accepts it; the cycle diagnoses the gap */
-    const uint64_t id = f.submit(160);
+    const uint64_t id = f.submit(160);    /* 64 tokens of room: this row would run at K6 */
     f.prefill(id);
-    const std::string gap = stderr_of([&] { REQUIRE(f.sch.step() != nullptr); });
+    const Request* r = f.sch.find(id);
+    REQUIRE(r != nullptr);
+    CHECK_EQ(r->n_computed, (int64_t)r->prompt.size());   /* decoding, so the cycle sees it */
+
+    const std::string gap = stderr_of([&] { CHECK(f.sch.step() == nullptr); });
     CHECK(has(gap, "deepest offered tier K2"));
     CHECK(has(gap, "named baseline would run at K6"));
-    CHECK(f.sch.draft().plan() == nullptr);              /* no cost plan this cycle */
-    CHECK_EQ(f.sch.draft_costs().buckets().size(), 0u);  /* nothing learnt at K6 */
-    CHECK_EQ(f.sch.draft_cycles_done(), 0);              /* the refused cycle did not open */
+    CHECK(f.sch.draft_cost_aborted());                   /* the run is on the fail-closed path */
+    CHECK(f.sch.draft().plan() == nullptr);              /* no plan: not a ceiling fallback */
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);              /* no ring record was completed */
+    CHECK(f.sch.draft_costs().buckets().empty());        /* nothing learnt at K6 */
+
+    /* The latch holds: no later step plans a batch, so nothing drafts at the ceiling. */
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+}
+
+/* The gap belongs to the batch, not to one row: if any row's own remaining budget would run past
+ * the ladder's top, the deepest offered plan cannot be priced for the cycle's shape and the whole
+ * cycle is refused -- including a row whose own cap is under the top. Drafting the clamped row
+ * under a plan-less cycle would be the silent ceiling fallback the admission rule refuses. */
+TEST(a_mixed_batch_with_one_row_past_the_ladder_is_refused_whole) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    f.cfg.draft_tiers_set = true;
+    f.cfg.draft_n_tiers   = 2;
+    f.cfg.draft_tiers[0]  = 0;
+    f.cfg.draft_tiers[1]  = 2;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    const uint64_t deep    = f.submit(160);        /* 63 tokens of room: cap K6 */
+    const uint64_t clamped = f.submit(170, 3);     /* two left after its first token: cap K1 */
+    f.prefill(deep);
+    f.prefill(clamped);
+    const Request* rd = f.sch.find(deep);
+    const Request* rc = f.sch.find(clamped);
+    REQUIRE(rd != nullptr);
+    REQUIRE(rc != nullptr);
+    CHECK_EQ(rd->n_computed, (int64_t)rd->prompt.size());
+    CHECK_EQ(rc->n_computed, (int64_t)rc->prompt.size());
+
+    const std::string gap = stderr_of([&] { CHECK(f.sch.step() == nullptr); });
+    CHECK(has(gap, "deepest offered tier K2"));
+    CHECK(has(gap, "named baseline would run at K6"));
+    CHECK(f.sch.draft_cost_aborted());
+    CHECK(f.sch.draft().plan() == nullptr);
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    CHECK(f.sch.draft_costs().buckets().empty());
+}
+
+/* Rows whose own budgets clamp both the offered top and the named baseline to the same k are not
+ * a gap: the fallback runs the shape the ladder offered, so its bucket is queryable by it. The
+ * plan is issued at that clamped k and the step drafts -- the ladder below exec_depth is only
+ * refused where it would have run deeper than it offers. */
+TEST(identically_clamped_rows_take_the_named_baseline_and_still_draft) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    f.cfg.draft_tiers_set = true;
+    f.cfg.draft_n_tiers   = 2;
+    f.cfg.draft_tiers[0]  = 0;
+    f.cfg.draft_tiers[1]  = 2;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    /* Two tokens of room each after the prefill's own token: min(ceiling, room - 1) is K1 for
+     * both, under the ladder's top. */
+    const uint64_t a = f.submit(160, 3);
+    const uint64_t b = f.submit(170, 3);
+    f.prefill(a);
+    f.prefill(b);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(!f.sch.draft_cost_aborted());
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    CHECK(p->source == DraftPlanSource::Fallback);   /* the named baseline, at the clamped k */
+    CHECK(p->fallback == DraftFallback::UnknownShape);
+    CHECK_EQ(p->max_k, 1);                           /* not the ceiling, not the ladder's top */
+    CHECK_EQ(planned(f.sch, a), 1);
+    CHECK_EQ(planned(f.sch, b), 1);
+    /* The width the scheduler drafts under the plan: a two-token proposal is cut to the plan's
+     * K1, not to the ceiling. */
+    int32_t two[2] = { 31, 32 };
+    CHECK_OK(f.sch.set_draft(a, two, 2));
+    CHECK_OK(f.sch.set_draft(b, two, 2));
+    CHECK_EQ(f.sch.find(a)->n_draft, 1);
+    CHECK_EQ(f.sch.find(b)->n_draft, 1);
+    f.commit_plain(11);
+    CHECK(!f.sch.draft_cost_aborted());
 }
 
 /* The same ladder is admitted when the executable depth really is 2: the ceiling may be deeper,

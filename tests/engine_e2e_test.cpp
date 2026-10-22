@@ -1943,6 +1943,131 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
     CHECK_EQ(cost.stop(), 0);
 }
 
+/* The coverage gap on a real serving run, through the writer -> file -> reader path with a real
+ * no-loan reference. The writer calibrates with --draft-reference (both lenders off); the file says
+ * `basis: "no-loan"` and carries no live loan. The reader binds it with --draft-profile and may
+ * price only the exact shapes the writer measured -- a reference is Measured-only.
+ *
+ * The ladder's top is K2 while the executable depth is K6, so a shape the reference does not hold
+ * has no priceable plan and the named baseline would run at a depth the ladder never offers. The
+ * cycle is refused by name and the run stops on the existing fail-closed latch: the request is
+ * answered with an error, the process exits non-zero, no plan is issued and no later cycle drafts
+ * at the ceiling. Two cases: the first request already has an unmeasured shape (it is Sampled; the
+ * writer measured Greedy), and a run that serves a priced Greedy request first and meets the gap
+ * only on the next request. The first case also proves the reader prices nothing new: a reference
+ * is immutable. */
+TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_cannot_price) {
+    tiny::TempDir dir("ref_gap");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "reference.json";
+
+    /* The writer: a real reference export, and it serves normally (a calibration records, it does
+     * not price its own cycles, so it drafts the named baseline at K2 and learns). */
+    Server writer;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile-out", out,
+                                             "--draft-reference" };
+        REQUIRE(writer.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the reference writer failed the request: %s\n%s\n", why.c_str(),
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the reference writer exited %d:\n%s\n", writer_exit,
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+
+    const json profile = json::parse(tiny::read_text(out), nullptr, false);
+    REQUIRE(profile.is_object());
+    const json fp = profile.value("fingerprint", json::object());
+    CHECK_EQ(fp.value("basis", std::string()), std::string("no-loan"));
+    CHECK(!fp.contains("live_loan"));      /* a no-loan reference names no loan */
+    REQUIRE(!profile.value("buckets", json::array()).empty());
+
+    const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
+                                                   "--draft-depth-tiers", "0,2",
+                                                   "--draft-window", "fixed",
+                                                   "--draft-policy", "cost",
+                                                   "--draft-profile", out };
+
+    /* The first request already has a shape the reference never measured: it is Sampled, the
+     * writer only measured Greedy. The reader's very first cycle cannot be priced. */
+    {
+        Server reader;
+        REQUIRE(reader.start(dir.path, reader_args));
+        const std::string bound = reader.output();
+        if (bound.find("basis no-loan") == std::string::npos)
+            fprintf(stderr, "    the reader did not bind the reference:\n%s\n", tail(bound).c_str());
+        CHECK(bound.find("basis no-loan") != std::string::npos);
+
+        const json refused =
+            post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
+        (void)refused;
+        const std::string log = reader.output();
+        if (status < 400)
+            fprintf(stderr, "    the unpriced request was not answered with an error (%d: %s):\n%s\n",
+                    status, why.c_str(), tail(log).c_str());
+        /* A real HTTP error response on the existing path, not a served result and not a reset. */
+        CHECK(status >= 400);
+        CHECK(status < 600);
+        if (log.find("deepest offered tier K2") == std::string::npos)
+            fprintf(stderr, "    the gap was not diagnosed:\n%s\n", tail(log).c_str());
+        CHECK(log.find("deepest offered tier K2") != std::string::npos);
+        CHECK(log.find("named baseline would run at K6") != std::string::npos);
+        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
+        CHECK(log.find("has no plan (") == std::string::npos);   /* not the legacy continuation */
+        const int reader_exit = reader.stop();
+        if (reader_exit == 0)
+            fprintf(stderr, "    the run did not stop on the refused cycle:\n%s\n", tail(log).c_str());
+        CHECK(reader_exit != 0);
+    }
+
+    /* A run that serves a priced Greedy request first -- the reference holds its shapes, so the run
+     * drafts the ladder's K2 (six positions would be the unnamed ceiling) -- and meets the gap only
+     * on the next, Sampled request. The gap is later, not a start failure. */
+    {
+        Server reader;
+        REQUIRE(reader.start(dir.path, reader_args));
+        const json served = post(reader.port, "/completion", completion(prompt, 24), &status, &why);
+        if (status != 200)
+            fprintf(stderr, "    the priced request failed: %s\n%s\n", why.c_str(),
+                    tail(reader.output()).c_str());
+        REQUIRE_EQ(status, 200);
+        REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+        CHECK_EQ(draft_positions(reader.port), 2);
+
+        post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
+        const std::string log = reader.output();
+        if (status < 400)
+            fprintf(stderr, "    the unpriced request was not answered with an error (%d: %s):\n%s\n",
+                    status, why.c_str(), tail(log).c_str());
+        CHECK(status >= 400);
+        CHECK(status < 600);
+        CHECK(log.find("deepest offered tier K2") != std::string::npos);
+        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
+        CHECK(log.find("has no plan (") == std::string::npos);
+        const int reader_exit = reader.stop();
+        if (reader_exit == 0)
+            fprintf(stderr, "    the run did not stop on the refused later cycle:\n%s\n",
+                    tail(log).c_str());
+        CHECK(reader_exit != 0);
+    }
+}
+
 /* The start path's lender registration, on a model that can lend at all. A model that can lend
  * needs conditional units: only MoE experts are RAD_ACCESS_CONDITIONAL, and only those the planner
  * tiers into the pinned host pool are movable -- that is what enables the heat engine and what

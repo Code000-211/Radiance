@@ -105,6 +105,10 @@ public:
     /* The last chosen `max_k`; for tests and logs. */
     int32_t last_k() const { return last_k_; }
 
+    /* This choose() call was refused by the explicit-ladder coverage gap, not by the hook: the
+     * cycle has no plan for a reason no later cycle can fix. Cleared at every entry. */
+    bool coverage_gap_refused() const { return gap_refused_; }
+
 private:
     /* One candidate assignment's expected tokens and price. `valid` false: nothing to compare. */
     struct Priced {
@@ -146,6 +150,8 @@ private:
     bool    chosen_ = false;
     /* The explicit-ladder coverage gap was diagnosed; once per priced/unpriced transition. */
     bool    gap_reported_ = false;
+    /* This choose() call returned RAD_E_UNSUPPORTED from the coverage gap. */
+    bool    gap_refused_ = false;
     /* The last issued plan's K per request: the window the paired step verifies. `fr_n_` counts the
      * entries in use; reset() forgets them without giving the storage back. */
     std::vector<uint64_t> fr_id_;

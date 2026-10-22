@@ -1325,8 +1325,8 @@ const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
-    /* The cycle was refused (a drifted residency): nothing is planned, and the engine stops on the
-     * latch instead of letting the step run at the ceiling. */
+    /* The cycle was refused (a drifted residency, or a shape the ladder cannot price): nothing is
+     * planned, and the engine stops on the latch instead of letting the step run at the ceiling. */
     if (draft_cost_aborted_) return nullptr;
 
     /* The drafter's snapshots describe the previous step and nothing reads them now. block_end()
@@ -2063,6 +2063,15 @@ void Scheduler::draft_cost_cycle() {
 
     const int rc = draft_.open_cycle(draft_view_, &draft_preds_);
     if (rc < 0) {
+        /* A coverage gap is not a broken hook: no later cycle of this deployment can price the
+         * offered top, so running on without a plan would draft at the ceiling and present the
+         * very depth the ladder never offers. Latch the existing fail-closed abort instead: step()
+         * and promote_next() then refuse to draft, and the engine stops the run through
+         * fail_loop(). */
+        if (draft_.planner().coverage_gap_refused()) {
+            draft_cost_aborted_ = true;
+            return;
+        }
         /* No plan this cycle: draft_cap() falls back to next_depth() and the cycle runs legacy.
          * Logged once, so a broken hook does not flood the log every step. */
         if (!draft_cost_failed_)
