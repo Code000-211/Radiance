@@ -203,18 +203,19 @@ TEST(a_rowless_chunk_with_a_built_pass_moves_the_watermark_on_completion) {
 
 /* The engine's idle branch is the other releaser of a deferred KV free. A request cancelled while
  * a drafter snapshot still names it keeps its blocks (Scheduler::cancel: pending_free); commit()
- * normally gives them back, and with no next step to commit, Engine::step_loop's idle branch
- * drains every rank's stream and calls release_deferred(). This case builds exactly that state on
- * the scheduler the engine itself runs -- a committed step, a block snapshot opened and closed
- * around the cancel -- then runs the real step_loop until its sweep has fired. No direct
+ * normally gives them back, and with no next step to commit, Engine::step_loop's idle branch calls
+ * rad_stream_sync on every rank's stream and then release_deferred(). This case builds exactly
+ * that state on the scheduler the engine itself runs -- a committed step, a block snapshot opened
+ * and closed around the cancel -- then runs the real step_loop until its sweep has fired. No direct
  * release_deferred() call: the release under test is the loop's.
  *
  * The pool is sized so the admission after the sweep has teeth: 20 blocks of 16 tokens. Request 1
  * holds 10 after its 160-token prompt; the 192-token prompt submitted next needs 12, so a sweep
  * that did not run leaves free_blocks at 10 and step() without a plan for it. What the rank below
- * contributes is only the branch's entry condition (step_loop binds ranks_[0]); it has no program
- * and issues no pass, so the sync it guards has nothing to drain here -- the release and its
- * effect on the pool are the facts this case asserts. */
+ * contributes is only the branch's entry condition (step_loop binds ranks_[0]); it has no program,
+ * so its ctx.stream() is null and the sync the branch calls on it fails with the engine ignoring
+ * the error. The release and its effect on the pool are the facts this case asserts; a successful
+ * rank-stream synchronization is NOT proven here and stays open. */
 TEST(idle_step_loop_sweeps_a_cancelled_requests_deferred_free) {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
@@ -273,9 +274,19 @@ TEST(idle_step_loop_sweeps_a_cancelled_requests_deferred_free) {
     REQUIRE(EngineTestPeer::sched(e).has_deferred());
     CHECK(h.kv.has_sequence(1));
 
-    /* The real loop. With nothing queued it reaches its idle branch, which syncs the ranks and
-     * sweeps the deferred free; stop() ends it once that has happened. */
+    /* The real loop. With nothing queued it reaches its idle branch, which attempts the rank syncs
+     * (a failing null-stream call here) and sweeps the deferred free; stop() ends it once that has
+     * happened. The guard stops and joins on any earlier return, too: a joinable thread destroyed
+     * at scope exit would terminate the test. */
     std::thread loop([&] { EngineTestPeer::step_loop(e); });
+    struct LoopGuard {
+        Engine&      e;
+        std::thread& t;
+        ~LoopGuard() {
+            EngineTestPeer::stop(e);
+            if (t.joinable()) t.join();
+        }
+    } loop_guard{e, loop};
     bool swept = false;
     for (int i = 0; i < 1000 && !swept; ++i) {
         swept = !EngineTestPeer::sched(e).has_deferred();

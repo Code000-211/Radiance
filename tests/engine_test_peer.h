@@ -113,14 +113,16 @@ struct EngineTestPeer {
     }
 
     /* One rank, for the branch of step_loop that needs ranks_[0]: it binds the rank's device and
-     * the idle branch syncs its stream. The rank has no program and runs no pass -- it exists so
-     * that branch can run, not to compute anything. */
+     * gives the idle branch a rank to walk. Its Ctx has no program, so ctx.stream() is null and
+     * the branch's rad_stream_sync(nullptr) fails -- the engine ignores that error. The rank
+     * exists so the branch can run, not to prove a rank-stream synchronization; that proof stays
+     * open (a fixture would need a real stream on the rank). */
     static void add_rank(Engine& e) { e.ranks_.push_back(std::make_unique<Engine::Rank>()); }
     /* The stop serve() raises after its transport ends; a fixture that runs step_loop itself sets
      * it once the branch under test has run. */
     static void stop(Engine& e) { e.stopping_.store(true, std::memory_order_release); }
     /* serve()'s stepper, run by a fixture that has no transport: the same loop, including the idle
-     * branch that drains a deferred release. */
+     * branch that calls rad_stream_sync per rank and then release_deferred(). */
     static int  step_loop(Engine& e) { return e.step_loop(); }
 };
 
