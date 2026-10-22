@@ -232,23 +232,36 @@ prediction and sample.
   from an undisturbed one. `Ctx::run_step` freezes `{step, tape, staged}` on the rank thread as the
   pass returns (`Ctx::StepEvidence`), and that snapshot is merged per rank into a slot keyed by step
   number (`Rank::StepSnap`); a draft pass shares the step number and keeps the trunk pass's slot
-  untouched. `Engine::step_evidence(step)` merges the ranks -- Record > Audit > Play > None -- and
-  a step no rank ran a pass for yields `replay_known = false`, which the sample treats as
-  `Unknown` and excludes. A per-step placement fact (`staged`) and heat movement inside the step's
-  own window (`moved`, bounded by the counters `prepare_release` snapshots) travel the same way.
+  untouched, but its tape class is merged into the same slot (`Ctx::last_pass_tape`, Record > Audit
+  > Play > None), so a recording or audited draft pass cannot leave its bracket filed as Play.
+  `Engine::step_evidence(step)` merges the ranks the same way, and a step no rank ran a pass for
+  yields `replay_known = false`, which the sample treats as `Unknown` and excludes. A per-step
+  placement fact (`staged`) and heat movement inside the step's own window (`moved`, bounded by the
+  counters `prepare_release` snapshots) travel the same way. `moved` is also frozen by a
+  sampler-only release when its record still names the step: that release carries the tiering
+  dispatch of a step issued ahead, and a step with no draft pass (a shared-KV head that drew K=0)
+  has no later release to report it before the next step re-bases the counter.
 - **A measurement is filed under the class the planner priced.** `draft_cost_observe` derives the
   shape's `ctx_class` as the deepest frozen row's, exactly `DraftPlanner::shape_of`; a constant
   (class 0, or the plan's per-row field) would file a long-context sample where no class-1 estimate
   can look it up.
 - **An inactive table and an absorbed sample are counted apart.** `DraftCostTable::observe` on a
   table that was never configured (or was cleared) increments `inactive()` -- surfaced as
-  `SchedMetrics::draft_obs_inactive` -- and returns `RAD_OK`; it is neither a refusal (the sample
-  was well formed) nor an absorption, so "nothing was learned" is never reported as "nothing was
-  offered".
+  `SchedMetrics::draft_obs_inactive`, carried to the server as
+  `ServerMetrics::draft_cost_observations_inactive` and exported as
+  `radiance:draft_cost_observations_inactive_total` -- and returns `RAD_OK`; it is neither a
+  refusal (the sample was well formed) nor an absorption, so "nothing was learned" is never
+  reported as "nothing was offered". Its unit is the cost observation, one per complete,
+  attributable cycle handed to an inactive table: not a row and not a cycle.
 - **The host backend cannot exercise the tape branches.** Only `core/device/aql.cpp` implements
   `tape_begin`; on the host every pass is unkeyed, so a host regression can prove the step binding
-  of the frozen snapshot and the placement bit, not a Play/Record/Audit transition. Those are
-  covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly.
+  of the frozen snapshot, the placement bit and the aggregation rule (`RuntimeTest` checks
+  `Ctx::merge_tape` over every class pair; `engine_loop_move_test` checks that a move injected into
+  a sampler-only release is filed under the step that release names, on a drafter-free fixture
+  where that release is the step's last one), not a real Play/Record/Audit transition. Those are
+  covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly;
+  a genuine tape run remains the missing proof that a Record/Audit draft pass reaches the bucket
+  rule above.
 - **The last cycle does not wait for shutdown.** A cycle is delivered at the next cycle's open,
   and an idle engine opens none -- its slots may even be recycled first. `Engine::step_loop`'s idle
   branch therefore calls `Scheduler::draft_ring_idle()`, which closes the open record under the

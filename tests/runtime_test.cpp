@@ -318,6 +318,34 @@ TEST(the_step_evidence_belongs_to_its_own_pass_and_not_to_a_later_one) {
     CHECK(!ev.staged);
 }
 
+/* A step's bracket holds its draft passes, so its replay class is the strongest any pass in it
+ * took (Rank::note_evidence merges the trunk record with Ctx::last_pass_tape). A recording or
+ * audited draft pass must not leave its bracket filed under Play: the cost policy keeps such a
+ * bracket out of the Play bucket.
+ *
+ * The host backend has no tape (only the AQL one defines tape_begin), so this is the aggregation
+ * rule alone. That a real Play/Record/Audit pass reaches it stays the missing proof; nothing on
+ * the host produces those classes. */
+TEST(the_steps_replay_class_covers_every_pass_in_its_bracket) {
+    using T = rad::Ctx;
+    const uint8_t all[] = { T::kStepTapeNone, T::kStepTapePlay, T::kStepTapeRecord,
+                            T::kStepTapeAudit };
+    auto strength = [](uint8_t t) {
+        return t == T::kStepTapeRecord ? 3 : t == T::kStepTapeAudit ? 2
+             : t == T::kStepTapePlay   ? 1 : 0;
+    };
+    for (uint8_t a : all)
+        for (uint8_t b : all) {
+            const uint8_t want = strength(a) >= strength(b) ? a : b;
+            CHECK_EQ((int)T::merge_tape(a, b), (int)want);
+        }
+
+    /* The case the trunk-only record got wrong: a Play trunk with a drafting Record pass. */
+    CHECK_EQ((int)T::merge_tape(T::kStepTapePlay, T::kStepTapeRecord), (int)T::kStepTapeRecord);
+    /* And the direction the trunk alone already caught: an audited trunk stays audited. */
+    CHECK_EQ((int)T::merge_tape(T::kStepTapeAudit, T::kStepTapePlay), (int)T::kStepTapeAudit);
+}
+
 /* Bucket boundaries are the constraint values and a band is inclusive at its upper bound (spec
  * §2.2). Off by one here means a prefill kernel running at M=1, a loss invisible in the output. */
 TEST(bucket_table_indexes_at_band_boundaries) {

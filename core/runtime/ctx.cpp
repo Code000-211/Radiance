@@ -1334,7 +1334,9 @@ int Ctx::run_step(const RadBatch* b) {
     }
     /* Freeze this pass's evidence before anything else runs on this thread: a draft pass shares the
      * step number and must not overwrite the trunk step's record, and the next step's ahead pass
-     * would otherwise be the one a reader sees. */
+     * would otherwise be the one a reader sees. Its tape class is kept either way: the step's
+     * bracket holds the draft passes too (Rank::note_evidence). */
+    last_pass_tape_ = tape_path_;
     if (b->draft_pass == 0)
         last_ev_ = StepEvidence{ b->step, tape_path_, staging_ };
 

@@ -109,7 +109,8 @@ if(RAD_FFMPEG_FOUND)
   target_link_libraries(rad_test_engine PRIVATE PkgConfig::RAD_FFMPEG)
 endif()
 
-set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_history_test)
+set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_loop_move_test
+                            engine_history_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
@@ -165,6 +166,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_engine_loop_test 60)  # one engine start and a handful of tiny decode steps
+set(RAD_TEST_CPU_BUDGET_engine_loop_move_test 30)  # its own process, one engine, three decode steps
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
@@ -332,6 +334,15 @@ if(TARGET engine_loop_test)
   # dynamic symbol table and every plugin fails to load.
   set_target_properties(engine_loop_test PROPERTIES ENABLE_EXPORTS ON)
   set_tests_properties(engine_loop_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+
+# engine_loop_move_test starts its own engine the same way (a headless checkpoint, so the dense
+# gemma4 plugin and libref). Same export requirement: the plugin binds the core's C ABI back to
+# this executable at dlopen.
+if(TARGET engine_loop_move_test)
+  add_dependencies(engine_loop_move_test gemma4 libref)
+  set_target_properties(engine_loop_move_test PROPERTIES ENABLE_EXPORTS ON)
+  set_tests_properties(engine_loop_move_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

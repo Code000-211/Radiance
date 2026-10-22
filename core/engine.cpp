@@ -67,6 +67,15 @@ extern "C" __attribute__((weak)) void rad_test_step_evidence(int step, int repla
     (void)step; (void)replay_known; (void)replay; (void)staged; (void)moved;
 }
 
+/* A placement move a fixture triggers in the release it names: the rank loop adds the value to the
+ * heat counters tiering_dispatch reads, so a host run without a tiered plan can still be the
+ * mover. `what` is the release (kIssueAll/kIssueModel/kIssueSampler). tests/engine_loop_move_test.cpp
+ * defines it strongly. */
+extern "C" __attribute__((weak)) int64_t rad_test_tiering_moves(int rank, int32_t step, int what) {
+    (void)rank; (void)step; (void)what;
+    return 0;
+}
+
 /* The third seam: the server's running state, reported from run_server()'s watcher once
  * Server::port() turns nonzero. That is the first moment a stop is one the transport accepts --
  * before it, httplib's stop() closes nothing and the signal is dropped (core/server/http.cpp). A
@@ -373,13 +382,25 @@ void Engine::rank_loop(int index) {
             /* Freeze what this step's passes did, keyed by the step that ran them. Read here, on
              * the thread and right after the passes: the next step's ahead pass is released before
              * this one is collected, so a delta read at collect time would report it. The stager
-             * and the tape are per pass, which is why the trunk pass's Ctx record is what carries
-             * them; `moved` spans from the counters prepare_release snapshotted to here, the
-             * step's own window including its tiering dispatch. */
-            if (s >= 0 && what != kIssueSampler) {
+             * is per pass, which is why the trunk pass's Ctx record is what carries it; the tape
+             * is merged over every pass of the step (Ctx::last_pass_tape), and `moved` spans from
+             * the counters prepare_release snapshotted to here, the step's own window including
+             * its tiering dispatch.
+             *
+             * A sampler-only release runs the tiering dispatch of a step issued ahead and notes
+             * too, while the record still names that step: without it, a step with no draft pass
+             * (a shared-KV head whose plan drew K=0) would lose its move -- the next release's
+             * base is already the ahead step's. The merge is idempotent, so the repeat of the
+             * trunk pass's own facts costs nothing. */
+            int64_t injected = 0;
+#ifdef RAD_TEST_HOOKS
+            if (s >= 0) injected = rad_test_tiering_moves(index, b->step, what);
+#endif
+            const Ctx::StepEvidence rec = r.ctx.last_step_evidence();
+            if (s >= 0 && (what != kIssueSampler || rec.step == b->step)) {
                 const HeatStats hs = r.heat.stats();
-                const int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions;
-                r.note_evidence(r.ctx.last_step_evidence(), moves > moves_before);
+                int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions + injected;
+                r.note_evidence(rec, r.ctx.last_pass_tape(), moves > moves_before);
             }
 
         }

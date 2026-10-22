@@ -396,19 +396,22 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
 }
 
 /* The observation ledger crosses the bridge with its units intact: the scheduler's three row
- * counters and its one cycle counter arrive as such, never converted into each other. */
+ * counters, its cycle counter and its cost-observation counter arrive as such, never converted
+ * into each other. */
 TEST(the_bridge_carries_the_observation_ledger_with_its_units) {
     rad::SchedMetrics m;
     m.draft_obs_attempted = 96;
     m.draft_obs_applied = 51;
     m.draft_obs_skipped = 45;
     m.draft_obs_discarded = 3;
+    m.draft_obs_inactive = 7;
 
     const server::SchedMetrics o = bridge_metrics(m);
     CHECK_EQ(o.draft_obs_rows_attempted, (int64_t)96);
     CHECK_EQ(o.draft_obs_rows_applied, (int64_t)51);
     CHECK_EQ(o.draft_obs_rows_skipped, (int64_t)45);
     CHECK_EQ(o.draft_obs_cycles_discarded, (int64_t)3);
+    CHECK_EQ(o.draft_cost_observations_inactive, (int64_t)7);
 }
 
 RAD_TEST_MAIN()

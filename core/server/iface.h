@@ -110,12 +110,14 @@ struct SchedMetrics {
     /* The cost policy's observation ledger (rad::SchedMetrics::draft_obs_*), cumulative over the
      * server's lifetime like every source counter -- there is no reset. The first three count
      * observation ROWS -- one per draft row of a delivered cycle, so a wider window contributes
-     * more of them -- and the last counts whole CYCLES dropped before delivery. The two units are
-     * not a sum. */
+     * more of them -- and the cycle counter counts whole CYCLES dropped before delivery. The
+     * cost-observation counter has its own unit again: one per valid observation handed to an
+     * inactive table, which is neither a row nor a dropped cycle. The units are not a sum. */
     int64_t draft_obs_rows_attempted = 0;
     int64_t draft_obs_rows_applied = 0;
     int64_t draft_obs_rows_skipped = 0;
     int64_t draft_obs_cycles_discarded = 0;
+    int64_t draft_cost_observations_inactive = 0;
     int64_t preemptions = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step

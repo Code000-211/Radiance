@@ -96,15 +96,15 @@ struct Engine::Rank {
     /* Promotions + demotions on this rank when prepare_release armed the step, so the rank thread
      * can bound `moved` to that step's window (arena reclaim runs on the scheduler thread). */
     int64_t  ev_moves_before = 0;
-    void note_evidence(const Ctx::StepEvidence& e, bool moved) {
+    void note_evidence(const Ctx::StepEvidence& e, uint8_t pass_tape, bool moved) {
         if (e.step < 0) return;
         StepSnap& s = ev[(uint32_t)e.step & 3u];
         if (s.step != e.step) s = StepSnap{};    /* a new step owns the slot */
         s.step = e.step;
-        /* Record > Audit > Play > None, as the cycle's key was always chosen. */
-        if (e.tape == Ctx::kStepTapeRecord || s.tape == Ctx::kStepTapeNone ||
-            (e.tape == Ctx::kStepTapeAudit && s.tape == Ctx::kStepTapePlay))
-            s.tape = e.tape;
+        /* Record > Audit > Play > None, over every pass of the step's bracket: the trunk record
+         * carries the bracket, but its draft passes run inside it and a recording or audited one
+         * must not leave the bracket filed under Play. */
+        s.tape = Ctx::merge_tape(Ctx::merge_tape(s.tape, e.tape), pass_tape);
         s.staged = s.staged || e.staged;
         s.moved  = s.moved  || moved;
     }

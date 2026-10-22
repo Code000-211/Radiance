@@ -343,6 +343,17 @@ public:
         bool    staged = false;           /* the stager armed for this pass */
     };
     StepEvidence last_step_evidence() const { return last_ev_; }
+    /* The class the last pass took, whichever pass it was (the trunk record above is the bracket's
+     * and a draft pass leaves it alone): a step's bracket holds its draft passes, so the engine
+     * merges this in with Rank::note_evidence. */
+    uint8_t     last_pass_tape() const { return last_pass_tape_; }
+    /* The strongest class of the two: Record > Audit > Play > None. */
+    static uint8_t merge_tape(uint8_t have, uint8_t add) {
+        if (add == kStepTapeRecord || have == kStepTapeNone ||
+            (add == kStepTapeAudit && have == kStepTapePlay))
+            return add;
+        return have;
+    }
     void*       arena_base()   const { return arena_.base(); }
     void*       scratch()      const { return arena_.scratch(); }
 
@@ -605,6 +616,7 @@ private:
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */
     StepEvidence    last_ev_;             /* the last trunk pass's evidence (run_step) */
+    uint8_t         last_pass_tape_ = kStepTapeNone;  /* the last pass's, draft included */
     uint8_t         tape_path_ = kStepTapeNone;   /* the branch run_pass took */
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;

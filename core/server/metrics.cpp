@@ -182,12 +182,13 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_accepted_.advance_to(m.draft_accepted);
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
-    /* The observation ledger, cumulative in the scheduler like the rest. Rows and cycles are
-     * different units; they are never summed. */
+    /* The observation ledger, cumulative in the scheduler like the rest. Rows, cycles and cost
+     * observations are different units; they are never summed. */
     c_draft_obs_rows_attempted_.advance_to(m.draft_obs_rows_attempted);
     c_draft_obs_rows_applied_.advance_to(m.draft_obs_rows_applied);
     c_draft_obs_rows_skipped_.advance_to(m.draft_obs_rows_skipped);
     c_draft_obs_cycles_discarded_.advance_to(m.draft_obs_cycles_discarded);
+    c_draft_cost_obs_inactive_.advance_to(m.draft_cost_observations_inactive);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_checkpoints_.advance_to(m.checkpoints_written);
@@ -428,6 +429,10 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_observation_cycles_discarded_total",
               "Draft-observation cycles dropped before delivery, incomplete or refused: whole "
               "cycles, not rows.", L, c_draft_obs_cycles_discarded_.get());
+    w.counter("radiance:draft_cost_observations_inactive_total",
+              "Valid cost observations handed to an inactive cost table: the deployment is "
+              "observing, not learning. One per observation, not per row or cycle.",
+              L, c_draft_cost_obs_inactive_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

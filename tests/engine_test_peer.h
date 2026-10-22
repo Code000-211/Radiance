@@ -90,6 +90,9 @@ struct EngineTestPeer {
     static int64_t watermark(Engine& e, uint64_t request_id) {
         return e.sched_.draft_watermark(request_id);
     }
+
+    /* The release kind a fixture's tiering hook answers for (Engine::issue_what_). */
+    static constexpr int kIssueSampler = Engine::kIssueSampler;
 };
 
 }  /* namespace rad */
