@@ -568,6 +568,20 @@ double metric(int port, const std::string& name) {
     return -1;
 }
 
+/* How many draft positions the run evaluated, or -1: /metrics exports one
+ * radiance:draft_position_reached_total line per position the engine drafted to, so the line count
+ * is the deepest verify window the run executed. */
+int draft_positions(int port) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/metrics", "") || c.read(&out) != 200) return -1;
+    const std::string tag = "radiance:draft_position_reached_total{";
+    int n = 0;
+    for (size_t at = 0; (at = out.find(tag, at)) != std::string::npos; at += tag.size())
+        if (at == 0 || out[at - 1] == '\n') ++n;
+    return n;
+}
+
 /* A completion of `n` tokens from token ids: greedy unless `temp` is set, end-of-text ignored so
  * every reply has the same length. */
 json completion(const std::vector<int32_t>& prompt, int n, double temp = 0.0, int64_t seed = 0,
@@ -1789,12 +1803,21 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
 
 /* --draft-profile-out end to end: a legacy serving run with a serial assistant head measures the
  * draft cycles one real request runs, exports them on the orderly SIGTERM shutdown, and a fresh
- * start of the same deployment -- which derives its own runtime identity -- binds the file and is
- * admitted on it. Nothing here writes a bucket by hand: the reader, the writer and the recording
- * ring have their own fixtures (engine_profile_test, sched_draft_test); this case proves that the
- * numbers in the file came out of this run. Both runs name the same ceiling: the Cost policy
- * validates its default tier ladder (up to 6) against it and refuses a shallower one rather than
- * clamping. */
+ * start of the same deployment -- which derives its own runtime identity -- binds the file and
+ * serves a real request on it. Nothing here writes a bucket by hand: the reader, the writer and the
+ * recording ring have their own fixtures (engine_profile_test, sched_draft_test); this case proves
+ * that the numbers in the file came out of this run.
+ *
+ * The reload still serves the named fallback, and this case records why instead of hiding it: the
+ * cost planner prices each cycle at the verify window the previous plan published, and its first
+ * cycle for a request has nothing to verify yet -- no plan named the row before it, so nothing was
+ * published. The calibration never files that shape: every cycle it exports verifies the window
+ * its own legacy plan had already published, so the whole file is keyed verify_k = 2 and holds no
+ * verify_k = 0 bucket. The first cycle therefore cannot be priced, and its fallback -- the
+ * ceiling, 6 -- publishes a window no measured bucket carries, so no later cycle lands on the
+ * measured depth either. The reload runs six draft positions where the calibration ran two. The
+ * concrete missing bucket is spelled out below; when a calibration can measure it, this case must
+ * flip to the priced depth. */
 TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_them) {
     /* A calibration run needs its own checkpoint (the assistant head lives in draft/), and the
      * shared World has none with a drafter. */
@@ -1805,12 +1828,12 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
     REQUIRE(tiny::write_gemma4(dir.path, s));
     const std::string out = dir / "profile.json";
 
-    const std::vector<std::string> common = { "--num-speculative-tokens", "6",
-                                        "--draft-window", "fixed" };
     Server calib;
     {
-        std::vector<std::string> a = common;
-        a.insert(a.end(), { "--draft-policy", "legacy", "--draft-profile-out", out });
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "legacy",
+                                             "--draft-profile-out", out };
         REQUIRE(calib.start(dir.path, a));
     }
     const std::vector<int32_t> prompt = prompt_ids(9, 64);
@@ -1851,12 +1874,13 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
     CHECK(usable);
 
     /* The reload. A fresh process derives the identity from the same deployment and must bind the
-     * file; its start is the assertion, since the Cost policy refuses an inactive table or one
-     * without a usable bucket, and the log names the match. */
+     * file; the log names the match. */
     Server cost;
     {
-        std::vector<std::string> a = common;
-        a.insert(a.end(), { "--draft-policy", "cost", "--draft-profile", out });
+        const std::vector<std::string> a = { "--num-speculative-tokens", "6",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile", out };
         REQUIRE(cost.start(dir.path, a));
     }
     const std::string cost_log = cost.output();
@@ -1864,6 +1888,37 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
         fprintf(stderr, "    the second run did not bind the profile:\n%s\n", tail(cost_log).c_str());
     CHECK(cost_log.find("buckets match this deployment") != std::string::npos);
     CHECK(cost_log.find("is not used for this deployment") == std::string::npos);
+
+    /* The shape the reload's first cycle would have to price is not in the file. It verifies
+     * nothing yet (nothing was published before its first plan), so it is keyed `verify_k = 0`
+     * with `verify_tokens = 1` and `history_tokens = 1`; the calibration's first measured cycle
+     * already verified the window its legacy drafting had published, so the file carries
+     * `verify_k = 2` with `verify_tokens = 3`. This is the concrete missing bucket:
+     *   { ctx_class: the prompt's, n_rows 1, verify_k 0, verify_tokens 1, rows [0],
+     *     history_tokens 1, prefill_tokens 0, pipeline_depth 1, draft_k 2, draft_rows [0,1,1],
+     *     sampling "greedy", replay "none", drafter "serial" }
+     * -- measured only once a calibration files a cycle that verifies nothing, which this one
+     * never does. No price is invented here to stand in for it. */
+    bool first_cycle_known = false;
+    for (const json& b : buckets)
+        if (b.value("shape", json::object()).value("verify_k", -1) == 0) first_cycle_known = true;
+    CHECK(!first_cycle_known);
+
+    /* So the reload serves the named fallback, and its window is the ceiling: the run drafts six
+     * positions where the calibration measured two. Position 0 is reached by every verify, the
+     * count of exported positions is the deepest window the run executed. */
+    const json served = post(cost.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the second run failed the request: %s\n%s\n", why.c_str(),
+                tail(cost.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+    const int positions = draft_positions(cost.port);
+    if (positions != 6)
+        fprintf(stderr, "    the reloaded run drafted %d positions, not the unpriced ceiling 6 "
+                        "(was the first-cycle shape measured?):\n%s\n",
+                positions, tail(cost.output()).c_str());
+    CHECK_EQ(positions, 6);
     CHECK_EQ(cost.stop(), 0);
 }
 

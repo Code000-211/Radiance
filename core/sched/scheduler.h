@@ -171,10 +171,12 @@ public:
 
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
      * PrefixCache::configure runs first and needs its checkpoint interval; pass nullptr to
-     * resolve one here. */
+     * resolve one here. `pass_replay` is the state every pass of this deployment runs under, when
+     * the caller can evidence it (`None` for a runtime that cannot record); `Unknown` otherwise. */
     int  init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
               const std::vector<BatchBuilder::RankIO>& ranks,
-              const ChunkGeometry* geo = nullptr);
+              const ChunkGeometry* geo = nullptr,
+              DraftReplay pass_replay = DraftReplay::Unknown);
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
@@ -614,6 +616,11 @@ private:
     int32_t draft_record_prev_k_ = -1;
     /* A cycle wider than the format's widest window was dropped; said once, counted after. */
     bool    draft_record_over_rows_warned_ = false;
+
+    /* What every pass of this deployment does at the tape, from runtime evidence: `None` when the
+     * backend cannot record (every pass runs unkeyed), `Unknown` when a pass may play, record or
+     * audit. Copied into each cost cycle's view; see DraftBatchView::replay. */
+    DraftReplay draft_pass_replay_ = DraftReplay::Unknown;
 
     /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so

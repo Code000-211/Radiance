@@ -212,6 +212,14 @@ struct DraftBatchView {
     int32_t kv_budget = 0;        /* KV tokens available for draft lookahead */
     int32_t prefill_tokens = 0;   /* prefill tokens sharing the step; 0 decode-only */
     bool    ngram_allowed = true; /* false: the head is the only drafter (the n-gram gate) */
+
+    /* The replay state every pass of this deployment runs under, when the caller knows it from
+     * runtime evidence: a runtime whose backend cannot record a pass runs all of them live and
+     * unkeyed, so the cycle is a plain run (`None`). `Unknown` (the default) means no such
+     * evidence: a recording deployment's pass may play, record or audit, and the state its key
+     * names exists only once the pass runs -- after this plan is issued. `shape_of` refuses a
+     * shape whose replay is `Unknown` rather than pricing a zero the run never established. */
+    DraftReplay replay = DraftReplay::Unknown;
 };
 
 /* ------------------------------------------------------------------ A: the cost key */

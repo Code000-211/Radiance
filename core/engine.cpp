@@ -2046,8 +2046,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             RAD_TRY(draft_cost_runtime(&runtime));
             RAD_TRY(load_draft_cost_profile(runtime));
         }
-        RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio,
-                            &geo_));
+        /* A runtime that cannot record a pass runs every one of them live and unkeyed, which is a
+         * fact about the deployment the cost view can carry. A recording runtime may play, record
+         * or audit, and which one a pass does exists only once it runs -- after its plan is
+         * issued -- so its cycles stay unpriced rather than declare a state they cannot know. */
+        RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_,
+                            ranks_[0]->ctx.records_passes() ? DraftReplay::Unknown
+                                                            : DraftReplay::None));
 #ifdef RAD_TEST_HOOKS
         /* The one point where a submission is race-free: the scheduler holds its KV and limits,
          * and neither the rank threads nor the stepper exist yet. */

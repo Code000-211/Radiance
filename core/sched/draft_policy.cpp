@@ -107,12 +107,13 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
     /* The loaded drafter, not who spends k[]: a head that is loaded keeps the history and KV of
      * a K0 row, so its K0 is a different bucket from a process with no head at all. */
     s->drafter = view.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
-    /* `DraftBatchView` carries no replay state, so this cycle did not observe one. That is a
-     * missing dimension, not a `None`: the field stays at its default and the flag says not to read
-     * it, so draft_shape_priceable() refuses the shape instead of a model keying it as measured.
-     * `DraftReplay::None` here would be the same claim with the evidence missing. */
-    s->replay = DraftReplay::None;
-    s->unknown |= (uint32_t)kDraftShapeReplayUnknown;
+    /* The view names the cycle's replay state only when the runtime evidenced it. Without that
+     * evidence the dimension is missing, not a `None`: the field stays at its default and the flag
+     * says not to read it, so draft_shape_priceable() refuses the shape instead of a model keying
+     * it as measured. `DraftReplay::None` here would be the same claim with the evidence missing. */
+    s->replay = view.replay;
+    if (view.replay == DraftReplay::Unknown)
+        s->unknown |= (uint32_t)kDraftShapeReplayUnknown;
     s->pipeline_depth = view.pipeline_depth;
     bool sampled = false;
     for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -221,9 +222,9 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->source         = src;
     out->fallback       = fb;
     out->probe          = DraftProbe::None;
-    /* Unobserved, like the shape's dimension: the plan has no unknown channel, so the priced shape
-     * it points at is where a reader must look (shape_of sets kDraftShapeReplayUnknown). */
-    out->replay         = DraftReplay::None;
+    /* The cycle's replay state as the view evidenced it; `Unknown` when the caller could not say,
+     * so a plan never declares a plain run it cannot establish. */
+    out->replay         = view.replay;
     out->timing_valid   = false;   /* the planner does not time the cycle */
     out->prefill_tokens = view.prefill_tokens;
     out->pipeline_depth = view.pipeline_depth;

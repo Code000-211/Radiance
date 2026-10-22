@@ -49,10 +49,12 @@ struct Fixture {
         build_program(prog, cfg, kv, pc, owned, blocks, states, max_tok, max_ctx);
     }
 
-    int start() {
+    /* `pass_replay` is what a real runtime evidences about its tape (Engine passes `None` for a
+     * backend that cannot record); a fixture that says nothing leaves the cycles unpriced. */
+    int start(DraftReplay pass_replay = DraftReplay::Unknown) {
         std::vector<BatchBuilder::RankIO> rio;
         rio.push_back({ 0, nullptr, &prog });
-        return sch.init(prog, cfg, &kv, &pc, rio);
+        return sch.init(prog, cfg, &kv, &pc, rio, nullptr, pass_replay);
     }
 
     uint64_t next_id = 1;
@@ -1524,19 +1526,19 @@ TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
     CHECK_EQ(first->history_tokens[0], first_hist);
 }
 
-/* The A/C seam against the real model: a version-2 profile measured for this deployment, read by
- * A's table, sees the shape the planner prices. The cycle does not observe its own replay state
- * -- `DraftBatchView` carries none -- so the planner marks that dimension Unknown and the shape is
- * not a measured key. A's table therefore refuses it, and a cycle it cannot price becomes the
- * named baseline: a fallback, never an invented number.
+/* The A/C seam against the real model: a version-3 profile measured for this deployment, read by
+ * A's table, sees the shape the planner prices.
  *
- * The last block shows what the same profile does once that dimension is supplied, which is the
- * piece the interface is missing (see the request in the issue).
+ * The cycle's replay state enters the view only as evidence (`DraftBatchView::replay`): a caller
+ * that cannot establish it leaves the dimension Unknown, A's table refuses the shape, and the
+ * cycle becomes the named baseline -- a fallback, never an invented number. A runtime that cannot
+ * record a pass establishes `None`, which is what its profile was measured under, and the same
+ * cycle is priced from the loaded buckets (the second fixture).
  *
  * The buckets are keyed the way this runtime runs: publish-then-verify at pipeline depth 1, so a
  * bucket's verify window is the previous cycle's distribution (nothing yet, on the first cycle)
  * and its draft distribution is the cycle's own. */
-TEST(the_real_profile_needs_the_replay_dimension_the_planner_cannot_observe) {
+TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
@@ -1617,27 +1619,40 @@ TEST(the_real_profile_needs_the_replay_dimension_the_planner_cannot_observe) {
     CHECK_EQ(p->pipeline_depth, 1);
     CHECK_EQ(draft_plan_valid(*p), RAD_OK);
 
-    /* The rest of the seam already fits: this profile prices the same cycle as measured once the
-     * replay dimension is known. Supplying it is the missing interface piece. */
-    DraftVerifyShape shape;
-    shape.n_rows = 1;
-    shape.verify_k = 0;
-    shape.verify_tokens = 1;
-    shape.history_tokens = 1;
-    shape.ctx_class = cls;
-    shape.pipeline_depth = 1;
-    shape.draft_k = 2;
-    shape.draft_rows[1] = 1;
-    shape.draft_rows[2] = 1;
-    shape.drafter = DraftDrafter::Serial;
-    shape.replay = DraftReplay::None;   /* what the driver would report for a live pass */
-    CHECK(draft_shape_priceable(shape));
-    CHECK_EQ(shape.verify_k, p->verify_k);
-    CHECK_EQ(shape.pipeline_depth, p->pipeline_depth);
-    DraftCostEstimate est;
-    CHECK_OK(table.estimate(shape, &est));
-    CHECK(est.valid);
-    CHECK(est.source == DraftCostSource::Measured);
+    /* The same profile and the same cycle, once the deployment evidences the state its passes run
+     * under: a backend that cannot record runs every pass live, so the view names `None` and the
+     * shape becomes the measured key the buckets hold. */
+    Fixture g;
+    g.build();
+    g.cfg.n_spec = 6;
+    CHECK_OK(g.start(DraftReplay::None));
+
+    DraftVerifyShape none_shape;
+    RealPrice none_real{ &table, &none_shape };
+    DraftController::Params gp = g.sch.draft().params();
+    gp.policy    = dp.policy;
+    gp.predictor = DraftPredictor{ &pred, predict };
+    gp.costs     = DraftCostModel{ &none_real, real_price };
+    CHECK_OK(g.sch.draft().configure(gp));
+
+    const uint64_t id2 = g.submit(8);
+    pred.set(id2, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
+    g.prefill(id2);
+    g.sch.find(id2)->sp.temp = 0.0f;
+    REQUIRE(g.sch.step() != nullptr);
+    const DraftPlan* pg = g.sch.draft().plan();
+    REQUIRE(pg != nullptr);
+    CHECK_EQ(none_shape.unknown, 0u);
+    CHECK(none_shape.replay == DraftReplay::None);
+    CHECK(draft_shape_priceable(none_shape));
+    CHECK(pg->source == DraftPlanSource::Cost);
+    CHECK(pg->fallback == DraftFallback::None);
+    CHECK(pg->replay == DraftReplay::None);
+    /* The ladder is 0/2/6 at one token per 2.0/1.3/5.0 ms: K=2 pays, so the priced plan drafts it
+     * rather than the fallback depth. */
+    CHECK_EQ(pg->k[0], 2);
+    CHECK_EQ(pg->verify_k, 0);   /* still the first cycle: nothing published before it */
+    CHECK_EQ(draft_plan_valid(*pg), RAD_OK);
 }
 
 /* ================================================================== the production wiring */

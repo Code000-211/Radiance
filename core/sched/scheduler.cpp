@@ -49,10 +49,12 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 
 /* ------------------------------------------------------------------ init */
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
-                    const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
+                    const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo,
+                    DraftReplay pass_replay) {
     if (!kv || !pc) return RAD_E_INVAL;
     prog_ = &prog;
     cfg_ = cfg;
+    draft_pass_replay_ = pass_replay;
     kv_ = kv;
     pc_ = pc;
 
@@ -1985,6 +1987,9 @@ void Scheduler::draft_cost_cycle() {
     /* Publish-then-verify: the step paired with this plan verifies what the previous cycle
      * published, so this plan's draft distribution reaches a verify one cycle later. */
     draft_view_.pipeline_depth = 1;
+    /* From the deployment, not this cycle: what its runtime can say about the tape is a fact of
+     * the backend, so every cycle of it runs under the same evidenced state (or none). */
+    draft_view_.replay         = draft_pass_replay_;
     /* The step this cycle pairs with may add the step budget; the KV lookahead may spend what the
      * pool has free. Both are bounds read here, not measurements (the step itself is planned
      * after this cycle opens). */
