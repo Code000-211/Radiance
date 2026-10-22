@@ -2921,9 +2921,10 @@ TEST(a_loaded_reference_decides_the_draft_depth_instead_of_the_fallback) {
     Server reader;
     REQUIRE(reader.start(dir.path, reload, device_env(128)));
     const std::string bind = reader.output();
-    if (bind.find("buckets match this deployment") == std::string::npos)
+    /* A no-loan reference binds under its own rule, not the live profile's match message. */
+    if (bind.find("basis no-loan -- an optimisation basis") == std::string::npos)
         fprintf(stderr, "    the reload did not bind the profile:\n%s\n", tail(bind).c_str());
-    CHECK(bind.find("buckets match this deployment") != std::string::npos);
+    CHECK(bind.find("basis no-loan -- an optimisation basis") != std::string::npos);
     CHECK(bind.find("is not used for this deployment") == std::string::npos);
     CHECK(bind.find("nothing is lent: it is all the cache's") != std::string::npos);
 
