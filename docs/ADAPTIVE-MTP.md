@@ -146,10 +146,13 @@ prediction and sample.
   `accept_greedy`'s uncensored count taken before the end-of-generation cut, so the cut must not
   shrink it. The two windows are never chained: `verified` is not bounded by `published`, because a
   verify window above the draft window computes positions this plan did not publish and one below
-  it stops short of them. Only `accepted <= published` crosses them, since a committed draft is one
-  this plan published. `Stopped` carries no label at `accepted`, and the censor decides where
-  commitment stopped -- `DraftController::observe` takes the committed count from the card -- so a
-  taller tally is accepted there: refusing it would lose every real label in a censored cycle.
+  it stops short of them. `accepted` is the paired verify's commit count, not this plan's published
+  count: a K0 plan issued ahead commits drafts a previously published plan produced, so
+  `accepted > published` is a measured cycle rather than a contradiction, and neither refusing it
+  nor zeroing `accepted` to fit a chain is admissible. `Stopped` carries no label at `accepted`, and
+  the censor decides where commitment stopped -- `DraftController::observe` takes the committed count
+  from the card -- so a taller tally is accepted there: refusing it would lose every real label in a
+  censored cycle.
 - **The output budget includes the bonus token.** `remaining` counts the tokens the request may
   still emit, and the verify step always emits the target's bonus token after the accepted prefix.
   Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
@@ -420,12 +423,16 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
 `cb5a69a` plus the same prerequisite:
 
 - The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
-  pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
-  CEST, last artifact of that run 02:17:52). `e0a053c`, `9bc94cd` and `8c91876`, and the
-  completion/bench change after them, add checks and are **unexecuted** -- the tree now carries
-  381/29 in `draft_types_test` and 128 cases in `sched_test`, none of them run. The run rebuilt 17
-  objects on the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the
-  older libavx objects are not part of these binaries.
+  pass 5/5 against the tree committed at 02:14:35 as `8f54c57` (docs at 02:15:09 as `7a9cbd0`);
+  `draft_types_test` reports 364 checks over 29 cases, built at 02:14:06 and run at 02:14:28, after a
+  first 364/29 run of the same change at 02:13:09 and under ASan at 02:13:32. The working tree
+  committed at 02:18:02 as `e0a053c` was built at 02:17:12 and executed at 02:17:27
+  (`draft_types_test`: 367/29) and at 02:17:53-59 (the other four suites); whether that commit is
+  byte-identical to the built tree can only be shown by a rebuild. `9bc94cd`, `8c91876`, `93d8797`,
+  `28cb9da` and `f77f93a` add checks to `draft_types_test` and `sched_test` and are **unexecuted**.
+  Every run here started after the 02:01:24 CEST pause order; nothing has run since 02:17:59. No
+  test target here depends on `libavx` (`ninja -t inputs`), so the older libavx objects are not part
+  of these binaries.
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
   baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
   five failures below fail on both.
