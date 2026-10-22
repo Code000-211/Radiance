@@ -18,20 +18,7 @@
 #include "rad_test.h"
 
 #include "engine.h"
-
-namespace rad {
-
-/* The friend core/engine.h declares under RAD_TEST_HOOKS. Compiled into this unit and into the
- * test copy of the engine units (tests/CMakeLists.txt), which together are every unit of this
- * link that includes engine.h; rad_core's own copies are never asked for. */
-struct EngineTestPeer {
-    using StepOut = Engine::StepOut;
-    static int  collect(Engine& e, const RadBatch* b, StepOut& so) { return e.collect_step(b, so); }
-    static void history_issued(Engine& e, bool on) { e.serial_hist_issued_ = on; }
-    static void step_end(Engine& e, RadEvent ev) { e.step_end_ = ev; }
-};
-
-}  /* namespace rad */
+#include "engine_test_peer.h"
 
 namespace {
 

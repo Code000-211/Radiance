@@ -39,6 +39,26 @@
 #include <thread>
 #include <unistd.h>
 
+#ifdef RAD_TEST_HOOKS
+/* Test-build-only seam: tests/CMakeLists.txt compiles the engine units a second time, for one test
+ * binary alone, with RAD_TEST_HOOKS. The loop calls this once per step, at the point where the
+ * step is issued and its completion flag reset but the wait has not run -- the one place where a
+ * driver outside the loop can see what the previous step left, what the reset left, and the history
+ * watermark before the finish moves it, and where it can withhold the step's completion proof.
+ * tests/engine_loop_test.cpp defines it strongly. rad_core is never compiled with RAD_TEST_HOOKS,
+ * so the production library carries neither this definition nor the call in any configuration. */
+extern "C" __attribute__((weak)) void rad_test_step_point(int step, int rows, bool prior_complete,
+                                                          bool complete) {
+    (void)step; (void)rows; (void)prior_complete; (void)complete;
+}
+
+/* The same test copy's second seam: called once in serve(), after the scheduler is initialised and
+ * before any rank or the stepper runs, so a driver can put one request in while there is no
+ * concurrent access. tests/engine_loop_test.cpp defines it strongly; the weak definition keeps
+ * every other test build that compiles these units linkable. */
+extern "C" __attribute__((weak)) void rad_test_serving() {}
+#endif
+
 namespace rad {
 
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
@@ -491,6 +511,11 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+#ifdef RAD_TEST_HOOKS
+        /* What the previous step left, read before the reset below. The step point in front of
+         * collect_step reports it beside the value the reset leaves. */
+        const bool rad_test_prior_complete = so.complete;
+#endif
         /* StepOut outlives the step (it is the loop's), so last step's completion must not be
          * readable as this one's before any wait has run. */
         so.complete = false;
@@ -717,6 +742,9 @@ int Engine::step_loop() {
          * commit. The card runs straight on while the host waits, commits and stages. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+#ifdef RAD_TEST_HOOKS
+        rad_test_step_point(b->step, (int)so.n_rows, rad_test_prior_complete, so.complete);
+#endif
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
@@ -1602,8 +1630,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         img_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
-    } else
-    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    } else {
+        RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio,
+                            &geo_));
+#ifdef RAD_TEST_HOOKS
+        /* The one point where a submission is race-free: the scheduler holds its KV and limits,
+         * and neither the rank threads nor the stepper exist yet. */
+        rad_test_serving();
+#endif
+    }
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over

@@ -80,11 +80,13 @@ set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core
 # that is why these units are built a second time here instead of defining it on the test alone.
 # The set of such units is exactly this list: engine.h is included by engine_priv.h (which only
 # these nine include), by core/main.cpp (the radiance binary, which never links this archive) and
-# by engine_step_test.cpp (compiled with the macro). A unit that starts including engine.h must
-# join this list, or one program would hold both definitions. Re-check with
+# by engine_step_test.cpp and engine_loop_test.cpp (both compiled with the macro). A unit that
+# starts including engine.h must join this list, or one program would hold both definitions.
+# Re-check with
 #   grep -rn '#include[[:space:]]*"\(core/\)\?engine\.h"' --include=*.cpp --include=*.h core tests
 # rad_core keeps its own, hook-free copies and is never asked for them: this archive goes in whole
-# and before it. Only engine_step_test links it, so no other test pays for the engine.
+# and before it. Only the tests in RAD_TESTS_WITH_ENGINE link it, so no other test pays for the
+# engine.
 set(RAD_ENGINE_SRC
   ${CMAKE_SOURCE_DIR}/core/engine.cpp
   ${CMAKE_SOURCE_DIR}/core/engine_bringup.cpp
@@ -107,7 +109,7 @@ if(RAD_FFMPEG_FOUND)
   target_link_libraries(rad_test_engine PRIVATE PkgConfig::RAD_FFMPEG)
 endif()
 
-set(RAD_TESTS_WITH_ENGINE engine_step_test)
+set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
@@ -162,6 +164,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_engine_loop_test 60)  # one engine start and a handful of tiny decode steps
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
@@ -317,6 +320,14 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+
+# engine_loop_test starts one engine of its own over a checkpoint with an assistant head: it needs
+# the plugin that serves the head (gemma4_bf16, selected by the fixture's quantization_config) and
+# libref's reference kernels. Like engine_e2e_test it pays a real startup, so it is `e2e` too.
+if(TARGET engine_loop_test)
+  add_dependencies(engine_loop_test gemma4_bf16 libref)
+  set_tests_properties(engine_loop_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
