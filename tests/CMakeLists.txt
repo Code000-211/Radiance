@@ -115,7 +115,7 @@ endif()
 
 set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_loop_move_test
                             engine_history_test engine_profile_test engine_cost_drift_test
-                            engine_couple_short_row_test)
+                            engine_couple_short_row_test engine_dtor_order_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)

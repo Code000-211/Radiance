@@ -209,6 +209,18 @@ struct EngineTestPeer {
      * exists so the branch can run, not to prove a rank-stream synchronization; that proof stays
      * open (a fixture would need a real stream on the rank). */
     static void add_rank(Engine& e) { e.ranks_.push_back(std::make_unique<Engine::Rank>()); }
+
+    /* The two allocations ~Engine owns and now frees only after the drain, filled the way
+     * bring-up fills them (tests/engine_dtor_order_test.cpp): a rank's pinned score target and its
+     * control-vector direction copy, which is a device allocation. The destructor's seam asks the
+     * allocator registry whether each is still live. */
+    static void set_score_host(Engine& e, int32_t index, float* p) {
+        e.ranks_[(size_t)index]->score_host = p;
+    }
+    static void set_cvec_dir(Engine& e, int32_t index, const float* d) {
+        if ((size_t)index >= e.cvec_views_.size()) e.cvec_views_.resize((size_t)index + 1);
+        e.cvec_views_[(size_t)index].dir = d;
+    }
     /* The stop serve() raises after its transport ends; a fixture that runs step_loop itself sets
      * it once the branch under test has run. */
     static void stop(Engine& e) { e.stopping_.store(true, std::memory_order_release); }
