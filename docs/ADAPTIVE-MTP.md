@@ -133,10 +133,12 @@ prediction and sample.
   inventing a reject label. The tally is still bounded where it protects a label:
   `draft_seq_observation_valid` requires `raw_match == accepted` for `Rejected` (otherwise the 0 at
   `accepted` would deny a token the drafter got right) and for `AllAccepted` (the row claims all it
-  checked was committed), and `raw_match <= generated` always. `Stopped` carries no label at
-  `accepted`, and the censor decides where commitment stopped -- `DraftController::observe` takes
-  the committed count from the card -- so a taller tally is accepted there: refusing it would lose
-  every real label in a censored cycle.
+  checked was committed), and `raw_match <= verified` always -- the paired verify window, not this
+  plan's `generated`: a plan issued ahead drafts and verifies different windows, and `raw_match` is
+  `accept_greedy`'s uncensored count taken before the end-of-generation cut, so the cut must not
+  shrink it. `Stopped` carries no label at `accepted`, and the censor decides where commitment
+  stopped -- `DraftController::observe` takes the committed count from the card -- so a taller
+  tally is accepted there: refusing it would lose every real label in a censored cycle.
 - **The output budget includes the bonus token.** `remaining` counts the tokens the request may
   still emit, and the verify step always emits the target's bonus token after the accepted prefix.
   Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
@@ -394,8 +396,11 @@ Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the pr
 `cb5a69a` plus the same prerequisite:
 
 - The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
-  pass 5/5 (`draft_types_test`: 367 checks over 29 cases after the review corrections, 310/23
-  before them).
+  pass 5/5 against `7a9cbd0` (`draft_types_test`: 364 checks over 29 cases; binary built 02:17:27
+  CEST, last artifact of that run 02:17:52). `e0a053c` and `9bc94cd` add checks and are
+  **unexecuted** -- the tree now carries 369/29, none of them run. The run rebuilt 17 objects on
+  the core path; no test target here depends on `libavx` (`ninja -t inputs`), so the older libavx
+  objects are not part of these binaries.
 - The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
   baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
   five failures below fail on both.

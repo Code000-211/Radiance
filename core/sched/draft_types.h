@@ -306,6 +306,7 @@ struct DraftPredictions {
     int32_t cap = 0;                   /* requests the caller's arrays hold (max_seqs) */
     uint64_t* req_id = nullptr;        /* [cap], same order as the view */
     DraftPrediction* seq = nullptr;    /* [cap] */
+    uint64_t cycle_id = 0;             /* the view's cycle this set was computed for */
     uint32_t version = 0;
 };
 
@@ -361,7 +362,8 @@ enum { RAD_DRAFT_MAX_FEATURES = 4 };
  * who produced this row (the plan's fill[] is only the permission). Both are part of the
  * observation, so no caller keeps a side list that can drift from the cycle. */
 struct DraftSeqObservation {
-    uint64_t raw_match = 0;  /* consecutive drafts that matched the target's own draw, uncensored */
+    uint64_t raw_match = 0;  /* consecutive drafts that matched the target's own draw, uncensored:
+                              * accept_greedy's count, before the end-of-generation cut */
     uint8_t  generated = 0;  /* draft tokens the head produced */
     uint8_t  published = 0;  /* tokens actually published to the proposal buffer */
     uint8_t  verified = 0;   /* draft positions the target computed (never the bonus token) */
@@ -533,11 +535,15 @@ inline bool draft_plan_bars_fill(const DraftPlan& p, int32_t i) {
 }
 
 /* Two version checks, deliberately different. A prediction set describes the view it was computed
- * for, so its version and rows must be the view's; reading the hook's current version instead
- * would hide a stale set. An observation describes the plan it names, so its version must be that
- * plan's (draft_plan_identifies), not the version the hooks carry now: a plan issued under an
- * older policy stays observable while it is alive. Neither check is the other's guard. */
+ * for, so its cycle, version and rows must be the view's; reading the hook's current version
+ * instead would hide a stale set. The cycle is part of that identity because a set computed for an
+ * earlier cycle carries that cycle's plan parameters even when every `req_id` still matches. The
+ * *history* a request owns is not this struct -- it outlives cycles and is keyed by `req_id` alone.
+ * An observation describes the plan it names, so its version must be that plan's
+ * (draft_plan_identifies), not the version the hooks carry now: a plan issued under an older policy
+ * stays observable while it is alive. Neither check is the other's guard. */
 inline bool draft_predictions_current(const DraftBatchView& view, const DraftPredictions& p) {
+    if (p.cycle_id != view.cycle_id) return false;
     if (p.version != view.policy_version) return false;
     if (p.n_seq != view.n_seq || p.n_seq < 0 || p.n_seq > p.cap) return false;
     if (p.n_seq == 0) return true;
@@ -549,16 +555,23 @@ inline bool draft_predictions_current(const DraftBatchView& view, const DraftPre
 }
 
 /* A row that may be learned from: the counts are ordered (generated >= published >= verified >=
- * checked >= accepted), `raw_match` counts matches among what the drafter generated and covers the
- * committed prefix, and `end` classifies the cut. An unclassified row is refused instead of
+ * checked >= accepted), `raw_match` counts matches among what the paired verify computed and covers
+ * the committed prefix, and `end` classifies the cut. An unclassified row is refused instead of
  * guessed.
  *
- * `raw_match` is bounded where it protects a label and nowhere else. `Rejected` writes a 0 at
- * position `accepted` (draft_label), so the tally must agree that this position did not match:
+ * `raw_match` is accept_greedy's uncensored tally, taken before `accept_cut_at_eog`: the cut
+ * shortens what is committed, not what was compared. Its bound is that same paired window --
+ * `raw_match <= verified` -- because a match is a comparison the target actually made. `generated`
+ * is this plan's own drafting and bounds nothing here: a plan issued ahead drafts and verifies
+ * different windows, and reading `k[i]` for the tally is the same confusion `verify_k` exists to
+ * avoid.
+ *
+ * `raw_match` is bounded further where it protects a label and nowhere else. `Rejected` writes a 0
+ * at position `accepted` (draft_label), so the tally must agree that this position did not match:
  * `raw_match == accepted`. `AllAccepted` claims everything it checked was committed, so a taller
  * tally contradicts it. `Stopped` carries no label at `accepted` at all, and the censor -- not the
  * tally -- decides where commitment stopped: `DraftController::observe` takes the committed count
- * from the card, and a budget or cancellation censor can stop it below the compared span. An upper
+ * from the card, so a budget or cancellation censor can stop it below the compared span. An upper
  * bound there would refuse a legitimate row and lose every label in that cycle, so `Stopped` keeps
  * only the general `raw_match >= accepted`. */
 inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
@@ -568,7 +581,7 @@ inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     if (o.published > o.generated) return false;
     if (a > (int)o.published || v > (int)o.published) return false;
     if (a > c || c > v) return false;
-    if (o.raw_match > (uint64_t)o.generated) return false;
+    if (o.raw_match > (uint64_t)v) return false;
     if (o.raw_match < (uint64_t)a) return false;
     switch (o.end) {
         case DraftSeqEnd::AllAccepted: return c == a && o.raw_match == (uint64_t)a;

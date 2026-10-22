@@ -613,6 +613,11 @@ TEST(a_prediction_set_is_bound_to_the_view_it_describes) {
     f.view.policy_version = 7;
     f.seq[0].req_id = 2;
     CHECK(!draft_predictions_current(f.view, f.pred));
+
+    /* Same requests, next cycle: the set carries the previous cycle's plan parameters. */
+    f.seq[0].req_id = 1;
+    f.view.cycle_id += 1;
+    CHECK(!draft_predictions_current(f.view, f.pred));
 }
 
 TEST(a_rows_origin_is_the_plans_permission_not_a_side_list) {
@@ -944,7 +949,13 @@ TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
     stopped.raw_match = 4;
     CHECK(!draft_seq_observation_valid(stopped));
 
-    /* raw_match counts matches among what was generated, not an independent tally. */
+    /* The tally is bounded by the window the paired step computed, not by the drafter's own count:
+     * shrinking `verified` below it must refuse the row even though `generated` still covers it. */
+    stopped.verified = 2;
+    CHECK(!draft_seq_observation_valid(stopped));
+    stopped.verified = 3;
+
+    /* raw_match counts matches among what was compared, not an independent tally. */
     DraftSeqObservation over;
     over.generated = 1; over.published = 1; over.verified = 1;
     over.accepted = 1; over.checked = 1; over.raw_match = 64;

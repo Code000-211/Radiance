@@ -35,6 +35,7 @@ inline int predict(void* ctx, const DraftBatchView& view, DraftPredictions* out)
     ++s->calls;
     if (!out || !out->seq || !out->req_id || out->cap < view.n_seq) return RAD_E_INVAL;
     out->n_seq = view.n_seq;
+    out->cycle_id = view.cycle_id;        /* the set describes this cycle */
     out->version = view.policy_version;   /* the view it describes, not a constant */
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->req_id[i] = view.seq[i].req_id;
