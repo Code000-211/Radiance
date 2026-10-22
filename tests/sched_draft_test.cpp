@@ -809,7 +809,7 @@ TEST(an_empty_snapshot_owes_no_pass_and_reports_no_failure) {
  * on the planned work and on neither `rounds` nor a row count. */
 TEST(a_kv_refusal_takes_the_draft_and_leaves_the_history_pass_owed) {
     Fixture f;
-    /* 16 tokens a block, 2 blocks: 21 committed + 1 + 6 fits, 21 + 6 + 6 does not. */
+    /* 16 tokens a block, 2 blocks: the verify step's 22 + 7 fits, its 22 + 7 + 6 rounds do not. */
     f.build(/*blocks=*/2, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
     f.cfg.n_spec = 6;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
@@ -821,6 +821,14 @@ TEST(a_kv_refusal_takes_the_draft_and_leaves_the_history_pass_owed) {
     pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
     use_cost_policy(f, pred);
     f.prefill(id);
+
+    /* Publish-then-verify: the first cycle verifies what the previous one published, and after the
+     * prefill nothing is published. It runs its one token and publishes the plan's six. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+    int32_t drafts[6] = { 41, 42, 43, 44, 45, 46 };
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
 
     REQUIRE(f.sch.step() != nullptr);
     CHECK_EQ(planned(f.sch, id), 6);

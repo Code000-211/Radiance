@@ -239,11 +239,16 @@ int parse_shape(const json& b, int32_t idx, DraftVerifyShape* s, std::string* er
         return refuse(err, RAD_E_INVAL, where + "shape.sampling: missing or unknown");
     s->sampling = (DraftSampling)sampling;
 
+    /* By name, never by the file's index: `DraftReplay::Unknown` sits at 0, so a cast would read a
+     * measured `none` as "no evidence" and no live shape could ever match its bucket. A profile is
+     * a measurement, so `unknown` is not a file value at all (draft_types.h). */
     static const char* const kReplay[] = { "none", "play", "record", "audit" };
+    static const DraftReplay kReplayValue[] = { DraftReplay::None, DraftReplay::Play,
+                                                DraftReplay::Record, DraftReplay::Audit };
     int replay = 0;
     if (!get_enum(sh, "replay", kReplay, 4, &replay))
         return refuse(err, RAD_E_INVAL, where + "shape.replay: missing or unknown");
-    s->replay = (DraftReplay)replay;
+    s->replay = kReplayValue[replay];
 
     static const char* const kDrafter[] = { "none", "serial", "ngram" };
     int drafter = 0;
