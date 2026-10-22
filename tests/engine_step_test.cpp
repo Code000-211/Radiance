@@ -154,8 +154,10 @@ TEST(engine_step_evidence_merges_a_steps_passes_and_isolates_the_next) {
     CHECK(!ev6.staged);
 
     /* A step no rank noted is a pure miss: step 8's slot holds nothing, so the read returns false
-     * and leaves the caller's evidence at its default -- Unknown, never a measured None
-     * (core/engine.cpp:908 resets it for exactly this case). */
+     * and writes only replay_known = false; replay/staged/moved stay as the caller handed them in.
+     * Here that is a fresh default, so replay reads Unknown -- never a measured None. Reader only:
+     * the caller's reset at core/engine.cpp:908 does not run from this test, and a pre-filled `out`
+     * would come back unchanged; that normalization stays open. */
     rad::DraftStepEvidence miss;
     CHECK(!EngineTestPeer::step_evidence(e, 8, &miss));
     CHECK(!miss.replay_known);
