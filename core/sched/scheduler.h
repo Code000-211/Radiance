@@ -564,6 +564,24 @@ private:
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
+    /* The calibration recording (--draft-profile-out): the same decode rows and the same
+     * observation ring as the cost policy, opened under the legacy/adaptive decision instead.
+     * Recording never touches the controller's plan, so draft_cap()/bars_fill() and the Cost
+     * lock are exactly what they are without it: the ring's record is the only output, and the
+     * engine exports it after the run. Armed at init from Config::draft_profile_out. */
+    void    draft_record_cycle();
+    /* One view per decode row at this cycle's open; the cost policy's cycle and the recording
+     * read the same rows. Caller holds mu_. */
+    int32_t draft_fill_view();
+    bool    draft_record_ = false;
+    /* The serial head's executed depth: min(--num-speculative-tokens, the drafter's own). The
+     * recording synthesises each cycle's plan at this bound, because that is the deepest round
+     * the head can publish. */
+    int32_t draft_head_depth_ = 0;
+    /* The depth the previous recording cycle drafted, -1 before the first: the paired step verifies
+     * that window, which is what the record's plan carries as history rows. */
+    int32_t draft_record_prev_k_ = -1;
+
     /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
      * the step path does not allocate. */

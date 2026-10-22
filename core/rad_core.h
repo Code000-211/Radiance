@@ -894,14 +894,16 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
-    /* --draft-profile: a rad-draft-profile/2 file measured on this deployment. Read once before
+    /* --draft-profile: a rad-draft-profile/3 file measured on this deployment. Read once before
      * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
-     * inactive and names the difference, and Cost is then refused by Scheduler::init. */
+     * inactive and names the difference, and Cost is then refused by Scheduler::init. An older
+     * format is refused by name: it cannot be bound to this deployment. */
     std::string draft_profile;
     /* --draft-profile-out: where a calibration run writes the cost profile it measured, with the
-     * same fingerprint and execution the reader derives. Written once at the end of serve(), after
-     * the observation ring is flushed; never over an existing file. Calibration runs under legacy:
-     * under cost the table would be pricing with the same numbers it records. */
+     * same fingerprint and execution the reader derives at startup. The observation ring records
+     * under legacy/adaptive; written once at the end of serve(), after the ring is flushed, and
+     * only when the run measured at least one bucket; never over an existing file. Under cost the
+     * table would be pricing with the same numbers it records, so that combination is refused. */
     std::string draft_profile_out;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------

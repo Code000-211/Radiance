@@ -14,9 +14,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -157,14 +160,18 @@ bool executed_within_plan(const DraftCostSample& s, const DraftPlan& p) {
     return true;
 }
 
-/* The origin mix the file records must fit the drafter the same bucket names: the head and the
- * lookup fallback cannot stand in for one another, and a row that produced nothing is None. */
+/* The origin mix the file records must fit the drafter the same bucket names. `drafter` is the
+ * process loaded for the pass (the serial head), and the origins are whose window each verify
+ * consumed: a head row needs the head loaded, but a lookup row does not need the lookup to be the
+ * only drafter -- the fallback fills any row the head left empty, so a serial deployment's mixed
+ * cycles carry both. Requiring the lookup to be the loaded drafter refused the whole export for
+ * every such run. A row that produced nothing is None under every drafter. */
 bool origins_fit_drafter(const DraftOrigin* origins, int32_t n_rows, DraftDrafter drafter) {
     for (int32_t i = 0; i < n_rows; ++i) {
         switch (origins[i]) {
             case DraftOrigin::None:   break;
             case DraftOrigin::Head:   if (drafter != DraftDrafter::Serial) return false; break;
-            case DraftOrigin::Lookup: if (drafter != DraftDrafter::Ngram) return false; break;
+            case DraftOrigin::Lookup: break;
         }
     }
     return true;
@@ -453,7 +460,9 @@ int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std
         return refuse(err, RAD_E_UNSUPPORTED,
                       "format: \"" + format + "\" is not " + expected +
                           " (version 1 has no draft distribution, pipeline depth or origin mix; "
-                          "a profile is regenerated, not rescaled)");
+                          "version 2 has no resolved placement or device equipment in its "
+                          "fingerprint, so it cannot be bound to a deployment; a profile is "
+                          "regenerated, not rescaled)");
 
     const auto fp = j.find("fingerprint");
     if (fp == j.end()) return refuse(err, RAD_E_INVAL, "fingerprint: missing");
@@ -642,6 +651,11 @@ int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_
         buckets.push_back(std::move(bj));
     }
     j["buckets"] = std::move(buckets);
+    /* A profile with nothing in it is not a calibration: a run that measured no cycle (or only
+     * diagnostic ones) must say so, not publish a file a reader would accept as a baseline. */
+    if (j["buckets"].empty())
+        return refuse(err, RAD_E_INVAL,
+                      "output: no bucket was measured; an empty profile is not a calibration");
     if (skipped) *skipped = skip;
     *out = j.dump(2) + "\n";
     return RAD_OK;
@@ -663,18 +677,35 @@ int draft_cost_profile_write_file(const std::string& path, const DraftCostProfil
         return refuse(err, rc, "output: the writer produced a file its reader refuses: " + perr);
 
     /* Same directory, so publishing is one link(): the target appears whole or not at all, and an
-     * existing file makes link() fail with EEXIST instead of being replaced. */
-    const std::string tmp = path + ".tmp." + std::to_string((long long)::getpid());
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return refuse(err, RAD_E_IO, "output: cannot create " + tmp);
-        f << text;
-        f.flush();
-        if (!f.good()) {
-            f.close();
-            ::unlink(tmp.c_str());
-            return refuse(err, RAD_E_IO, "output: cannot write " + tmp);
+     * existing file makes link() fail with EEXIST instead of being replaced. The temporary is
+     * created with O_EXCL under a name of its own, so a second writer (or a leftover from a
+     * crashed run) cannot be truncated under this one, and it is fsynced before the link: a
+     * profile that a crash leaves published-but-empty is worse than no profile. */
+    static std::atomic<unsigned long> seq{ 0 };
+    const std::string tmp = path + ".tmp." + std::to_string((long long)::getpid()) + "." +
+                            std::to_string(seq.fetch_add(1));
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0)
+        return refuse(err, RAD_E_IO,
+                      "output: cannot create " + tmp + ": " + std::strerror(errno));
+    bool ok = true;
+    size_t done = 0;
+    while (ok && done < text.size()) {
+        const ssize_t w = ::write(fd, text.data() + done, text.size() - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+        } else {
+            done += (size_t)w;
         }
+    }
+    if (ok && ::fsync(fd) != 0) ok = false;
+    const int werr = ok ? 0 : errno;
+    if (::close(fd) != 0 && ok) ok = false;
+    if (!ok) {
+        ::unlink(tmp.c_str());
+        return refuse(err, RAD_E_IO, "output: cannot write " + tmp + ": " +
+                                         std::strerror(werr ? werr : errno));
     }
     if (::link(tmp.c_str(), path.c_str()) != 0) {
         const int e = errno;
@@ -686,6 +717,21 @@ int draft_cost_profile_write_file(const std::string& path, const DraftCostProfil
                                          std::strerror(e));
     }
     ::unlink(tmp.c_str());
+    /* The entry itself is durable only once its directory is: report a directory that cannot be
+     * synced rather than claim a profile the next crash may drop. */
+    std::string dir = ".";
+    const size_t slash = path.rfind('/');
+    if (slash != std::string::npos) dir = slash == 0 ? "/" : path.substr(0, slash);
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd < 0)
+        return refuse(err, RAD_E_IO, "output: published " + path + " but cannot open " + dir +
+                                         " to sync it: " + std::strerror(errno));
+    const int drc = ::fsync(dfd);
+    const int derr = drc == 0 ? 0 : errno;
+    ::close(dfd);
+    if (drc != 0)
+        return refuse(err, RAD_E_IO, "output: published " + path + " but cannot sync " + dir +
+                                         ": " + std::strerror(derr));
     return RAD_OK;
 }
 
@@ -714,8 +760,8 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
     }
     if (profile.execution != runtime.execution) {
         reason_ = profile.execution == DraftCostExecution::Shrinking
-                      ? "profile is for shrinking rounds, this runtime runs rectangular"
-                      : "profile is for rectangular rounds, this runtime runs shrinking";
+                      ? "execution: profile is for shrinking rounds, this runtime runs rectangular"
+                      : "execution: profile is for rectangular rounds, this runtime runs shrinking";
         return RAD_OK;
     }
     if ((int32_t)profile.buckets.size() > capacity)

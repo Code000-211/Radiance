@@ -1545,7 +1545,7 @@ TEST(the_real_profile_needs_the_replay_dimension_the_planner_cannot_observe) {
     };
     /* 1 token / 2.0 ms, 3 / 1.3, 7 / 5.0: K=2 pays, K=6 does not. */
     const std::string profile =
-        "{\"format\": \"rad-draft-profile/2\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
+        "{\"format\": \"rad-draft-profile/3\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
         "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
         "\"placement\": \"vram\"}, \"execution\": \"rectangular\", \"buckets\": [" +
         bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "]}";
@@ -2157,4 +2157,108 @@ TEST(a_usable_bucket_admits_the_cost_policy_without_a_fallback_admission) {
     CHECK(!f.sch.draft_costs().fallback_admitted());
     CHECK_OK(f.start());
 }
+/* --draft-profile-out at its production seam: a legacy run records the cycles it actually ran,
+ * and issuing that record must not turn the Cost policy on. The controller keeps no plan, so
+ * draft_cap() still reads next_depth() and the run drafts exactly what it would without the flag;
+ * what reaches the table is the executed distribution, not the ceiling. */
+TEST(a_legacy_run_with_a_profile_out_records_the_cycles_it_ran) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_cycle.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);   /* the table Engine::begin_draft_calibration configures before init */
+    CHECK_OK(f.start());
+
+    /* Recording is not Cost: no controller plan, before or after the first cycle. */
+    CHECK(!f.sch.draft().cost_policy());
+    CHECK(f.sch.draft().plan() == nullptr);
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.draft().plan() == nullptr);
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    /* The next open closes the record; its bucket is the cycle's executed distribution. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.draft().plan() == nullptr);
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 1);
+    const DraftCostBucket& b1 = bs[0];
+    CHECK_EQ(b1.flags, 0);
+    CHECK_EQ(b1.n, 1);
+    CHECK(b1.mean_ms > 0.0);
+    CHECK_EQ(b1.rounds, 6);
+    for (int32_t j = 1; j <= 6; ++j) {
+        CHECK_EQ(b1.draft_round_rows[j], 2);
+        CHECK_EQ(b1.shape.draft_rows[j], 2);
+    }
+    CHECK_EQ(b1.draft_rows_total, 12);
+    CHECK_EQ(b1.shape.draft_k, 6);
+    CHECK_EQ(b1.shape.pipeline_depth, 1);
+    CHECK_EQ(b1.shape.n_rows, 2);
+    /* The first cycle verifies the window the cycle before it drafted, and there was none. */
+    CHECK_EQ(b1.shape.verify_k, 0);
+    CHECK_EQ(b1.shape.verify_tokens, 2);
+    CHECK_EQ(b1.shape.history_tokens, 2);
+    CHECK(b1.shape.drafter == DraftDrafter::Serial);
+}
+
+/* The same recording under --draft-window adaptive: draft_cap() is now the sequence's stop, so the
+ * cycle drafts fewer rows than the head's depth and the bucket must say so. Recording the ceiling
+ * here would file a price for rounds nobody ran. */
+TEST(an_adaptive_run_with_a_profile_out_records_the_window_it_drafted) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_window      = DraftWindow::Adaptive;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_record_adaptive.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+    CHECK(!f.sch.draft().cost_policy());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.draft().plan() == nullptr);
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    REQUIRE(f.sch.step() != nullptr);
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 1);
+    const DraftCostBucket& b1 = bs[0];
+    CHECK_EQ(b1.flags, 0);
+    CHECK_EQ(b1.n, 1);
+    CHECK(b1.shape.drafter == DraftDrafter::Serial);
+    /* The window the controller chose, not the head's 6: whatever it is, the bucket, the rows and
+     * the round count all describe that one extent. */
+    const int32_t k = b1.shape.draft_k;
+    CHECK(k >= 1 && k <= 6);
+    CHECK_EQ(b1.rounds, k);
+    for (int32_t j = 1; j <= k; ++j) CHECK_EQ(b1.draft_round_rows[j], 2);
+    for (int32_t j = k + 1; j <= 6; ++j) CHECK_EQ(b1.draft_round_rows[j], 0);
+    CHECK_EQ(b1.draft_rows_total, 2 * k);
+}
+
 RAD_TEST_MAIN()

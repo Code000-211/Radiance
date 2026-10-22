@@ -78,6 +78,18 @@ struct EngineTestPeer {
         return e.load_draft_cost_profile(runtime);
     }
 
+    /* --draft-profile-out's two production calls (core/engine.cpp): the startup check serve() makes
+     * before Scheduler::init, and the export it makes at the end. A host fixture reaches every
+     * refusal that runs before the identity is derived; the derivation itself needs ranks. */
+    static int begin_calibration(Engine& e) { return e.begin_draft_calibration(); }
+    static int export_calibration(Engine& e) { return e.export_draft_cost_profile(); }
+    /* The armed state begin_draft_calibration would have produced, for the export branches a
+     * fixture without ranks cannot reach through the derivation. */
+    static void set_calibrating(Engine& e, const DraftCostRuntime& r) {
+        e.draft_calib_runtime_ = r;
+        e.draft_calibrating_    = true;
+    }
+
     /* One step's commit, as the engine does after collect_step: every entry committed the same
      * token with no accepted draft, which is what a prefill chunk's step reports. */
     static int  commit(Engine& e, int32_t token = 0, uint8_t eos = 0) {

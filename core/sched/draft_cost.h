@@ -2,7 +2,7 @@
  *
  * The policy (C) compares candidate plans by their expected batch time, so it asks the
  * DraftCostModel seam for a price in milliseconds for a DraftVerifyShape. This is that price: a
- * versioned profile of measured buckets (`rad-draft-profile/2`, docs/ADAPTIVE-MTP.md), keyed by
+ * versioned profile of measured buckets (`rad-draft-profile/3`, docs/ADAPTIVE-MTP.md), keyed by
  * the verify shape -- verify tokens and N_j, pipeline depth, context class, history and prefill
  * tokens, sampling, replay state and the loaded drafter -- paired with the draft distribution that
  * actually ran, never by (rows, max K) alone.
@@ -158,25 +158,29 @@ struct DraftCostProfile {
 };
 
 /* Parses and validates one profile. RAD_OK, or a negative RAD_E_* (RAD_E_UNSUPPORTED for a
- * format id this reader does not know -- including rad-draft-profile/1, whose key had no draft
- * distribution, no pipeline depth and no origin mix, RAD_E_INVAL for a malformed or inconsistent
- * file) with `err` naming the problem. */
+ * format id this reader does not know -- rad-draft-profile/1 has no draft distribution, pipeline
+ * depth or origin mix, and rad-draft-profile/2 has no resolved placement or device equipment in
+ * its fingerprint, so neither can be bound to a deployment; RAD_E_INVAL for a malformed or
+ * inconsistent file) with `err` naming the problem. */
 int draft_cost_profile_parse(const std::string& text, DraftCostProfile* out, std::string* err);
 /* Reads `path` and parses it. The file is not on the step path. */
 int draft_cost_profile_read(const std::string& path, DraftCostProfile* out, std::string* err);
 
-/* The inverse reader: `p` as a rad-draft-profile/2 file, in `*out`. Refuses (RAD_E_INVAL with
+/* The inverse reader: `p` as a rad-draft-profile/3 file, in `*out`. Refuses (RAD_E_INVAL with
  * `err` naming the bucket) rather than inventing what it cannot state: a bucket whose origin mix
  * was not captured, or whose origins do not fit its drafter, is not written. Buckets carrying a
  * flag the file cannot name -- the runtime-only kDraftSampleShortened / kDraftBucketUnpriced -- are
  * diagnostics, are left out, and are counted in `*skipped` (optional); the caller reports them.
- * The text parses back with draft_cost_profile_parse. */
+ * A profile that would end up with no bucket at all is refused: an empty file is not a
+ * calibration, and a reader must never take one for a baseline. The text parses back with
+ * draft_cost_profile_parse. */
 int draft_cost_profile_write(const DraftCostProfile& p, std::string* out, int32_t* skipped,
                              std::string* err);
 /* Writes `p` to `path` atomically and never over an existing file: the text is built and parsed
- * back first, written to a temporary in the same directory, then published with link(), which
- * fails with EEXIST instead of replacing. Every failure is RAD_E_IO (or the writer's own refusal)
- * with `err` naming the path and the reason -- an export that did not happen is never silent. */
+ * back first, written and fsynced as an O_EXCL temporary in the same directory, then published
+ * with link(), which fails with EEXIST instead of replacing, and the directory is synced before
+ * the write is reported as done. Every failure is RAD_E_IO (or the writer's own refusal) with
+ * `err` naming the path and the reason -- an export that did not happen is never silent. */
 int draft_cost_profile_write_file(const std::string& path, const DraftCostProfile& p,
                                   int32_t* skipped, std::string* err);
 

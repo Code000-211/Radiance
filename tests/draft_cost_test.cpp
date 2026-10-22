@@ -91,7 +91,7 @@ json bucket_json(int32_t ctx, int32_t n_rows, int32_t k, std::vector<int32_t> ro
 }
 
 std::string profile_text(const std::vector<json>& buckets) {
-    json j{ { "format", "rad-draft-profile/2" }, { "fingerprint", fingerprint_json() },
+    json j{ { "format", "rad-draft-profile/3" }, { "fingerprint", fingerprint_json() },
             { "execution", "rectangular" }, { "buckets", json::array() } };
     for (const json& b : buckets) j["buckets"].push_back(b);
     return j.dump();
@@ -262,7 +262,7 @@ TEST(the_reader_accepts_the_documented_profile) {
      * C8 numbers are replayed in the_documented_c8_gradient_is_reproduced_without_a_new_measurement
      * and the two must not be conflated. */
     const std::string text = R"({
-      "format": "rad-draft-profile/2",
+      "format": "rad-draft-profile/3",
       "fingerprint": {
         "model": "Qwen3.8-Flash-Next", "quant": "gguf-q4_k_m", "tp": 2, "tp_wire": "wht6",
         "gpus": "2x Radeon AI PRO R9700", "kernels": "libr4d test+gfx1201",
@@ -304,9 +304,11 @@ TEST(the_reader_accepts_the_documented_profile) {
     CHECK(b.target_ms > 0.0 && b.draft_ms > 0.0 && b.host_ms > 0.0);
 }
 
-TEST(a_version_1_profile_is_refused_by_name) {
-    /* v1 has no draft distribution, no pipeline depth and no origin mix, so its buckets cannot be
-     * mapped onto the current key by assuming zeros. The reader refuses the id; it never rescales. */
+TEST(an_older_profile_is_refused_by_name) {
+    /* v1 has no draft distribution, no pipeline depth and no origin mix; v2 has no resolved
+     * placement or device equipment in its fingerprint, so it cannot be bound to a deployment.
+     * Neither can be mapped onto the current key by assuming zeros: the reader refuses the id and
+     * names the version it will read. It never rescales. */
     std::string err;
     DraftCostProfile p;
 
@@ -314,13 +316,19 @@ TEST(a_version_1_profile_is_refused_by_name) {
     v1["format"] = "rad-draft-profile/1";
     CHECK_EQ(draft_cost_profile_parse(v1.dump(), &p, &err), RAD_E_UNSUPPORTED);
     CHECK(has(err, "rad-draft-profile/1"));
-    CHECK(has(err, "rad-draft-profile/2"));
-
-    const std::string v3 = R"({"format":"rad-draft-profile/3","fingerprint":{},"execution":"rectangular","buckets":[]})";
-    CHECK_EQ(draft_cost_profile_parse(v3, &p, &err), RAD_E_UNSUPPORTED);
     CHECK(has(err, "rad-draft-profile/3"));
 
-    /* A v2 bucket that lost the new fields is malformed, not a v1 file to be guessed at. */
+    json v2 = json::parse(profile_text({ bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0) }));
+    v2["format"] = "rad-draft-profile/2";
+    CHECK_EQ(draft_cost_profile_parse(v2.dump(), &p, &err), RAD_E_UNSUPPORTED);
+    CHECK(has(err, "rad-draft-profile/2"));
+    CHECK(has(err, "placement"));
+
+    const std::string v4 = R"({"format":"rad-draft-profile/4","fingerprint":{},"execution":"rectangular","buckets":[]})";
+    CHECK_EQ(draft_cost_profile_parse(v4, &p, &err), RAD_E_UNSUPPORTED);
+    CHECK(has(err, "rad-draft-profile/4"));
+
+    /* A bucket that lost a current field is malformed, not an older file to be guessed at. */
     json missing = bucket_json(0, 8, 3, { 0, 8, 8, 8 }, 43.0);
     missing["shape"].erase("draft_rows");
     CHECK_EQ(draft_cost_profile_parse(profile_text({ missing }), &p, &err), RAD_E_INVAL);
@@ -1207,11 +1215,23 @@ TEST(write_file_never_overwrites_an_existing_profile) {
     const std::string path = std::string(dir) + "/p.json";
     {
         std::ofstream f(path, std::ios::binary);
-        f << "{\"format\":\"rad-draft-profile/2\"}";
+        f << "{\"format\":\"rad-draft-profile/3\"}";
     }
     DraftCostProfile p;
     p.fingerprint = runtime_fingerprint();
     p.execution = DraftCostExecution::Shrinking;
+    /* A profile with no bucket is refused by the writer (empty run, below), so the "fresh path"
+     * half of this test needs one. */
+    DraftCostBucket b;
+    b.shape = query(0, 4, 1, { 0, 4 });
+    b.rounds = 1;
+    b.draft_round_rows[1] = 4;
+    b.draft_rows_total = 4;
+    b.mean_ms = 10.0;
+    b.n = 3;
+    b.origins_known = true;
+    for (int32_t j = 0; j < b.shape.n_rows; ++j) b.origins[j] = DraftOrigin::Head;
+    p.buckets.push_back(b);
     std::string err;
     const int rc = draft_cost_profile_write_file(path, p, nullptr, &err);
     CHECK_EQ(rc, RAD_E_IO);
@@ -1219,13 +1239,86 @@ TEST(write_file_never_overwrites_an_existing_profile) {
 
     std::ifstream f(path, std::ios::binary);
     std::string kept((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK_EQ(kept, std::string("{\"format\":\"rad-draft-profile/2\"}"));
+    CHECK_EQ(kept, std::string("{\"format\":\"rad-draft-profile/3\"}"));
 
     /* A fresh path publishes the whole file. */
     const std::string fresh = std::string(dir) + "/fresh.json";
     CHECK_EQ(draft_cost_profile_write_file(fresh, p, nullptr, &err), RAD_OK);
     DraftCostProfile q;
     CHECK_EQ(draft_cost_profile_read(fresh, &q, &err), RAD_OK);
+}
+
+/* A run that measured nothing is not a calibration: publishing an empty profile would let the
+ * next start load it as a baseline whose every estimate is the fallback. The writer refuses, and a
+ * profile whose every bucket is diagnostic (left out of the file) is empty for this purpose.
+ * The reader still accepts an empty bucket list -- a hand-written file is not a measurement. */
+TEST(the_writer_refuses_a_profile_with_no_measured_bucket) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
+    CHECK(err.find("no bucket") != std::string::npos);
+
+    char dir[] = "/tmp/rad-draft-profile-XXXXXX";
+    CHECK(::mkdtemp(dir) != nullptr);
+    const std::string path = std::string(dir) + "/empty.json";
+    CHECK_EQ(draft_cost_profile_write_file(path, p, nullptr, &err), RAD_E_INVAL);
+    std::ifstream f(path, std::ios::binary);
+    CHECK(!f.good());   /* no file at all, not an empty one */
+
+    /* Only diagnostic buckets a file cannot name: skipped on the way out, so it has none. */
+    DraftCostBucket diag;
+    diag.shape = query(0, 4, 1, { 0, 4 });
+    diag.rounds = 1;
+    diag.draft_round_rows[1] = 4;
+    diag.draft_rows_total = 4;
+    diag.mean_ms = 4.0;
+    diag.n = 1;
+    diag.origins_known = true;
+    for (int32_t j = 0; j < diag.shape.n_rows; ++j) diag.origins[j] = DraftOrigin::Head;
+    diag.flags = kDraftSampleShortened;   /* kept for diagnosis, no name in the file */
+    p.buckets.push_back(diag);
+    int32_t skipped = 0;
+    CHECK_EQ(draft_cost_profile_write(p, &text, &skipped, &err), RAD_E_INVAL);
+    CHECK(err.find("no bucket") != std::string::npos);
+    CHECK_EQ(skipped, 0);   /* the skip is only counted for a file that is written */
+}
+
+/* The origin mix follows the drafter that really filled the rows: a serial deployment's fallback
+ * fills the rows the head left empty, so a serial bucket may carry lookup rows. Requiring the
+ * lookup to be the loaded drafter refused every such export. The reverse -- a lookup-only bucket
+ * naming a head row -- is still a broken record. */
+TEST(a_serial_bucket_may_carry_lookup_rows) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.execution = DraftCostExecution::Shrinking;
+    DraftCostBucket b;
+    b.shape = query(0, 4, 1, { 0, 4 });
+    b.rounds = 1;
+    b.draft_round_rows[1] = 4;
+    b.draft_rows_total = 4;
+    b.mean_ms = 10.0;
+    b.n = 2;
+    b.origins_known = true;
+    b.origins[0] = DraftOrigin::Head;
+    b.origins[1] = DraftOrigin::Lookup;
+    b.origins[2] = DraftOrigin::Lookup;
+    b.origins[3] = DraftOrigin::None;
+    p.buckets.push_back(b);
+
+    std::string text, err;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_OK);
+    DraftCostProfile q;
+    CHECK_EQ(draft_cost_profile_parse(text, &q, &err), RAD_OK);
+    CHECK_EQ((int)q.buckets.size(), 1);
+    CHECK(q.buckets[0].origins[1] == DraftOrigin::Lookup);
+
+    /* A head row under an n-gram-only bucket is still refused: the head was not the drafter. */
+    p.buckets[0].shape.drafter = DraftDrafter::Ngram;
+    CHECK_EQ(draft_cost_profile_write(p, &text, nullptr, &err), RAD_E_INVAL);
+    CHECK(err.find("origins do not fit") != std::string::npos);
 }
 
 /* The backend's round model, not this cycle's distribution: a uniform cycle on the serial backend
@@ -1263,10 +1356,12 @@ TEST(a_uniform_bucket_of_a_shrinking_backend_is_still_one_profile) {
     DraftCostEstimate e;
     CHECK_EQ(t.estimate(query(0, 4, 2, { 0, 4, 4 }), &e), RAD_OK);
     CHECK(e.source == DraftCostSource::Measured);
-    /* A query planning a different distribution is a different key, not a different profile. At
-     * pipeline_depth 0 that mix is refused as unpriceable rather than priced as the bucket's. */
+    /* A query planning a different distribution is a different key, not a different profile: no
+     * bucket matches and the fallback borrows no anchor across another executed extent, so the
+     * caller's named baseline is the answer -- never the bucket's price. */
     DraftCostEstimate other;
-    CHECK_EQ(t.estimate(make_shape(0, 4, { 0, 4, 4 }, 0, 2, { 0, 4, 2 }, 0), &other), RAD_E_INVAL);
+    CHECK_EQ(t.estimate(make_shape(0, 4, { 0, 4, 4 }, 0, 2, { 0, 4, 2 }, 0), &other), RAD_OK);
+    CHECK(!other.valid);
 }
 
 /* The backend's round model: a serial head that runs rounds per row is shrinking even when a

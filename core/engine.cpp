@@ -25,6 +25,7 @@
 #include "util/stallwatch.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -37,6 +38,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef RAD_TEST_HOOKS
@@ -1642,8 +1644,9 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
 
 /* --draft-profile-out: the calibration mode. Refused, not ignored, when it cannot produce an
  * honest profile: the two flags together would read and write the same identity, Cost would price
- * with the numbers it is recording, and an existing path would be replaced. All three are checked
- * here, at startup, so a run that cannot export says so before serving instead of after. */
+ * with the numbers it is recording, an existing path would be replaced, and only the serial head
+ * can be recorded. All of them are checked here, at startup, so a run that cannot export says so
+ * before serving instead of after. */
 int Engine::begin_draft_calibration() {
     if (cfg_.draft_profile_out.empty()) return RAD_OK;
     if (!cfg_.draft_profile.empty()) {
@@ -1661,32 +1664,64 @@ int Engine::begin_draft_calibration() {
                 "measures no draft cycle to export");
         return RAD_E_INVAL;
     }
-    if (::access(cfg_.draft_profile_out.c_str(), F_OK) == 0) {
+    /* The file's drafter dimension can only name the serial head: the block drafter proposes a
+     * whole block in one pass and the lookup drafter's rounds are the trunk's own, so neither has
+     * a per-row K this format could record. A run without the head would export a profile that
+     * misnames what produced it. */
+    if (!serial_drafting() || cfg_.n_spec <= 0) {
+        RAD_ERR("--draft-profile-out: needs a serial draft head and a positive ceiling (drafter "
+                "kind %d, depth %d, ceiling %d), because the profile names its rounds per row",
+                (int)drafter_.kind, (int)drafter_.depth, cfg_.n_spec);
+        return RAD_E_INVAL;
+    }
+    /* The writer links into place as the real gate (EEXIST); this only turns the common case into
+     * a startup error. Anything else -- a missing directory, no permission -- is not "free". */
+    struct stat st;
+    if (::stat(cfg_.draft_profile_out.c_str(), &st) == 0) {
         RAD_ERR("--draft-profile-out '%s' already exists; a calibration run does not overwrite a "
                 "profile -- move it or choose another path", cfg_.draft_profile_out.c_str());
         return RAD_E_INVAL;
     }
-    /* One honest limit of this mode: the observation ring is opened by the cost policy, so a
-     * calibration run under legacy/adaptive records no cycles yet. Named, because an empty file
-     * would otherwise look like a measurement of zero. */
-    RAD_WARN("--draft-profile-out: the observation ring runs only under --draft-policy cost, so "
-             "this calibration run writes an empty profile; the recording wiring is the next step");
+    if (errno != ENOENT) {
+        RAD_ERR("--draft-profile-out '%s': %s", cfg_.draft_profile_out.c_str(),
+                std::strerror(errno));
+        return RAD_E_IO;
+    }
+    /* The identity is derived here, before the scheduler starts: an incomplete one must fail
+     * before the run, not at export, and the profile is then written with the fingerprint this run
+     * was bound to. The table is admitted with no buckets -- it is the recording's target, and
+     * with Cost refused above nothing can ever be priced from it. */
+    RAD_TRY(draft_cost_runtime(&draft_calib_runtime_));
+    DraftCostProfile empty;
+    empty.fingerprint = draft_calib_runtime_.fingerprint;
+    empty.execution   = draft_calib_runtime_.execution;
+    RAD_TRY(sched_.draft_costs().configure(empty, draft_calib_runtime_));
+    if (!sched_.draft_costs().active()) {
+        RAD_ERR("--draft-profile-out: the recording table refused this runtime: %s",
+                sched_.draft_costs().reason().c_str());
+        return RAD_E_STATE;
+    }
     draft_calibrating_ = true;
     return RAD_OK;
 }
 
 int Engine::export_draft_cost_profile() {
     if (!draft_calibrating_) return RAD_OK;
-    DraftCostRuntime runtime;
-    RAD_TRY(draft_cost_runtime(&runtime));
-
     /* Everything the step loop measured has to reach the table before the table is read. */
     sched_.flush_draft_observations();
 
     DraftCostProfile p;
-    p.fingerprint = runtime.fingerprint;
-    p.execution   = runtime.execution;
+    p.fingerprint = draft_calib_runtime_.fingerprint;
+    p.execution   = draft_calib_runtime_.execution;
     p.buckets.assign(sched_.draft_costs().buckets().begin(), sched_.draft_costs().buckets().end());
+    /* A run that measured no cycle (no request served, no serial round executed) must not leave a
+     * file a reader would take as a baseline: the writer refuses it too, but the reason belongs in
+     * the log rather than in a generic parse error. */
+    if (p.buckets.empty()) {
+        RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
+                "cycle, which is not a calibration", cfg_.draft_profile_out.c_str());
+        return RAD_E_INVAL;
+    }
 
     int32_t skipped = 0;
     std::string err;
@@ -1700,8 +1735,10 @@ int Engine::export_draft_cost_profile() {
         RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
                  "their flag)", skipped);
     RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
-             cfg_.draft_profile_out.c_str(), p.buckets.size(), runtime.fingerprint.model.c_str(),
-             runtime.execution == DraftCostExecution::Shrinking ? "shrinking" : "rectangular");
+             cfg_.draft_profile_out.c_str(), p.buckets.size(),
+             draft_calib_runtime_.fingerprint.model.c_str(),
+             draft_calib_runtime_.execution == DraftCostExecution::Shrinking ? "shrinking"
+                                                                            : "rectangular");
     return RAD_OK;
 }
 
@@ -1990,10 +2027,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     /* A calibration export is part of the run's result, not a courtesy: its failure is the
-     * engine's status. The transport's status still wins when both are non-zero. */
-    const int xrc = export_draft_cost_profile();
-    /* A step-loop error takes precedence over the transport's status. */
+     * engine's status. A run the step loop aborted measured nothing a profile could stand on, so
+     * it writes no file. The step-loop error still wins when both are non-zero. */
     const int ls = loop_status_.load(std::memory_order_acquire);
+    const int xrc = ls < 0 ? RAD_OK : export_draft_cost_profile();
     if (ls < 0) return ls;
     if (xrc != RAD_OK) return xrc;
     return s;

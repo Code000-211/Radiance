@@ -158,6 +158,18 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         return RAD_E_UNSUPPORTED;
     }
 
+    /* The calibration's recording (--draft-profile-out): the same ring the cost policy uses, opened
+     * under whatever policy this deployment really runs. It never sets the controller's plan, so
+     * draft_cap()/bars_fill() and the Cost lock are exactly what they are without it. `cost` is
+     * refused together with the flag (engine.cpp), so the two never arm at once. The file can name
+     * only the serial head, so a deployment without one cannot be recorded (refused by name there);
+     * the depth is the deepest round the head can publish. */
+    draft_record_ = !cfg.draft_profile_out.empty();
+    draft_head_depth_ = 0;
+    draft_record_prev_k_ = -1;
+    if (draft_record_)
+        draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
+
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
     /* The plan's caller-provided arrays are sized at max_seqs (draft_types.h). */
@@ -1767,39 +1779,35 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
     if (draft_.cost_policy()) { draft_cost_cycle(); return; }
-    if (!draft_.adaptive()) return;
-    /* The rows the opening step will decode: every running sequence past its prompt. Those that
-     * may speculate choose D through their estimates; the rest emit one token each, which still
-     * counts in the step's yield and cost. A sequence still prefilling is neither. */
-    draft_est_.clear();
-    int n_rows = 0;
-    for (int32_t slot : running_) {
-        SchedReq& s = *reqs_[(size_t)slot];
-        if (!s.req || !s.running) continue;
-        const Request& r = *s.req;
-        if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
-        ++n_rows;
-        if (r.may_speculate) draft_est_.push_back(&s.adapt);
+    if (draft_.adaptive()) {
+        /* The rows the opening step will decode: every running sequence past its prompt. Those
+         * that may speculate choose D through their estimates; the rest emit one token each, which
+         * still counts in the step's yield and cost. A sequence still prefilling is neither. */
+        draft_est_.clear();
+        int n_rows = 0;
+        for (int32_t slot : running_) {
+            SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || !s.running) continue;
+            const Request& r = *s.req;
+            if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len())
+                continue;
+            ++n_rows;
+            if (r.may_speculate) draft_est_.push_back(&s.adapt);
+        }
+        (void)draft_.plan_step(draft_est_.data(), (int)draft_est_.size(), n_rows);
     }
-    (void)draft_.plan_step(draft_est_.data(), (int)draft_est_.size(), n_rows);
+    if (draft_record_) draft_record_cycle();
 }
 
-/* The cost policy opens its cycle here: one view of the decode rows, one frozen plan. The plan
- * decides each row's K for the whole cycle, K=0 included: a speculation-off decision is not a
- * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
-void Scheduler::draft_cost_cycle() {
-    if (!draft_.cost_policy()) return;
-    /* Everything the last plan's rows will ever carry is in by now -- its verify at the paired
-     * step's commit, its drafting from the publications after it -- and B should hold those labels
-     * before it predicts this cycle. */
-    draft_ring_close(draft_ring_cur_);
-    draft_ring_cur_ = 0;
+/* The decode rows at this cycle's open, one view each. Both the cost policy's cycle and the
+ * calibration recording name the same rows, so the view is built in one place. A row still
+ * prefilling is not in it: it emits nothing to speculate about. */
+int32_t Scheduler::draft_fill_view() {
     int32_t n = 0;
     for (int32_t slot : running_) {
         SchedReq& s = *reqs_[(size_t)slot];
         if (!s.req || !s.running) continue;
         const Request& r = *s.req;
-        /* A row still prefilling is not in the view: it emits nothing to speculate about. */
         if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
         if (n >= draft_view_.cap) break;
 
@@ -1825,6 +1833,97 @@ void Scheduler::draft_cost_cycle() {
                       : v.remaining <= 0 ? DraftEligibility::OutputExhausted
                                          : DraftEligibility::Eligible;
     }
+    return n;
+}
+
+/* The calibration cycle. The cost policy is off, so nothing here may issue a plan to the
+ * controller: draft_cap() and bars_fill() read the controller's plan, and setting one would
+ * change what this run drafts. The record is the ring's, and its plan states what the
+ * legacy/adaptive sites can actually do this cycle:
+ *
+ *   - k[i] is the executed depth, min(the step's window, the head's depth), for every row. The
+ *     serial rounds are capped by next_depth() and by the deepest adaptive window, and the
+ *     head's own depth can be shallower than either; nothing publishes past that, and a plan
+ *     that claimed the ceiling would file every cycle as a truncated run (observe()).
+ *   - fill[] is Serial where k[] is positive, because that is the drafter the format can name.
+ *     The lookup fallback is deliberately not named (the n-gram site in step()); its verify
+ *     still lands as label_origin, and the writer accepts that under a serial bucket.
+ *   - pipeline_depth is 1: the head's proposals are verified by the paired step, exactly as
+ *     under the cost policy.
+ *
+ * The cycle id is the same counter the cost policy uses, so the ring's records never collide. */
+void Scheduler::draft_record_cycle() {
+    draft_ring_close(draft_ring_cur_);
+    draft_ring_cur_ = 0;
+    int32_t n = draft_fill_view();
+    /* A cycle with more rows than the widest verify window cannot be priced at all
+     * (draft_shape_priceable), so the record names the first RAD_SCHED_MAX_SPEC of them. */
+    if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
+    if (n <= 0) return;
+
+    /* The plan's arrays are the stack's, unlike the cost policy's: the record copies them, and
+     * nothing else reads this plan. */
+    int32_t kk[RAD_SCHED_MAX_SPEC + 1] = {};
+    DraftDrafter fill[RAD_SCHED_MAX_SPEC + 1] = {};
+    int32_t nj[RAD_SCHED_MAX_SPEC + 1] = {};
+    int32_t hist[RAD_SCHED_MAX_SPEC + 1] = {};
+    const int32_t prev = draft_record_prev_k_ >= 0 ? draft_record_prev_k_ : 0;
+    int32_t kmax = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        const DraftSeqView& v = draft_view_seq_[(size_t)i];
+        /* What the step will really cap this row at: the head cannot publish past its own depth,
+         * and the step sites refuse a row that may not speculate. Naming the window for every row
+         * would file a shape more rows drafted than the run can execute. */
+        int32_t ki = 0;
+        if (v.eligibility == DraftEligibility::Eligible && (size_t)v.slot < reqs_.size()) {
+            ki = draft_cap(*reqs_[(size_t)v.slot]);
+            if (ki > draft_head_depth_) ki = draft_head_depth_;
+            if (ki < 0) ki = 0;
+            if (ki > RAD_SCHED_MAX_SPEC) ki = RAD_SCHED_MAX_SPEC;
+        }
+        kk[i]   = ki;
+        fill[i] = ki > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+        /* The paired step verifies the window the previous cycle drafted (the cost plan's rule);
+         * with no controller plan there is nothing to freeze, so the previous record's depth
+         * stands in -- legacy chooses the same window every cycle unless the window moved. */
+        hist[i] = 1 + prev;
+        if (ki > kmax) kmax = ki;
+    }
+    DraftPlan p;
+    p.cycle_id       = ++draft_cycle_id_;
+    p.policy_version = RAD_DRAFT_POLICY_VERSION;
+    p.n_seq          = n;
+    p.cap            = n;
+    p.k_ceiling      = cfg_.n_spec;
+    p.max_k          = kmax;
+    p.verify_k       = kmax;
+    p.pipeline_depth = 1;
+    p.source         = DraftPlanSource::Legacy;
+    p.prefill_tokens = 0;   /* step_finished stamps the step's own share on the record */
+    p.k              = kk;
+    p.fill           = fill;
+    p.rows           = nj;
+    p.history_tokens = hist;
+    /* Identity and context class come from the view the cycle just built (draft_ring_open). */
+    if (draft_plan_rows(p) != RAD_OK) return;
+    draft_ring_open(p);
+    if (draft_ring_cycle(p.cycle_id)) {
+        draft_ring_cur_ = p.cycle_id;
+        draft_record_prev_k_ = kmax;
+    }
+}
+
+/* The cost policy opens its cycle here: one view of the decode rows, one frozen plan. The plan
+ * decides each row's K for the whole cycle, K=0 included: a speculation-off decision is not a
+ * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
+void Scheduler::draft_cost_cycle() {
+    if (!draft_.cost_policy()) return;
+    /* Everything the last plan's rows will ever carry is in by now -- its verify at the paired
+     * step's commit, its drafting from the publications after it -- and B should hold those labels
+     * before it predicts this cycle. */
+    draft_ring_close(draft_ring_cur_);
+    draft_ring_cur_ = 0;
+    const int32_t n = draft_fill_view();
 
     draft_view_.cycle_id       = ++draft_cycle_id_;
     draft_view_.policy_version = RAD_DRAFT_POLICY_VERSION;
@@ -1895,7 +1994,12 @@ void Scheduler::draft_cost_cycle() {
  * cycle that never got another open.
  */
 void Scheduler::draft_ring_open(const DraftPlan& p) {
-    if (p.n_seq <= 0 || !p.req_id || p.n_seq > p.cap) return;
+    if (p.n_seq <= 0 || p.n_seq > p.cap) return;
+    if ((size_t)p.n_seq > draft_view_seq_.size()) return;
+    /* A plan that carries no request identity of its own -- the calibration's, which was built
+     * for this one record -- is named by the view the cycle just built. The cost policy's plan
+     * carries its own and is copied verbatim. */
+    const bool view_identity = p.req_id == nullptr;
     DraftCycleRecord* r = nullptr;
     for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
         if (!draft_ring_[i].active) { r = &draft_ring_[i]; break; }
@@ -1932,13 +2036,14 @@ void Scheduler::draft_ring_open(const DraftPlan& p) {
     r->plan.timing_valid   = false;   /* the planner does not time; the bracket does */
     r->plan.prefill_tokens = p.prefill_tokens;
     for (int32_t i = 0; i < p.n_seq; ++i) {
-        r->id[i]             = p.req_id[i];
-        r->slot[i]           = p.slot[i];
-        r->gen[i]            = p.slot_gen[i];
+        const DraftSeqView& v = draft_view_seq_[(size_t)i];
+        r->id[i]             = view_identity ? v.req_id : p.req_id[i];
+        r->slot[i]           = view_identity ? v.slot : p.slot[i];
+        r->gen[i]            = view_identity ? v.slot_gen : p.slot_gen[i];
         r->k[i]              = p.k[i];
         r->fill[i]           = p.fill[i];
-        r->ctx_class[i]      = p.ctx_class[i];
-        r->history_tokens[i] = p.history_tokens[i];
+        r->ctx_class[i]      = view_identity ? v.ctx_class : p.ctx_class[i];
+        r->history_tokens[i] = p.history_tokens ? p.history_tokens[i] : v.ctx_len;
         r->sampled[i]        = draft_view_seq_[(size_t)i].sampling == DraftSampling::Sampled ? 1 : 0;
         r->seq[i]            = DraftSeqObservation{};
         r->state[i]          = 0;
@@ -1956,10 +2061,12 @@ Scheduler::DraftCycleRecord* Scheduler::draft_ring_cycle(uint64_t cycle_id) {
  * lookup fill is not published (see the n-gram site in step()): its verify still counts --
  * `verified` is not chained to `published` -- and B does not learn from a row with no drafting. */
 void Scheduler::draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin origin) {
-    if (!draft_.cost_policy() || !s.req) return;
-    const DraftPlan* p = draft_.plan();
-    if (!p) return;
-    DraftCycleRecord* r = draft_ring_cycle(p->cycle_id);
+    if (!draft_.cost_policy() && !draft_record_) return;
+    if (!s.req) return;
+    /* The controller names the cycle it planned; the calibration's record has no controller plan,
+     * and draft_ring_cur_ is the cycle the recording just opened. */
+    const DraftPlan* p = draft_.cost_policy() ? draft_.plan() : nullptr;
+    DraftCycleRecord* r = draft_ring_cycle(p ? p->cycle_id : draft_ring_cur_);
     if (!r) return;
     if (n < 0) n = 0;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
@@ -1977,7 +2084,8 @@ void Scheduler::draft_ring_publish(const SchedReq& s, int32_t n, DraftOrigin ori
 
 void Scheduler::draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
                                   uint64_t raw_match) {
-    if (!draft_.cost_policy() || !e.req) return;
+    if (!draft_.cost_policy() && !draft_record_) return;
+    if (!e.req) return;
     int32_t v = e.n_spec;
     if (v < 0) v = 0;
     if (accepted < 0) accepted = 0;
@@ -2059,7 +2167,7 @@ void Scheduler::draft_ring_close(uint64_t cycle_id) {
         else if (r.state[j] == 2) complete = false;
     }
     if (resolved) draft_cost_observe(r);
-    if (complete) {
+    if (complete && draft_.cost_policy()) {
         DraftObservation o;
         o.cycle_id       = r.cycle_id;
         o.policy_version = r.plan.policy_version;
@@ -2085,6 +2193,10 @@ void Scheduler::draft_ring_close(uint64_t cycle_id) {
         } else {
             ++draft_cycles_done_;
         }
+    } else if (complete) {
+        /* Recording: the cycle went to the table above, and B (the predictor) belongs to the cost
+         * policy's runtime, not to the legacy run this calibration leaves untouched. */
+        ++draft_cycles_done_;
     } else {
         ++draft_cycles_dropped_;
     }
@@ -2582,7 +2694,7 @@ void Scheduler::step_finished(const DraftStepEvidence& ev) {
      * open -- the verify reported at commit, the drafting published after it -- and `ns` covers
      * the step and the draft rounds the engine ran after its commit. The plan's own copy stays
      * timing_valid = false; this one is the timed record observe() will read. */
-    if (draft_.cost_policy()) {
+    if (draft_.cost_policy() || draft_record_) {
         if (DraftCycleRecord* r = draft_ring_cycle(draft_ring_cur_)) {
             r->timed          = ns > 0;
             r->total_ms       = (double)ns / 1e6;

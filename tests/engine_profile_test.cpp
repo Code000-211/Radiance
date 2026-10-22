@@ -32,7 +32,7 @@ using rad::EngineTestPeer;
 /* A profile whose fingerprint is the runtime below, with no buckets: enough to reach configure()
  * and the admission branch without repeating the bucket fixture from draft_cost_test. */
 const char* kProfile = R"({
-  "format": "rad-draft-profile/2",
+  "format": "rad-draft-profile/3",
   "fingerprint": {
     "model": "tiny", "quant": "bf16", "tp": 1, "tp_wire": "n/a",
     "gpus": "1x host dev=0 cu=1 vram=0", "kernels": "none", "kv_format": "bf16",
@@ -113,4 +113,99 @@ TEST(a_matching_profile_is_admitted_before_the_scheduler_starts) {
     CHECK(EngineTestPeer::sched(e).draft_costs().active());
 }
 
+/* --draft-profile-out's startup checks. Every refusal below runs before draft_cost_runtime, so a
+ * host fixture reaches it; a run that cannot export must say so at startup, not after serving. */
+RadDrafterDecl serial_head(int depth) {
+    RadDrafterDecl d{};
+    d.kind  = RAD_DRAFT_SERIAL;
+    d.depth = depth;
+    return d;
+}
+
+TEST(a_calibration_refuses_both_profile_flags_at_once) {
+    Config cfg;
+    cfg.draft_profile     = write_case_file("engine_calib_both_read.json", kProfile);
+    cfg.draft_profile_out = radtest::tmp_path("engine_calib_both_out.json");
+    Engine e(std::move(cfg));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
+}
+
+TEST(a_calibration_refuses_the_cost_policy) {
+    Config cfg;
+    cfg.draft_profile_out = radtest::tmp_path("engine_calib_cost.json");
+    cfg.draft_policy      = rad::DraftPolicyKind::Cost;
+    Engine e(std::move(cfg));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+}
+
+TEST(a_calibration_refuses_the_kl_mode) {
+    Config cfg;
+    cfg.draft_profile_out = radtest::tmp_path("engine_calib_kld.json");
+    cfg.kld_record        = radtest::tmp_path("engine_calib_kld_dir");
+    Engine e(std::move(cfg));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+}
+
+/* The profile names its rounds per row, which only the serial head has: a block or n-gram drafter,
+ * or a serial head with no depth, would write a file that misnames what produced it. */
+TEST(a_calibration_refuses_a_run_without_a_serial_head) {
+    Config cfg;
+    cfg.draft_profile_out = radtest::tmp_path("engine_calib_nohead.json");
+    cfg.n_spec            = 6;
+    Engine e(std::move(cfg));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+
+    EngineTestPeer::drafter(e, serial_head(0));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+
+    /* A head and a ceiling pass that check and reach the identity: with no rank planned there is
+     * no deployment to bind the profile to, and the refusal happens here, before the scheduler
+     * starts -- not at export after a run that could never have written a valid header. */
+    EngineTestPeer::drafter(e, serial_head(4));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_STATE);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
+
+    Config zero;
+    zero.draft_profile_out = radtest::tmp_path("engine_calib_nospec.json");
+    zero.n_spec            = 0;
+    Engine z(std::move(zero));
+    EngineTestPeer::drafter(z, serial_head(4));
+    CHECK_EQ(EngineTestPeer::begin_calibration(z), RAD_E_INVAL);
+}
+
+TEST(a_calibration_refuses_an_existing_output_path) {
+    Config cfg;
+    cfg.draft_profile_out = write_case_file("engine_calib_exists.json", "{}");
+    cfg.n_spec            = 6;
+    Engine e(std::move(cfg));
+    EngineTestPeer::drafter(e, serial_head(6));
+    CHECK_EQ(EngineTestPeer::begin_calibration(e), RAD_E_INVAL);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
+}
+
+/* An empty run is not a calibration: the export refuses rather than write a file a reader would
+ * take as a baseline. The writer has its own guard (tests/draft_cost_test.cpp); this is the
+ * production caller's. */
+TEST(the_export_refuses_a_run_that_measured_no_bucket) {
+    const std::string path = radtest::tmp_path("engine_calib_empty.json");
+    Config cfg;
+    cfg.draft_profile_out = path;
+    Engine e(std::move(cfg));
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    CHECK_EQ(EngineTestPeer::export_calibration(e), RAD_E_INVAL);
+    CHECK(!std::ifstream(path).good());
+}
+
+TEST(the_export_of_an_unarmed_run_writes_nothing) {
+    const std::string path = radtest::tmp_path("engine_calib_unarmed.json");
+    Config cfg;
+    cfg.draft_profile_out = path;
+    Engine e(std::move(cfg));
+    CHECK_EQ(EngineTestPeer::export_calibration(e), RAD_OK);
+    CHECK(!std::ifstream(path).good());
+}
+
 }  /* namespace */
+
+RAD_TEST_MAIN()

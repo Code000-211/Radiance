@@ -333,16 +333,18 @@ drafter. Initialisation is explicitly not depth 0. A speculation-off plan is nev
 n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
 "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
 
-## Draft profile format, version 2
+## Draft profile format, version 3
 
 `core/sched/draft_cost.cpp` (A) reads and validates this; the parser never runs on the step path.
-The format id is `rad-draft-profile/2` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id —
-including `rad-draft-profile/1`, whose key had no draft distribution, origin or pipeline depth — is
-refused by name, not reinterpreted under the current keys.
+The format id is `rad-draft-profile/3` (`RAD_DRAFT_PROFILE_VERSION`). A file with another id is
+refused by name, not reinterpreted under the current keys: `rad-draft-profile/1` had no draft
+distribution, origin or pipeline depth, and `rad-draft-profile/2` had no resolved placement or
+device equipment in its fingerprint, so it cannot be bound to a deployment. Older profiles are
+regenerated, never rescaled.
 
 ```json
 {
-  "format": "rad-draft-profile/2",
+  "format": "rad-draft-profile/3",
   "fingerprint": {
     "model": "Qwen3.8-Flash-Next",
     "quant": "gguf-q4_k_m",
@@ -411,19 +413,29 @@ refused by name, not reinterpreted under the current keys.
   reader derives it and the `--draft-profile-out` writer derives it from the same function, so
   read and write cannot drift. A `rectangular`-stamped profile for a serial deployment is refused
   by name and must be recalibrated, not restamped.
-- **Writing a profile (`--draft-profile-out`).** A calibration run names an output path; when the
-  engine exits, after the observation ring is flushed, it writes the buckets it measured with the
-  same fingerprint and execution the reader derives. It refuses `--draft-profile` (a calibration
-  does not read its own input), refuses `--draft-policy cost` (the table would price with the
-  numbers it is recording), refuses a generator or embedding deployment (no scheduler, so no
-  cycle would ever be recorded) and refuses a path that already exists -- the file is written to a
-  temporary in the same directory and published with `link()`, so it appears whole or not at all
-  and an existing file is never replaced. A bucket whose origin mix was not captured, or whose
-  rows do not fit its drafter, is not written at all: the serializer refuses rather than inventing
-  `head`. Diagnostic buckets whose flags the file cannot name (truncations, warmup/record/audit)
-  are left out and counted in the log. `--draft-profile-out` writes an empty profile today under
-  legacy: the observation ring is opened by the cost policy, and wiring recording into
-  the calibration policy is the next step.
+- **Writing a profile (`--draft-profile-out`).** A calibration run decodes under `legacy` or
+  `adaptive` with the recording armed in place of the cost policy: the same decode rows and the
+  same observation ring, but the controller's plan is never set, so `draft_cap()`/`bars_fill()`
+  and the rest of the run are exactly what they are without the flag, and `cost` stays refused
+  rather than weakened. Each cycle's record names the depth the step really caps each row at
+  (the head's own depth, the adaptive window, 0 for a row that may not speculate), so a bucket
+  describes a shape the run could execute. When the engine exits -- and only when the step loop
+  did not abort -- the ring is flushed and the measured buckets are written with the same
+  fingerprint and execution the reader derives. The identity is derived at startup, before the
+  scheduler runs: an incomplete fingerprint refuses the calibration up front instead of failing
+  after a complete run. It also refuses `--draft-profile` (a calibration does not read its own
+  input), a deployment without a serial draft head and a positive ceiling (the file's drafter
+  dimension can only name that head), a generator or embedding deployment (no scheduler, so no
+  cycle would ever be recorded) and a path that already exists. The file is written to a
+  temporary in the same directory with `O_CREAT|O_EXCL`, fsynced, published with `link()` (so it
+  appears whole or not at all and an existing file is never replaced) and its directory is
+  synced. A run that measured no bucket is refused by the writer and never published: an empty
+  file would read as a calibration of nothing. A bucket whose origin mix was not captured, or
+  whose rows do not fit its drafter, is not written at all: the serializer refuses rather than
+  inventing `head`. The origin mix follows the drafter that filled each row -- the lookup fallback
+  fills rows the serial head left empty, so a serial bucket may carry `lookup` rows; a `head` row
+  under a lookup-only bucket is still refused. Diagnostic buckets whose flags the file cannot name
+  (truncated and unpriced ones) are left out and counted in the log.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually

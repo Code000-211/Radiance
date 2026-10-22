@@ -165,15 +165,16 @@ static const Flag g_flags[] = {
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
-    { "--draft-profile",      "PATH",   "a rad-draft-profile/2 file measured on this deployment,\n"
+    { "--draft-profile",      "PATH",   "a rad-draft-profile/3 file measured on this deployment,\n"
     "                                    read before the scheduler starts; a fingerprint or\n"
     "                                    execution mismatch disables it and is named in the log.\n"
     "                                    Not accepted on a generator or embedding model" },
     { "--draft-profile-out",  "PATH",   "write the cost profile this run measured to PATH when the\n"
     "                                    engine exits, with this deployment's fingerprint and\n"
-    "                                    execution; refused if PATH exists. Calibrate under\n"
-    "                                    --draft-policy legacy, not cost. Not accepted on a\n"
-    "                                    generator or embedding model" },
+    "                                    execution; refused if PATH exists or nothing was measured.\n"
+    "                                    Records under --draft-policy legacy or adaptive, not cost;\n"
+    "                                    needs a serial draft head. Not accepted on a generator or\n"
+    "                                    embedding model" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },

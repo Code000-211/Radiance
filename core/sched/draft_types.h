@@ -51,8 +51,11 @@ namespace rad {
 enum { RAD_SCHED_MAX_SPEC = 64 };
 
 /* The draft profile's on-disk format (docs/ADAPTIVE-MTP.md). A file whose header differs is
- * refused by name, never reinterpreted under the current keys. */
-enum { RAD_DRAFT_PROFILE_VERSION = 2 };
+ * refused by name, never reinterpreted under the current keys. Version 3 is the first whose
+ * fingerprint carries the resolved placement (strategy, budgets, residency digest) and the device
+ * equipment; a version-2 file was written before those were required, so it cannot be bound to a
+ * deployment and is regenerated rather than rescaled. */
+enum { RAD_DRAFT_PROFILE_VERSION = 3 };
 
 /* Context-length buckets of the profile key. A bucket is a property of the text, not of the
  * deployment: profiles only carry the buckets the configured capacity can reach. */

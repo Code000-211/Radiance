@@ -442,8 +442,12 @@ private:
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter and the host's block driver both read the committed sequence). */
     bool pipelining_ = false;
-    /* --draft-profile-out was validated at startup and this run exports on exit. */
+    /* --draft-profile-out was validated at startup and this run exports on exit. The runtime is
+     * derived there -- before the scheduler starts -- so a deployment whose identity cannot be
+     * established refuses the calibration up front and the exported header is the identity the run
+     * was actually bound to. */
     bool draft_calibrating_ = false;
+    DraftCostRuntime draft_calib_runtime_;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round
