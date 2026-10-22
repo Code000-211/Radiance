@@ -128,7 +128,9 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
  * history-only row whose hist_n is positive, and a failed build for those rows returns the same
  * null. The drafting-row count cannot tell the two apart, so it is not consulted; a null the
  * cycle owes is refused, because running on would publish a round the card never ran and move
- * the watermark over history never written. */
+ * the watermark over history never written. The word is per call -- the scheduler resets it
+ * before the attempt, sets it on the failure in that same call, and this reads it before the
+ * snapshot can end -- so an earlier success cannot cover a later failure. */
 int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
@@ -171,8 +173,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             /* See above: the scheduler, not the drafting-row count, says whether the null was
              * idle. It answers for the call just made, before the next one overwrites it. */
             if (sched_.serial_batch_failed()) {
-                RAD_ERR("drafter '%s': draft pass %d of step %d could not be built, and the open "
-                        "cycle owes it", drafter_.name, rd, step);
+                RAD_ERR("drafter '%s': draft pass %d of step %d got no batch and the scheduler "
+                        "reports it as failed; the open cycle owes it", drafter_.name, rd, step);
                 return RAD_E_STATE;
             }
             continue;
