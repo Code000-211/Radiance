@@ -925,6 +925,114 @@ TEST(a_kv_refusal_takes_the_draft_and_leaves_the_history_pass_owed) {
     CHECK(!f.sch.serial_batch_failed());
 }
 
+/* ================================================================== a pass that cannot be built */
+
+/* Counter-case 3 to `all_draft_rows_can_fall_away_and_the_history_pass_is_still_asked_for`: the
+ * same K0-only snapshot, but the owed history pass itself cannot be built. The null is then a pass
+ * that was owed and lost -- the one reading a driver must not take for idleness, and the one a row
+ * count cannot reach, because that snapshot's only row drafts nothing.
+ *
+ * `sched_fail_next_build()` is the test build's one-shot refusal of the next build that has work to
+ * do (tests/sched_fakes.h, behind RAD_TEST_HOOKS). It reaches the builder's own null path, which is
+ * what a real refusal looks like to serial_batch(); nothing about it exists in a build without
+ * tests. */
+TEST(a_k0_history_pass_that_cannot_be_built_reports_a_failure) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(501);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+    int32_t drafts[6] = { 41, 42, 43, 44, 45, 46 };
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK(e->ctx_len + e->n_spec + 6 > 512);   /* the premise: no room left for a draft round */
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);   /* nobody drafts */
+    CHECK_EQ(rounds, 1);                                 /* one pass: the history */
+
+    sched_fail_next_build();
+    CHECK(f.sch.serial_batch(0, 2) == nullptr);
+    CHECK(f.sch.serial_batch_failed());   /* owed, and not built: not idleness */
+}
+
+/* The counter-case for the status itself: it speaks for one call and for one snapshot. A pass that
+ * did build must not leave the way open for a later failure to go unreported; a failure must not
+ * outlive the call that produced it, nor the snapshot it belonged to. */
+TEST(a_failed_pass_is_not_masked_by_an_earlier_success_or_a_new_snapshot) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(501);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+    int32_t drafts[6] = { 41, 42, 43, 44, 45, 46 };
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK(e->ctx_len + e->n_spec + 6 > 512);
+
+    int rounds = 6;
+    Scheduler::SerialRow rows[6];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);
+    CHECK_EQ(rounds, 1);
+
+    /* A built pass reports no failure ... */
+    REQUIRE(f.sch.serial_batch(0, 2) != nullptr);
+    CHECK(!f.sch.serial_batch_failed());
+
+    /* ... and does not hide the next one: the same owed pass, refused once. */
+    sched_fail_next_build();
+    CHECK(f.sch.serial_batch(0, 3) == nullptr);
+    CHECK(f.sch.serial_batch_failed());
+
+    /* The next call answers for itself: past the history nothing is owed, so this null is idle and
+     * the failure above is not carried into it. */
+    CHECK(f.sch.serial_batch(2, 4) == nullptr);
+    CHECK(!f.sch.serial_batch_failed());
+
+    /* Nor does ending the snapshot rewrite the last answer ... */
+    sched_fail_next_build();
+    CHECK(f.sch.serial_batch(0, 5) == nullptr);
+    CHECK(f.sch.serial_batch_failed());
+    f.sch.serial_end(0, false);
+    CHECK(f.sch.serial_batch_failed());
+
+    /* ... only the next snapshot does, before any pass is asked of it. */
+    rounds = 6;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 6), 0);
+    CHECK(!f.sch.serial_batch_failed());
+    REQUIRE(f.sch.serial_batch(0, 6) != nullptr);   /* one shot, not a broken builder */
+    CHECK(!f.sch.serial_batch_failed());
+}
+
 /* ================================================================== identity across admission */
 
 /* A cancelled request's depth must not reach the next request on its slot. The slot is recycled
