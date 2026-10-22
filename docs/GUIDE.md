@@ -2880,6 +2880,8 @@ there is none.
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
+| `draft_observation_rows_attempted_total`, `_rows_applied_total`, `_rows_skipped_total` | the cost policy's observation ledger, in **rows**: one per draft row of a *delivered* cycle, so a wider window contributes more. `_applied` moved a request's window estimate, `_skipped` taught nothing (no teachable label, or a recycled request/slot identity) |
+| `draft_observation_cycles_discarded_total` | in **whole cycles**: dropped before delivery (incomplete, or refused by the predictor). Not rows, and never a sum with the three row counters |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
 | `engine_steps_held_total` | decode-only steps `--prefill-interleave` ran between chunks (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
@@ -2892,13 +2894,18 @@ there is none.
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
-Two pitfalls:
+Three pitfalls:
 
 - `draft_acceptance_ratio` is conditional on having drafted, so it can stay high while tokens per
   step collapse. Blocks per step (`draft_tokens_total / depth` over `engine_steps_decode_total`)
   separates the two; `scripts/mcdecl.sh` measures it.
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
+- `draft_observation_rows_attempted_total = 0` means no observation was delivered to the
+  predictor — not that no work ran. Drafting and verification happen under `legacy` too, and a
+  cycle is only delivered when the next one opens (or the engine goes idle); until then
+  `attempted` stays where it was. All four observation counters are cumulative source counters
+  over the server's lifetime, like every `radiance:` counter: nothing resets them.
 
 `deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
 
