@@ -112,6 +112,10 @@ int DraftPredictModel::predict(const DraftBatchView& view, DraftPredictions* out
         }
     }
     out->n_seq = view.n_seq;
+    /* The cycle is part of the set's identity, not only its rows: draft_predictions_current
+     * compares it first, so a set from an earlier cycle is not current even when every request
+     * still matches. */
+    out->cycle_id = view.cycle_id;
     out->version = p_.version;
     const int D = p_.max_depth;
     for (int32_t i = 0; i < view.n_seq; ++i) {

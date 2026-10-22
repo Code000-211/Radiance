@@ -83,7 +83,9 @@ public:
     int configure(const Params& p, DraftPredictState* states, int32_t cap);
     const Params& params() const { return p_; }
 
-    /* DraftPredictFn: fills out->seq[] in view order, starting a recycled slot at the prior.
+    /* DraftPredictFn: fills out->seq[] in view order, starting a recycled slot at the prior, and
+     * stamps the view's cycle into the set: draft_predictions_current compares (cycle, version,
+     * rows), so a set computed for an earlier cycle is not current while its history still is.
      * Refuses a view of another policy version. */
     int predict(const DraftBatchView& view, DraftPredictions* out) const;
     /* The trampoline an integrator puts in DraftHooks::predictor. */

@@ -7,9 +7,9 @@
  * "head" by default. Lookups and K0 rows never enter the head's estimate. An observation that
  * names no plan is refused by the contract's gate; a cycle from an older policy stays observable
  * while it is alive; a recycled slot is skipped, never merged into the new generation.
- * Extrapolation moves a prior without inflating evidence; the reported n is the effective sample
- * size, not the cycle count; and an offline replay of code -> prose -> code gives the same answer
- * whatever the batch order.
+ * Extrapolation moves a prior without inflating evidence; the reported n is the raw label count
+ * while the effective sample size only shapes unc; and an offline replay of code -> prose -> code
+ * gives the same answer whatever the batch order.
  *
  * No card, no scheduler, no RNG: the observations are the ones E will publish, and nothing here
  * claims a target-sampling or device property.
@@ -649,6 +649,38 @@ TEST(an_older_consistent_cycle_still_teaches_after_a_version_bump) {
     /* A prediction for the old version, however, is not this model's to make. */
     r.view.policy_version = 1;
     CHECK_EQ(r.predict(), RAD_E_INVAL);
+}
+
+TEST(a_prediction_set_is_bound_to_its_cycle_while_history_outlives_it) {
+    /* Same requests, same policy version, another cycle: the set computed for the old cycle is
+     * not current. The view's plan parameters belong to the cycle, and only the cycle names
+     * them; the request set alone would let the previous cycle's set pass as this one's. */
+    Rig c(6);
+    c.add(0, 10, 0);
+    c.view.cycle_id = 100;
+    REQUIRE_EQ(c.model.predict(c.view, &c.pred), RAD_OK);
+    CHECK_EQ(c.pred.cycle_id, 100u);
+    CHECK(draft_predictions_current(c.view, c.pred));
+    c.view.cycle_id = 101;
+    CHECK(!draft_predictions_current(c.view, c.pred));
+    REQUIRE_EQ(c.model.predict(c.view, &c.pred), RAD_OK);
+    CHECK_EQ(c.pred.cycle_id, 101u);
+    CHECK(draft_predictions_current(c.view, c.pred));
+
+    /* A new cycle is not a new request: the history survives the stamp. */
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    CHECK_OK(r.observe(10, 3, 3));
+    const uint16_t n = r.state[0].n[1];
+    const float learned = r.state[0].a[1];
+    CHECK(n > 0);
+    r.add(0, 10, 0, 1);
+    r.view.cycle_id = 7;
+    CHECK_OK(r.predict());
+    CHECK_EQ(r.pred.cycle_id, 7u);
+    CHECK_EQ(r.state[0].req_id, 10u);
+    CHECK_EQ(r.state[0].n[1], n);
+    CHECK_NEAR(r.state[0].a[1], learned, 0.0);
 }
 
 TEST(predict_refuses_a_batch_it_cannot_fill) {
