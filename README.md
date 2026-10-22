@@ -1,9 +1,4 @@
-This is strictly just a Development fork every Credit goes to StillDeadCode on Codeberg.
-
-For the People on Launch80 that want to try out some of the stuff that i work on.
-
-
-
+This is strictly just a Development fork, every Credit goes to https://codeberg.org/StillDeadcode
 
 # radiance
 
