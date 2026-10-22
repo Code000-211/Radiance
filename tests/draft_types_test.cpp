@@ -1000,6 +1000,22 @@ TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
     narrower.raw_match = 3;         /* more matches than the verify window compared */
     CHECK(!draft_seq_observation_valid(narrower));
 
+    /* A current K0 plan in front of the verify window a previously published plan produced. Nothing
+     * is drafted now, yet the step commits drafts from that window, so `accepted` and the tally are
+     * positive; `accepted <= published` would refuse the row and lose a measured cycle. */
+    DraftSeqObservation k0_after;
+    k0_after.generated = 0; k0_after.published = 0; k0_after.verified = 4;
+    k0_after.accepted = 3; k0_after.checked = 3; k0_after.raw_match = 3;
+    k0_after.end = DraftSeqEnd::AllAccepted;
+    CHECK(draft_seq_observation_valid(k0_after));
+    k0_after.end = DraftSeqEnd::Stopped;          /* a censor stopped commitment below the span */
+    k0_after.raw_match = 4;
+    CHECK(draft_seq_observation_valid(k0_after));
+    k0_after.raw_match = 5;                      /* past the window the paired verify computed */
+    CHECK(!draft_seq_observation_valid(k0_after));
+    k0_after.raw_match = 2;                      /* fewer matches than were committed */
+    CHECK(!draft_seq_observation_valid(k0_after));
+
     /* K0 with the paired verify still pending: nothing drafted, nothing compared, nothing
      * committed. A zero verified is a measured zero here, and a tally of one would be a match the
      * target never had a draft to compare. */

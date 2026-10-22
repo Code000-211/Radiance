@@ -70,13 +70,18 @@ int DraftController::configure(const Params& p) {
     return RAD_OK;
 }
 
-void DraftController::observe(int drafted, int accepted) {
+void DraftController::observe(int drafted, int accepted, int raw_match) {
     if (drafted <= 0) return;
     if (drafted > RAD_SCHED_MAX_SPEC) drafted = RAD_SCHED_MAX_SPEC;
     if (accepted < 0) accepted = 0;
     if (accepted > drafted) accepted = drafted;
+    /* The raw tally is the uncensored comparison: a censored stop leaves it above `accepted`, and
+     * it can never sit below what was committed. */
+    if (raw_match < accepted) raw_match = accepted;
+    if (raw_match > drafted) raw_match = drafted;
     tot_drafted_  += drafted;
     tot_accepted_ += accepted;
+    tot_raw_      += raw_match;
 
     /* Position j is evaluated only if every earlier position was accepted: 0..accepted-1 are
      * evaluated and accepted, position `accepted` (if drafted) evaluated and rejected, and nothing

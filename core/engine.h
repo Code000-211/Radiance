@@ -257,6 +257,9 @@ private:
         std::vector<float>    lg;         /* the first row's logits, at -vv */
         std::vector<int32_t>  token;      /* [n_seq] */
         std::vector<int32_t>  accepted;   /* [n_seq] */
+        /* [n_seq] accept_greedy's tally before accept_cut_at_eog: the end-of-generation cut
+         * shortens what is committed, not what was compared. The observation's raw_match. */
+        std::vector<int32_t>  raw_match;
         std::vector<uint8_t>  eos;        /* [n_seq] */
         /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
          * empty on a step with none. */

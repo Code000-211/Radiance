@@ -564,15 +564,17 @@ inline bool draft_predictions_current(const DraftBatchView& view, const DraftPre
  * prefix, and `end` classifies the cut. An unclassified row is refused instead of guessed.
  *
  * The two windows are not interchangeable, and the row carries both:
- *   - this plan's drafting -- `generated >= published`, and a committed draft was published
- *     (`accepted <= published`);
+ *   - this plan's drafting -- `generated >= published`;
  *   - the paired verify -- `verified >= checked >= accepted`, and the tally is a comparison, so
  *     `raw_match <= verified` and `raw_match >= accepted`.
- * Only `accepted <= published` crosses them, because a committed draft is one this plan published.
- * `verified` is deliberately *not* chained to `published`: a plan issued ahead drafts and verifies
- * different windows, so a verify window above the draft window makes `verified > published` and one
- * below makes `verified < published`, both legitimate. Binding them is the confusion `verify_k`
- * exists to avoid.
+ * `accepted` belongs to the verify cycle, not to this plan's draft output. A K0 plan issued ahead
+ * verifies the window a previously published plan produced, and commits drafts this row never
+ * published: `accepted > published` is a measured cycle, not a contradiction. Chaining the two
+ * would refuse it and lose its labels; writing a synthetic zero to fit the chain would lose the
+ * acceptance itself. `verified` is likewise *not* chained to `published`: a plan issued ahead drafts
+ * and verifies different windows, so a verify window above the draft window makes
+ * `verified > published` and one below makes `verified < published`, both legitimate. Binding them
+ * is the confusion `verify_k` exists to avoid.
  *
  * `raw_match` is accept_greedy's uncensored tally, taken before `accept_cut_at_eog`: the cut
  * shortens what is committed, not what was compared. Its window is the paired verify's, which is
@@ -591,10 +593,10 @@ inline bool draft_seq_observation_valid(const DraftSeqObservation& o) {
     const int a = (int)o.accepted, c = (int)o.checked, v = (int)o.verified;
     if (o.generated > RAD_SCHED_MAX_SPEC || o.published > RAD_SCHED_MAX_SPEC) return false;
     if (a > RAD_SCHED_MAX_SPEC || c > RAD_SCHED_MAX_SPEC || v > RAD_SCHED_MAX_SPEC) return false;
-    /* This plan's drafting. */
+    /* This plan's drafting. `a > published` is not a drafting error: `accepted` counts the paired
+     * verify's commits, which can be drafts another plan published. See the header comment. */
     if (o.published > o.generated) return false;
-    if (a > (int)o.published) return false;
-    /* The paired verify's window. `v > published` is not an error: see the header comment. */
+    /* The paired verify's window. `v > published` is not an error either. */
     if (a > c || c > v) return false;
     if (o.raw_match > (uint64_t)v) return false;
     if (o.raw_match < (uint64_t)a) return false;

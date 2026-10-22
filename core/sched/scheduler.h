@@ -124,6 +124,7 @@ public:
     struct StepResult {
         int             n_seq = 0;
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
+        const int32_t*  n_raw = nullptr;       /* [n_seq] matches before the EOG cut, >= n_accepted */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
         /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its

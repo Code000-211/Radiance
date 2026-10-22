@@ -1974,6 +1974,10 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     d2.observe(2, 5);                 /* accepted past the draft is clamped, not counted */
     CHECK_EQ(d2.accepted(), 2);
     CHECK_EQ(d2.drafted(), 802);
+    /* The raw tally outlives the end-of-generation cut: one committed, two compared. */
+    d2.observe(2, 1, 2);
+    CHECK_EQ(d2.accepted(), 3);
+    CHECK_EQ(d2.raw_matches(), 2);
 
     /* Depth 0 is speculation off, and it configures. */
     DraftController d3;

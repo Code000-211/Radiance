@@ -762,6 +762,7 @@ int Engine::step_loop() {
         Scheduler::StepResult res{};
         res.n_seq      = (int)plan.e.size();
         res.n_accepted = so.accepted.data();
+        res.n_raw      = so.raw_match.data();
         res.token      = so.token.data();
         res.eos        = so.eos.data();
         if (!so.lp.empty()) {
@@ -887,6 +888,7 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
+    so.raw_match.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 1);
     if (plan.e.empty()) return RAD_OK;
     RAD_TRY(await_step_end());
@@ -996,6 +998,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
+    so.raw_match.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
     /* A step with no sampled rows has nothing to read back, so the host does not wait for a readback
@@ -1059,6 +1062,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
             RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            /* The uncensored tally, taken before the cut below: a match is a comparison the target
+             * made, whether or not the step went on to commit it. */
+            so.raw_match[i] = acc;
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step

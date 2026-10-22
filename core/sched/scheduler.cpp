@@ -1871,6 +1871,11 @@ int Scheduler::commit(const StepResult& res) {
             int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
             if (a < 0) a = 0;
             if (a > e.n_spec) a = e.n_spec;
+            /* The raw tally is the comparison behind `a`, never below it: the EOG cut shortens what
+             * was committed, not what matched. Clamped to the same window it was compared over. */
+            int32_t raw = res.n_raw ? res.n_raw[i] : a;
+            if (raw < a) raw = a;
+            if (raw > e.n_spec) raw = e.n_spec;
             /* A row issued ahead was staged at the furthest reachable context; it really
              * continued from the committed end. */
             const int64_t ctx0 = e.dev ? r.n_computed : (int64_t)e.ctx_len;
@@ -1922,7 +1927,7 @@ int Scheduler::commit(const StepResult& res) {
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
-                draft_.observe(e.n_spec, a);
+                draft_.observe(e.n_spec, a, raw);
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */

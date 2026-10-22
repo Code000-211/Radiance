@@ -159,12 +159,15 @@ public:
         return (d >= 0 && d <= RAD_SCHED_MAX_SPEC) ? by_depth_[d] : 0;
     }
 
-    /* One verify's outcome: `drafted` proposed, a prefix of `accepted` taken. Metrics only. */
-    void observe(int drafted, int accepted);
+    /* One verify's outcome: `drafted` proposed, a prefix of `accepted` taken, `raw_match` the
+     * uncensored match tally behind it (the end-of-generation cut shortens the commitment, not the
+     * tally). `raw_match` defaults to `accepted` for callers without the raw count. Metrics only. */
+    void observe(int drafted, int accepted, int raw_match = -1);
 
     /* Metrics (spec §14). Cumulative and exact. */
     int64_t drafted()  const { return tot_drafted_; }
     int64_t accepted() const { return tot_accepted_; }
+    int64_t raw_matches() const { return tot_raw_; }   /* uncensored: >= accepted() */
     float   acceptance() const {
         return tot_drafted_ ? (float)((double)tot_accepted_ / (double)tot_drafted_) : 0.0f;
     }
@@ -186,7 +189,7 @@ public:
 
 private:
     Params  p_;
-    int64_t tot_drafted_ = 0, tot_accepted_ = 0;
+    int64_t tot_drafted_ = 0, tot_accepted_ = 0, tot_raw_ = 0;
     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
     int     seen_ = 0;
