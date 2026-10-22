@@ -239,11 +239,10 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             serial_k_[(size_t)i] = rd == 0 ? 1 : rd;
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
-        /* Round 0 is the history pass. Its watermark may move only once it has run on every
-         * participating rank, and the host can only confirm rank 0: collect_step's one wait
-         * fences step_end_, recorded on rank 0's stream after these passes, while another rank's
-         * stream is never waited on here. A second rank therefore leaves the word false, which
-         * costs a repeated history pass and no watermark (scheduler.cpp). */
+        /* Round 0 is the history pass. Two things make the claim: only rank 0's stream can be
+         * fenced, so a second rank leaves the word false; and the step's wait has to have covered
+         * the passes -- collect_step returns before its wait on a step with no logit rows, which
+         * is exactly the history-only case, so finish takes that wait itself. */
         if (rd == 0) serial_hist_ran_ = ranks_.size() == 1;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
@@ -308,6 +307,12 @@ struct BlockHold {
  * shrink to the active prefix. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    /* collect_step returns before its wait on a step with no logit rows (engine.cpp), so on such
+     * a step nothing has yet fenced the passes this claim is about -- and a row-less prefill chunk
+     * is exactly the history-only case. step_end_ was recorded on rank 0's stream after them, so
+     * wait on it here: a failed pass surfaces as this error, and the word never moves the
+     * watermark over it. */
+    if (serial_hist_ran_ && so.n_rows <= 0) RAD_TRY(rad_event_sync(step_end_));
     SerialHold hold(sched_, serial_hist_ran_);
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
