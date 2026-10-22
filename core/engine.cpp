@@ -440,6 +440,16 @@ int Engine::step_loop() {
     pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
                   (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
+    /* The replay state and placement activity a cost cycle is keyed by (DraftStepEvidence). The
+     * counters are cumulative and only this thread reads them here, so the delta across a step is
+     * what that step's bracket did. */
+    std::vector<Ctx::PassCounts> prev_pc(ranks_.size());
+    std::vector<int64_t>         prev_moves(ranks_.size(), 0);
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        prev_pc[(size_t)i]    = ranks_[i]->ctx.pass_counts();
+        const HeatStats hs    = ranks_[i]->heat.stats();
+        prev_moves[(size_t)i] = (int64_t)hs.promotions + (int64_t)hs.demotions;
+    }
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
@@ -817,8 +827,30 @@ int Engine::step_loop() {
                                               : run_block_drafter(b->step);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
-         * (Scheduler::step_finished). */
-        sched_.step_finished();
+         * (Scheduler::step_finished). What the tape and the placement engines did inside that
+         * bracket goes with it: the scheduler cannot see either, and a state nobody established
+         * must reach A as Unknown, not as a measured None. */
+        DraftStepEvidence ev;
+        ev.replay_known = true;
+        bool recorded = false, audited = false, played = false;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const Ctx::PassCounts pc = ranks_[i]->ctx.pass_counts();
+            recorded = recorded || pc.recorded > prev_pc[i].recorded;
+            audited  = audited  || pc.audited  > prev_pc[i].audited;
+            played   = played   || pc.played   > prev_pc[i].played;
+            prev_pc[i] = pc;
+            const HeatStats hs = ranks_[i]->heat.stats();
+            const int64_t moves = (int64_t)hs.promotions + (int64_t)hs.demotions;
+            ev.moved = ev.moved || moves > prev_moves[i];
+            prev_moves[i] = moves;
+            ev.staged = ev.staged || ranks_[i]->stager.staged();
+        }
+        /* Audited and recorded are rarer than played, and a cycle that both recorded and played
+         * is still a recording for the price's key. */
+        ev.replay = recorded ? DraftReplay::Record
+                  : audited  ? DraftReplay::Audit
+                  : played   ? DraftReplay::Play : DraftReplay::None;
+        sched_.step_finished(ev);
         tier_tick();
         loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();

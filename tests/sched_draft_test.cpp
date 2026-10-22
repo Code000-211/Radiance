@@ -107,6 +107,187 @@ struct Fixture {
     }
 };
 
+/* ================================================================== A's production sample */
+
+/* Install an empty profile for this runtime so the table is active (a configured deployment with
+ * no measurements yet). The samples then land in `buckets()`, which is what a host test can read
+ * without a profile file. */
+void activate_costs(Fixture& f) {
+    DraftCostProfile p;
+    p.fingerprint.model     = "test";
+    p.fingerprint.quant     = "q";
+    p.fingerprint.tp_wire   = "w";
+    p.fingerprint.gpus      = "g";
+    p.fingerprint.kernels   = "k";
+    p.fingerprint.kv_format = "bf16";
+    p.fingerprint.placement = "all_vram";
+    p.fingerprint.tp        = 1;
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    CHECK_OK(f.sch.draft_costs().configure(p, rt));
+    REQUIRE(f.sch.draft_costs().active());
+}
+
+/* The plan's scalars for one cycle, copied: the controller's storage moves with the next open. */
+struct PlanCopy {
+    int32_t max_k = 0;
+    int32_t verify_k = 0;
+    int32_t pipeline_depth = 0;
+    int32_t n_seq = 0;
+    int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
+    std::vector<int32_t> k;
+    std::vector<uint64_t> id;
+    int at(uint64_t req) const {
+        for (size_t i = 0; i < id.size(); ++i)
+            if (id[(size_t)i] == req) return k[i];
+        return -1;
+    }
+};
+PlanCopy copy_plan(Scheduler& s) {
+    PlanCopy c;
+    const DraftPlan* p = s.draft().plan();
+    if (!p) return c;
+    c.max_k = p->max_k;
+    c.verify_k = p->verify_k;
+    c.pipeline_depth = p->pipeline_depth;
+    c.n_seq = p->n_seq;
+    for (int32_t j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) c.rows[j] = p->rows[j];
+    for (int32_t i = 0; i < p->n_seq; ++i) {
+        c.k.push_back(p->k[i]);
+        c.id.push_back(p->req_id[i]);
+    }
+    return c;
+}
+
+/* A's table is fed by the cycle the scheduler itself ran, not by a caller: the sample carries the
+ * executed distribution (what each row published, not what the plan allowed), the verify window
+ * that actually ran, and the step bracket. A cycle state nobody established reports Unknown and is
+ * never filed as a measured None. */
+TEST(a_cycle_measures_the_executed_distribution_and_refuses_unknown_evidence) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+    activate_costs(f);
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+
+    /* Cycle 1: nothing can be priced without a profile, so the fallback sets both rows to the
+     * configured depth. Its plan is the one the sample is filed under. */
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy p1 = copy_plan(f.sch);
+    REQUIRE(p1.n_seq == 2);
+    CHECK_EQ(p1.max_k, 6);
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, p1.at(id)));
+
+    /* The engine's evidence: a live pass with no tape recording (None), nothing staged or moved. */
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);
+
+    /* Cycle 2: opening it closes cycle 1, which is now a measurement. */
+    REQUIRE(f.sch.step() != nullptr);
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 1);
+    const DraftCostBucket& b1 = bs[0];
+    /* A bucket keeps the attribution flags only, so a clean measurement has none -- not even
+     * Valid: `record()` strips it, the price itself is the flag. */
+    CHECK_EQ(b1.flags, 0);
+    CHECK_EQ(b1.n, 1);
+    CHECK(b1.mean_ms > 0.0);
+    /* The executed distribution is the plan's: two rows each published their full window. */
+    CHECK_EQ(b1.rounds, p1.max_k);
+    for (int32_t j = 1; j <= p1.max_k; ++j) {
+        CHECK_EQ(b1.draft_round_rows[j], p1.rows[j]);
+        CHECK_EQ(b1.shape.draft_rows[j], p1.rows[j]);
+    }
+    CHECK_EQ(b1.shape.draft_k, p1.max_k);
+    CHECK_EQ(b1.draft_rows_total, 2 * p1.max_k);
+    /* The verify half: cycle 1's step verified nothing, and n_rows is the plan's row count. */
+    CHECK_EQ(b1.shape.n_rows, p1.n_seq);
+    CHECK_EQ(b1.shape.verify_k, 0);
+    CHECK_EQ(b1.shape.verify_tokens, 2 * (1 + 0));
+    CHECK_EQ(b1.shape.history_tokens, b1.shape.verify_tokens);
+    CHECK_EQ(b1.shape.pipeline_depth, 1);
+    CHECK_EQ(b1.shape.prefill_tokens, 0);
+    CHECK(b1.shape.sampling == DraftSampling::Sampled);   /* the fixture's rows sample (temp 1.0) */
+    CHECK(b1.shape.replay == DraftReplay::None);
+    CHECK(b1.shape.drafter == DraftDrafter::Serial);
+
+    /* Cycle 2 does not establish its replay state (the harness has no tape): the default evidence
+     * must not be read as a measured None, so no bucket is filed and the refusal is counted. */
+    const size_t buckets_before = bs.size();
+    const int64_t ignored_before = f.sch.draft_costs().ignored();
+    f.commit(11, 0, [](const StepEntry&) { return 2; });
+    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+    f.sch.step_finished();                       /* no evidence at all */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets_before);
+    CHECK_EQ(f.sch.draft_costs().ignored(), ignored_before + 1);
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);     /* not an error: an unattributed sample */
+
+    /* Cycle 3 with one row leaving early. `a` is cancelled after the plan named it and before the
+     * step's commit; `b` still runs its full window, so the global round count reaches max_k --
+     * the sample must still be shortened, because the bracket timed one row less than the shape
+     * it would be filed under. */
+    const PlanCopy p3 = copy_plan(f.sch);
+    REQUIRE(p3.n_seq == 2);
+    CHECK(f.sch.cancel(a) >= 0);
+    f.commit(11, 0, [](const StepEntry&) { return 2; });
+    CHECK_OK(f.sch.set_draft(b, six, p3.at(b)));
+    f.sch.step_finished(live);
+
+    const int64_t dropped_before = f.sch.draft_cycles_dropped();
+    REQUIRE(f.sch.step() != nullptr);            /* cycle 4 opens: cycle 3 closes */
+    CHECK_EQ(f.sch.draft_cycles_dropped(), dropped_before + 1);   /* B never got a hole */
+    REQUIRE(f.sch.draft_costs().buckets().size() == buckets_before + 1);
+    const DraftCostBucket& b3 = f.sch.draft_costs().buckets()[buckets_before];
+    CHECK(b3.flags & kDraftSampleShortened);
+    CHECK_EQ(b3.rounds, p3.max_k);               /* the global count alone says "complete" */
+    CHECK_EQ(b3.draft_round_rows[1], 1);         /* one row per round actually ran */
+    CHECK_EQ(b3.shape.n_rows, 2);                /* the plan's count, unchanged */
+    /* A shortened bucket is a diagnostic, never a price. */
+    const DraftVerifyShape query = b3.shape;
+    DraftCostEstimate est;
+    CHECK_OK(f.sch.draft_costs().estimate(query, &est));
+    CHECK(!(est.valid && est.source == DraftCostSource::Measured));
+}
+
+/* A cycle whose step was never bracketed has no time and is refused, not filed at zero cost. */
+TEST(an_untimed_cycle_is_refused_by_a_rather_than_priced_at_zero) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+    activate_costs(f);
+
+    const uint64_t a = f.submit(160);
+    f.prefill(a);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    const int32_t k = copy_plan(f.sch).at(a);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, six, k));
+    /* Deliberately no step_finished(): the cycle has no bracket. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.draft_costs().buckets().empty());
+    CHECK_EQ(f.sch.draft_cost_refused(), 1);
+    CHECK(f.sch.draft_cycles_done() >= 1);       /* B's path is unaffected by A's refusal */
+}
+
 /* ------------------------------------------------------------------ the policy's hooks */
 /* Per request, the conditional acceptance at each draft position. Under the additive price below,
  * a row's optimum is the deepest draft whose survival probability still pays 0.05. */

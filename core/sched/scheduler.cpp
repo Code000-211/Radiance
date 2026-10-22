@@ -170,6 +170,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         r.ctx_class.assign((size_t)cfg.max_seqs, 0);
         r.history_tokens.assign((size_t)cfg.max_seqs, 0);
         r.seq.assign((size_t)cfg.max_seqs, DraftSeqObservation{});
+        r.sampled.assign((size_t)cfg.max_seqs, 0);
         r.state.assign((size_t)cfg.max_seqs, 0);
         r.plan.cap      = cfg.max_seqs;
         r.plan.req_id   = r.id.data();
@@ -1874,6 +1875,14 @@ void Scheduler::draft_ring_open(const DraftPlan& p) {
     r->active   = true;
     r->cycle_id = p.cycle_id;
     r->n_seq    = p.n_seq;
+    /* The bracket is not established yet: the step that owns this cycle has not even been built,
+     * and only step_finished() can say what it cost and what the tape did in it. */
+    r->timed           = false;
+    r->total_ms        = 0.0;
+    r->prefill_tokens  = 0;
+    r->admitted0       = m_.admitted;
+    r->replay          = DraftReplay::Unknown;
+    r->placed          = 0;
     /* Scalars first; the arrays below are the record's own storage and never move after init. */
     r->plan.cycle_id       = p.cycle_id;
     r->plan.policy_version = p.policy_version;
@@ -1887,7 +1896,7 @@ void Scheduler::draft_ring_open(const DraftPlan& p) {
     r->plan.fallback       = p.fallback;
     r->plan.probe          = p.probe;
     r->plan.replay         = p.replay;
-    r->plan.timing_valid   = p.timing_valid;
+    r->plan.timing_valid   = false;   /* the planner does not time; the bracket does */
     r->plan.prefill_tokens = p.prefill_tokens;
     for (int32_t i = 0; i < p.n_seq; ++i) {
         r->id[i]             = p.req_id[i];
@@ -1897,6 +1906,7 @@ void Scheduler::draft_ring_open(const DraftPlan& p) {
         r->fill[i]           = p.fill[i];
         r->ctx_class[i]      = p.ctx_class[i];
         r->history_tokens[i] = p.history_tokens[i];
+        r->sampled[i]        = draft_view_seq_[(size_t)i].sampling == DraftSampling::Sampled ? 1 : 0;
         r->seq[i]            = DraftSeqObservation{};
         r->state[i]          = 0;
     }
@@ -1985,14 +1995,21 @@ void Scheduler::draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen)
 /* The cycle is over: every row has reported or will never. Delivered at most once, and only when
  * every row of the plan is in the record -- a cycle missing a row is not a smaller observation, it
  * is a different one. The record is retired whatever the predictor answers: a refused observation
- * is a dropped cycle, not a retried one. */
+ * is a dropped cycle, not a retried one.
+ *
+ * A's sample asks a different question: it prices what RAN, so a row that left the cycle belongs
+ * in the measurement -- as kDraftSampleShortened, which keeps the bucket out of pricing -- while B
+ * still receives only a cycle without a hole. */
 void Scheduler::draft_ring_close(uint64_t cycle_id) {
     DraftCycleRecord* rp = draft_ring_cycle(cycle_id);
     if (!rp) return;
     DraftCycleRecord& r = *rp;
-    bool complete = r.n_seq > 0;
-    for (int32_t j = 0; j < r.n_seq && complete; ++j)
-        if (r.state[j] != 1) complete = false;
+    bool complete = r.n_seq > 0, resolved = r.n_seq > 0;
+    for (int32_t j = 0; j < r.n_seq; ++j) {
+        if (r.state[j] == 0) complete = resolved = false;
+        else if (r.state[j] == 2) complete = false;
+    }
+    if (resolved) draft_cost_observe(r);
     if (complete) {
         DraftObservation o;
         o.cycle_id       = r.cycle_id;
@@ -2024,6 +2041,88 @@ void Scheduler::draft_ring_close(uint64_t cycle_id) {
     }
     r.active = false;
     r.n_seq  = 0;
+}
+
+/* A's sample for one resolved cycle. The price is the cost of the distribution that RAN
+ * (draft_cost.h): `rounds`/`draft_round_rows` come from what each row published, the verify window
+ * from what each row actually verified. `shape.draft_k`/`draft_rows` stay the plan's -- provenance
+ * and the upper bound -- but they are not the key. */
+void Scheduler::draft_cost_observe(DraftCycleRecord& r) {
+    DraftCostSample s;
+    s.cycle_id       = r.cycle_id;
+    s.policy_version = r.plan.policy_version;
+    DraftVerifyShape& sh = s.shape;
+    sh.n_rows         = r.n_seq;
+    sh.ctx_class      = 0;
+    sh.draft_k        = r.plan.max_k;
+    for (int32_t j = 0; j <= RAD_SCHED_MAX_SPEC; ++j) sh.draft_rows[j] = r.rows[j];
+    sh.pipeline_depth = r.plan.pipeline_depth;
+    sh.prefill_tokens = r.prefill_tokens;
+    sh.replay         = r.replay;
+    s.replay          = r.replay;   /* A keys on the sample's, and requires the shape's to agree */
+    /* Every fill the policy produces is the serial head (draft_policy.cpp's finish()); the lookup
+     * fill is never published to the ring and so never names a row here. */
+    sh.drafter  = r.plan.k_ceiling > 0 ? DraftDrafter::Serial : DraftDrafter::None;
+    sh.sampling = DraftSampling::Greedy;
+    int32_t vk = 0;
+    for (int32_t i = 0; i < r.n_seq; ++i) {
+        if (r.sampled[i]) sh.sampling = DraftSampling::Sampled;
+        if (r.state[i] == 1 && (int32_t)r.seq[i].verified > vk)
+            vk = (int32_t)r.seq[i].verified;
+    }
+    /* A row that left did not verify, so only reported rows count here. n_rows stays the plan's
+     * (draft_shape_matches_plan pins it), which leaves a dropped row's bonus token overstated --
+     * the cycle carries Shortened and is never priced. */
+    sh.verify_k = vk;
+    for (int32_t i = 0; i < r.n_seq; ++i) {
+        if (r.state[i] != 1) continue;
+        for (int32_t j = 1; j <= (int32_t)r.seq[i].verified; ++j) ++sh.rows[j];
+    }
+    sh.verify_tokens = r.n_seq;
+    for (int32_t j = 1; j <= vk; ++j) sh.verify_tokens += sh.rows[j];
+    /* serial: one history row per verified position, plus the lead row. */
+    sh.history_tokens = sh.verify_tokens;
+
+    for (int32_t i = 0; i < r.n_seq; ++i)
+        if ((int32_t)r.seq[i].published > s.rounds) s.rounds = (int32_t)r.seq[i].published;
+    for (int32_t i = 0; i < r.n_seq; ++i)
+        for (int32_t j = 1; j <= (int32_t)r.seq[i].published; ++j) ++s.draft_round_rows[j];
+    for (int32_t j = 1; j <= s.rounds; ++j) s.draft_rows_total += s.draft_round_rows[j];
+    for (int32_t i = 0; i < r.n_seq; ++i) s.drafted += (int32_t)r.seq[i].generated;
+
+    if (r.timed) s.flags |= kDraftSampleValid;
+    /* The bracket timed less than the shape it would be filed under: the deepest planned round
+     * never ran, or a row left before its verify. The global round count alone cannot tell -- one
+     * row can leave while the deepest round still ran for the others. */
+    if (s.rounds < r.plan.max_k) s.flags |= kDraftSampleShortened;
+    for (int32_t i = 0; i < r.n_seq; ++i)
+        if (r.state[i] == 2) s.flags |= kDraftSampleShortened;
+    if (m_.admitted != r.admitted0) s.flags |= kDraftSampleAdmission;
+    if (r.placed) s.flags |= kDraftSamplePlacement;
+    if (r.replay == DraftReplay::Record) s.flags |= kDraftSampleRecord;
+    else if (r.replay == DraftReplay::Audit) s.flags |= kDraftSampleAudit;
+    s.total_ms = r.total_ms;
+
+    DraftObservation o;
+    o.cycle_id       = r.cycle_id;
+    o.policy_version = r.plan.policy_version;
+    o.n_seq          = r.n_seq;
+    o.cap            = r.plan.cap;
+    o.plan           = &r.plan;
+    o.req_id         = r.id.data();
+    o.slot           = r.slot.data();
+    o.slot_gen       = r.gen.data();
+    o.seq            = r.seq.data();
+    o.complete       = true;
+    const int rc = draft_costs_.observe(o, s);
+    if (rc < 0) {
+        if (!draft_cost_warned_) {
+            draft_cost_warned_ = true;
+            RAD_WARN("draft cost: cycle %llu not measured (%s); further refusals are counted only",
+                     (unsigned long long)r.cycle_id, rad_strerror(rc));
+        }
+        ++draft_cost_refused_;
+    }
 }
 
 /* ------------------------------------------------------------------ the next step */
@@ -2379,7 +2478,7 @@ int Scheduler::commit(const StepResult& res) {
  *
  * Host timing, always available. Per-op device timing adds synchronisations that change the
  * mover's slot supply, so profiled runs are not comparable (spec §16). */
-void Scheduler::step_finished() {
+void Scheduler::step_finished(const DraftStepEvidence& ev) {
     std::lock_guard<std::mutex> lk(mu_);
     if (step_start_.time_since_epoch().count() == 0) return;   /* no step has run */
 
@@ -2395,6 +2494,25 @@ void Scheduler::step_finished() {
             decode_floor_.update(ns);
             m_.step_ns_decode_best  = decode_floor_.best();
             m_.step_ns_decode_recent = decode_floor_.recent();
+        }
+    }
+    /* A's cycle bracket. This call is the only place that sees it: the ring's record is still
+     * open -- the verify reported at commit, the drafting published after it -- and `ns` covers
+     * the step and the draft rounds the engine ran after its commit. The plan's own copy stays
+     * timing_valid = false; this one is the timed record observe() will read. */
+    if (draft_.cost_policy()) {
+        if (DraftCycleRecord* r = draft_ring_cycle(draft_ring_cur_)) {
+            r->timed          = ns > 0;
+            r->total_ms       = (double)ns / 1e6;
+            r->plan.timing_valid = r->timed;
+            r->replay         = ev.replay_known ? ev.replay : DraftReplay::Unknown;
+            r->placed         = (ev.staged || ev.moved) ? 1 : 0;
+            r->prefill_tokens = 0;
+            for (const StepEntry& e : plan_.e)
+                if (e.is_prefill) r->prefill_tokens += e.n_tokens;
+            /* The plan keeps what it was priced on -- including the replay it declared -- and the
+             * sample's shape carries what ran (draft_cost_observe). Only timing_valid is the
+             * bracket's to say, because the planner cannot time its own cycle. */
         }
     }
 

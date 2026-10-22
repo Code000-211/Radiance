@@ -4,9 +4,12 @@ This is the working agreement for the adaptive-MTP work on Qwen3.8-Flash-Next, T
 AI PRO R9700. `spec.md` remains the binding design; this file records the internal seam (P00), the
 versioned profile and benchmark-manifest formats, the CLI names, and which files each strand owns.
 
-**Status: P00 only.** The contracts and their fakes exist and are tested on the host. No cost
-model, predictor, policy, flag or telemetry is wired into a running engine, and no M1/M2 or GPU
-result has been measured or is claimed here.
+**Status: host-wired, inactive by default.** The contracts, their fakes and the scheduler wiring
+exist and are tested on the host: B's predictor and A's cost table are both fed from the cycle
+ring, and the cost policy is opt-in (`--draft-policy cost`; the default stays `legacy`). Cost is
+still inactive without a configured profile -- `DraftCostTable::configure` is called by no
+deployment path yet, so every estimate takes its named fallback -- and the sample path only
+measures: it activates nothing. No M1/M2 or GPU result has been measured or is claimed here.
 
 ## The seam
 
@@ -184,9 +187,12 @@ prediction and sample.
   bucket it would otherwise name. `shortened` and the unpriced bucket (`kDraftBucketUnpriced`)
   stay **online diagnosis**: the profile format gets no name for either — a new format for
   diagnostic buckets is not needed — and neither is fed back as a regular measurement or used as
-  a fallback anchor. A truncated bracket prices nothing, not even another shape. The plan itself
-  is not rewritten afterwards to make `timing_valid` true; that field says the executing
-  path opened the bracket before the cycle's first work and closed it after its last.
+  a fallback anchor. A truncated bracket prices nothing, not even another shape. `timing_valid`
+  is the executing path's statement, never the planner's: the plan is issued with it false, and
+  only the cycle ring's record of that plan takes it from a bracket `step_finished()` closed --
+  one opened before the step's build and closed after its draft rounds. A cycle whose bracket
+  never opened or never closed keeps it false, and `observe` refuses that sample (`RAD_E_INVAL`)
+  rather than pricing it at zero; nothing flips the field afterwards to force a sample through.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.

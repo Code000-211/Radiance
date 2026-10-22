@@ -123,6 +123,17 @@ struct SchedReq {
     }
 };
 
+/* What the executing path did inside one step's cycle bracket. The engine sees the tape and the
+ * placement engines; the scheduler does not. `replay_known` stays false unless a caller that
+ * actually knows reports, so a state nobody established is Unknown rather than a measured None
+ * (draft_cost.h: the replay state is part of a sample's key). */
+struct DraftStepEvidence {
+    bool        replay_known = false;
+    DraftReplay replay       = DraftReplay::Unknown;
+    bool        staged       = false;  /* the trunk pass armed the pooled experts through the ring */
+    bool        moved        = false;  /* the placement engine promoted or demoted */
+};
+
 class Scheduler {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
@@ -296,8 +307,9 @@ public:
     int             commit(const StepResult& r);
     /* Ends the step for timing; call once per loop iteration that ran a step, after the drafter,
      * so the draft rounds are charged to the step (see the definition). Without it the counters
-     * stay correct but there is no timing. */
-    void            step_finished();
+     * stay correct but there is no timing. `ev` is what only the caller can see: the replay state
+     * the tape ran in and whether placement changed inside the bracket. */
+    void            step_finished(const DraftStepEvidence& ev = DraftStepEvidence{});
 
     /* ---------------------------------------------------- the serial drafter (spec §10)
      *
@@ -396,6 +408,12 @@ public:
      * state is meaningful only while the slot holds that (req_id, slot_gen). */
     int64_t draft_cycles_done() const { return draft_cycles_done_; }
     int64_t draft_cycles_dropped() const { return draft_cycles_dropped_; }
+    /* A's cost table -- what the cycle samples measured -- and how many samples its observe()
+     * refused. Read-only use is the step path's; a deployment (or a test) may configure the
+     * profile through the mutable form. */
+    const DraftCostTable& draft_costs() const { return draft_costs_; }
+    DraftCostTable&       draft_costs() { return draft_costs_; }
+    int64_t               draft_cost_refused() const { return draft_cost_refused_; }
     const DraftPredictState* draft_predict_state(int32_t slot) const {
         if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;
         return &draft_predict_state_[(size_t)slot];
@@ -558,10 +576,11 @@ private:
      * preempt/resume without the scheduler copying anything.
      *
      * A's table starts empty: no profile is loaded yet, so every estimate is invalid and the
-     * policy issues its named fallback. The sample path that would feed it is not wired --
-     * DraftCostTable::observe needs a per-cycle total_ms and the cycle's executed replay state,
-     * and the scheduler has neither today (DraftController::step_time measures a decode step for
-     * the adaptive window only). Named, not faked. */
+     * policy issues its named fallback. The sample that feeds it is the cycle ring's own record:
+     * step_finished() stamps the step bracket -- total_ms and the executed replay state the engine
+     * reports -- onto the open record, and draft_ring_close() hands that record to
+     * DraftCostTable::observe. The planner cannot time its own cycle, so the plan it produced
+     * says timing_valid = false; the ring's copy is the one the bracket makes valid. */
     DraftCostTable                 draft_costs_;
     DraftPredictModel              draft_predict_;
     std::vector<DraftPredictState> draft_predict_state_;
@@ -581,8 +600,17 @@ private:
         std::vector<int32_t>      ctx_class;
         std::vector<int32_t>      history_tokens;
         std::vector<DraftSeqObservation> seq;    /* one per plan row, accumulated */
+        std::vector<uint8_t>      sampled;       /* row i: its cycle sampled, not the argmax */
         std::vector<uint8_t>      state;         /* row i: 0 pending, 1 reported, 2 dropped */
         int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
+        /* The step bracket, filled by step_finished(). `timed` is the honest gate: a step that
+         * was never bracketed has no total_ms and cannot be a measurement. */
+        double   total_ms = 0.0;
+        int32_t  prefill_tokens = 0;             /* prefill tokens that shared the step */
+        int64_t  admitted0 = 0;                  /* m_.admitted at open, for the admission flag */
+        DraftReplay replay = DraftReplay::Unknown;
+        uint8_t  placed = 0;                     /* placement changed inside the bracket */
+        bool     timed = false;
         int32_t  n_seq = 0;
         uint64_t cycle_id = 0;
         bool     active = false;
@@ -596,6 +624,8 @@ private:
     int64_t          draft_cycles_done_ = 0;      /* observations the predictor accepted */
     int64_t          draft_cycles_dropped_ = 0;   /* incomplete, evicted or refused */
     bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
+    int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
+    bool             draft_cost_warned_ = false;
 
     void draft_ring_open(const DraftPlan& plan);
     DraftCycleRecord* draft_ring_cycle(uint64_t cycle_id);
@@ -604,6 +634,9 @@ private:
                            uint64_t raw_match);
     void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);
     void draft_ring_close(uint64_t cycle_id);
+    /* Hand one resolved record to A: the executed distribution, the verify window that ran, the
+     * step bracket and the evidence step_finished() stamped on it. */
+    void draft_cost_observe(DraftCycleRecord& r);
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
