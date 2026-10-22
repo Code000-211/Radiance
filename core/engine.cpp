@@ -1713,13 +1713,30 @@ int Engine::export_draft_cost_profile() {
     DraftCostProfile p;
     p.fingerprint = draft_calib_runtime_.fingerprint;
     p.execution   = draft_calib_runtime_.execution;
-    p.buckets.assign(sched_.draft_costs().buckets().begin(), sched_.draft_costs().buckets().end());
-    /* A run that measured no cycle (no request served, no serial round executed) must not leave a
-     * file a reader would take as a baseline: the writer refuses it too, but the reason belongs in
-     * the log rather than in a generic parse error. */
+    /* The fingerprint names the plan resolved at start. A bucket carrying kDraftSamplePlacement
+     * was measured while the mover was moving a unit (Scheduler::step_finished takes that from the
+     * rank's own move evidence), so its time is the cost of a residency this header does not
+     * name. The file has no field that could name the drifted residency, so those observations are
+     * left out -- only the affected ones: a clean cycle before the first move still measured the
+     * start plan and stays. */
+    int32_t placement = 0;
+    for (const DraftCostBucket& b : sched_.draft_costs().buckets()) {
+        if (b.flags & kDraftSamplePlacement) { ++placement; continue; }
+        p.buckets.push_back(b);
+    }
+    /* A run that measured no cycle (no request served, no serial round executed) -- or one whose
+     * every cycle was placement-affected -- must not leave a file a reader would take as a
+     * baseline: the writer refuses the empty one too, but the reason belongs in the log rather than
+     * in a generic parse error. */
     if (p.buckets.empty()) {
-        RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
-                "cycle, which is not a calibration", cfg_.draft_profile_out.c_str());
+        if (placement > 0)
+            RAD_ERR("--draft-profile-out '%s': all %d measured bucket(s) were placement-affected, "
+                    "so none describes the start residency the fingerprint names; a calibration "
+                    "needs cycles the mover did not disturb", cfg_.draft_profile_out.c_str(),
+                    (int)placement);
+        else
+            RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
+                    "cycle, which is not a calibration", cfg_.draft_profile_out.c_str());
         return RAD_E_INVAL;
     }
 
@@ -1734,6 +1751,10 @@ int Engine::export_draft_cost_profile() {
     if (skipped > 0)
         RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
                  "their flag)", skipped);
+    if (placement > 0)
+        RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) left out (a mover change "
+                 "inside the bracket; the fingerprint names the plan, not the drifted residency)",
+                 (int)placement);
     RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
              cfg_.draft_profile_out.c_str(), p.buckets.size(),
              draft_calib_runtime_.fingerprint.model.c_str(),

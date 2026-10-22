@@ -439,7 +439,12 @@ regenerated, never rescaled.
   fills it in the next) with the same executed distribution, and the file names both joined with
   `+` (`head+lookup`) instead of picking a sample or discarding the export. Diagnostic buckets
   whose flags the file cannot name (truncated and unpriced ones) are left out and counted in the
-  log.
+  log. A bucket measured while the mover was moving a unit (`kDraftSamplePlacement`) is left out
+  as well: the fingerprint names the plan resolved at start, the file has no field that could
+  name the residency the mover drifted to, and writing that bracket anyway would present it as a
+  price of the start placement. Only the affected buckets go -- a clean cycle before the first
+  move still measured the plan and is exported -- and a run whose every bucket was placement-
+  affected refuses the export instead of publishing a file that prices nothing.
 - **No cost policy without an admissible baseline.** `Scheduler::init` refuses
   `draft_policy = Cost` unless the cost table has a baseline for THIS runtime: `active()` (i.e.
   `configure()` matched a profile to this runtime's fingerprint) **and** a price it can actually

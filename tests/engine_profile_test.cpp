@@ -197,6 +197,82 @@ TEST(the_export_refuses_a_run_that_measured_no_bucket) {
     CHECK(!std::ifstream(path).good());
 }
 
+/* One bucket of the fingerprint above, `ctx` and `flags` being the only difference between the
+ * clean cycle and the one the mover disturbed. Origins are Verify provenance, one name per row. */
+std::string bucket_json(int ctx, const std::string& flags) {
+    return R"({
+        "ctx_class": )" + std::to_string(ctx) + R"(,
+        "shape": { "n_rows": 8, "verify_k": 3, "verify_tokens": 32, "history_tokens": 0,
+                   "prefill_tokens": 0, "pipeline_depth": 0,
+                   "rows": [0, 8, 8, 8], "draft_k": 3, "draft_rows": [0, 8, 8, 8],
+                   "origins": ["head", "head", "head", "head", "head", "head", "head", "none"],
+                   "sampling": "greedy", "replay": "play", "drafter": "serial" },
+        "extent": { "rounds": 3, "draft_rows_total": 24, "draft_round_rows": [0, 8, 8, 8] },
+        "time_ms": { "mean": 43.0, "unc": 0.6, "n": 5 },
+        "components_ms": { "target": 25.9, "draft": 12.1, "host": 4.2, "valid": true },
+        "flags": [)" + flags + R"(]
+    })";
+}
+
+std::string calibrated_profile(const std::string& buckets) {
+    return std::string(R"({
+      "format": "rad-draft-profile/3",
+      "fingerprint": {
+        "model": "tiny", "quant": "bf16", "tp": 1, "tp_wire": "n/a",
+        "gpus": "1x host dev=0 cu=1 vram=0", "kernels": "none", "kv_format": "bf16",
+        "placement": "all_vram vram=0 host=0 file=0 dyn=1 res=0000000000000000"
+      },
+      "execution": "rectangular",
+      "buckets": [)") + buckets + R"(]
+    })";
+}
+
+/* The fingerprint names the plan resolved at start. A bucket the mover disturbed was measured
+ * under a residency that plan does not describe, and the file has no field that could name the
+ * drifted one -- so that observation is left out of the calibration export, not written as if the
+ * cycle had run on the start placement. Only the affected bucket goes: the clean cycle before it
+ * still measured the plan and is exported. */
+TEST(the_export_leaves_out_the_bucket_the_mover_disturbed) {
+    const std::string out = radtest::tmp_path("engine_calib_placement.json");
+    Config cfg;
+    cfg.draft_profile     = write_case_file("engine_calib_placement_in.json",
+                                            calibrated_profile(bucket_json(0, R"("ahead")") + "," +
+                                                               bucket_json(1, R"("placement")")));
+    cfg.draft_profile_out = out;
+    Engine e(std::move(cfg));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    REQUIRE(EngineTestPeer::sched(e).draft_costs().active());
+    REQUIRE_EQ((int)EngineTestPeer::sched(e).draft_costs().buckets().size(), 2);
+
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    REQUIRE_EQ(EngineTestPeer::export_calibration(e), RAD_OK);
+
+    rad::DraftCostProfile written;
+    std::string err;
+    REQUIRE_EQ(rad::draft_cost_profile_read(out, &written, &err), RAD_OK);
+    REQUIRE_EQ((int)written.buckets.size(), 1);
+    CHECK_EQ(written.buckets[0].shape.ctx_class, 0);
+    CHECK_EQ((int)(written.buckets[0].flags & rad::kDraftSamplePlacement), 0);
+}
+
+/* And when every measured cycle was placement-affected there is nothing left that the header
+ * could describe: writing a file of diagnostics would hand a reader a profile that prices
+ * nothing. */
+TEST(the_export_refuses_a_calibration_whose_every_bucket_was_placement_affected) {
+    const std::string out = radtest::tmp_path("engine_calib_placement_only.json");
+    Config cfg;
+    cfg.draft_profile     = write_case_file("engine_calib_placement_only_in.json",
+                                            calibrated_profile(bucket_json(0, R"("placement")")));
+    cfg.draft_profile_out = out;
+    Engine e(std::move(cfg));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    REQUIRE_EQ((int)EngineTestPeer::sched(e).draft_costs().buckets().size(), 1);
+
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    CHECK_EQ(EngineTestPeer::export_calibration(e), RAD_E_INVAL);
+    CHECK(!std::ifstream(out).good());
+}
+
 TEST(the_export_of_an_unarmed_run_writes_nothing) {
     const std::string path = radtest::tmp_path("engine_calib_unarmed.json");
     Config cfg;
