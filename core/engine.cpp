@@ -84,6 +84,11 @@ extern "C" __attribute__((weak)) int64_t rad_test_tiering_moves(int rank, int32_
  * driver binds its one stop to this rather than to the signal handler's disposition, which is
  * installed before run() and so says nothing about whether a stop would survive. */
 extern "C" __attribute__((weak)) void rad_test_serving_ready(int port) { (void)port; }
+
+/* A placement move a fixture publishes while the engine idles, where no rank thread runs and no
+ * host plan can raise the heat counters: the engine's cumulative count adds it, so the move
+ * between two brackets can be replayed. tests/engine_cost_drift_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int64_t rad_test_residency_moves() { return 0; }
 #endif
 
 namespace rad {
@@ -439,6 +444,9 @@ int64_t Engine::residency_moves() const {
         const HeatStats hs = r->heat.stats();
         moves += (int64_t)hs.promotions + (int64_t)hs.demotions;
     }
+#ifdef RAD_TEST_HOOKS
+    moves += rad_test_residency_moves();
+#endif
     return moves;
 }
 
@@ -541,6 +549,11 @@ int Engine::step_loop() {
     while (!stopping_.load(std::memory_order_acquire)) {
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
+        /* The profile is bound to the residency the run started on. Read the cumulative evidence
+         * here -- the rank threads are parked at the barrier, so no rank writes -- and before the
+         * cycle below opens: the mover's idle tick publishes its move after step_finished, and a
+         * cycle priced before this read would be priced on the placement the run has left. */
+        sched_.draft_residency(residency_moves() - draft_moves_baseline_);
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
          * step ahead while a request waits, and a request with unencoded media waits. */
         if (!ahead && sched_.encodes_pending()) {
@@ -551,6 +564,13 @@ int Engine::step_loop() {
         ahead = nullptr;
         if (issued) sched_.promote_next();
         else        b = sched_.step();
+        /* A cycle whose policy ended on a residency drift is refused above; the run stops here,
+         * on the engine's existing error path, instead of drafting the rest of it at the ceiling. */
+        if (sched_.draft_cost_aborted()) {
+            RAD_ERR("draft cost: the residency no longer matches the profile; stopping instead of "
+                    "drafting at the ceiling");
+            return fail_loop(RAD_E_STATE);
+        }
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */

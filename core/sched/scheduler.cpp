@@ -1255,6 +1255,9 @@ const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
+    /* The cycle was refused (a drifted residency): nothing is planned, and the engine stops on the
+     * latch instead of letting the step run at the ceiling. */
+    if (draft_cost_aborted_) return nullptr;
 
     /* The drafter's snapshots describe the previous step and nothing reads them now. block_end()
      * and serial_end() normally clear them; this covers a drafter that stopped part way, so a
@@ -1934,6 +1937,20 @@ void Scheduler::draft_record_cycle() {
  * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
 void Scheduler::draft_cost_cycle() {
     if (!draft_.cost_policy()) return;
+    /* After a divergence there is no cycle this profile may price: it was measured on a placement
+     * the run has left. Opening the cycle anyway would leave draft_cap() at the ceiling, which is
+     * the implicit fallback the admission rule refuses at init; the cycle is refused and the next
+     * planning site reports it, so the engine ends the run on its error path. */
+    if (draft_drift_) {
+        if (!draft_cost_aborted_) {
+            draft_cost_aborted_ = true;
+            RAD_ERR("draft cost: %s; the cost run cannot price another cycle",
+                    draft_costs_.reason().empty()
+                        ? "the residency no longer matches the profile"
+                        : draft_costs_.reason().c_str());
+        }
+        return;
+    }
     /* Everything the last plan's rows will ever carry is in by now -- its verify at the paired
      * step's commit, its drafting from the publications after it -- and B should hold those labels
      * before it predicts this cycle. */
@@ -2447,8 +2464,11 @@ void Scheduler::promote_next() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!next_open_) return;
     /* The other place a cycle opens: the step issued ahead becomes current without step(). Its
-     * proposals were counted under the last cycle's D; the next ones are drafted under this one. */
+     * proposals were counted under the last cycle's D; the next ones are drafted under this one.
+     * A refused cycle (a drifted residency) leaves the ahead plan unexecuted: what it was planned
+     * under no longer describes the run, and the engine stops on the latch. */
     draft_cycle();
+    if (draft_cost_aborted_) return;
     std::swap(plan_, plan_next_);
     plan_next_.reset();
     step_prefill_tok_ = 0;
@@ -2686,6 +2706,35 @@ int Scheduler::commit(const StepResult& res) {
 }
 
 /* ------------------------------------------------------------------ the end of a step */
+/* The residency the profile was measured on, in one sticky decision. The evidence is cumulative
+ * since the profile was bound; a move between two brackets -- the scheduler's own ticks run after
+ * step_finished -- leaves no per-step stamp, so the engine hands the same count in before the next
+ * cycle opens (draft_residency). Requires mu_. */
+void Scheduler::draft_drift_note(int64_t moves_since_bind) {
+    if (moves_since_bind <= 0 || draft_drift_) return;
+    if (!draft_.cost_policy() && !draft_record_) return;
+    /* Sticky, because the run cannot move back to it: every later bracket is marked, and no
+     * measurement after the move describes the start residency however clean it looks. */
+    draft_drift_ = true;
+    if (draft_.cost_policy() && draft_costs_.active()) {
+        /* Fail closed: the loaded profile was measured on the start placement, so it stops
+         * pricing and stops learning. Not admit_fallback() -- drift is no admission to
+         * price without measurements, and the policy's own named baseline is not a substitute. */
+        draft_costs_.deactivate("residency drifted from the fingerprint's start placement");
+        RAD_WARN("draft cost: %s; the loaded profile stops pricing and learning",
+                 draft_costs_.reason().c_str());
+    } else if (draft_record_) {
+        RAD_WARN("draft cost: residency drifted from the fingerprint's start placement; "
+                 "no cycle recorded after this point describes it and the calibration "
+                 "cannot export a usable bucket");
+    }
+}
+
+void Scheduler::draft_residency(int64_t moves_since_bind) {
+    std::lock_guard<std::mutex> lk(mu_);
+    draft_drift_note(moves_since_bind);
+}
+
 /* Closes the step's timing after the drafter has run. The next step's drafter runs after commit,
  * the first moment its inputs exist, and its rounds are real forward passes; timed at commit they
  * would be charged to nothing, so step time would read short and `decode_tps` high. A caller that
@@ -2725,25 +2774,10 @@ void Scheduler::step_finished(const DraftStepEvidence& ev) {
         /* The profile's fingerprint names the residency the run started on. The move evidence the
          * rank froze covers the step's own bracket only; a move between two brackets -- the
          * scheduler's tier and arena ticks run after step_finished -- leaves no such stamp, so the
-         * engine reports the cumulative count since the profile was bound and once it diverges,
-         * every later bracket is marked: no measurement after the move describes the start
-         * residency, however clean it looks. Sticky, because the run cannot move back to it. */
-        if (ev.moves_since_bind > 0 && !draft_drift_) {
-            draft_drift_ = true;
-            if (draft_.cost_policy() && draft_costs_.active()) {
-                /* Fail closed: the loaded profile was measured on the start placement, so it stops
-                 * pricing and stops learning. Not admit_fallback() -- drift is no admission to
-                 * price without measurements, and the policy's own named baseline is what remain. */
-                draft_costs_.deactivate(
-                    "residency drifted from the fingerprint's start placement");
-                RAD_WARN("draft cost: %s; the loaded profile stops pricing and learning",
-                         draft_costs_.reason().c_str());
-            } else if (draft_record_) {
-                RAD_WARN("draft cost: residency drifted from the fingerprint's start placement; "
-                         "no cycle recorded after this point describes it and the calibration "
-                         "cannot export a usable bucket");
-            }
-        }
+         * engine reports the cumulative count since the profile was bound, both here and before
+         * each cycle open (draft_residency), and once it diverges every later bracket is marked:
+         * no measurement after the move describes the start residency, however clean it looks. */
+        draft_drift_note(ev.moves_since_bind);
         if (DraftCycleRecord* r = draft_ring_cycle(draft_ring_cur_)) {
             r->timed          = ns > 0;
             r->total_ms       = (double)ns / 1e6;

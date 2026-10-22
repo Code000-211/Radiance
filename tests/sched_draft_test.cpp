@@ -2469,6 +2469,245 @@ TEST(a_drifted_residency_stops_the_cost_policy_from_pricing_the_loaded_profile) 
     CHECK_EQ(f.sch.draft_costs().reason(),
              std::string("residency drifted from the fingerprint's start placement"));
     CHECK(!f.sch.draft_costs().fallback_admitted());
+
+    /* The next planning site must open no cycle at all. With the table inactive every price is
+     * "not priced", the planner would issue its named fallback at the ceiling, and the run would
+     * draft at a depth the profile never measured -- the implicit baseline the admission rule
+     * refuses. The open is refused instead, and the latch is what the engine ends the run on. */
+    CHECK(!f.sch.draft_cost_aborted());
+    const DraftPlan* before = f.sch.draft().plan();
+    REQUIRE(before != nullptr);
+    const uint64_t cycle_before = before->cycle_id;
+    CHECK(f.sch.step() == nullptr);
+    CHECK(f.sch.draft_cost_aborted());
+    /* No new plan was priced: the one in force is still the last cycle opened before the drift. */
+    REQUIRE(f.sch.draft().plan() != nullptr);
+    CHECK_EQ(f.sch.draft().plan()->cycle_id, cycle_before);
+    CHECK(f.sch.draft().plan()->source != DraftPlanSource::Fallback);
+    CHECK(!f.sch.draft_costs().fallback_admitted());
+    /* One-way: the next planning site is refused too, without a second cycle. */
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.draft().plan()->cycle_id, cycle_before);
+}
+
+/* B1's other half: the move is published between two brackets -- the scheduler's idle ticks run
+ * after step_finished -- so no bracket of the closing cycle carries it. The engine hands the
+ * cumulative count in before it opens the next cycle (Engine::step_loop's head, draft_residency),
+ * and that open is refused on the same sticky decision: no cycle priced on the start placement,
+ * and no fallback at the ceiling either. */
+TEST(a_cycle_opened_after_a_between_brackets_move_is_refused) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 6;
+    f.cfg.draft_policy  = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true);
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    f.sch.step_finished(live);                 /* the bracket's own evidence: no move */
+    REQUIRE(f.sch.draft_costs().active());
+
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    const uint64_t cycle = p->cycle_id;
+
+    /* The idle tick's move, reported where the engine reports it: before the next planning. */
+    f.sch.draft_residency(1);
+    CHECK(!f.sch.draft_costs().active());
+    CHECK_EQ(f.sch.draft_costs().reason(),
+             std::string("residency drifted from the fingerprint's start placement"));
+    CHECK(!f.sch.draft_cost_aborted());        /* noted, but no planning site has run yet */
+
+    CHECK(f.sch.step() == nullptr);
+    CHECK(f.sch.draft_cost_aborted());
+    CHECK(!f.sch.draft_costs().fallback_admitted());
+    REQUIRE(f.sch.draft().plan() != nullptr);
+    CHECK_EQ(f.sch.draft().plan()->cycle_id, cycle);   /* the refused open priced nothing */
+    CHECK(f.sch.draft().plan()->source != DraftPlanSource::Fallback);
+}
+
+/* The same refusal at the other planning site: a step issued ahead becomes current in
+ * promote_next(), which opens its cycle there. A drifted run must not execute that step under the
+ * old plan, and the ahead plan is left where it is. */
+TEST(a_promoted_step_after_a_between_brackets_move_is_refused) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 6;
+    f.cfg.draft_policy  = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true);
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.expect_draft(id, 6);
+    REQUIRE(f.sch.step_next() != nullptr);    /* the step issued ahead, with its own plan */
+
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    const uint64_t cycle = p->cycle_id;
+
+    f.sch.draft_residency(1);
+    f.sch.promote_next();
+    CHECK(f.sch.draft_cost_aborted());
+    CHECK(!f.sch.draft_costs().fallback_admitted());
+    /* The ahead plan was not made current, and nothing was priced after the drift. */
+    REQUIRE(f.sch.draft().plan() != nullptr);
+    CHECK_EQ(f.sch.draft().plan()->cycle_id, cycle);
+    REQUIRE_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(entry_of(f.sch, id)->n_spec, 0);   /* the ahead step (6) never became current */
+}
+
+/* ================================================================== the plan's edge cases */
+
+/* A row admitted after the cycle's view was built is not priced by that plan. The plan is the
+ * budget: a row it does not name drafts nothing this cycle, rather than falling back to the
+ * configured ceiling -- that would be a draft the cycle never priced. */
+TEST(a_row_admitted_after_the_cycle_opened_drafts_nothing_under_its_plan) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 6;
+    f.cfg.draft_policy  = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true);
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t a = f.submit(160);
+    pred.set(a, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(a);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    /* B arrives while A decodes: the next cycle's view is A only, and B is admitted afterwards,
+     * in the same step -- so it is in the step's plan and not in the cycle's. */
+    const uint64_t b = f.submit(160);
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy p = copy_plan(f.sch);
+    CHECK_EQ(p.at(a), 6);
+    CHECK_EQ(p.at(b), -1);                      /* the plan does not name B */
+    REQUIRE(entry_of(f.sch, b) != nullptr);     /* the step does carry it */
+    f.commit_plain(11);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    CHECK_OK(f.sch.set_draft(b, six, 6));
+    CHECK_EQ(f.sch.find(b)->n_draft, 0);
+}
+
+/* The ceiling is the run's, not the head's: a draft head declared deeper than
+ * --num-speculative-tokens can run must not be asked for rounds the step cannot verify. */
+TEST(a_head_deeper_than_the_ceiling_drafts_only_the_ceiling) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 2;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t two[2] = { 31, 32 };
+    CHECK_OK(f.sch.set_draft(id, two, 2));
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* e = entry_of(f.sch, id);
+    REQUIRE(e != nullptr);
+    CHECK_EQ(e->n_spec, 2);
+    f.commit_plain(11);
+
+    int rounds = 4;                              /* what the head could run */
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 2);                         /* the ceiling clamps the rounds */
+    CHECK_EQ(rows[0].seq, id);
+}
+
+/* The published extent may be shorter than the executed one: the step issued ahead was planned to
+ * verify three and the head still ran six rounds, so set_draft() cuts the publication to three and
+ * keeps what ran. The cycle keeps both -- its bucket prices six rounds and the verify it carried. */
+TEST(a_publication_cut_below_the_executed_rounds_keeps_the_executed_extent) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec        = 6;
+    f.cfg.draft_policy  = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.01f });
+    use_cost_policy(f, pred);
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;    /* what step_next() requires of a decode row */
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    /* Cycle A: the plan opens at six; its step verifies nothing (the prefill published nothing). */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(planned(f.sch, id), 6);
+    f.commit_plain(11);
+
+    /* The step issued ahead is planned to verify three; the head executes six. The publication is
+     * cut to the planned count, and the six rounds it ran stay with the cycle. */
+    f.sch.expect_draft(id, 3);
+    REQUIRE(f.sch.step_next() != nullptr);
+    CHECK_OK(f.sch.set_draft(id, six, 6));
+    CHECK_EQ(f.sch.find(id)->n_draft, 3);
+
+    /* A closes at the promote; the step now current verifies the three that were published. */
+    f.sch.promote_next();
+    REQUIRE(entry_of(f.sch, id) != nullptr);
+    CHECK_EQ(entry_of(f.sch, id)->n_spec, 3);
+    CHECK_OK(f.commit(11, 0, [](const StepEntry& e) { return e.n_spec; }));
+    CHECK_OK(f.sch.set_draft(id, six, 6));       /* six published under B ... */
+    f.sch.step_finished(live);
+
+    /* ... and the next open closes B: six rounds ran, three positions were verified. */
+    REQUIRE(f.sch.step() != nullptr);
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    const DraftCostBucket* hit = nullptr;
+    for (const DraftCostBucket& x : bs)
+        if (x.rounds == 6 && x.shape.verify_k == 3) hit = &x;
+    REQUIRE(hit != nullptr);
+    CHECK_EQ(hit->flags, 0);                     /* a complete measurement, not shortened */
+    CHECK_EQ(hit->draft_round_rows[6], 1);
+    CHECK_EQ(hit->draft_rows_total, 6);
+    CHECK_EQ(hit->shape.draft_k, 6);
+    CHECK_EQ(hit->shape.rows[1], 1);
+    CHECK_EQ(hit->shape.rows[3], 1);
+    CHECK_EQ(hit->shape.rows[4], 0);
+    CHECK_EQ(hit->shape.verify_tokens, 4);       /* one row, 1 + three verified positions */
 }
 
 RAD_TEST_MAIN()

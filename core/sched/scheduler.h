@@ -427,6 +427,15 @@ public:
      * so this is exactly what shutdown would have recorded, only earlier. */
     void flush_draft_observations();
     int64_t               draft_cost_refused() const { return draft_cost_refused_; }
+    /* The engine's cumulative residency evidence since the profile was bound, handed in before it
+     * opens the next cycle. Same sticky rule step_finished applies inside a bracket: a move the
+     * scheduler's own ticks publish between two brackets leaves no per-step stamp, and a cycle
+     * priced after it would be priced on a placement the run has left. */
+    void                  draft_residency(int64_t moves_since_bind);
+    /* Set when a cost cycle was refused because the residency drifted: the run has no profile it
+     * can price with, and the engine ends it on its error path rather than drafting at the ceiling.
+     * Not a fallback admission; the table stays inactive. */
+    bool                  draft_cost_aborted() const { return draft_cost_aborted_; }
     const DraftPredictState* draft_predict_state(int32_t slot) const {
         if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;
         return &draft_predict_state_[(size_t)slot];
@@ -664,6 +673,13 @@ private:
      * record opened after the divergence is marked placed, so no cycle measured on the drifted
      * placement can be priced or exported. */
     bool             draft_drift_ = false;
+    /* A cost cycle was refused after the drift: the run cannot price and must not fall back to the
+     * ceiling, so the next planning site reports it and the engine stops. One-way. */
+    bool             draft_cost_aborted_ = false;
+
+    /* The one sticky drift decision, shared by step_finished (the bracket that just closed) and
+     * draft_residency (before the next cycle opens). Requires mu_. */
+    void draft_drift_note(int64_t moves_since_bind);
 
     /* The row's label provenance (whose window the verify measured) is stamped at report time;
      * see draft_ring_report(). */

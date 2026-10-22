@@ -268,6 +268,20 @@ prediction and sample.
   learning, and it does not `admit_fallback()` -- drift is no admission to price without the
   measurement the deployment was admitted on. Calibration keeps recording so the drift is visible
   and counted, but every record after the move is marked and the export leaves them out.
+- **The online policy fails closed before the next planning, not inside the step it affects.**
+  `step_finished` is not the only place the count is read: the engine reports the same cumulative
+  evidence at the top of every `step_loop` iteration (`Scheduler::draft_residency`), before
+  `promote_next()`/`step()` open the next cycle. The scheduler's idle ticks run after
+  `step_finished`, so a move published there would otherwise be seen only by the cycle after the
+  one it priced. Once the divergence is noted under `cost`, `draft_cost_cycle()` refuses to open a
+  cycle at all: it sets a one-way latch (`draft_cost_aborted`), logs the deactivation reason, and
+  leaves the last plan in force. `step()` returns no plan and `promote_next()` leaves the step
+  issued ahead unexecuted; the engine then ends the run on its existing error path
+  (`Engine::fail_loop`), which stops the loop, aborts the barrier and calls `Scheduler::shutdown`
+  for the work already in flight. It does **not** fall back to the ceiling: with the table inactive
+  every price is "not priced", the planner's named fallback would draft at `cfg.n_spec`, and that
+  is the implicit baseline the admission rule refuses (docs above, `admit_fallback()`). Drift is a
+  stopped cost run, not a new policy and not a silent legacy run.
 - **A measurement is filed under the class the planner priced.** `draft_cost_observe` derives the
   shape's `ctx_class` as the deepest frozen row's, exactly `DraftPlanner::shape_of`; a constant
   (class 0, or the plan's per-row field) would file a long-context sample where no class-1 estimate
