@@ -11,26 +11,29 @@
  *    The first case pins that (green). Measured with the per-slot records removed locally, it goes
  *    red with `no_record` set and the fill stopping after four slots -- which is the review's
  *    premise, true of the pool as `init` sizes it, not of the pool a loan is filled from.
- *  - "turnover > 0". `Mover::fill_settled()` does not look at the reserved turnover slots, so an
- *    idle mover answers "materialised" while `turnover_slots` lent slots are empty.
+ *  - "turnover > 0". `Mover::fill_settled()` must not answer "materialised" while
+ *    `turnover_slots` lent slots are empty: the reserve is part of the start placement.
  *    Engine::start_placement_settled() reads exactly that answer, resolves there and freezes the
- *    drift exemption; the first regular step then fills the reserve and its promotions read as
- *    moves (measured: 2).
+ *    drift exemption; without the check the first regular step fills the reserve and its
+ *    promotions read as moves (measured on 8699a27: 2). The case pins the fixed answer.
  *  - "continuous requests". A serving engine has no idle tick between brackets and grows the loan
  *    after each of them (Engine::loan_tick(idle=false)). Mover::fill decides `initial` from
- *    `dispatches`, so the wave after the first observed bracket is not initial and reads as drift
- *    while the start fill is still running (measured: 16 of 24).
+ *    `dispatches`, so a wave issued after the first observation is not initial and counts as
+ *    drift. The third case separates the two: growth while the start episode is still open (zero
+ *    dispatches) is the start fill; growth after the first observation is a real move, as
+ *    `Engine::rank_fill_exempt` freezes the exemption at the resolve. There is no blanket
+ *    initial-fill exception for later growth (measured on 8699a27: 16 of 24).
  *
  * The fixture is the planner's own deployment (place_test.cpp's shape: a routed layer on the host
  * pool, the rest resident), a plain device allocation standing in for the KV carve, and the mover's
  * real fill/balance/idle_tick. Nothing here re-implements the fill: the cases assert on HeatStats,
  * MoverStats and Mover::fill_settled().
  *
- * No production file and no shared fixture is touched: this file is the whole change, and the glob
- * in tests/CMakeLists.txt picks it up with no list entry (it includes no engine.h). The
- * engine-level half -- step_loop reading start_placement_settled() with a real mover and a queue
- * rather than the weak seam -- needs an entry in RAD_TESTS_WITH_ENGINE and a rank with a plan; that
- * belongs to Integration 1.
+ * The glob in tests/CMakeLists.txt picks this file up with no list entry (it includes no engine.h).
+ * The engine-level half -- step_loop reading start_placement_settled() with a real mover and a
+ * queue rather than the weak seam -- is not here: a served dense host fixture plans every weight
+ * as static (the resolved weights budget covers statics), so it has no movable unit and never
+ * lends, and a MoE fixture the planner would tier is not available. That proof stays open.
  */
 #include "rad_test.h"
 
@@ -280,11 +283,11 @@ TEST(the_reserved_turnover_slots_keep_the_start_placement_unsettled) {
     /* Two lent slots are covered by the loan and empty: the placement is not materialised. */
     CHECK_EQ(r.h.stats().initial_fill_promotions, (uint64_t)(slots - 2));
 
-    /* THE INVARIANT. Today this answers true (fill_settled ignores the reserve), so
-     * Engine::start_placement_settled() resolves here and freezes the exemption at slots-2; the
-     * first regular step's two promotions then read as `moves(frozen)` = 2 (measured on 8699a27).
-     * With the reserve checked, the engine holds the prices until those slots are filled and
-     * freezes a count that covers them. */
+    /* THE INVARIANT. `fill_settled()` answers false until the working reserve is all that is
+     * free, so Engine::start_placement_settled() cannot resolve here and freeze the exemption at
+     * slots-2 -- which made the first regular step's two promotions read as `moves(frozen)` = 2
+     * on 8699a27. The engine holds the prices until those slots are filled and freezes a count
+     * that covers them. */
     CHECK(!r.m.fill_settled());
 
     /* The first regular step's fill (`balance(heat, turnover=false)`) fills the reserve. These are
@@ -318,26 +321,27 @@ TEST(the_reserved_turnover_slots_keep_the_start_placement_unsettled) {
 }
 
 
-/* The same episode with the loan still growing -- what a serving engine does: loan_tick grows the
- * loan in prefill-chunk steps after every bracket (core/engine.cpp:1006, `idle=false`, no
- * idle_tick), so a start loan larger than the first offer arrives in several waves. The second
- * request path is the point: `tiering_dispatch` observes before it balances (engine.cpp:297 vs
- * :330), so the wave after the first bracket is `initial=false` in Mover::fill, and
- * Engine::residency_moves keeps `initial_fill_promotions` as the exemption until the placement is
- * resolved. A start fill still in progress therefore reads as drift before anything has been
- * decided -- and the resolve itself is what the growing loan postpones.
+/* The multi-wave start fill, driven by the loan actually growing -- what a serving engine does:
+ * loan_tick grows the loan in prefill-chunk steps after every bracket (core/engine.cpp, `idle=
+ * false`, no idle_tick), so a start loan larger than the first offer arrives in several waves.
+ * The waves that arrive before the first observation are the start fill: every heat is zero, the
+ * units are the plan's own lent slots, and the amount is a function of the loan and the plan.
+ * Growth after the first observation is a heat decision and must stay distinguishable from that
+ * start episode: `Mover::fill` marks it `initial=false`, and `Engine::rank_fill_exempt` exempts
+ * only the initial count a resolve freezes, so it counts as a move. There is no blanket
+ * initial-fill exception for later growth.
  *
- * The case is the reviewer's "mehrwelliger Startfill" without the record premise: the pool is
- * sized per lent slot (see the first case) and the fill issues every free slot of the offer it is
- * given, so the waves here come from the offer growing, which is what production does. */
-TEST(a_fill_wave_after_the_first_bracket_is_still_the_start_placement) {
+ * No record premise here: the pool is sized per lent slot (see the first case), so the waves come
+ * from the offer growing, which is what production does. */
+TEST(loan_growth_is_the_start_fill_only_before_the_first_observation) {
     Rig r(/*n_expert*/ 64, /*strips*/ 8);
     REQUIRE_EQ(r.build(), RAD_OK);
     const int64_t slots = r.m.flex_capacity() / r.plan.classes[0].stride;
     REQUIRE(slots >= 8);
 
     /* A loan is measured per stretch, so a small offer still covers the top slot of every stretch:
-     * here it covers one of the three slots each holds. */
+     * one slot costs 272 tokens (a stride plus the alignment unit, in 16-token units), and here
+     * the stretches hold three slots each. */
     CHECK_OK(r.m.set_loan(Mover::kLendKV, 512));
     CHECK_OK(r.fill_now());
     const int64_t offered = (int64_t)r.h.stats().promotions;
@@ -345,20 +349,36 @@ TEST(a_fill_wave_after_the_first_bracket_is_still_the_start_placement) {
     REQUIRE(offered < slots);
     /* Before any observation this is the plan's own fill: initial by definition. */
     CHECK_EQ(r.h.stats().initial_fill_promotions, (uint64_t)offered);
+    CHECK(r.m.fill_settled());
 
-    /* The first bracket: the step routes, then the loan grows after it, as loan_tick does. */
+    /* The loan grows while the start episode is still open: the next wave covers the second slot
+     * of every stretch, still at zero dispatches. It is the same start fill, in a second wave. */
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, 768));
+    CHECK_OK(r.fill_now());
+    const int64_t covered = (int64_t)r.h.stats().promotions;
+    REQUIRE(covered > offered);
+    REQUIRE(covered < slots);
+    CHECK_EQ(r.h.stats().initial_fill_promotions, (uint64_t)covered);
+    CHECK(r.m.fill_settled());
+    CHECK_EQ(r.h.stats().moves((int64_t)r.h.stats().initial_fill_promotions), (int64_t)0);
+
+    /* The first bracket: the step routes. From here a fill is a heat decision. */
     std::vector<int32_t> counts((size_t)64, 0);
     counts[0] = 4;
     r.h.observe(0, counts.data(), (int32_t)counts.size());
     REQUIRE_EQ(r.h.stats().dispatches, (uint64_t)1);
+
+    /* The loan grows again after the bracket, as loan_tick does. This wave is not the start fill:
+     * it is later growth the exemption must not cover. */
     CHECK_OK(r.m.set_loan(Mover::kLendKV, r.loan.all()));
     CHECK_OK(r.fill_now());
-
     CHECK_EQ(r.h.stats().promotions, (uint64_t)slots);
-    /* Both waves are the start fill: the placement it materialises is the one the plan lent and
-     * the fingerprint names. Today the second wave is `initial=false` and reads as `offered`
-     * moves. */
-    CHECK_EQ(r.h.stats().moves((int64_t)r.h.stats().initial_fill_promotions), (int64_t)0);
+    CHECK_EQ(r.h.stats().initial_fill_promotions, (uint64_t)covered);
+    CHECK(r.m.fill_settled());
+    /* The start episode stays exactly the two zero-dispatch waves; the post-bracket wave reads as
+     * `slots - covered` moves, which is how a real later drift remains visible. */
+    CHECK_EQ(r.h.stats().moves((int64_t)r.h.stats().initial_fill_promotions),
+             (int64_t)(slots - covered));
 }
 
 RAD_TEST_MAIN()

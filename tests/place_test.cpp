@@ -1712,13 +1712,14 @@ TEST(the_start_fill_includes_the_turnover_slots) {
     int64_t issued = 0;
     for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) if (r.h.busy(u)) ++issued;
     CHECK_EQ(issued, slots - 2);
-    for (Deadline dl; !r.m.fill_settled() && !dl.passed();) {
+    for (Deadline dl; (r.h.stats().promotions < (uint64_t)(slots - 2) ||
+                       any_busy(r.h, r.hf.plan)) && !dl.passed();) {
         rad_stream_sync(r.m.transfer_stream());
         CHECK_OK(r.m.idle_tick(&r.h));
     }
-    /* Settled with the reserve still empty: the mover's own answer does not ask for the turnover
-     * slots, so the startup fill cannot stop at this call. */
-    CHECK(r.m.fill_settled());
+    /* Not settled with the reserve still empty: the turnover slots are part of the start
+     * placement, so the startup fill has to hold them and repeat rather than stop at this call. */
+    CHECK(!r.m.fill_settled());
     CHECK_EQ((int64_t)r.h.stats().promotions, slots - 2);
     CHECK_EQ(r.m.flex_used_bytes(), (slots - 2) * stride);
 

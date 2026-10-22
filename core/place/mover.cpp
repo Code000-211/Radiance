@@ -1369,6 +1369,14 @@ bool Mover::fill_settled() const {
      * published it has set the tier; the quarantine that follows guards issued kernels only. */
     for (const Move& m : moves_)
         if (m.state == Move::State::Copying && m.fill) return false;
+    /* The turnover slots are part of the start placement, and the idle balance keeps them free.
+     * Answering "materialised" with covered lent slots empty is what made
+     * Engine::start_placement_settled() resolve there and freeze the drift exemption before the
+     * reserve was filled: the first step's fill then read as moves. Complete_start_fill holds
+     * turnover to fill them; only a class whose free covered slots are down to its working
+     * reserve is settled. */
+    for (const ClassPools& cp : pools_)
+        if (cp.slab.n_free() > cp.n_work) return false;
     return true;
 }
 

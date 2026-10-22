@@ -285,19 +285,20 @@ prediction and sample.
 - **The start placement resolves once, and the fill that materialises it is exempt only before
   that.** A dynamic plan's fill promotes pooled units into slots the KV cache lends; the start
   placement is the plan plus that fill, so the profile may only be priced once the fill has
-  landed. `Mover::fill_settled()` says so: the fill has run since the loan and had nothing left to
-  issue, and no copy it issued is still landing. A plan that never fills is settled from the
-  start. The engine latches it (`Engine::start_placement_settled`,
-  `Engine::settle_start_placement`) only between two brackets, so a bracket is never stamped with
-  a placement it ran without: until the resolve, every record carries
-  `DraftStepEvidence::placement_unresolved` and is marked, and `DraftCostTable::hold_prices` makes
-  `estimate()` answer nothing, so the run executes its named baseline instead of pricing a
-  residency it has not reached. The idle branch is not the only read: a run under continuous load
-  may never take it, so `step_loop` reads the same predicate again after `publish(false)`, when the
-  bracket is closed and the rank threads are parked -- otherwise a fill that landed under load
-  would keep the prices held for as long as requests kept arriving. That mark is per bracket, not
-  sticky -- the first clean bracket after the fill has landed is a measurement of the start
-  placement again.
+  landed. `Mover::fill_settled()` says so: the fill has run since the loan, no covered lent slot
+  is free past the working reserve (the turnover slots are part of the start placement, and the
+  balance keeps them free until turnover is held), and no copy it issued is still landing. A plan
+  that never fills is settled from the start. The engine latches it
+  (`Engine::start_placement_settled`, `Engine::settle_start_placement`) only between two
+  brackets, so a bracket is never stamped with a placement it ran without: until the resolve,
+  every record carries `DraftStepEvidence::placement_unresolved` and is marked, and
+  `DraftCostTable::hold_prices` makes `estimate()` answer nothing, so the run executes its named
+  baseline instead of pricing a residency it has not reached. The idle branch is not the only
+  read: a run under continuous load may never take it, so `step_loop` reads the same predicate
+  again after `publish(false)`, when the bracket is closed and the rank threads are parked --
+  otherwise a fill that landed under load would keep the prices held for as long as requests kept
+  arriving. That mark is per bracket, not sticky -- the first clean bracket after the fill has
+  landed is a measurement of the start placement again.
 - **The initial fill is provably the plan's, not a heat decision.** `Mover::fill()` marks a
   promotion `initial` when it is issued before the first observation (`HeatStats::
   initial_fill_promotions`); at zero dispatches every heat is zero, so the units are taken by layer
