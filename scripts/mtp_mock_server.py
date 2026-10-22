@@ -14,8 +14,8 @@ Environment:
   MOCK_CHUNKS     content chunks per request (default 20)
   MOCK_GAP_MS     milliseconds between chunks (default 50)
   MOCK_FAIL       the N-th request answers 500 instead of streaming (default 0, never)
-  MOCK_JSON       "compact" (default) or "spaced": legal JSON with different spacing. Keys are
-                  deliberately in an order the runner does not assume.
+  MOCK_JSON       "compact" (default) or "spaced": legal JSON with different spacing, the
+                  top-level keys in the other order, and a quoted key inside the escaped content
   MOCK_PIDFILE    write this process's PID here once it is listening
   MOCK_BODY_LOG   append every request body here, one per line
 """
@@ -30,6 +30,9 @@ CHUNKS = int(os.environ.get("MOCK_CHUNKS", "20"))
 GAP = float(os.environ.get("MOCK_GAP_MS", "50")) / 1000.0
 FAIL_AT = int(os.environ.get("MOCK_FAIL", "0"))
 SPACED = os.environ.get("MOCK_JSON", "compact") == "spaced"
+# The spaced answer also puts a quoted key inside the content, escaped in the JSON. A byte-reading
+# client truncates that value at the escaped quote, and the chunk must still count as an arrival.
+TEXT = '{"text": "x"}' if SPACED else "x"
 PIDFILE = os.environ.get("MOCK_PIDFILE", "")
 BODY_LOG = os.environ.get("MOCK_BODY_LOG", "")
 
@@ -107,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                     seen["draft"] += 1
                     seen["acc"] += 1
                 self.chunk("data: " + dumps(
-                    {"choices": [{"index": 0, "text": "x"}]}) + "\n\n")
+                    {"choices": [{"index": 0, "text": TEXT}]}) + "\n\n")
                 time.sleep(GAP)
             # The usage line comes at the stream's end, after the window has closed.
             self.chunk("data: " + dumps(

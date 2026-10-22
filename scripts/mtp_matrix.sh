@@ -213,8 +213,9 @@ EOF
   chk "c: exit status is a failure"   "$?" 1
   chk "c: row unusable"               "$(awk 'NR == 2 {print $22}' "$rows")" 0
 
-  # F: the same good run, but every answer is legal JSON with different spacing and key order.
-  # The parser must not depend on how this mock happens to print.
+  # F: the same good run, but every answer is legal JSON with different spacing, the top-level keys
+  # in the other order, and a quoted key inside the escaped content. The client reads bytes, so it
+  # must neither mistake that content for the "text" key nor lose the chunk: the counts stay 600.
   MOCK_JSON=spaced MOCK_CHUNKS=300 MOCK_GAP_MS=20 RADIANCE="$HERE/mtp_mock_server.py" PORT=8130 \
     WIN=1 RAMP=20 SETTLE=1 "$SELF" "$d/manifest.json" > "$d/f.log" 2>&1
   chk "f: exit status"                "$?" 0
@@ -505,8 +506,6 @@ start_server() {   # $1 arm, $2 port
 
 metric() { curl -s -m 10 "$U/metrics" | grep -F "$1" | grep -v '^#' | awk '{print $NF}' | head -1; }
 
-now_us() { local t=${EPOCHREALTIME/[.,]/}; printf '%s' "$t"; }
-
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 # One streaming request. Records "send <us>", then one line per content chunk arrival, then
@@ -515,14 +514,19 @@ json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # to EOF rather than stopping at [DONE], so no chunk after the last one is lost and the status file
 # is always complete by the time it is read.
 stream_one() {   # $1 payload, $2 out file
-  printf 'send\t%s\n' "$(now_us)" > "$2"
-  local body rest v      # no process per chunk: this runs on the measured path
+  # EPOCHREALTIME read directly: a $(date) or a helper in a command substitution forks on the
+  # measured path, once per send and once per chunk.
+  local ts=${EPOCHREALTIME/[.,]/}
+  printf 'send\t%s\n' "$ts" > "$2"
+  local body rest v
   while IFS= read -r line; do
     case $line in
       'data: '*)
         body=${line#data: }
-        # JSON spacing and key order are the server's choice, so nothing matches a fixed
-        # substring beyond the key itself; only the value between the quotes is read.
+        # Not a JSON parser: it finds the key anywhere in the chunk and reads up to the next
+        # quote. That covers the two facts needed here -- a content arrival, a usage count.
+        # Limit: text carrying an escaped quote is truncated (only emptiness is decided); a
+        # server that stops sending a non-empty "text" per chunk needs a real parser.
         case $body in *'"completion_tokens"'*)
           rest=${body#*'"completion_tokens"'}
           rest=${rest#*:}
@@ -535,7 +539,10 @@ stream_one() {   # $1 payload, $2 out file
           v=${rest#*'"'}                  # past the opening quote of the value
           if [ "$v" = "$rest" ]; then v=  # no string value at all
           else v=${v%%'"'*}; fi           # up to its closing quote
-          [ -n "$v" ] && printf '%s\n' "$(now_us)" >> "$2" ;;  # empty delta: no arrival
+          if [ -n "$v" ]; then            # empty delta: no arrival
+            ts=${EPOCHREALTIME/[.,]/}
+            printf '%s\n' "$ts" >> "$2"
+          fi ;;
         esac
         ;;
     esac
@@ -577,11 +584,11 @@ run_window() {   # $1 arm $2 workload $3 conc $4 rep $5 dir
   local s0 d0 r0 a0 p0 t0 s1 d1 r1 a1 p1 t1 run
   s0=$(metric 'radiance:engine_steps_decode_total'); d0=$(metric 'radiance:decode_tokens_total')
   r0=$(metric 'radiance:draft_tokens_total');        a0=$(metric 'radiance:draft_accepted_total')
-  p0=$(metric 'radiance:prefill_tokens_total');      t0=$(now_us)
+  p0=$(metric 'radiance:prefill_tokens_total');      t0=${EPOCHREALTIME/[.,]/}
   sleep "$WIN"
   s1=$(metric 'radiance:engine_steps_decode_total'); d1=$(metric 'radiance:decode_tokens_total')
   r1=$(metric 'radiance:draft_tokens_total');        a1=$(metric 'radiance:draft_accepted_total')
-  p1=$(metric 'radiance:prefill_tokens_total');      t1=$(now_us)
+  p1=$(metric 'radiance:prefill_tokens_total');      t1=${EPOCHREALTIME/[.,]/}
   run=$(metric 'vllm:num_requests_running')
   local c_close=0
   [ "${run:-}" = "$c" ] && c_close=1
