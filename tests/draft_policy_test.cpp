@@ -380,9 +380,9 @@ TEST(the_controller_freezes_one_plan_per_cycle_and_keys_it_by_identity) {
     CHECK_EQ(dc.configure(dp), RAD_OK);
     CHECK(dc.cost_policy());
 
-    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    REQUIRE_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
     const DraftPlan* plan = dc.plan();
-    CHECK(plan != nullptr);
+    REQUIRE(plan != nullptr);   /* no plan means the rest of the case indexes nothing */
     CHECK_EQ(plan->cycle_id, 41u);
     CHECK_EQ(plan->n_seq, 2);
     const int32_t k0 = dc.planned_k(100, 0, 1);
@@ -399,8 +399,10 @@ TEST(the_controller_freezes_one_plan_per_cycle_and_keys_it_by_identity) {
 
     /* A new cycle is a new plan. */
     f.view.cycle_id = 42;
-    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
-    CHECK_EQ(dc.plan()->cycle_id, 42u);
+    REQUIRE_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    const DraftPlan* next = dc.plan();
+    REQUIRE(next != nullptr);
+    CHECK_EQ(next->cycle_id, 42u);
 }
 
 TEST(choose_is_deterministic_and_does_not_write_the_predictions) {
@@ -597,9 +599,9 @@ TEST(alternating_plans_are_read_per_request_and_never_mixed) {
     CHECK_EQ(dc.configure(dp), RAD_OK);
 
     f.view.cycle_id = 1;
-    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    REQUIRE_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
     const DraftPlan* p1 = dc.plan();
-    CHECK(p1 != nullptr);
+    REQUIRE(p1 != nullptr);
     CHECK_EQ(p1->k[0], 6);
     CHECK_EQ(p1->k[1], 2);
     CHECK_EQ(p1->k[2], 0);
@@ -623,9 +625,9 @@ TEST(alternating_plans_are_read_per_request_and_never_mixed) {
     rows.a[2] = 0.0f;
     rows.a[3] = 0.95f;
     f.view.cycle_id = 2;
-    CHECK_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
+    REQUIRE_EQ(dc.open_cycle(f.view, &f.pred), RAD_OK);
     const DraftPlan* p2 = dc.plan();
-    CHECK(p2 != nullptr);
+    REQUIRE(p2 != nullptr);
     CHECK_EQ(p2->cycle_id, 2u);
     CHECK_EQ(p2->n_seq, 4);
     CHECK_EQ(dc.planned_k(100, 0, 1), -1);   /* not in this cycle's plan at all */

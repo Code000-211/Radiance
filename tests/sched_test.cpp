@@ -1974,12 +1974,14 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     d2.observe(2, 5);                 /* accepted past the draft is clamped, not counted */
     CHECK_EQ(d2.accepted(), 2);
     CHECK_EQ(d2.drafted(), 802);
-    /* The raw tally outlives the end-of-generation cut: one committed, two compared. The clamp
-     * probe above contributes its two through `raw_match`'s documented default (a caller without
-     * the raw count reports its committed prefix), so the total is 4 and still >= accepted(). */
+    /* The raw tally is cumulative over the whole sequence: the 100 probes contribute 0 (raw
+     * defaults to the committed prefix, and none were committed), the clamp probe contributes its
+     * clamped 2, this call its 2 compared -- 4 in total, and still >= accepted() (3), because the
+     * end-of-generation cut shortens the commitment, not the tally. */
     d2.observe(2, 1, 2);
     CHECK_EQ(d2.accepted(), 3);
     CHECK_EQ(d2.raw_matches(), 4);
+    CHECK(d2.raw_matches() >= d2.accepted());
 
     /* Depth 0 is speculation off, and it configures. */
     DraftController d3;
