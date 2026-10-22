@@ -163,6 +163,31 @@ Driver g_driver;
  * ahead-shutdown case armed it, so the watermark case runs no drift. */
 std::atomic<int64_t> g_ahead_moves{0};
 
+/* The fixture, restored on the way into and out of a case that arms it. REQUIRE returns from the
+ * case body, so a reset written at the case's end runs only when every check passed; a failed one
+ * would leave `serving`, the trace or an injected move to the case after it. Declared after the
+ * case's Engine, so this runs before the engine it names dies. */
+struct FixtureScope {
+    FixtureScope() { reset(); }
+    ~FixtureScope() { reset(); }
+    FixtureScope(const FixtureScope&) = delete;
+    FixtureScope& operator=(const FixtureScope&) = delete;
+    static void reset() {
+        g_ahead_moves.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(g_driver.mu);
+        g_driver.engine        = nullptr;
+        g_driver.req_id        = 1;
+        g_driver.withheld      = false;
+        g_driver.serving       = false;
+        g_driver.submit_rc     = RAD_OK;
+        g_driver.trip_ahead    = false;
+        g_driver.ahead_tripped = false;
+        g_driver.model_passes.clear();
+        g_driver.trace.clear();
+        g_driver.ev.clear();
+    }
+};
+
 std::string trace_text_locked() {
     std::string s = "   step  rows  prior  reset  hist  withheld  watermark\n";
     for (const Rec& r : g_driver.trace) {
@@ -344,12 +369,13 @@ namespace {
  * boundary is the teardown sync in Ctx::shutdown (core/runtime/ctx.cpp), which this test cannot
  * see; that half stays a code-path claim, not a measured one.
  *
- * Order: this case must stay ahead of the watermark case below. Each starts its own engine in
- * this process; the watermark case ends by raising SIGTERM, and the watcher that answers it reads
- * a process-global flag run_server never clears (core/engine.cpp:2250, 3249). A second engine
- * started after that raise would find the flag already set, stop a transport that has not reached
- * its accept loop (a no-op), and then serve a server nothing can stop. This case raises no signal,
- * so it leaves the flag as it found it. */
+ * This case raises no signal: the stop comes from the aborted step loop. It used to have to stay
+ * ahead of the watermark case, which raises SIGTERM, because run_server never cleared the
+ * process-global flag the handler sets -- a later serve would read the earlier run's stop before
+ * its transport reached the accept loop, stop nothing, and serve a listener nothing could stop.
+ * That lifecycle is repaired (core/engine.cpp clears the flag per run; core/server/http.cpp
+ * remembers a stop that precedes its listener), and FixtureScope resets the driver on every path,
+ * so neither case depends on the other's cleanliness or on the order. */
 TEST(a_cost_drift_stop_leaves_the_step_issued_ahead_uncommitted_and_drains_it) {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
@@ -385,6 +411,9 @@ TEST(a_cost_drift_stop_leaves_the_step_issued_ahead_uncommitted_and_drains_it) {
     REQUIRE(rad::device_is_host());
 
     Engine e(std::move(cfg));
+    /* From here to the end of the case, every path -- including a REQUIRE's early return -- leaves
+     * the global driver clean for the case after this one. */
+    FixtureScope fixture;
     REQUIRE_EQ(e.start(), RAD_OK);
     {
         const nlohmann::json info = nlohmann::json::parse(EngineTestPeer::info(e));
@@ -521,21 +550,95 @@ TEST(a_cost_drift_stop_leaves_the_step_issued_ahead_uncommitted_and_drains_it) {
     CHECK_EQ(EngineTestPeer::sched(e).draft_costs().reason(),
              std::string("residency drifted from the fingerprint's start placement"));
     CHECK(!EngineTestPeer::sched(e).draft_costs().fallback_admitted());
+    /* The fixture reset that used to stand here moved to FixtureScope: this path is the one that
+     * reaches the end, and the failed ones had to leave the same state behind. */
+}
 
-    /* Leave the fixture as the case below expects to find it. It was written as the only case in
-     * this binary and so resets nothing itself: this run's records, its transport report and its
-     * injected move must not survive it. */
-    g_ahead_moves.store(0, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(g_driver.mu);
-        g_driver.trip_ahead    = false;
-        g_driver.ahead_tripped = false;
-        g_driver.withheld      = false;
-        g_driver.serving       = false;
-        g_driver.submit_rc     = RAD_OK;
-        g_driver.model_passes.clear();
-        g_driver.trace.clear();
-        g_driver.ev.clear();
+/* A second serve in the same process is a second stop lifetime.
+ *
+ * The SIGTERM that ended the first run is answered by a process-global flag. If run_server kept
+ * it, the second run's watcher would read the first run's stop before the second transport's
+ * accept loop exists, stop nothing, and then wait on a listener nothing can stop -- the call
+ * below would not return, and both bounded waits end this process as the failure that is. Both
+ * stops are real SIGTERMs, raised only after the engine reported its transport running, so the
+ * handler is in place and the first has completed before the second starts. The same engine
+ * serves twice: serve() builds its own threads and scheduler state, so this is the repeat, not a
+ * second engine.
+ *
+ * The driver is left detached -- the serving seam submits a request only when one is attached --
+ * so the case is about the stop lifetime, not about what a stopped run leaves in the scheduler.
+ * Its FixtureScope resets the driver on the way in and out, and no signal remains for the case
+ * after it. */
+TEST(a_second_serve_does_not_inherit_the_previous_runs_stop) {
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+    radtest::skip("this build has HIP; the case needs the host backend guaranteed at compile time "
+                  "(configure -DRAD_WITH_HIP=OFF)");
+    return;
+#endif
+    setenv("ROCR_VISIBLE_DEVICES", "99", 1);
+    setenv("RADIANCE_HOST_VRAM_MIB", "512", 1);
+
+    tiny::TempDir dir("engine_loop_serve_again");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+
+    Argv argv({ "--model", dir.path,
+                "--radiance-home", home(),
+                "--kernels", "libref",
+                "--debug-accept-reference-kernels",
+                "--num-speculative-tokens", "3",
+                "--draft-window", "fixed",
+                "--max-num-batched-tokens", "64",
+                "--host", "127.0.0.1",
+                "--port", "0" });
+    rad::Config cfg;
+    REQUIRE_EQ(rad::config_parse(argv.argc(), argv.argv.data(), &cfg), RAD_OK);
+    REQUIRE(rad::device_is_host());
+
+    Engine e(std::move(cfg));
+    FixtureScope fixture;
+    REQUIRE_EQ(e.start(), RAD_OK);
+
+    for (int run = 0; run < 2; ++run) {
+        {
+            std::lock_guard<std::mutex> lk(g_driver.mu);
+            g_driver.serving = false;
+        }
+        std::promise<int> served;
+        std::future<int>  done = served.get_future();
+        std::thread serve_thread([&] { served.set_value(e.serve(nullptr)); });
+
+        /* Nothing is signalled before the server is known to be running: a start failure and a
+         * stop inherited from the previous run both end this process here, with no stop sent. */
+        if (!wait_serving(done, std::chrono::steady_clock::now() + std::chrono::seconds(60))) {
+            const bool returned =
+                done.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+            std::fprintf(stderr, "engine_loop_test (serve again, run %d): the server never "
+                                 "reported a running transport%s, so no stop was sent:\n%s\n",
+                         run + 1, returned ? " (serve() returned first)" : " within 60 s",
+                         trace_text().c_str());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        if (done.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+            ::raise(SIGTERM) != 0) {
+            std::fprintf(stderr, "engine_loop_test (serve again, run %d): raise(SIGTERM) failed "
+                                 "although the server reported itself running and accepts a "
+                                 "stop:\n%s\n", run + 1, trace_text().c_str());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        if (done.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+            std::fprintf(stderr, "engine_loop_test (serve again, run %d): serve() did not return "
+                                 "within 60 s after the stop:\n%s\n", run + 1,
+                         trace_text().c_str());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        serve_thread.join();
+        CHECK_EQ(done.get(), RAD_OK);
     }
 }
 

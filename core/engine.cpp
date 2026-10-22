@@ -2375,6 +2375,10 @@ std::string request_overrides(const Config& c) {
  * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
  * IChatTemplate::apply. */
 int Engine::run_server() {
+    /* One serve is one stop lifetime. The handler below sets a process-global flag and a second
+     * serve() would otherwise read the previous run's stop before its own transport is listening:
+     * it would stop nothing, and then serve a listener nothing can stop. */
+    g_signalled.store(false, std::memory_order_relaxed);
     /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
      * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
      * hold the session table the sessions view reads. */

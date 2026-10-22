@@ -15,6 +15,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
+
 /* A loopback connection that gives up on a read after `timeout_s`, or -1. */
 static int dial(int port, int timeout_s) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -97,6 +102,43 @@ struct LiveServer {
         return send_all(fd, send) ? fd : -1;
     }
 };
+
+/* A stop requested before the listener runs is not lost.
+ *
+ * The engine stops the server from its watcher, which may run while the transport is still
+ * registering its routes; httplib's stop() only closes a listening socket and is a no-op before
+ * its accept loop. A transport that is asked to stop first (the same call, before run()) must
+ * return instead of serving a listener nothing can stop. Nothing here is timed: a stop that is
+ * dropped leaves run() blocked in the accept loop forever, and the bounded wait below is only
+ * how that failure is reported. */
+TEST(a_stop_before_the_listener_runs_is_remembered) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.host = "127.0.0.1";
+    o.port = 0;
+    o.n_threads = 2;
+    o.max_seqs = 2;
+    o.default_max_tokens = 32;
+    Server srv(d, o);
+
+    srv.stop();
+    std::promise<int> ran;
+    std::future<int> done = ran.get_future();
+    std::thread run([&] { ran.set_value(srv.run()); });
+    if (done.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        std::fprintf(stderr, "transport_test: run() did not return after a stop requested before "
+                             "the listener ran: the stop was dropped and the accept loop is "
+                             "waiting for one\n");
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    run.join();
+    CHECK_EQ(done.get(), RAD_OK);
+}
 
 /* The pool outgrows the admission ceiling. A generation holds its connection's worker while it
  * runs, so a pool no larger than the ceiling fills before admission refuses anyone: the 429 never
