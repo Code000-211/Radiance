@@ -292,13 +292,19 @@ that name their axes.
 
 ## Verifying P00 on the host
 
-**Compiler.** Every build and compiled test — P00 and strands A–F — uses the compiler the engine
-ships with, ROCm's clang at `${ROCM_PATH:-/opt/rocm}/llvm/bin/clang++` (the compiler `hipcc`
-drives). A system compiler is not a substitute; if the toolchain is missing, the blocker is
-reported rather than worked around. The intended entry point names it: `./build.sh` passes both
-compiler paths itself and refuses to configure without them, and the `default` CMake preset sets
-the same pair. Name it explicitly, in a build directory of its own so a differently compiled tree
-cannot be mistaken for this one:
+**Compiler.** Every build and compiled test — P00 and strands A–F — uses ROCm's clang 23: C at
+`/opt/rocm/llvm/bin/clang`, C++ at `/opt/rocm/llvm/bin/clang++`, HIP through
+`${ROCM_PATH:-/opt/rocm}/bin/hipcc`, which drives the same clang. The two `llvm/bin` spellings are
+not two toolchains: on the delivered ROCm 10.0.0 image `/opt/rocm/llvm/bin/{clang,clang++}` and
+`/opt/rocm/lib/llvm/bin/{clang,clang++}` all resolve to
+`/opt/rocm/core-10.0/lib/llvm/bin/clang-23` (one inode, `2103776`; sha256
+`241bf4da7ec39bc00b68ed74f6be751516d9892ed990e8c7fa372bad18500247`), and `hipcc --version` names
+the same `AMD clang version 23.0.0git (8f497e0…)`. ROCm clang 23 is the mandate; no ROCm 10.1
+requirement follows from it. A system compiler is not a substitute; if the toolchain is missing,
+the blocker is reported rather than worked around. The entry points name it: `./build.sh` passes
+both compiler paths itself and refuses to configure without them, and the `default` CMake preset
+sets the same pair. Name it explicitly, in a build directory of its own so a differently compiled
+tree cannot be mistaken for this one:
 
 ```bash
 /opt/rocm/llvm/bin/clang++ --version   # the proof: path and version beside the result
@@ -307,36 +313,48 @@ cannot be mistaken for this one:
 ctest --test-dir build-mtp-clang --output-on-failure -LE 'gpu|oot' -j 8
 ```
 
-The P00 result recorded on 2026-10-22 used `/opt/rocm/llvm/bin/clang++` (AMD clang 23.0.0git, ROCm
+**Build prerequisite, separate from P00.** A whole-tree clang 23 build needs branch
+`build/clang23-libavx` (from `cb5a69a`), which P00 does not contain:
+
+| Commit | What |
+|--------|------|
+| `dcb4e6f` | libavx: a duplicated `target` attribute, and a bf16 intrinsic in an OpenMP-outlined loop |
+| `c04006e` | `-Wl,--build-id`: kbench names a plugin by its ELF build-id note, which clang does not add itself |
+| `1ef93d2` | `core/device/aql.cpp`: prefer ROCm's `kfd_ioctl.h` (1.16) over the host kernel's 1.11 |
+
+That branch is reconciled with the `eval-main` handoff, not a parallel repair variant:
+`git diff dcb4e6f <eval-main> -- libavx` is empty, so the two libavx commits carry exactly
+eval-main's `8d46163` and `0bdecad`, and `1ef93d2` is eval-main's `ce42e4e` verbatim. The aql change
+is visible only in a HIP build (`RAD_WITH_HIP=OFF` compiles the translation unit out), so the host
+results below do not exercise it.
+
+**Result (2026-10-22).** Measured with `/opt/rocm/llvm/bin/clang{,++}` (AMD clang 23.0.0git, ROCm
 llvm-project `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed as ROCm 10.0.0), `-DRAD_WITH_HIP=OFF`,
-Ninja, `RelWithDebInfo`: the targeted suites `draft_types_test`, `sched_test`, `sample_test`,
-`runtime_test`, `config_test` pass 5/5 (`draft_types_test`: 310 checks over 23 cases), and the
-broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 98/104. Five of the six failures fail
-identically on `cb5a69a` with the same compiler and configuration; the sixth, `glm5next_test`,
-passes there at 9.3 s and crosses its 10 s CPU budget only under the broad run's parallel load (it
-passes again in the 94-test fast tier). None of them is caused by P00:
+Ninja and `RelWithDebInfo` (`-O2 -g -DNDEBUG`) on both sides — P00 plus the prerequisite above, and
+`cb5a69a` plus the same prerequisite:
 
-| Failure | Reason | Baseline `cb5a69a` |
-|---------|--------|--------------------|
-| `images_test` | 9 checks, HTTP 500: no FFmpeg on this host | same 500s |
-| `videos_test` | 8 checks, `encoding_failed` / 400: no FFmpeg | same |
-| `gbnf_test_shard3` | `json_schema_walks_write_only_valid_instances` (`gbnf_test.cpp:1857`) | same failure |
-| `gbnf_test_shard2` | CPU budget 31.5 s > 10 s, all 7 cases ok | 21.2 s > 10 s |
-| `tokenizer_test` | CPU budget 32.2 s > 20 s, all 23 cases ok | 25.7 s > 20 s |
-| `glm5next_test` | CPU budget 10.9 s > 10 s, all 16 cases ok | 9.3 s, passes |
+- The targeted suites `draft_types_test`, `sched_test`, `sample_test`, `runtime_test`, `config_test`
+  pass 5/5 (`draft_types_test`: 310 checks over 23 cases).
+- The broad host suite (`-LE 'gpu|oot'`, 104 tests) passes 97/104 on P00. The same suite on the
+  baseline tree registers 103 tests (`draft_types_test` is P00's) and passes 98/103. Exactly the
+  five failures below fail on both.
+- The two further broad-run failures on P00, `glm5next_test` (10.49 s CPU) and `quant_ggml_test`
+  (25.84 s CPU), pass individually on the same tree (7.83 s and 6.01 s) and passed in the baseline
+  broad run: they cross a wall-clock budget under the eight-way parallel run, not a check.
 
-The last three are wall-clock budgets under an eight-way parallel run on this host, not check
-failures; `glm5next_test` is the one that moved across the line and needs headroom, not a fix.
-None of the six touches `core/sched/`.
+The five, each run alone (`ctest -R '^<name>$' -j1`) with the same invocation on both trees:
 
-The whole-tree clang build needs the `build/clang23-libavx` commit first (the two kernel-source
-incompatibilities noted below); the broad run above was made with that patch applied to the
-working tree only, and P00 itself contains no libavx change.
+| Failure | P00 + prerequisite | `cb5a69a` + prerequisite |
+|---------|--------------------|--------------------------|
+| `gbnf_test_shard2` | 41715 checks over 7 cases in 20.94 s; `FAIL the binary spent 20.94 s of CPU, over its budget of 10 s (RAD_TEST_CPU_BUDGET)` | 41715 checks, 22.30 s CPU, same budget failure |
+| `gbnf_test_shard3` | `FAIL json_schema_walks_write_only_valid_instances`, `tests/gbnf_test.cpp:1857: CHECK(ok)`, `seed 69 wrote {"n":\x0a 91,"s":"bion\xf0\x85\xaa\x8d","t":\x0a[] }`; 1 failure | identical failure, same seed and output |
+| `images_test` | 9 failures, all `500 server_error: the picture could not be encoded: this build has no media decoder … (RAD_WITH_FFMPEG)` | same 9 failures |
+| `tokenizer_test` | 907 checks over 23 cases in 25.98 s; `FAIL the binary spent 26.04 s of CPU, over its budget of 20 s` | 907 checks, 30.89 s CPU, same budget failure |
+| `videos_test` | 8 failures: `tests/videos_test.cpp:238` `status` `"failed"` vs `"completed"`, `:239` `seconds` `"auto"` vs `"0.12"` | same 8 failures |
+
+None of the five touches `core/sched/`; the budget overruns above and the two load cases are this
+host's speed, not a check result. The earlier 99/104 and 98/104 figures were taken with
+`CMAKE_BUILD_TYPE` unset (an unoptimised build) and are superseded by the RelWithDebInfo runs
+above.
 
 The test binary is picked up by the existing `*_test.cpp` glob; no CMake edit is needed.
-
-The linker now states `--build-id` explicitly, which Debian's GCC driver passed by itself and
-clang's does not, so rad-kbench keeps a plugin identity whichever compiler links. The two libavx
-incompatibilities clang 23 has with GCC-built kernel sources (a duplicated `target` attribute and a
-bf16 intrinsic inside an OpenMP-outlined loop) are **not** part of P00; they are on branch
-`build/clang23-libavx` (commit `dcb4e6f`, from `cb5a69a`) and must land for a whole-tree clang build.
