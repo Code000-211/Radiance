@@ -117,9 +117,11 @@ TEST(a_k0_plan_bars_every_drafter_including_the_ngram_fallback) {
         CHECK(draft_plan_bars_fill(f.plan, i));
     }
 
-    /* A drafting plan names its filler; the fallback still may not take the request over. */
+    /* A drafting plan names its filler; the fallback still may not take the request over. At
+     * depth 0 it also verifies the window it drafts, so verify_k is the new max_k. */
     f.plan.k[0] = 2;
     f.plan.max_k = 2;
+    f.plan.verify_k = 2;
     f.plan.fill[0] = DraftDrafter::Serial;
     CHECK_EQ(draft_plan_rows(f.plan), RAD_OK);
     CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
@@ -781,6 +783,243 @@ TEST(a_cost_plan_without_a_cost_model_is_unsupported) {
 
     CHECK_EQ(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan),
              RAD_E_UNSUPPORTED);
+}
+
+TEST(an_identifying_plan_is_bounded_by_the_rows_it_was_sized_for) {
+    /* ASan repro: cap 1, n_seq 2. The plan's own capacity is checked before the identity loop, or
+     * the check that is meant to stop a stale row is the read past the caller's storage. The
+     * identity arrays here really are one row, so a regression is an ASan failure, not a diff. */
+    draft_fake::Fixture f;
+    f.add(0, 7);
+    f.add(1, 8);
+    draft_fake::Policy policy;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+
+    uint64_t req[1] = { 7 };
+    int32_t slot[1] = { 0 };
+    uint32_t gen[1] = { 1 };
+    f.plan.cap = 1;   /* the storage is one row; the plan claims two */
+    f.plan.req_id = req;
+    f.plan.slot = slot;
+    f.plan.slot_gen = gen;
+
+    uint64_t o_req[2] = { 7, 8 };
+    int32_t o_slot[2] = { 0, 1 };
+    uint32_t o_gen[2] = { 1, 1 };
+    DraftSeqObservation rows[2] = {};
+    DraftObservation obs;
+    obs.cycle_id = f.plan.cycle_id;
+    obs.policy_version = f.plan.policy_version;
+    obs.n_seq = 2;
+    obs.cap = 2;
+    obs.plan = &f.plan;
+    obs.req_id = o_req;
+    obs.slot = o_slot;
+    obs.slot_gen = o_gen;
+    obs.seq = rows;
+    obs.complete = true;
+
+    CHECK(!draft_plan_identifies(f.plan, obs));
+    CHECK(!draft_observation_deliverable(obs));
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+}
+
+TEST(the_delivery_and_attribution_gates_refuse_a_plan_that_fails_its_own_check) {
+    /* A plan whose max_k escapes its ceiling is not a cycle to learn from, however cleanly the
+     * observation names it. Identity says "these rows are this plan's"; the plan's own gate says
+     * "this plan could have been issued". Both are needed. */
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 3;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+
+    DraftSeqObservation row;
+    row.generated = 3; row.published = 3; row.verified = 3;
+    row.accepted = 2; row.checked = 3; row.raw_match = 2;
+    row.end = DraftSeqEnd::Rejected; row.origin = DraftOrigin::Head;
+    DraftObservation obs;
+    obs.cycle_id = f.plan.cycle_id;
+    obs.policy_version = f.plan.policy_version;
+    obs.n_seq = 1;
+    obs.cap = 1;
+    obs.plan = &f.plan;
+    obs.req_id = f.req_id;
+    obs.slot = f.slot;
+    obs.slot_gen = f.slot_gen;
+    obs.seq = &row;
+    obs.complete = true;
+
+    DraftCostSample sample;
+    sample.cycle_id = f.plan.cycle_id;
+    sample.policy_version = f.plan.policy_version;
+    sample.total_ms = 4.0;
+    sample.flags = kDraftSampleValid;
+
+    CHECK(draft_observation_deliverable(obs));
+    CHECK(draft_sample_attributable(obs, sample));
+
+    f.plan.k_ceiling = 1;   /* max_k 3 is now outside the ceiling it declared */
+    CHECK(draft_plan_identifies(f.plan, obs));
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL);
+    CHECK(!draft_observation_deliverable(obs));
+    CHECK(!draft_sample_attributable(obs, sample));
+
+    /* An unfinished cycle has no bracket to fold into a bucket either. */
+    f.plan.k_ceiling = 6;
+    obs.complete = false;
+    CHECK(!draft_sample_attributable(obs, sample));
+}
+
+TEST(an_origin_is_bounded_by_the_draft_budget_it_claims) {
+    /* `k[]` is the budget for every drafter, so the amount is part of the fit, not only the
+     * type: a head row that reports more proposals than its row was allowed is not this plan's
+     * work, and neither is one that claims the head while reporting none. */
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    draft_fake::Policy policy;
+    policy.legacy_k = 1;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+    CHECK_EQ(f.plan.k[0], 1);
+
+    DraftSeqObservation row;
+    row.generated = 1; row.published = 1; row.verified = 1;
+    row.accepted = 1; row.checked = 1; row.raw_match = 1;
+    row.end = DraftSeqEnd::AllAccepted; row.origin = DraftOrigin::Head;
+    CHECK(draft_seq_observation_valid(row));
+    CHECK(draft_origin_fits_plan(f.plan, 0, row));
+
+    row.generated = 2;   /* two proposals on a budget of one */
+    CHECK(draft_seq_observation_valid(row));
+    CHECK(!draft_origin_fits_plan(f.plan, 0, row));
+
+    row.generated = 0; row.published = 0; row.verified = 0;
+    row.accepted = 0; row.checked = 0; row.raw_match = 0;
+    CHECK(draft_seq_observation_valid(row));
+    CHECK(!draft_origin_fits_plan(f.plan, 0, row));   /* still Head: a row that produced nothing is None */
+    row.origin = DraftOrigin::None;
+    CHECK(draft_origin_fits_plan(f.plan, 0, row));
+
+    /* A count past the verify band is not a count, whatever the budget says. */
+    row.origin = DraftOrigin::Head;
+    row.generated = RAD_SCHED_MAX_SPEC + 1;
+    row.published = RAD_SCHED_MAX_SPEC + 1;
+    CHECK(!draft_seq_observation_valid(row));
+}
+
+TEST(the_end_of_the_checked_span_and_the_raw_match_are_one_statement) {
+    DraftSeqObservation o;
+    o.generated = 3; o.published = 3; o.verified = 3;
+    o.accepted = 1; o.checked = 2; o.raw_match = 1;
+    o.end = DraftSeqEnd::Rejected;
+    CHECK(draft_seq_observation_valid(o));
+    float label = -1.0f;
+    REQUIRE(draft_label(o, 1, &label));
+    CHECK_EQ(label, 0.0f);
+
+    /* The reviewer's repro: a rejection that says the draft matched. Accepting it would write a 0
+     * for a token the drafter got right; the classification and the tally must agree. */
+    DraftSeqObservation wrong_reject = o;
+    wrong_reject.raw_match = 2;
+    CHECK(!draft_seq_observation_valid(wrong_reject));
+
+    /* A matched stop is the one position past the prefix; two compared matches are neither a
+     * rejection nor a stop. */
+    DraftSeqObservation stopped;
+    stopped.generated = 3; stopped.published = 3; stopped.verified = 3;
+    stopped.accepted = 1; stopped.checked = 1; stopped.raw_match = 1;
+    stopped.end = DraftSeqEnd::Stopped;
+    CHECK(draft_seq_observation_valid(stopped));   /* censored before anything was compared */
+    stopped.raw_match = 2;
+    CHECK(draft_seq_observation_valid(stopped));   /* the EOG the target chose */
+    CHECK(!draft_label(stopped, 1, nullptr));       /* matched, not committed: no label */
+    stopped.raw_match = 3;
+    CHECK(!draft_seq_observation_valid(stopped));
+
+    /* raw_match counts matches among what was generated, not an independent tally. */
+    DraftSeqObservation over;
+    over.generated = 1; over.published = 1; over.verified = 1;
+    over.accepted = 1; over.checked = 1; over.raw_match = 64;
+    over.end = DraftSeqEnd::AllAccepted;
+    CHECK(!draft_seq_observation_valid(over));
+}
+
+TEST(the_verify_distribution_is_the_plans_own_when_nothing_is_issued_ahead) {
+    /* Nothing issued ahead: the plan drafts and verifies the same window, so its verify_k is its
+     * max_k and the shape it was priced on is the plan's own rows. */
+    draft_fake::Fixture f;
+    f.add(0, 1);
+    f.add(1, 2, 2);   /* two tokens left: one draft plus the bonus */
+    draft_fake::Policy policy;
+    policy.legacy_k = 2;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+    CHECK_EQ(f.plan.pipeline_depth, 0);
+    CHECK_EQ(f.plan.max_k, 2);
+    CHECK_EQ(f.plan.verify_k, 2);
+    CHECK_EQ(f.plan.rows[1], 2);
+    CHECK_EQ(f.plan.rows[2], 1);
+
+    DraftVerifyShape ok;
+    ok.n_rows = 2;
+    ok.verify_k = 2;
+    ok.rows[1] = 2; ok.rows[2] = 1;
+    ok.verify_tokens = 2 + 2 + 1;
+    ok.draft_k = 2;
+    ok.draft_rows[1] = 2; ok.draft_rows[2] = 1;
+    CHECK(draft_shape_priceable(ok));
+    CHECK(draft_shape_matches_plan(ok, f.plan));
+
+    /* The reviewer's repro: three empty verify rounds are not a measured zero, they are a missing
+     * shape. The token count is consistent, so only the deepest-round rule refuses it. */
+    DraftVerifyShape all_zero = ok;
+    all_zero.verify_k = 3;
+    all_zero.verify_tokens = 2;
+    CHECK(!draft_shape_priceable(all_zero));
+
+    /* A verify distribution from another K is priced, but it is not this plan's verify pass. */
+    DraftVerifyShape other = ok;
+    other.verify_k = 1;
+    other.rows[2] = 0;
+    other.verify_tokens = 2 + 2;
+    CHECK(draft_shape_priceable(other));
+    CHECK(!draft_shape_matches_plan(other, f.plan));
+
+    /* The plan gate holds the same binding: no plan verifies another K than it drafts here. */
+    f.plan.verify_k = 1;
+    const std::string log = stderr_of([&] { CHECK_EQ(draft_plan_valid(f.plan), RAD_E_INVAL); });
+    CHECK(has(log, "verifies"));
+    f.plan.verify_k = 2;
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+}
+
+TEST(an_ahead_plan_may_verify_a_different_k_than_it_drafts) {
+    /* Issued ahead, the verify pass belongs to the cycle the paired step verifies: verifying a
+     * different K than this plan drafts is the point, and both the plan gate and the shape check
+     * must leave it alone. */
+    draft_fake::Fixture f;
+    f.view.pipeline_depth = 1;
+    f.add(0, 1);
+    f.add(1, 2, 2);
+    draft_fake::Policy policy;
+    policy.legacy_k = 2;
+    REQUIRE(draft_fake::choose(&policy, f.view, f.pred, DraftCostModel{}, &f.plan) == RAD_OK);
+    CHECK_EQ(f.plan.pipeline_depth, 1);
+    CHECK_EQ(f.plan.max_k, 2);
+
+    f.plan.verify_k = 1;   /* the previous cycle verified one draft per row, not two */
+    CHECK_EQ(draft_plan_valid(f.plan), RAD_OK);
+
+    DraftVerifyShape s;
+    s.n_rows = 2;
+    s.verify_k = 1;
+    s.rows[1] = 2;
+    s.verify_tokens = 2 + 2;
+    s.draft_k = 2;
+    s.draft_rows[1] = 2; s.draft_rows[2] = 1;
+    s.pipeline_depth = 1;
+    CHECK(s.verify_k != s.draft_k);
+    CHECK(draft_shape_priceable(s));
+    CHECK(draft_shape_matches_plan(s, f.plan));
 }
 
 RAD_TEST_MAIN()

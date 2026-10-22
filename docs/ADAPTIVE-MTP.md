@@ -28,22 +28,28 @@ prediction and sample.
   owns, sized at `max_seqs` (requests) or `RAD_SCHED_MAX_SPEC` (draft positions). A whole hook call
   is allocation-free. Profile I/O and its buffers stay outside the step path.
 - **Arrays are bounded by `RAD_SCHED_MAX_SPEC` (64)**, libr4d's verify query-row band. K is
-  counted after the committed token; the first target is K = 0..6. `draft_plan_rows` and
-  `draft_plan_valid` refuse `n_seq > cap` before reading `k[]`, so a caller cannot make the
-  contract check read past the storage it sized.
+  counted after the committed token; the first target is K = 0..6. `draft_plan_rows`,
+  `draft_plan_valid` and `draft_plan_identifies` refuse `n_seq > cap` before they read `k[]` or the
+  identity arrays, so a caller cannot make a contract check read past the storage it sized -- the
+  identity check included, which is the one a delivery path calls on a plan it did not issue.
 - **A plan is immutable from issue until every pass it names is consumed.** `choose` writes it
   once; no other hook writes into it, and `observe` takes only const inputs. Historical plans stay
   identifiable while `issue_ahead()` uses them; the scheduler sizes its ring for the live cycles
   in advance, and a telemetry overflow drops and counts records rather than blocking the card.
-- **Lifecycle: Preempt → Recycle → Resume.** A plan and its observation live in the cycle ring,
-  keyed by identity, until the observation is delivered or abandoned. Preemption stops the work but
-  does not discard a cycle that already ran: its observation is delivered when `complete`.
-  Recycling a slot resets slot state but must not free or rewrite a plan or observation still in
-  flight; resume starts a new cycle with a new plan, and the old observation never merges into it.
-  Delivery is `draft_observation_deliverable`, which never consults the live slot — so a recycled
-  generation cannot drop a measured cycle — and refuses a row whose origin does not fit its plan.
-  The ring owns copies of `req_id`, `slot` and `slot_gen`; pointers into live slot state would
-  change identity under the observation.
+- **Lifecycle: Preempt → Recycle → Resume, as a predicate, not as storage.** P00 supplies the
+  *check*, `draft_observation_deliverable`, and the identity it applies; it does not supply a ring,
+  an owner, an allocation or a free. The cycle ring -- a plan and its observation kept alive until
+  the observation is delivered or abandoned, with copies of `req_id`, `slot` and `slot_gen` rather
+  than pointers into live slot state -- is **C's** to build and to prove. A copied `DraftPlan`
+  struct whose `req_id`/`slot`/`slot_gen` were copied but whose `k`, `fill`, `rows`, `ctx_class` and
+  `history_tokens` still point into the issuing caller's storage is not ownership of the plan: the
+  lifetime test does exactly that, so it exercises the predicate, and the doc claim stops here.
+  Preemption stops the work but does not discard a cycle that already ran: its observation is
+  delivered when `complete`. Recycling a slot resets slot state but must not free or rewrite a plan
+  or observation still in flight; resume starts a new cycle with a new plan, and the old observation
+  never merges into it. Delivery never consults the live slot -- so a recycled generation cannot
+  drop a measured cycle -- and refuses a row whose origin does not fit its plan, and a plan that
+  fails its own gate.
 - **Identity is `(cycle_id, policy_version, req_id, slot, slot_gen)`.** A recycled slot is another
   request, and `draft_plan_identifies(plan, observation)` is the check that the rows a hook is
   handed came from the plan they name — the observation carries both the identity arrays and the
@@ -58,8 +64,10 @@ prediction and sample.
 - **Origin is part of the cycle, not a side list.** `DraftPlan::fill[]` is the permission (who may
   spend `k[]`); `DraftSeqObservation::origin` is the fact (who produced the row: `Head`, `Lookup`
   or `None`). `draft_origin_fits_plan` refuses a lookup row behind a head budget, a head row behind
-  a lookup budget, and any proposal on a K0 row the plan barred — the K0/fallback leak. An
-  observation with no origin is not priced as head.
+  a lookup budget, any proposal on a K0 row the plan barred -- the K0/fallback leak -- and the
+  amount: `Head`/`Lookup` require `0 < generated <= k[i]`, so a row reporting more proposals than
+  its budget is not this plan's work, and a row that produced nothing is `None` whatever its budget
+  was. An observation with no origin is not priced as head.
 - **The current verify-K (`verify_k`) and the next draft-K (`max_k`) are separate fields:**
   reading one for the other is how a proposal from another generation leaks into a step.
 - **`k[]` is the budget for every drafter.** The plan names per request who may fill it (`fill[]`):
@@ -73,11 +81,15 @@ prediction and sample.
   `history_tokens > 0` is "policy K0 with history", not "no work".
 - **Verify distribution and planned draft distribution are separate keys.** `DraftVerifyShape`
   carries `rows[]` for the verify pass and `draft_rows[]`/`draft_k` for the draft rounds the plan
-  asks for; under `pipeline_depth > 0` they belong to different cycles. `rounds` plus one total
-  cannot tell two shrinking distributions apart, so `DraftCostSample` carries the executed
-  distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan` checks the planned
-  distribution against the plan's `k[]`; `draft_shape_priceable` requires both distributions to be
-  monotone and complete and `verify_tokens` to equal `n_rows + sum_j rows[j]`.
+  asks for; under `pipeline_depth > 0` they belong to different cycles and may name different K.
+  `rounds` plus one total cannot tell two shrinking distributions apart, so `DraftCostSample`
+  carries the executed distribution per round (`draft_round_rows[]`). `draft_shape_matches_plan`
+  checks the planned distribution against the plan's `k[]`; at `pipeline_depth == 0` it also binds
+  `verify_k` and `rows[]` to the plan, because nothing is issued ahead and the plan verifies the
+  window it drafts (`draft_plan_valid` binds `verify_k == max_k` there). `draft_shape_priceable`
+  requires both distributions to be monotone and complete, `verify_tokens` to equal
+  `n_rows + sum_j rows[j]`, and the deepest round of each to be non-empty: `verify_k > 0` with
+  `rows[verify_k] == 0` is a missing shape, not a measured zero.
 - **A missing measurement is not zero.** `DraftVerifyShape::unknown` names an absent history,
   prefill, replay or plan distribution; `draft_shape_priceable` refuses the shape, and the caller
   takes its named fallback. A zero is only a zero when it was measured as one.
@@ -88,7 +100,10 @@ prediction and sample.
   `max_tokens`, cancellation and the context end remain the `DraftCensor` reason; a censor does not
   erase a rejection measured before it. Raw match length, commit length, and the censor reason are
   separate fields, which is what lets F assert a correctly hit but uncommitted EOG without
-  inventing a reject label.
+  inventing a reject label. The length and the classification are still one statement:
+  `draft_seq_observation_valid` requires `raw_match == accepted` for `Rejected` and `AllAccepted`,
+  `raw_match ∈ {accepted, accepted + 1}` for `Stopped`, and `raw_match <= generated` always -- a
+  "rejection" whose own tally says the draft matched is refused, not labelled 0.
 - **The output budget includes the bonus token.** `remaining` counts the tokens the request may
   still emit, and the verify step always emits the target's bonus token after the accepted prefix.
   Drafts are therefore bounded by `remaining - 1` (`draft_budget_k`); with one token left the
@@ -101,7 +116,10 @@ prediction and sample.
   bracket, `kDraftSampleValid`, and no warmup, record, audit, admission or placement flag. A
   sample with `cycle_id = 0` is unattributed and never accepted; a non-finite or non-positive
   total is not a duration. Real DMA cost is routed away by its flag, not discarded as an outlier.
-  An `ahead` sample stays flagged so the model can weigh it.
+  An `ahead` sample stays flagged so the model can weigh it. The observation overload also requires
+  a completed cycle over a plan that passes `draft_plan_valid`: an unfinished cycle has no bracket
+  to fold in, and a plan that fails its own gate names no shape the sample could have been measured
+  under.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.
