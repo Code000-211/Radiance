@@ -33,9 +33,12 @@
  * so telemetry overflow never blocks the card.
  *
  * Units are milliseconds or nothing. A shape with no bucket is priced by one documented
- * interpolation step (the neighbouring context class) or by a heuristic fallback: the nearest
- * measured anchor scaled by the verify-token ratio plus a fixed margin. That margin is a rule of
- * thumb for preferring a bound over nothing, not a proven upper bound, and the estimate carries it
+ * interpolation step (the neighbouring context class) or by a heuristic fallback: a measured
+ * anchor that ran the same executed draft distribution, scaled by the verify-token ratio plus a
+ * fixed margin. The fallback scales verify work only -- it never prices draft work it has not
+ * measured, so a query planning more draft rounds than any bucket ran gets no number and the
+ * caller's named baseline instead of a shallower run's cost. That margin is a rule of thumb for
+ * preferring a bound over nothing, not a proven upper bound, and the estimate carries it
  * as uncertainty. With no anchor at all the estimate is invalid and the caller uses its named fixed
  * baseline. A unitless prior is never reported as milliseconds.
  *
@@ -145,9 +148,10 @@ constexpr double kDraftCostCtxStep = 0.10;
  * DraftCostEstimate::unc_ms, so the caller can see how much of the number is the rule. */
 constexpr double kDraftCostFallbackMargin = 0.25;
 
-/* Strand-A bucket flag, created online only: the sample was a truncation whose bracket no query
- * can express (observe()). Such a bucket is kept for diagnosis and never returned by estimate();
- * a profile file has no name for it and it is never written. */
+/* Strand-A bucket flag, created online only: the sample was a truncation -- the plan's deepest
+ * round never ran -- so its bracket carries the cost of stopping early and prices no plan.
+ * observe() keeps it for diagnosis and never returns it by estimate(); a profile file has no name
+ * for it and it is never written. */
 enum : uint16_t { kDraftBucketUnpriced = 1u << 15 };
 
 /* The profile in memory, plus the online updates from completed cycles. configure() copies the
@@ -178,9 +182,10 @@ public:
      * drafter included -- against the executed draft distribution: the query's
      * `draft_k`/`draft_rows[]` is the distribution it plans to execute, and only a bucket measured
      * at exactly that distribution prices it. A query that plans more than was ever measured gets
-     * no measurement, however close the bucket's plan was. Measured from an exact bucket,
-     * Interpolated from the neighbouring context class, or a heuristic fallback scaled from the
-     * nearest anchor. valid = false when there is no anchor at all. Allocation-free. */
+     * no measurement, however close the bucket's plan was; so does one with no anchor that ran its
+     * own distribution. Measured from an exact bucket, Interpolated from the neighbouring context
+     * class, or a heuristic fallback scaled from the nearest anchor that ran the same distribution.
+     * valid = false when there is no such anchor at all. Allocation-free. */
     int estimate(const DraftVerifyShape& shape, DraftCostEstimate* out) const;
 
     /* Learns from one completed cycle. Refuses an incomplete observation, one that does not
@@ -189,8 +194,9 @@ public:
      * own distribution or that is not priceable (an unknown dimension is refused, never priced as
      * zero), an executed distribution that could not have run or that exceeds the plan it took, and
      * a non-finite or non-positive time. Only an attributable sample updates a measured bucket; the
-     * rest are kept as diagnostics, and a truncation no query can express (drafts planned, none
-     * run) is stored with kDraftBucketUnpriced instead of seeding a measured bucket. */
+     * rest are kept as diagnostics, and a truncation -- the plan's deepest round never ran, so the
+     * bracket carries abort cost -- is stored with kDraftBucketUnpriced instead of seeding a
+     * measured bucket. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */

@@ -29,8 +29,9 @@ using json = nlohmann::json;
 /* The flags that make a bucket a diagnostic record rather than a measurement of normal
  * operation. kDraftSampleAhead is not here: an ahead sample is usable when the caller checked
  * its bracket, it only stays visible through n_ahead. kDraftBucketUnpriced is the online-only
- * record of a truncation no query can express (observe()), so it is a diagnostic in the same
- * sense and is excluded from pricing and from anchoring alike. */
+ * record of a truncation -- the plan's deepest round never ran, so the bracket carries abort cost
+ * (observe()) -- and is a diagnostic in the same sense: excluded from pricing and from anchoring
+ * alike. */
 constexpr uint16_t kDisturbing = kDraftSampleWarmup | kDraftSampleRecord | kDraftSampleAudit |
                                  kDraftSampleAdmission | kDraftSamplePlacement |
                                  kDraftBucketUnpriced;
@@ -550,16 +551,21 @@ int DraftCostTable::estimate(const DraftVerifyShape& s, DraftCostEstimate* out) 
     }
 
     /* 3. No bucket at all for this shape: a heuristic bound scaled from the nearest measured anchor
-     * of the same class, preferring one that ran this very extent. The ratio is never below 1, so
-     * the bound never prices a shape under a measured one, and the margin is reported as
-     * uncertainty rather than hidden -- it is a rule of thumb, not a proven upper bound. */
+     * of the same class *and the same executed draft distribution*. The ratio scales verify work
+     * only; it is never allowed to stand in for draft work, because the draft part is not linear in
+     * the verify window and a scaling factor for it would be a slope A has not measured. A query
+     * that plans more draft rounds than any bucket ran therefore gets no number at all -- the
+     * caller's named baseline -- instead of pricing the deeper plan at a shallower run's cost,
+     * which is what made the deepest tier win for free. The ratio is never below 1, so the bound
+     * never prices a shape under a measured one, and the margin is reported as uncertainty rather
+     * than hidden -- it is a rule of thumb, not a proven upper bound. */
     const DraftCostBucket* anchor = nullptr;
     int32_t anchor_rank = INT32_MAX;
     for (const DraftCostBucket& b : buckets_) {
         if (!bucket_usable(b) || !anchor_class_matches(b.shape, s)) continue;
+        if (!extent_same(b, s.draft_k, s.draft_rows)) continue;
         if (b.shape.verify_tokens <= 0) continue;
-        const int32_t rank = (extent_same(b, s.draft_k, s.draft_rows) ? 0 : 1000) +
-                             std::abs(b.shape.verify_k - s.verify_k);
+        const int32_t rank = std::abs(b.shape.verify_k - s.verify_k);
         if (rank < anchor_rank) {
             anchor = &b;
             anchor_rank = rank;
@@ -650,11 +656,14 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
     if (!active_) return RAD_OK;   /* no usable profile: nothing to learn into */
 
-    if (draft_sample_storable(sample) && plan->max_k > 0 && sample.rounds == 0) {
-        /* Drafts were planned and none ran: the bracket is a verify window plus an abandoned draft
-         * phase, not the price of any plan a query can name. A query with draft_k = 0 plans no draft
-         * work at all, so this bracket would overprice it as Measured. Kept for diagnosis, never
-         * priced -- estimate() and the anchor search both reject it. */
+    if (draft_sample_storable(sample) && sample.rounds < plan->max_k) {
+        /* The plan's deepest round never ran: the bracket is a verify window plus a draft phase
+         * that was cut short, and a cut-short phase carries the cost of stopping -- drain, rows in
+         * flight, discarded slots -- that a plan deliberately drawn at that extent would not pay.
+         * That holds after some rounds exactly as after none: a two-of-six run is not the price of
+         * a two-round plan. A is not told which stop was natural and which was an abort, so it
+         * prices neither. Kept for diagnosis, never priced -- estimate() and the anchor search
+         * both reject it. */
         record(sample, (uint16_t)(kDraftBucketUnpriced |
                                   (sample.flags & (kDisturbing | kDraftSampleAhead))));
         return RAD_OK;

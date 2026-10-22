@@ -426,13 +426,21 @@ TEST(a_missing_bucket_is_one_interpolation_or_a_named_bound) {
     CHECK(std::fabs(e.unc_ms - std::sqrt(0.6 * 0.6 + 4.3 * 4.3)) < 1e-9);
     CHECK_EQ(e.coverage, 7);
 
-    /* A deeper shape at the same class: a bound above the anchor, no coverage claimed. */
+    /* A deeper draft distribution at the same class: the anchor ran three rounds, the query plans
+     * six. A verify-token ratio cannot stand in for three unmeasured draft rounds, so there is no
+     * number here -- the named baseline -- and the deeper tier does not win by being free. */
     CHECK_EQ(t.estimate(query(0, 8, 6, { 0, 8, 8, 8, 8, 8, 8 }), &e), RAD_OK);
+    CHECK(!e.valid);
+    CHECK_EQ(e.ms, 0.0);
+
+    /* A bound is still available where only the verify side differs: same executed distribution,
+     * more history in the key. The ratio is 1 and the margin is the whole bound. */
+    CHECK_EQ(t.estimate(query(0, 8, 3, { 0, 8, 8, 8 }, 512), &e), RAD_OK);
     CHECK(e.valid);
     CHECK(e.source == DraftCostSource::ConservativeFallback);
     CHECK_EQ(e.coverage, 0);
-    CHECK(e.ms > 43.0);
-    CHECK(e.unc_ms > 0.0);
+    CHECK_EQ(e.ms, 43.0 * 1.25);
+    CHECK(std::fabs(e.unc_ms - std::sqrt(0.6 * 0.6 + 10.75 * 10.75)) < 1e-9);
 
     /* Two classes away with nothing measured between: no anchor, no number. */
     CHECK_EQ(t.estimate(query(3, 8, 3, { 0, 8, 8, 8 }), &e), RAD_OK);
@@ -531,15 +539,14 @@ TEST(a_shrinking_distribution_is_its_own_bucket_at_the_same_rounds_and_total) {
     CHECK(e.source == DraftCostSource::Interpolated);
     CHECK_EQ(e.ms, 26.0);
 
-    /* With only [3,1,1] measured, the other distribution must never borrow it as a measurement: at
-     * the same class it is a named bound, one class further there is no anchor and no number. */
+    /* With only [3,1,1] measured, the other distribution must never borrow it -- not as a
+     * measurement and not as a bound: at the same class the two distributions are two kernels, and
+     * the fallback scales verify work only, so there is no number at either class. That is what
+     * keeps an unmeasured deeper tier from being priced at a shallower one's cost. */
     DraftCostTable only_a;
     CHECK_EQ(only_a.configure(parse_or_fail(profile_text({ a })), runtime()), RAD_OK);
     CHECK_EQ(only_a.estimate(query(0, 4, 3, b_rows), &e), RAD_OK);
-    CHECK(e.valid);
-    CHECK(e.source == DraftCostSource::ConservativeFallback);
-    CHECK_EQ(e.coverage, 0);
-    CHECK_EQ(e.ms, 25.0);   /* 20.0 x (1 + 25 %), verify_tokens equal */
+    CHECK(!e.valid);
     CHECK_EQ(only_a.estimate(query(1, 4, 3, b_rows), &e), RAD_OK);
     CHECK(!e.valid);
 }
@@ -662,10 +669,11 @@ TEST(an_ahead_bucket_is_found_again_as_measured_through_its_plan) {
     CHECK(e.source != DraftCostSource::Measured);
 }
 
-TEST(a_short_execution_does_not_price_the_full_plan) {
-    /* The converse of the ahead case: a cycle may legally stop before its plan's deepest round,
-     * and that shorter run is its own measurement. A query for the full plan must not borrow it --
-     * that would price an execution nobody measured. */
+TEST(a_short_execution_is_not_the_price_of_a_short_plan) {
+    /* A cycle may legally stop before its plan's deepest round. Its bracket then carries the cost
+     * of stopping -- drain, rows in flight, discarded slots -- which a plan deliberately drawn at
+     * that extent would not pay. So it prices neither the full plan nor the shorter one: it is a
+     * diagnostic in both directions, not just when no round ran. */
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
     const DraftVerifyShape full = make_shape(0, 8, { 0, 8, 8, 8, 8 }, 0, -1, {}, 0);
@@ -680,45 +688,51 @@ TEST(a_short_execution_does_not_price_the_full_plan) {
     CHECK_EQ((int)t.buckets().size(), 1);
     CHECK_EQ(t.buckets()[0].rounds, 2);
     CHECK_EQ(t.buckets()[0].shape.draft_k, 4);   /* the plan stays as provenance and upper bound */
+    CHECK((t.buckets()[0].flags & kDraftBucketUnpriced) != 0);
 
     DraftCostEstimate e;
     CHECK_EQ(t.estimate(full, &e), RAD_OK);
-    CHECK(e.valid);
-    CHECK(e.source == DraftCostSource::ConservativeFallback);   /* a bound, not this run */
-    CHECK_EQ(e.coverage, 0);
-    CHECK_EQ(e.ms, 22.5);   /* 18.0 x (1 + 25 %): the heuristic margin, not a measurement */
+    CHECK(!e.valid);   /* nobody measured the full plan */
 
-    /* The other half of the finding: the run is not unreachable either. A query that plans the
-     * executed distribution -- the same verify window, two rounds of 8,8 -- is priced by its own
-     * measurement, not kept out by the plan the bucket was attributed against. */
+    /* And the run is not sold as the price of a two-round plan either: the abandoned tail is work
+     * this bracket paid and that plan would not. */
     const DraftVerifyShape short_plan = make_shape(0, 8, { 0, 8, 8, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
     CHECK_EQ(t.estimate(short_plan, &e), RAD_OK);
-    CHECK(e.valid);
+    CHECK(!e.valid);
+
+    /* A cycle that ran every planned round is priced as usual -- shrinking included, because the
+     * plan's deepest round did run. */
+    DraftCostSample full_run = sample_of(full, 24.0);
+    full_run.cycle_id = 2;
+    CHECK_EQ(t.observe(completed_cycle(plan_for(full, 2)), full_run), RAD_OK);
+    CHECK_EQ(t.estimate(full, &e), RAD_OK);
     CHECK(e.source == DraftCostSource::Measured);
-    CHECK_EQ(e.ms, 18.0);
+    CHECK_EQ(e.ms, 24.0);
     CHECK_EQ(e.coverage, 1);
 }
 
-TEST(a_truncated_or_shrinking_run_prices_the_query_that_plans_it) {
-    /* Q2-Q4 of the review. One planned K3 shape, two completed cycles: one stopped after two full
-     * rounds (31.0 ms), one ran all three rounds shrinking 8,5,2 (38.0 ms). Each is reachable by a
-     * query planning exactly what it ran, the plan's own deeper distribution is not, and the two
-     * are never averaged. */
+TEST(a_truncation_and_a_shrinking_run_are_told_apart) {
+    /* Q2-Q4 of the review, with the stop distinguished from the shrinking execution. One planned
+     * K3 shape, two cycles: one stopped after two full rounds (31.0 ms), one ran all three rounds
+     * shrinking 8,5,2 (38.0 ms). The shrinking run finished its plan, so it is the measurement of
+     * its own distribution; the stopped run is a diagnostic and prices nothing. */
     DraftCostTable t;
     CHECK_EQ(t.configure(parse_or_fail(profile_text({})), runtime()), RAD_OK);
     const DraftVerifyShape full = make_shape(0, 8, { 0, 8, 8, 8 }, 0, -1, {}, 0);
     const PlanFixture p = plan_for(full);
 
-    /* Q2: two of three rounds, both full. */
+    /* Q2: two of three rounds, both full -- cut short, so it carries abort cost. */
     CHECK_EQ(t.observe(completed_cycle(p), truncated(full, 2, 31.0)), RAD_OK);
 
     DraftCostEstimate e;
     CHECK_EQ(t.estimate(full, &e), RAD_OK);
-    CHECK(e.source == DraftCostSource::ConservativeFallback);   /* Q2's 38.75 */
-    CHECK_EQ(e.coverage, 0);
-    CHECK_EQ(e.ms, 31.0 * 1.25);   /* heuristic fallback over this very measurement */
+    CHECK(!e.valid);   /* not the plan's price, and no anchor to scale from */
+    const DraftVerifyShape two_rounds = make_shape(0, 8, { 0, 8, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
+    CHECK_EQ(t.estimate(two_rounds, &e), RAD_OK);
+    CHECK(!e.valid);   /* nor is it the price of a two-round plan */
 
-    /* Q3/Q4: the same shape, a third cycle that shrank 8,5,2 in three rounds. */
+    /* Q3/Q4: the same shape, a third cycle that shrank 8,5,2 in three rounds -- its plan's deepest
+     * round ran, so this is a real measurement of that distribution. */
     DraftCostSample shrinking = sample_of(full, 38.0);
     shrinking.cycle_id = 2;
     shrinking.draft_round_rows[2] = 5;
@@ -728,11 +742,7 @@ TEST(a_truncated_or_shrinking_run_prices_the_query_that_plans_it) {
     CHECK_EQ(t.observe(completed_cycle(p2), shrinking), RAD_OK);
     CHECK_EQ((int)t.buckets().size(), 2);   /* two executions, neither folded into the other */
 
-    const DraftVerifyShape two_rounds = make_shape(0, 8, { 0, 8, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
     const DraftVerifyShape shrunk = make_shape(0, 8, { 0, 8, 8, 8 }, 0, 3, { 0, 8, 5, 2 }, 0);
-    CHECK_EQ(t.estimate(two_rounds, &e), RAD_OK);
-    CHECK(e.source == DraftCostSource::Measured);
-    CHECK_EQ(e.ms, 31.0);
     CHECK_EQ(t.estimate(shrunk, &e), RAD_OK);
     CHECK(e.source == DraftCostSource::Measured);
     CHECK_EQ(e.ms, 38.0);
@@ -753,12 +763,10 @@ TEST(a_shorter_verify_window_is_not_sold_the_longer_runs_bracket) {
     DraftCostEstimate e;
     const DraftVerifyShape cheap = make_shape(0, 8, { 0, 8, 8 }, 0, 2, { 0, 8, 8 }, 0);
     CHECK_EQ(t.estimate(cheap, &e), RAD_OK);
-    CHECK(e.source != DraftCostSource::Measured);
-    CHECK_EQ(e.coverage, 0);
-    CHECK(e.ms >= 31.0);   /* the heuristic bound never prices under the measurement it scales */
+    CHECK(!e.valid);   /* the only run of that extent was cut short, so it is not an anchor */
 }
 
-TEST(a_truncation_no_query_can_express_is_kept_as_a_diagnostic) {
+TEST(a_truncation_is_kept_as_a_diagnostic_and_prices_nothing) {
     /* Drafts were planned and none ran: the bracket is a verify window plus an abandoned draft
      * phase. A K0 query plans no draft work, so recording this as a measured K0 bucket would
      * overprice it; the sample is kept flagged and prices nothing. */
