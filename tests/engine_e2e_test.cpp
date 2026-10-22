@@ -1954,13 +1954,15 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
  * reports the mover's own count (experts.flex_capacity, Mover::count_flex) and the startup line
  * names the slots it carved. Both are facts about the registration this start made.
  *
- * The reference twin that would show the same start registering nothing cannot be run today, so
+ * The reference twin that would show the same start registering nothing does not run today, so
  * this case pins the precondition it needs: --draft-reference requires --draft-profile-out
- * (core/engine.cpp:1922), which requires a serial draft head (core/engine.cpp:1951); the only arch
- * that declares conditional experts reaches at most a DFlash block drafter
- * (arch/common/rad_gemma4_dflash.h:628), and the plugin that has the serial head refuses any
- * checkpoint with experts (arch/gemma4_bf16/gemma4_bf16.cpp:1632). The discriminating pair stays
- * open until some deployment is both. */
+ * (core/engine.cpp:1922), which requires a serial draft head (core/engine.cpp:1951). gemma4 -- the
+ * only plugin these tiny checkpoints can reach that declares conditional experts -- has a DFlash
+ * block drafter at most (arch/common/rad_gemma4_dflash.h:628), and the plugin that carries the
+ * serial assistant head refuses any checkpoint with experts
+ * (arch/gemma4_bf16/gemma4_bf16.cpp:1632). An arch that is both routed and serial-drafted exists
+ * (qwen35_fp8's MTP, qwen4exp_fp8, glm5next), but no tiny fixture writes one. The discriminating
+ * pair stays open until a deployment is both. */
 TEST(the_live_start_offers_its_experts_a_positive_loan) {
     tiny::TempDir dir("moe");
     REQUIRE(dir.ok());
