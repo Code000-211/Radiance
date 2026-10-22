@@ -259,10 +259,12 @@ prediction and sample.
 - **The host backend cannot exercise the tape branches.** Only `core/device/aql.cpp` implements
   `tape_begin`; on the host every pass is unkeyed, so a host regression can prove the step binding
   of the frozen snapshot, the placement bit and the aggregation rule (`RuntimeTest` checks
-  `Ctx::merge_tape` over every class pair; `engine_step_test` files the rank thread's own notes
-  into an evidence slot -- a draft pass's `pass_tape`, a repeated note, the next step and a second
-  rank -- and reads `Engine::step_evidence`, so the slot merge and the cross-rank read are covered
-  without a tape transition; `engine_loop_move_test` checks that a move injected into
+  `Ctx::merge_tape` over every class pair; `engine_step_test` injects the notes a rank thread would
+  file (the peer calls `Rank::note_evidence` directly; no rank thread, device or `Ctx` pass runs)
+  into an evidence slot (a draft pass's `pass_tape`, a repeated note, the next step, a
+  shared slot and a second rank) and reads them back through `Engine::step_evidence`, so the slot
+  merge, the alias reset and the cross-rank read are covered without a tape transition;
+  `engine_loop_move_test` checks that a move injected into
   a sampler-only release is filed under the step that release names, on a drafter-free fixture
   where that release is the step's last one), not a real Play/Record/Audit transition. Those are
   covered by the `Ctx` contract and by fixtures that hand `step_finished` a replay state directly;

@@ -97,13 +97,15 @@ struct EngineTestPeer {
     /* The release kind a fixture's tiering hook answers for (Engine::issue_what_). */
     static constexpr int kIssueSampler = Engine::kIssueSampler;
 
-    /* One note into a rank's evidence slot, exactly as the rank thread files it after a pass
-     * (Rank::note_evidence), and the scheduler's cross-rank read (Engine::step_evidence). The rank
-     * exists for its slots alone: nothing here starts a device or a thread. */
+    /* One note into a rank's evidence slot: the exact call the rank thread makes after a pass
+     * (Rank::note_evidence), injected from the fixture because no rank thread, device or Ctx pass
+     * runs here. Ranks up to `rank` are created first: Engine::step_evidence dereferences every
+     * rank, as production fills ranks_ in order, so a fixture must not leave a null slot. */
     static void note_evidence(Engine& e, int32_t rank, const Ctx::StepEvidence& ev,
                               uint8_t pass_tape, bool moved) {
         if ((int32_t)e.ranks_.size() <= rank) e.ranks_.resize((size_t)rank + 1);
-        if (!e.ranks_[(size_t)rank]) e.ranks_[(size_t)rank] = std::make_unique<Engine::Rank>();
+        for (int32_t i = 0; i <= rank; ++i)
+            if (!e.ranks_[(size_t)i]) e.ranks_[(size_t)i] = std::make_unique<Engine::Rank>();
         e.ranks_[(size_t)rank]->note_evidence(ev, pass_tape, moved);
     }
     static bool step_evidence(Engine& e, int32_t step, DraftStepEvidence* out) {

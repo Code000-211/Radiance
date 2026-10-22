@@ -78,11 +78,13 @@ set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core
 # core/engine.h declares only under RAD_TEST_HOOKS. A friend is part of the class definition, so
 # every unit of a link that includes core/engine.h has to be compiled with the macro together --
 # that is why these units are built a second time here instead of defining it on the test alone.
-# The set of such units is exactly this list: engine.h is included by engine_priv.h (which only
-# these nine include), by core/main.cpp (the radiance binary, which never links this archive) and
-# by engine_step_test.cpp, engine_loop_test.cpp and engine_history_test.cpp (all three compiled
-# with the macro). A unit that starts including engine.h must join this list, or one program
-# would hold both definitions. Re-check with
+# The set of such units is exactly this list: engine.h is included by engine_priv.h (included by
+# these nine engine units, and by tests/engine_test_peer.h for Engine::Rank), by core/main.cpp (the
+# radiance binary, which never links this archive) and by the four tests in RAD_TESTS_WITH_ENGINE --
+# engine_step_test.cpp, engine_loop_test.cpp and engine_history_test.cpp directly,
+# engine_loop_move_test.cpp through engine_test_peer.h. All four are compiled with the macro. A
+# unit that starts including engine.h must join this list, or one program would hold both
+# definitions. Re-check with
 #   grep -rn '#include[[:space:]]*"\(core/\)\?engine\.h"' --include=*.cpp --include=*.h core tests
 # rad_core keeps its own, hook-free copies and is never asked for them: this archive goes in whole
 # and before it. Only the tests in RAD_TESTS_WITH_ENGINE link it, so no other test pays for the

@@ -90,9 +90,10 @@ TEST(engine_step_does_not_clear_a_previous_completion) {
 /* The scheduler reads one DraftStepEvidence per step from the ranks' evidence slots. The rank
  * thread notes every pass of the step's bracket into the same slot, so this is the aggregation the
  * reader depends on: a draft pass's tape must count as the step's, repeated notes must not lose the
- * strongest class, and the next step must not inherit anything. No card is involved -- the notes
- * are the exact calls the rank thread makes (Rank::note_evidence) and the read is
- * Engine::step_evidence. */
+ * strongest class, the next step must not inherit anything, and a slot shared by two steps must not
+ * answer for the older one. No card is involved: the notes are the exact calls the rank thread
+ * makes (Rank::note_evidence), injected through the test peer because no rank thread runs here, and
+ * the read is Engine::step_evidence. */
 TEST(engine_step_evidence_merges_a_steps_passes_and_isolates_the_next) {
     Engine e(rad::Config{});
     using Ctx = rad::Ctx;
@@ -151,6 +152,30 @@ TEST(engine_step_evidence_merges_a_steps_passes_and_isolates_the_next) {
     REQUIRE(EngineTestPeer::step_evidence(e, 6, &ev6));
     CHECK(ev6.replay == rad::DraftReplay::None);
     CHECK(!ev6.staged);
+
+    /* A step no rank noted is a pure miss: step 8's slot holds nothing, so the read returns false
+     * and leaves the caller's evidence at its default -- Unknown, never a measured None
+     * (core/engine.cpp:908 resets it for exactly this case). */
+    rad::DraftStepEvidence miss;
+    CHECK(!EngineTestPeer::step_evidence(e, 8, &miss));
+    CHECK(!miss.replay_known);
+    CHECK(miss.replay == rad::DraftReplay::Unknown);
+
+    /* Slot aliasing: 5 and 9 share slot 1 (step & 3). The note for 9 replaces the slot, and the
+     * read for 5 afterwards is a miss -- not 9's facts answered under the old step number. */
+    Ctx::StepEvidence s9{};
+    s9.step = 9;
+    s9.tape = Ctx::kStepTapeNone;
+    EngineTestPeer::note_evidence(e, 0, s9, Ctx::kStepTapeNone, /*moved=*/false);
+    rad::DraftStepEvidence ev9;
+    REQUIRE(EngineTestPeer::step_evidence(e, 9, &ev9));
+    CHECK(ev9.replay_known);
+    CHECK(ev9.replay == rad::DraftReplay::None);
+    CHECK(!ev9.staged);
+    CHECK(!ev9.moved);
+    rad::DraftStepEvidence stale5;
+    CHECK(!EngineTestPeer::step_evidence(e, 5, &stale5));   /* the slot now names step 9 */
+    CHECK(!stale5.replay_known);
 }
 
 RAD_TEST_MAIN()
