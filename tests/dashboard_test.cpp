@@ -236,17 +236,19 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     json dc = d.get("/stats")["draft_cost"];
     CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)1);
     CHECK_EQ(dc.value("no_plan", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("empty", (int64_t)0), (int64_t)0);
     CHECK(!dc.contains("last_k"));
     CHECK(!dc.contains("last_replay"));
     CHECK(!dc.contains("last_source"));
     CHECK(!dc.contains("last_fallback"));
 
-    /* The last plan: all four dimensions by name, and the three ends summing to the cycles. */
+    /* The last plan: all four dimensions by name, and the ends summing to the cycles. */
     d.sched.m.draft_cost_cycles      = 4;
     d.sched.m.draft_cost_no_plan     = 0;
     d.sched.m.draft_cost_priced      = 3;
     d.sched.m.draft_cost_fallback    = 1;
     d.sched.m.draft_cost_last_k      = 2;
+    d.sched.m.draft_cost_last_rows   = 6;
     d.sched.m.draft_cost_last_source = 1;   /* DraftPlanSource::Cost */
     d.sched.m.draft_cost_last_fallback = 2; /* DraftFallback::UnknownShape */
     const char* names[] = { "unknown", "none", "play", "record", "audit" };
@@ -257,12 +259,33 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
         CHECK_EQ(dc.value("priced", (int64_t)0), (int64_t)3);
         CHECK_EQ(dc.value("fallback", (int64_t)0), (int64_t)1);
         CHECK_EQ(dc.value("last_k", (int64_t)0), (int64_t)2);
+        CHECK_EQ(dc.value("last_rows", (int64_t)0), (int64_t)6);
         CHECK_EQ(dc.value("last_replay", std::string()), std::string(names[r]));
     }
     CHECK_EQ(dc.value("last_source", std::string()), std::string("cost"));
     CHECK_EQ(dc.value("last_fallback", std::string()), std::string("unknown_shape"));
 
-    /* The four ends and the two counts that qualify them: a forced calibration plan is neither a
+    /* An empty planning point is its own end: an idle or prefill step issues the valid K0 plan for
+     * an empty view, and a page that folded it into `fallback` would report a policy that chose
+     * the fallback on a run whose real plans never did. */
+    d.sched.m.draft_cost_cycles = 5;
+    d.sched.m.draft_cost_empty  = 1;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("empty", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("priced", (int64_t)0) + dc.value("fallback", (int64_t)0) +
+                 dc.value("empty", (int64_t)0) + dc.value("no_plan", (int64_t)0),
+             dc.value("cycles", (int64_t)0));
+    /* The `last_*` fields belong to the last plan with rows, so an empty step before that plan
+     * does not publish a K0 decision: no rows, no fields. */
+    d.sched.m.draft_cost_last_rows = 0;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK(!dc.contains("last_k"));
+    CHECK(!dc.contains("last_rows"));
+    d.sched.m.draft_cost_last_rows = 6;
+    d.sched.m.draft_cost_cycles    = 4;
+    d.sched.m.draft_cost_empty     = 0;
+
+    /* The five ends and the two counts that qualify them: a forced calibration plan is neither a
      * price nor a fallback, and `tiers_priced` says whether the search weighed a shallower depth
      * instead of never measuring it. */
     d.sched.m.draft_cost_cycles       = 4;
@@ -278,7 +301,8 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     CHECK_EQ(dc.value("calib_cut", (int64_t)0), (int64_t)1);
     CHECK_EQ(dc.value("tiers_priced", (int64_t)0), (int64_t)1);
     CHECK_EQ(dc.value("priced", (int64_t)0) + dc.value("fallback", (int64_t)0) +
-                 dc.value("calib_forced", (int64_t)0) + dc.value("no_plan", (int64_t)0),
+                 dc.value("calib_forced", (int64_t)0) + dc.value("empty", (int64_t)0) +
+                 dc.value("no_plan", (int64_t)0),
              dc.value("cycles", (int64_t)0));
 
     /* The reference's own count stands alone: a no-loan run absorbs nothing, so this is the only
@@ -287,9 +311,11 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     d.sched.m.draft_cost_cycles            = 0;
     d.sched.m.draft_cost_priced            = 0;
     d.sched.m.draft_cost_fallback          = 0;
+    d.sched.m.draft_cost_empty             = 0;
     d.sched.m.draft_cost_no_plan           = 0;
     d.sched.m.draft_cost_calibration       = 0;
     d.sched.m.draft_cost_calibration_cut   = 0;
+    d.sched.m.draft_cost_last_rows         = 0;
     d.sched.m.draft_cost_reference_skipped = 2;
     dc = d.get("/stats")["draft_cost"];
     CHECK_EQ(dc.value("reference_skipped", (int64_t)0), (int64_t)2);

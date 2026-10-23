@@ -654,6 +654,72 @@ TEST(the_ledger_shows_how_many_depths_the_cost_search_priced) {
     CHECK_EQ(both.planner.last_tiers_priced(), 2);
 }
 
+/* The same evidence per depth, which the ledger's count cannot show: every offered tier records
+ * whether it was priced and for how much, and the issued plan carries its own estimate -- the
+ * number a diagnostic compares against the alternatives. A depth the model could not price keeps
+ * `valid` false instead of a zero, and a plan that priced nothing (a calibration) says so by
+ * `last_price_known() == false`, not by an invalid price. */
+TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
+    DraftPolicyConfig cfg = cost_config(3);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+
+    Cycle c(3, cfg);
+    c.pred.a = 0.95f;
+    c.add(0, 1);
+    c.costs.measured = true;
+    c.costs.ms[2] = 2.9;
+    c.costs.ms[3] = 3.0;   /* K0 is never asked to price: the deepest is the coverage gate */
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    REQUIRE(c.planner.last_price_known());
+    REQUIRE_EQ(c.planner.last_n_tier_prices(), 3);
+    const DraftTierPrice* tp = c.planner.last_tier_prices();
+    CHECK_EQ(tp[0].k, 0);
+    CHECK(!tp[0].valid);               /* asked, but this model has no K0 measurement */
+    CHECK_EQ(tp[1].k, 2);
+    CHECK(tp[1].valid);
+    CHECK_NEAR(tp[1].ms, 2.9, 1e-9);
+    CHECK_NEAR(tp[1].unc_ms, 0.05 * 2.9, 1e-9);
+    CHECK_EQ(tp[2].k, 3);
+    CHECK(tp[2].valid);
+    CHECK_NEAR(tp[2].ms, 3.0, 1e-9);
+    /* The issued plan is the deep one, and its own estimate is exactly that tier's. */
+    CHECK_EQ(c.f.plan.max_k, 3);
+    CHECK_EQ(c.planner.last_price().k, 3);
+    CHECK(c.planner.last_price().valid);
+    CHECK_NEAR(c.planner.last_price().ms, 3.0, 1e-9);
+
+    /* An unpriced deepest tier takes the named baseline: a search ran (`last_price_known`), the
+     * gate stopped it before any alternative was compared, and the issued plan's own estimate is
+     * invalid rather than zero. */
+    Cycle u(3, cfg);
+    u.pred.a = 0.95f;
+    u.add(0, 1);
+    u.costs.measured = true;
+    u.costs.ms[2] = 2.9;   /* a shallow price exists, and is not evidence for the deep gate */
+    CHECK_EQ(u.choose(), RAD_OK);
+    CHECK(u.f.plan.source == DraftPlanSource::Fallback);
+    CHECK(u.planner.last_price_known());
+    REQUIRE_EQ(u.planner.last_n_tier_prices(), 1);   /* only the gate was asked */
+    CHECK_EQ(u.planner.last_tier_prices()[0].k, 3);
+    CHECK(!u.planner.last_tier_prices()[0].valid);
+    CHECK_EQ(u.planner.last_tiers_priced(), 0);
+    CHECK(!u.planner.last_price().valid);
+
+    /* A calibration prices nothing at all: empty list, and "no search ran" is a different fact
+     * from "the search found no price". */
+    DraftPolicyConfig cal = cfg;
+    cal.calib_k[0] = 2;
+    cal.calib_k[1] = 3;
+    cal.n_calib_k  = 2;
+    Cycle k(3, cal);
+    k.add(0, 1);
+    CHECK_EQ(k.choose(), RAD_OK);
+    CHECK(k.f.plan.source == DraftPlanSource::Calibration);
+    CHECK(!k.planner.last_price_known());
+    CHECK_EQ(k.planner.last_n_tier_prices(), 0);
+}
+
 TEST(the_documented_c8_pair_prices_depth_three_ahead_of_depth_five) {
     /* core/rad_core.h documents C8 at depth 5: 43.0 ms, 23.3 tokens; at depth 3: 36.3 ms,
      * 22.3 tokens -- 0.542 against 0.614 tokens per millisecond. The acceptance below is chosen

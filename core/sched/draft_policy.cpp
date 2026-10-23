@@ -130,6 +130,9 @@ void DraftPlanner::reset() {
     gap_refused_  = false;
     calib_pos_ = 0;      /* the sequence starts over; configure() starts it here too */
     last_tiers_priced_ = 0;
+    last_n_tier_price_ = 0;
+    last_price_known_  = false;
+    last_price_ = DraftTierPrice{};
     fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
 }
 
@@ -307,6 +310,9 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                          const DraftCostModel& costs, DraftPlan* out) {
     gap_refused_ = false;
     last_tiers_priced_ = 0;   /* only a Cost search below fills this */
+    last_n_tier_price_ = 0;   /* and with it the per-depth prices */
+    last_price_known_ = false;
+    last_price_ = DraftTierPrice{};
     if (!out || !out->k || !out->rows || !out->req_id || !out->slot || !out->slot_gen ||
         !out->why || !out->fill || !out->ctx_class || !out->history_tokens)
         return RAD_E_INVAL;
@@ -363,6 +369,10 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     if (!costs.estimate) return RAD_E_UNSUPPORTED;
 
     int evals = 0;
+    /* From here on a price was asked for: the trace may report a price or its absence, but never
+     * as "no search ran" (which is what a calibration or a legacy plan says). */
+    last_price_known_ = true;
+    last_n_tier_price_ = c_.n_tiers;
 
     /* Stage 1: the homogeneous baselines. The deepest offered plan is the coverage gate: if it
      * cannot be priced, the batch takes the named baseline -- never a shallower tier that happens
@@ -380,6 +390,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     {
         const int rc = price(view, pred, costs, out->k, -1, &evals, &best_p);
         if (rc < 0) return rc;
+        last_tier_price_[c_.n_tiers - 1] =
+            DraftTierPrice{deepest, best_p.valid, best_p.ms, best_p.unc};
     }
 
     if (!best_p.valid) {
@@ -419,6 +431,12 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         int32_t top = 0;
         for (int32_t i = 0; i < view.n_seq; ++i)
             if (out->k[i] > top) top = out->k[i];
+        last_price_.k = top;
+        /* The gate stopped the search here: the deepest offered tier is the only depth anything
+         * was asked about, and its price was not obtained. The shallower alternatives were never
+         * compared, so the trace lists one depth, not a ladder of unasked ones. */
+        last_tier_price_[0] = DraftTierPrice{deepest, best_p.valid, best_p.ms, best_p.unc};
+        last_n_tier_price_  = 1;
         return finish(view, top, DraftPlanSource::Fallback, DraftFallback::UnknownShape, out);
     }
 
@@ -437,6 +455,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         Priced p;
         const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
         if (rc < 0) return rc;
+        last_tier_price_[t] = DraftTierPrice{c_.tiers[t], p.valid, p.ms, p.unc};
         if (!p.valid) continue;
         ++tiers_priced;
         if (p.yield / p.ms > best_p.yield / best_p.ms) {
@@ -533,6 +552,20 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     if (top != last_k_) held_ = 0;   /* a new depth starts a new hold */
     last_k_ = top;
     chosen_ = true;
+
+    /* The issued assignment's own estimate -- after the budget cut and the hysteresis, so it
+     * describes the plan the step will run, not the search's winner. Diagnostic only: a model
+     * error here must not refuse a plan the search already decided, so it only leaves the price
+     * invalid. The extra estimate spends from the same budget, after every decision was made. */
+    last_price_.k = top;
+    if (evals < c_.max_evals) {
+        Priced p;
+        if (price(view, pred, costs, out->k, -1, &evals, &p) >= 0) {
+            last_price_.valid  = p.valid;
+            last_price_.ms     = p.ms;
+            last_price_.unc_ms = p.unc;
+        }
+    }
 
     return finish(view, top, issued_priced ? DraftPlanSource::Cost : DraftPlanSource::Fallback,
                   issued_priced ? DraftFallback::None : DraftFallback::Resources, out);

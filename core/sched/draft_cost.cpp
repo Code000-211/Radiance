@@ -967,9 +967,9 @@ DraftCostBucket* DraftCostTable::find_mutable(const DraftVerifyShape& shape, uin
     return &buckets_.back();
 }
 
-void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
+DraftCostBucket* DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
     DraftCostBucket* b = find_mutable(s.shape, flags, s.rounds, s.draft_round_rows);
-    if (!b) return;
+    if (!b) return nullptr;
     const double x = s.total_ms;
     if (b->n == 0) {
         b->mean_ms = x;
@@ -989,9 +989,20 @@ void DraftCostTable::record(const DraftCostSample& s, uint16_t flags) {
     if (s.target_ms >= 0.0 && finite(s.target_ms)) b->target_ms = s.target_ms;
     if (s.draft_ms >= 0.0 && finite(s.draft_ms)) b->draft_ms = s.draft_ms;
     if (s.host_ms >= 0.0 && finite(s.host_ms)) b->host_ms = s.host_ms;
+    return b;
+}
+
+void DraftCostTable::note_recorded(DraftCostBucket* b) {
+    last_observe_.what = DraftCostDisposition::Recorded;
+    if (!b) return;   /* the table was full: `dropped()` is the cumulative record of that */
+    last_observe_.bucket  = (int32_t)(b - buckets_.data());
+    last_observe_.n       = b->n;
+    last_observe_.mean_ms = b->mean_ms;
+    last_observe_.unc_ms  = b->unc_ms;
 }
 
 int DraftCostTable::observe(const DraftObservation& observation, const DraftCostSample& sample) {
+    last_observe_ = DraftCostObserve{};   /* Refused until a path below says otherwise */
     if (!observation.complete) return RAD_E_INVAL;
 
     /* Identity first: an unattributed sample (0 = unattributed, draft_types.h) cannot be traced to
@@ -1027,11 +1038,19 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
     if (!executed_within_plan(sample, *plan)) return RAD_E_INVAL;
 
     if (!finite(sample.total_ms) || !(sample.total_ms > 0.0)) return RAD_E_INVAL;
-    if (!active_) { ++inactive_; return RAD_OK; }   /* no usable profile: nothing to learn into */
+    if (!active_) {
+        ++inactive_;
+        last_observe_.what = DraftCostDisposition::Inactive;
+        return RAD_OK;
+    }
     /* A loaded reference is immutable: the bracket is counted and dropped, before any record()
      * path can create or move a bucket. Live occupancy is not a reason to update it -- the
      * reference describes the no-loan start placement for the whole run, not the current one. */
-    if (reference_) { ++reference_skipped_; return RAD_OK; }
+    if (reference_) {
+        ++reference_skipped_;
+        last_observe_.what = DraftCostDisposition::ReferenceSkipped;
+        return RAD_OK;
+    }
 
     if (draft_sample_storable(sample) && sample.rounds < plan->max_k) {
         /* The plan's deepest round never ran: the bracket is a verify window plus a draft phase
@@ -1041,23 +1060,24 @@ int DraftCostTable::observe(const DraftObservation& observation, const DraftCost
          * a two-round plan. A is not told which stop was natural and which was an abort, so it
          * prices neither. Kept for diagnosis, never priced -- estimate() and the anchor search
          * both reject it. */
-        record(sample, (uint16_t)(kDraftBucketUnpriced |
-                                  (sample.flags & (kDisturbing | kDraftSampleAhead))));
+        note_recorded(record(sample, (uint16_t)(kDraftBucketUnpriced |
+                                                (sample.flags & (kDisturbing | kDraftSampleAhead)))));
         return RAD_OK;
     }
     if (draft_sample_attributable(observation, sample)) {
-        record(sample, (uint16_t)(sample.flags & kDraftSampleAhead));
+        note_recorded(record(sample, (uint16_t)(sample.flags & kDraftSampleAhead)));
         return RAD_OK;
     }
     if ((sample.flags & kDisturbing) && draft_sample_storable(sample)) {
         /* Stored apart with its flags: a recording, audit, warmup, admission or placement bracket
          * is not a price of normal operation, but it is not an outlier to be discarded either. A
          * flagged bracket that did not time the shape (not valid) is not storable at all. */
-        record(sample, (uint16_t)(sample.flags & (kDisturbing | kDraftSampleAhead)));
+        note_recorded(record(sample, (uint16_t)(sample.flags & (kDisturbing | kDraftSampleAhead))));
         return RAD_OK;
     }
     /* Not valid and not flagged: the bracket did not time this shape. Nothing to learn. */
     ++ignored_;
+    last_observe_.what = DraftCostDisposition::Ignored;
     return RAD_OK;
 }
 

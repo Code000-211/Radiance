@@ -278,21 +278,45 @@ prediction and sample.
   table's key.
 - **The plan ledger names the choice, not the measurement.** `SchedMetrics` counts the cycles the
   policy opened (`draft_cost_cycles`) and how each ended: priced (`draft_cost_priced`, `source`
-  Cost), the named fallback (`draft_cost_fallback`), or no plan at all (`draft_cost_no_plan`, the
-  controller refused the view); the three always sum to `draft_cost_cycles`. It also carries the
-  last plan's source, fallback reason, depth and declared replay (`draft_cost_last_source`,
-  `draft_cost_last_fallback`, `draft_cost_last_k`, `draft_cost_last_replay`), which stay 0 until a
-  plan is issued. A no-loan reference table absorbs nothing, so it reports what it refused instead
-  (`draft_ref_skipped`). Together these separate a policy which never saw a priceable shape from a
-  ladder that had nothing measured -- a distinction a fallback-only run cannot make from its
-  plans. `cycles` advances at the planning sites: an idle run leaves it flat, so it is not a step
-  or a time measure. `/stats` publishes the block as `draft_cost`, with the last plan's replay,
-  source and fallback **by name**, and no `last_*` field until a plan has been issued.
+  Cost), the named fallback (`draft_cost_fallback`), a forced calibration depth with rows
+  (`draft_calib_forced`), an empty planning point (`draft_cost_empty`), or no plan at all
+  (`draft_cost_no_plan`, the controller refused the view); the five always sum to
+  `draft_cost_cycles`. `empty` is not a decision: every step opens a cycle, and a pure prefill or
+  idle step has no decode rows to plan over, so the controller issues the valid K0 plan for an
+  empty view -- no ring record, no bracket, no sample -- and that must not read as "the policy
+  chose the fallback" in a run that also issues real ones. The ledger also carries the last plan's
+  source, fallback reason, depth, declared replay and row count (`draft_cost_last_source`,
+  `draft_cost_last_fallback`, `draft_cost_last_k`, `draft_cost_last_replay`,
+  `draft_cost_last_rows`), which describe the last plan **with rows**: an idle or prefill step
+  cannot overwrite the last real decision, and they stay 0 until such a plan is issued. A valid
+  all-K0 plan is one of them -- `last_k == 0` with `last_rows > 0` is a decision to draft nothing,
+  not an empty ledger. A no-loan reference table absorbs nothing, so it reports what it refused
+  instead (`draft_ref_skipped`), and the per-cycle trace names the same discard on each sample
+  (`disposition=reference`) so a cumulative count can be attributed to a cycle. Together these
+  separate a policy which never saw a priceable shape from a ladder that had nothing measured -- a
+  distinction a fallback-only run cannot make from its plans. `cycles` advances at the planning
+  sites: it is not a step or a time measure, and a server that keeps taking steps with no request
+  rows still advances it, in `empty`. `/stats` publishes the block as `draft_cost`, with the last
+  plan with rows' replay, source and fallback **by name** and its `last_rows`, and no `last_*`
+  field until such a plan has been issued.
 - **The per-cycle trace is a diagnostic, not a ledger.** `RADIANCE_DRAFT_TRACE=1` logs, for the
-  first 64 lines of a run, each issued plan (source, fallback reason, per-row K and downgrade),
-  each bracket's per-rank tape classes, and each completed sample's full price shape with its
-  filing result. That is what ties a plan to a shape and a rank set; it is off by default, bounded,
-  and reads nothing the policy does not already decide.
+  first 64 lines of a run, and only for request-bearing cycles -- a step with no decode rows
+  spends no line, so an idle or prefill phase before the measurement window cannot consume it:
+  each issued plan (source, fallback reason, per-row K and downgrade, and -- when a cost search
+  ran -- the issued assignment's own price `price=ok:ms+-unc`/`invalid` and every offered depth's
+  alternative in `tiers=[k:ok:ms+-unc|k:invalid,...]`; `price=-` and `tiers=[]` say no search ran,
+  which is a calibration or legacy plan and not a search that found no price), each bracket's
+  per-rank tape classes, and each completed sample's full key -- verify window `verify_rows`, the
+  executed extent `round_rows`, pipeline depth, sampling, replay and loaded drafter, beside the
+  plan's own `draft_rows` -- with what `observe()` did with it (`disposition`) and the bucket it
+  landed in (`bucket`, `n`, `mean+-unc`). In the bracket line `ranks=N` is the deployment's rank
+  count and a `-` in `tape=[...]` means that rank did not run that step (not evidence of `None`);
+  `none` is a rank that ran and found no keyed tape. That is what ties a plan to a shape, an
+  extent, a bucket and a rank set; it is off by default, bounded, and reads nothing the policy does
+  not already decide.
+  **A real subprocess run with a long idle phase before the measurement window is the trace's own
+  test** (`sched_draft_test.cpp`, `a_long_idle_phase_does_not_spend_the_draft_trace`): the window
+  must still hold the first request-bearing cycles' plans, brackets and samples.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.

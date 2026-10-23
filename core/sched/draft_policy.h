@@ -91,6 +91,17 @@ struct DraftPolicyConfig {
     int32_t n_calib_k = 0;
 };
 
+/* One depth's price as the last Cost search actually obtained it, for the diagnostic trace. A
+ * depth the model could not price keeps `valid` false and its numbers meaningless: "the shallow
+ * alternative lost" and "it was never measured" are different facts, and the ledger's count alone
+ * cannot tell them apart. `k` names the offered tier, not the per-row clamped depth the batch ran. */
+struct DraftTierPrice {
+    int32_t k         = 0;
+    bool    valid     = false;
+    double  ms        = 0.0;
+    double  unc_ms    = 0.0;
+};
+
 class DraftPlanner {
 public:
     int  configure(const DraftPolicyConfig& c);
@@ -118,6 +129,21 @@ public:
      * ledger -- a Cost plan at the deep tier alone does not show whether the shallow one lost or
      * was never priced. Reset to 0 by reset() and by a plan that is not a Cost decision. */
     int32_t last_tiers_priced() const { return last_tiers_priced_; }
+
+    /* The prices the last choose() actually asked for, in ladder order: validity and the estimate
+     * for the homogeneous plan at that depth, whether or not it won. A depth enters the list only
+     * once the search asked about it -- the whole ladder when the deepest tier priced, the deepest
+     * gate alone when it did not (the shallower alternatives are then not compared, and a trace
+     * that listed them as invalid would claim they were examined). A calibration's forced plan
+     * prices nothing, so the list is empty and `last_price_known()` is false -- never an invalid
+     * price, which would read as "the search ran and found none". */
+    const DraftTierPrice* last_tier_prices() const { return last_tier_price_; }
+    int32_t last_n_tier_prices() const { return last_n_tier_price_; }
+    /* A Cost search ran this cycle (whether or not it produced a price). */
+    bool    last_price_known() const { return last_price_known_; }
+    /* The estimate of the plan that was issued -- after the budget cut and the hysteresis, the
+     * assignment the step will really run -- with `valid` false when it could not be priced. */
+    const DraftTierPrice& last_price() const { return last_price_; }
 
     /* This choose() call was refused by the explicit-ladder coverage gap, not by the hook: the
      * cycle has no plan for a reason no later cycle can fix. Cleared at every entry. */
@@ -168,6 +194,11 @@ private:
     int32_t calib_pos_ = 0;
     /* Tiers the last Cost search found priced (see last_tiers_priced()). */
     int32_t last_tiers_priced_ = 0;
+    /* The last search's per-depth prices and the issued plan's own (see last_tier_prices()). */
+    DraftTierPrice last_tier_price_[RAD_DRAFT_MAX_TIERS] = {};
+    int32_t        last_n_tier_price_ = 0;
+    bool           last_price_known_ = false;
+    DraftTierPrice last_price_;
     /* The explicit-ladder coverage gap was diagnosed; once per priced/unpriced transition. */
     bool    gap_reported_ = false;
     /* This choose() call returned RAD_E_UNSUPPORTED from the coverage gap. */

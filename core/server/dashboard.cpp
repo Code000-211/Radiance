@@ -262,30 +262,40 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["draft_positions"] = std::move(pos);
 
         /* The cost policy's plan ledger: how every cycle it opened ended -- priced, the named
-         * fallback, a forced calibration plan, or no plan at all -- and what the last plan asked
-         * for. `last_replay` is the candidate the plan declared -- the state the previous bracket
-         * ran under, which the next key may not share -- so a run that prices at `play` and a run
-         * that only ever sees `record` are told apart; what actually ran is in `passes` on the
-         * arena's sibling block and in the samples. `cycles` advances at the planning sites, not
-         * per step or per second: an idle run leaves it flat. The four ends sum to it, and the
-         * `last_*` fields appear only once a plan was issued -- an empty ledger is not a plan at
-         * K=0. `tiers_priced` is the last Cost plan's evidence that the shallower depths were
-         * actually weighed, not merely absent from the choice. `calib_forced`/`calib_cut` are the
-         * calibration's own counts: forced plans, and of them the ones a plan-time resource cut
-         * touched (which is not `Shortened`, a bracket that stopped below its plan).
-         * `reference_skipped` is the reference table's own count and stands on its own, because a
-         * no-loan run absorbs nothing and would otherwise publish no block at all. */
+         * fallback, a forced calibration plan, an empty planning point, or no plan at all -- and
+         * what the last plan with rows asked for. `last_replay` is the candidate the plan declared
+         * -- the state the previous bracket ran under, which the next key may not share -- so a run
+         * that prices at `play` and a run that only ever sees `record` are told apart; what
+         * actually ran is in `passes` on the arena's sibling block and in the samples. `cycles`
+         * advances at the planning sites, not per step or per second: a run that keeps taking
+         * steps with no request rows keeps advancing it, so it rises while an idle server is fed,
+         * and only `empty` explains those cycles. The five ends sum to it. `empty` is a step with
+         * no decode rows to plan over -- the valid K0 plan for an empty view, which is neither a
+         * decision nor a measurement; a run that issues real fallbacks still counts them in
+         * `fallback`. The `last_*` fields describe the last plan **with rows**, so an idle or
+         * prefill step cannot overwrite the last real decision, and they appear only once such a
+         * plan was issued: a valid all-K0 plan is one (`last_k` 0 with `last_rows > 0`), an empty
+         * ledger is not. `tiers_priced` is the last Cost plan's evidence that the shallower depths
+         * were actually weighed, not merely absent from the choice. `calib_forced`/`calib_cut` are
+         * the calibration's own counts: forced plans **with rows** (an empty forced plan is
+         * `empty`), and of them the ones a plan-time resource cut touched (which is not
+         * `Shortened`, a bracket that stopped below its plan). `reference_skipped` is the
+         * reference table's own count and stands on its own, because a no-loan run absorbs nothing
+         * and would otherwise publish no block at all; the per-cycle discard is
+         * `disposition=reference` on the trace's sample line. */
         if (m.draft_cost_cycles > 0 || m.draft_cost_reference_skipped > 0) {
             json dc;
             dc["cycles"]   = m.draft_cost_cycles;
             dc["priced"]   = m.draft_cost_priced;
             dc["fallback"] = m.draft_cost_fallback;
+            dc["empty"]    = m.draft_cost_empty;
             dc["no_plan"]  = m.draft_cost_no_plan;
             dc["calib_forced"] = m.draft_cost_calibration;
             dc["calib_cut"]    = m.draft_cost_calibration_cut;
             dc["reference_skipped"] = m.draft_cost_reference_skipped;
-            if (m.draft_cost_cycles > m.draft_cost_no_plan) {
+            if (m.draft_cost_last_rows > 0) {
                 dc["last_k"]        = m.draft_cost_last_k;
+                dc["last_rows"]     = m.draft_cost_last_rows;
                 dc["last_replay"]   = draft_replay_name((DraftReplay)m.draft_cost_last_replay);
                 dc["last_source"]   = draft_plan_source_name((DraftPlanSource)m.draft_cost_last_source);
                 dc["last_fallback"] = draft_fallback_name((DraftFallback)m.draft_cost_last_fallback);

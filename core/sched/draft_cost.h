@@ -229,6 +229,36 @@ constexpr double kDraftCostFallbackMargin = 0.25;
  * for it and it is never written. */
 enum : uint16_t { kDraftBucketUnpriced = 1u << 15 };
 
+/* What observe() did with the sample it was handed, for the per-cycle trace. Diagnostic only: the
+ * cumulative counters (`reference_skipped`, `ignored`, `inactive`) stay the record, and no pricing
+ * path reads this. A reference table's per-cycle discard is exactly the fact a cumulative count
+ * cannot attribute to a cycle. */
+enum class DraftCostDisposition : uint8_t {
+    Refused = 0,         /* the observation or the sample failed a gate (observe's rc names it) */
+    Inactive,            /* valid, but the table has no profile to learn into */
+    ReferenceSkipped,    /* valid, but the loaded reference may not be overwritten */
+    Recorded,            /* filed into a bucket (unpriced/flagged buckets included) */
+    Ignored,             /* storable bracket that did not time its shape */
+};
+
+struct DraftCostObserve {
+    DraftCostDisposition what = DraftCostDisposition::Refused;
+    int32_t bucket = -1;     /* index into buckets() when what == Recorded, else -1 */
+    int32_t n = 0;           /* the bucket's sample count after the record */
+    double  mean_ms = 0.0;   /* and its amortised mean and half-width */
+    double  unc_ms = 0.0;
+};
+
+inline const char* draft_cost_disposition_name(DraftCostDisposition d) {
+    switch (d) {
+        case DraftCostDisposition::Inactive:         return "inactive";
+        case DraftCostDisposition::ReferenceSkipped: return "reference";
+        case DraftCostDisposition::Recorded:         return "recorded";
+        case DraftCostDisposition::Ignored:          return "ignored";
+        default:                                     return "refused";
+    }
+}
+
 /* The profile in memory, plus the online updates from completed cycles. configure() copies the
  * profile; the caller's DraftCostProfile and its storage are not referenced afterwards. */
 class DraftCostTable {
@@ -328,6 +358,9 @@ public:
      * reference may not be overwritten by the run it prices. */
     int observe(const DraftObservation& observation, const DraftCostSample& sample);
 
+    /* What the last observe() did with its sample -- for the trace only (DraftCostObserve). */
+    const DraftCostObserve& last_observe() const { return last_observe_; }
+
     /* The P00 handle the pipeline wires into DraftHooks::costs. */
     DraftCostModel handle() { return DraftCostModel{this, &estimate_thunk}; }
     static int estimate_thunk(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* out);
@@ -345,10 +378,15 @@ private:
     bool record_only_ = false;
     bool hold_prices_ = false;
     bool reference_ = false;
+    DraftCostObserve last_observe_;
 
     DraftCostBucket* find_mutable(const DraftVerifyShape& shape, uint16_t flags, int32_t rounds,
                                   const int32_t* round_rows);
-    void record(const DraftCostSample& sample, uint16_t flags);
+    /* Returns the bucket the sample was filed into (null when the table is full), so the trace can
+     * name it; the cumulative bucket data is unchanged by that return value. */
+    DraftCostBucket* record(const DraftCostSample& sample, uint16_t flags);
+    /* Fills last_observe_ from the bucket a record() call returned (null: capacity drop). */
+    void note_recorded(DraftCostBucket* b);
 };
 
 }  /* namespace rad */

@@ -2525,11 +2525,13 @@ TEST(the_next_cycle_declares_the_last_brackets_observed_replay) {
     CHECK_EQ(m.draft_cost_fallback, base.draft_cost_fallback);
     CHECK_EQ(m.draft_cost_no_plan, base.draft_cost_no_plan);
     CHECK_EQ(m.draft_cost_last_k, k);
+    CHECK_EQ(m.draft_cost_last_rows, 1);
     CHECK_EQ(m.draft_cost_last_replay, (int64_t)DraftReplay::Audit);
     CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Cost);
     CHECK_EQ(m.draft_cost_last_fallback, (int64_t)DraftFallback::None);
     /* Every opened cycle has exactly one named end, so none of them can go missing. */
-    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_cost_no_plan,
+    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
+                 m.draft_cost_empty + m.draft_cost_no_plan,
              m.draft_cost_cycles);
     CHECK_EQ(m.draft_ref_skipped, (int64_t)0);   /* a live table learns; nothing is refused */
 }
@@ -2578,6 +2580,11 @@ TEST(an_observed_replay_never_writes_into_a_reference_table) {
     CHECK_EQ(f.sch.draft_costs().reference_skipped(), 3);
     /* The same count is what /stats publishes: the refusal is visible, not internal. */
     CHECK_EQ(f.sch.metrics().draft_ref_skipped, (int64_t)3);
+    /* And the last sample's own outcome is the per-cycle record of that discard, with no bucket
+     * named: a cumulative count cannot say which cycle the reference refused. */
+    const DraftCostObserve& ob = f.sch.draft_costs().last_observe();
+    CHECK(ob.what == DraftCostDisposition::ReferenceSkipped);
+    CHECK_EQ(ob.bucket, -1);
 }
 
 /* The other side of the same gate: one bucket estimate() would price from (no disturbing flag, a
@@ -3354,7 +3361,9 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
     for (int i = 0; i < 4; ++i) f.prefill(ids[i]);
 
     /* The prefill step(s) opened a forced plan over no rows, and the sequence did not move: the
-     * next row-bearing plan still takes its first element. */
+     * next row-bearing plan still takes its first element. In the ledger such a cycle is an empty
+     * planning point, not a forced measurement -- it has no depth to measure -- and it leaves the
+     * last plan with rows alone (there is none yet). */
     const DraftPlan* p0 = f.sch.draft().plan();
     REQUIRE(p0 != nullptr);
     CHECK_EQ(p0->n_seq, 0);
@@ -3362,7 +3371,9 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
     CHECK_EQ(p0->max_k, 0);
     const SchedMetrics prefilled = f.sch.metrics();
     CHECK(prefilled.draft_cost_cycles >= 1);
-    CHECK_EQ(prefilled.draft_calib_forced, prefilled.draft_cost_cycles);
+    CHECK_EQ(prefilled.draft_cost_empty, prefilled.draft_cost_cycles);
+    CHECK_EQ(prefilled.draft_calib_forced, 0);
+    CHECK_EQ(prefilled.draft_cost_last_rows, 0);
     CHECK_EQ(prefilled.draft_cost_last_k, 0);
 
     const int32_t forced[5] = { 3, 2, 2, 3, 3 };
@@ -3417,19 +3428,21 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
     CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
     CHECK_EQ(f.sch.draft_costs().ignored(), 0);
 
-    /* The ledger: every opened cycle was a forced calibration plan, none a decision, and the four
-     * ends still account for every cycle that opened. */
+    /* The ledger: every opened cycle was a forced calibration plan with rows or an empty planning
+     * point, none a decision, and the five ends still account for every cycle that opened. */
     const SchedMetrics m = f.sch.metrics();
     CHECK_EQ(m.draft_cost_priced, 0);
     CHECK_EQ(m.draft_cost_fallback, 0);
     CHECK_EQ(m.draft_cost_no_plan, 0);
-    CHECK_EQ(m.draft_calib_forced, m.draft_cost_cycles);
+    CHECK_EQ(m.draft_cost_empty, prefilled.draft_cost_cycles);
+    CHECK_EQ(m.draft_calib_forced, 6);   /* the five loop cycles and the retiring open */
     CHECK_EQ(m.draft_cost_tiers_priced, 0);
     CHECK_EQ(m.draft_calib_cut, 0);
     CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
-                 m.draft_cost_no_plan,
+                 m.draft_cost_empty + m.draft_cost_no_plan,
              m.draft_cost_cycles);
     CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Calibration);
+    CHECK_EQ(m.draft_cost_last_rows, 4);
     CHECK_EQ(m.draft_cost_last_k, 2);
 }
 
@@ -3494,6 +3507,182 @@ TEST(a_budget_cut_shortens_a_forced_plan_and_the_next_cycle_verifies_it) {
     CHECK_EQ(bs[0].rounds, 2);
     CHECK_EQ(bs[0].draft_rows_total, 24 * 2);
     CHECK_EQ(f.sch.draft_cost_refused(), 0);
+}
+
+/* A cycle opens at every step, and a step with no decode rows plans over an empty view: the
+ * controller issues the valid K0 plan for it (draft_policy.cpp's fallback branch), which is
+ * exactly the shape the old ledger counted as "the policy chose the fallback". The ledger counts
+ * it apart (`empty`), keeps the `last_*` plan for the last plan **with rows**, and spends no trace
+ * line. A valid all-K0 plan over real rows is still a decision: `last_k == 0` with `last_rows > 0`. */
+TEST(an_idle_or_prefill_step_is_an_empty_planning_point_not_a_fallback) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);                     /* live, empty, fallback admitted */
+    CHECK_OK(f.start(DraftReplay::None));
+
+    /* Idle: no request exists, so every step plans nothing and the cycle is an empty planning
+     * point. Nothing was decided, measured or drafted. */
+    for (int i = 0; i < 10; ++i) CHECK(f.sch.step() == nullptr);
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_cycles, 10);
+    CHECK_EQ(m.draft_cost_empty, 10);
+    CHECK_EQ(m.draft_cost_fallback, 0);
+    CHECK_EQ(m.draft_cost_priced, 0);
+    CHECK_EQ(m.draft_cost_no_plan, 0);
+    CHECK_EQ(m.draft_cost_last_rows, 0);   /* no plan with rows yet: no last_* at all */
+    CHECK_EQ(m.draft_cost_last_k, 0);
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    {
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr);
+        CHECK_EQ(p->n_seq, 0);
+        CHECK_EQ(p->max_k, 0);
+        /* The plan is the fallback branch's shape -- which is why the ledger must not count it
+         * as the policy's fallback choice. */
+        CHECK(p->source == DraftPlanSource::Fallback);
+    }
+
+    /* A pure prefill step is the same kind of planning point: the chunk runs, nothing decodes. */
+    const uint64_t id = f.submit(64);
+    REQUIRE(f.sch.step() != nullptr);
+    m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_cycles, 11);
+    CHECK_EQ(m.draft_cost_empty, 11);
+    CHECK_EQ(m.draft_cost_fallback, 0);
+    CHECK_EQ(m.draft_cost_last_rows, 0);
+    f.commit_plain(11);
+
+    /* The first decode cycle has a row and the named baseline (the table is empty): a real
+     * fallback, and the first plan the `last_*` fields may describe. */
+    REQUIRE(f.sch.step() != nullptr);
+    m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_cycles, 12);
+    CHECK_EQ(m.draft_cost_empty, 11);
+    CHECK_EQ(m.draft_cost_fallback, 1);
+    CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Fallback);
+    CHECK_EQ(m.draft_cost_last_rows, 1);
+    CHECK_EQ(m.draft_cost_last_k, 6);       /* the executable depth */
+    f.commit_plain(11);
+
+    /* A row that may not speculate plans K0 over a real row: no drafts by decision, not an empty
+     * planning point. `last_k == 0` with `last_rows > 0` is that decision. */
+    Request* r = f.sch.find(id);
+    REQUIRE(r != nullptr);
+    r->may_speculate = false;
+    REQUIRE(f.sch.step() != nullptr);
+    m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_cycles, 13);
+    CHECK_EQ(m.draft_cost_empty, 11);       /* the K0 plan is not one of them */
+    CHECK_EQ(m.draft_cost_fallback, 2);
+    CHECK_EQ(m.draft_cost_last_rows, 1);
+    CHECK_EQ(m.draft_cost_last_k, 0);
+    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
+                 m.draft_cost_empty + m.draft_cost_no_plan,
+             m.draft_cost_cycles);
+}
+
+/* ------------------------------------------------------- the trace window (a child process)
+ *
+ * `RADIANCE_DRAFT_TRACE` is read once per process, and the window is what a real run's diagnosis
+ * depends on: 64 lines shared by plans, brackets and samples. A long idle phase before the
+ * measurement window -- idle steps, then prefill chunks, none of them planning a decode row -- used
+ * to spend one plan line each and leave nothing for the cycles that were being measured. The
+ * child below runs 200 idle steps and then a handful of decode cycles; the parent runs it with the
+ * trace on and checks that every request-bearing cycle is still fully traceable. */
+
+/* The child: an idle phase longer than the whole window, then a request-bearing run. It prints its
+ * own ledger so the parent can check the phase really was longer than 64 cycles. */
+TEST(the_draft_trace_child_runs_a_long_idle_phase_before_the_measurement_window) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    for (int i = 0; i < 200; ++i) CHECK(f.sch.step() == nullptr);
+
+    const uint64_t id = f.submit(32);
+    f.prefill(id);
+    const int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    for (int c = 0; c < 8; ++c) {
+        REQUIRE(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr && p->n_seq == 1);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, six, p->max_k));
+        f.sch.step_finished(live);
+    }
+    /* One more open retires the last bracket's cycle, so its sample is delivered and traced. */
+    REQUIRE(f.sch.step() != nullptr);
+
+    const SchedMetrics m = f.sch.metrics();
+    const int64_t rows = m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced;
+    printf("TRACE-CHILD empty=%lld rows=%lld samples=%lld\n", (long long)m.draft_cost_empty,
+           (long long)rows, (long long)f.sch.draft_cycles_done());
+}
+
+/* Runs this binary with one case selected and `env` set, returning its output. */
+std::string run_one_case(const std::string& name, const std::string& env) {
+    char exe[4096] = {};
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
+    CHECK(n > 0);
+    const std::string cmd = "env -u RAD_TEST_FILTER -u RAD_TEST_STRICT -u RAD_TEST_LEVEL "
+                            "-u RAD_TEST_CPU_BUDGET -u RAD_TEST_CPU_BUDGET_SCALE " + env +
+                            " '" + std::string(exe) + "' '" + name + "' 2>&1";
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return out;
+    char buf[4096];
+    size_t got;
+    while ((got = std::fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, got);
+    pclose(p);
+    return out;
+}
+
+int count_lines_with(const std::string& out, const std::string& needle) {
+    int n = 0;
+    size_t at = 0;
+    while ((at = out.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+    return n;
+}
+
+/* The trace the diagnosis reads: an idle phase longer than the 64-line window must not spend it,
+ * and plan, bracket and sample lines must stay attributable to each other. */
+TEST(a_long_idle_phase_does_not_spend_the_draft_trace) {
+    const std::string out =
+        run_one_case("the_draft_trace_child_runs_a_long_idle_phase_before_the_measurement_window",
+                     "RADIANCE_DRAFT_TRACE=1");
+    REQUIRE(!out.empty());
+
+    /* The child's own ledger: the idle phase alone opened more cycles than the whole window. */
+    const size_t tag = out.find("TRACE-CHILD ");
+    REQUIRE(tag != std::string::npos);
+    long long empty = 0, rows = 0, samples = 0;
+    REQUIRE(std::sscanf(out.c_str() + tag, "TRACE-CHILD empty=%lld rows=%lld samples=%lld",
+                        &empty, &rows, &samples) == 3);
+    CHECK(empty > 64);               /* without the fix the window was gone before any request */
+    CHECK_EQ(rows, 9);               /* the eight loop cycles and the retiring open */
+    CHECK_EQ(samples, 8);            /* every loop cycle but the last is delivered */
+
+    /* Plans, brackets and samples: every request-bearing cycle is fully traceable ... */
+    CHECK_EQ(count_lines_with(out, "draft trace: plan "), rows);
+    /* The retiring open never finishes its step, so it has a plan and no bracket. */
+    CHECK_EQ(count_lines_with(out, "draft trace: bracket "), rows - 1);
+    CHECK_EQ(count_lines_with(out, "draft trace: sample "), samples);
+    /* ... nothing was suppressed ... */
+    CHECK(!has(out, "further trace lines are suppressed"));
+    /* ... and no empty planning point was traced at all, which is what left the window intact. */
+    CHECK(!has(out, "rows=0 "));
 }
 
 RAD_TEST_MAIN()

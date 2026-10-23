@@ -1123,8 +1123,10 @@ int Engine::step_loop() {
          * next step's ahead pass has been released since. A step no rank reported is Unknown. */
         DraftStepEvidence ev;
         /* No rank ran a pass for this step (a sampler-only release with nothing issued ahead):
-         * Unknown, so A excludes the sample instead of pricing it as undisturbed. */
-        if (!step_evidence(b->step, &ev)) ev = DraftStepEvidence{};
+         * Unknown, so A excludes the sample instead of pricing it as undisturbed. The record is
+         * kept rather than cleared: it already names every rank and marks each one absent, and
+         * `ranks=0` would claim a deployment with no ranks instead of ranks that did not run. */
+        (void)step_evidence(b->step, &ev);
         /* The per-step fields above describe this bracket; the residency is cumulative, so a move
          * the scheduler's own ticks made between two brackets still reaches the bracket measured
          * after it. Fills are not moves (residency_moves). */

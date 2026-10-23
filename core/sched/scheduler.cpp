@@ -36,17 +36,38 @@ static bool draft_trace_on() {
     return on;
 }
 
-/* A cycle's plan as issued: what the policy chose, why, and for which rows. Bounded to the first
- * rows of the batch; the price shape itself is logged from the sample, where it is exact. */
+/* A cycle's plan as issued: what the policy chose, why, for which rows, and -- when a cost search
+ * ran -- the prices it actually obtained: the issued assignment's own estimate and, per offered
+ * depth, whether that alternative had a price at all. A calibration or legacy plan priced nothing:
+ * `price=-` and `tiers=[]` say so, and are not `price=invalid` (a search that found none). The
+ * price shape itself is logged from the sample, where it is exact. */
 void Scheduler::draft_trace_plan(const DraftPlan& p) {
     if (!draft_trace_on() || draft_trace_left_ <= 0) return;
+    const DraftPlanner& pl = draft_.planner();
     std::string s;
     char b[256];
     snprintf(b, sizeof b, "cycle=%llu source=%s fallback=%s rows=%d max_k=%d verify_k=%d replay=%s "
-             "pipeline=%d prefill=%d k=[", (unsigned long long)p.cycle_id,
+             "pipeline=%d prefill=%d price=", (unsigned long long)p.cycle_id,
              draft_plan_source_name(p.source), draft_fallback_name(p.fallback), p.n_seq, p.max_k,
              p.verify_k, draft_replay_name(p.replay), p.pipeline_depth, p.prefill_tokens);
     s += b;
+    if (!pl.last_price_known()) {
+        s += "-";
+    } else if (pl.last_price().valid) {
+        snprintf(b, sizeof b, "ok:%.3f+-%.3f", pl.last_price().ms, pl.last_price().unc_ms);
+        s += b;
+    } else {
+        s += "invalid";
+    }
+    s += " tiers=[";
+    const DraftTierPrice* tp = pl.last_tier_prices();
+    for (int32_t t = 0; t < pl.last_n_tier_prices(); ++t) {
+        if (tp[t].valid) snprintf(b, sizeof b, "%s%d:ok:%.3f+-%.3f", t ? "," : "", tp[t].k,
+                                  tp[t].ms, tp[t].unc_ms);
+        else            snprintf(b, sizeof b, "%s%d:invalid", t ? "," : "", tp[t].k);
+        s += b;
+    }
+    s += "] k=[";
     const int32_t shown = p.n_seq < 16 ? p.n_seq : 16;
     for (int32_t i = 0; i < shown && p.k; ++i) {
         snprintf(b, sizeof b, "%s%d", i ? "," : "", p.k[i]);
@@ -105,24 +126,49 @@ void Scheduler::draft_trace_bracket(const DraftStepEvidence& ev) {
 }
 
 /* The completed price shape a sample was filed (or refused) under, so a plan can be followed to
- * the bucket that answered it. */
+ * the bucket that answered it. The whole key is printed: the verify window (`verify_rows`), the
+ * executed extent (`round_rows`), pipeline depth, sampling, replay and the loaded drafter beside
+ * the plan's own distribution (`draft_rows`, provenance and upper bound), plus what observe() did
+ * with the sample and the bucket it landed in. `disposition` is the per-cycle record of a reference
+ * discard that the cumulative counter can only count. */
 void Scheduler::draft_trace_sample(const DraftCostSample& s, int rc) {
     if (!draft_trace_on() || draft_trace_left_ <= 0) return;
     const DraftVerifyShape& sh = s.shape;
+    const DraftCostObserve& ob = draft_costs_.last_observe();
     std::string line;
     char b[256];
-    snprintf(b, sizeof b, "cycle=%llu rc=%s flags=0x%x replay=%s n_rows=%d ctx_class=%d verify_k=%d "
-             "verify_tokens=%d history=%d prefill=%d draft_k=%d rounds=%d drafted=%d draft_rows=[",
+    snprintf(b, sizeof b, "cycle=%llu rc=%s flags=0x%x disposition=%s replay=%s sampling=%s "
+             "drafter=%s pipeline=%d n_rows=%d ctx_class=%d verify_k=%d verify_tokens=%d "
+             "history=%d prefill=%d draft_k=%d rounds=%d drafted=%d plan_rows_total=%d ",
              (unsigned long long)s.cycle_id, rc == RAD_OK ? "ok" : rad_strerror(rc),
-             (unsigned)s.flags, draft_replay_name(s.replay), sh.n_rows, sh.ctx_class, sh.verify_k,
-             sh.verify_tokens, sh.history_tokens, sh.prefill_tokens, sh.draft_k, s.rounds,
-             s.drafted);
+             (unsigned)s.flags, draft_cost_disposition_name(ob.what), draft_replay_name(s.replay),
+             draft_sampling_name(sh.sampling), draft_drafter_name(sh.drafter), sh.pipeline_depth,
+             sh.n_rows, sh.ctx_class, sh.verify_k, sh.verify_tokens, sh.history_tokens,
+             sh.prefill_tokens, sh.draft_k, s.rounds, s.drafted, s.draft_rows_total);
     line += b;
+    line += "verify_rows=[";
+    for (int32_t j = 1; j <= sh.verify_k && j <= RAD_SCHED_MAX_SPEC; ++j) {
+        snprintf(b, sizeof b, "%s%d", j > 1 ? "," : "", sh.rows[j]);
+        line += b;
+    }
+    line += "] draft_rows=[";
     for (int32_t j = 0; j <= sh.draft_k && j <= RAD_SCHED_MAX_SPEC; ++j) {
         snprintf(b, sizeof b, "%s%d", j ? "," : "", sh.draft_rows[j]);
         line += b;
     }
+    line += "] round_rows=[";
+    for (int32_t j = 1; j <= s.rounds && j <= RAD_SCHED_MAX_SPEC; ++j) {
+        snprintf(b, sizeof b, "%s%d", j > 1 ? "," : "", s.draft_round_rows[j]);
+        line += b;
+    }
     line += "]";
+    if (ob.what == DraftCostDisposition::Recorded && ob.bucket >= 0) {
+        snprintf(b, sizeof b, " bucket=%d n=%d mean=%.3f+-%.3f", ob.bucket, ob.n, ob.mean_ms,
+                 ob.unc_ms);
+    } else {
+        snprintf(b, sizeof b, " bucket=-");
+    }
+    line += b;
     RAD_INFO("draft trace: sample %s", line.c_str());
     if (--draft_trace_left_ == 0)
         RAD_INFO("draft trace: further trace lines are suppressed (64 written)");
@@ -2174,7 +2220,8 @@ void Scheduler::draft_cost_cycle() {
     draft_view_.ngram_allowed  = true;
 
     const int rc = draft_.open_cycle(draft_view_, &draft_preds_);
-    /* Opened, planned or not: the three ends below (priced, fallback, no plan) sum to this. */
+    /* Opened, planned or not: the five ends below (priced, fallback, calib_forced, empty, no plan)
+     * sum to this. */
     ++m_.draft_cost_cycles;
     if (rc < 0) {
         /* Counted apart from both a priced cycle and a fallback, so "the controller refused this
@@ -2202,6 +2249,16 @@ void Scheduler::draft_cost_cycle() {
         const DraftPlan* p = draft_.plan();
         draft_ring_cur_ = p->cycle_id;
         draft_ring_open(*p);
+        /* An empty planning point: every step opens a cycle, and a pure prefill or idle step has
+         * no decode rows to plan over, so the controller issues the valid K0 plan for an empty
+         * view. It is neither a decision nor a measurement -- no ring record, no bracket, no
+         * sample -- so it is counted apart, leaves the `last_*` plan alone and spends no trace
+         * line. A valid all-K0 plan over real rows is still a decision (`last_rows > 0`). */
+        if (p->n_seq <= 0) {
+            ++m_.draft_cost_empty;
+            m_.draft_cost_tiers_priced = 0;
+            return;
+        }
         /* What the policy decided, for /stats: whether this cycle was priced at all, what it asked
          * for and why, and under which candidate. The replay is the candidate the plan declared --
          * the last bracket's observed state, not this cycle's (see draft_cycle_replay_). */
@@ -2215,9 +2272,10 @@ void Scheduler::draft_cost_cycle() {
             ++m_.draft_cost_fallback;
             m_.draft_cost_tiers_priced = 0;
         } else if (p->source == DraftPlanSource::Calibration) {
-            /* A forced plan, counted apart from both decision sources so a measurement never reads
-             * as a cost choice. A plan over an empty view is forced too (it has no rows and does
-             * not advance the sequence), and is counted here: the ledger's ends sum to `cycles`. */
+            /* A forced plan with rows, counted apart from both decision sources so a measurement
+             * never reads as a cost choice. A forced plan over an empty view is an `empty`
+             * planning point above: it has no depth to measure, and only a plan with rows
+             * advances the sequence. */
             ++m_.draft_calib_forced;
             m_.draft_cost_tiers_priced = 0;
             /* A plan-time resource cut (cap_of or the token/KV budget) is not kDraftSampleShortened
@@ -2229,6 +2287,7 @@ void Scheduler::draft_cost_cycle() {
         m_.draft_cost_last_replay   = (int64_t)p->replay;
         m_.draft_cost_last_source   = (int64_t)p->source;
         m_.draft_cost_last_fallback = (int64_t)p->fallback;
+        m_.draft_cost_last_rows     = p->n_seq;
         draft_trace_plan(*p);
     }
 }

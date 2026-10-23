@@ -655,8 +655,10 @@ private:
     uint32_t                     slot_gen_ = 0;
     bool                         draft_cost_failed_ = false;
     /* RADIANCE_DRAFT_TRACE: a bounded per-cycle trace of what was planned, what the ranks ran and
-     * which shape the sample was filed under. Off by default, and silent again after this many
-     * lines -- a diagnostic for one run, not a log stream. */
+     * which shape the sample was filed under. Off by default, silent again after this many lines,
+     * and spent only by request-bearing cycles: an idle or prefill cycle plans nothing, so it
+     * cannot consume the window before the run reaches the cycles worth logging. A diagnostic for
+     * one run, not a log stream. */
     int32_t                      draft_trace_left_ = 64;
     void draft_trace_plan(const DraftPlan& p);
     void draft_trace_bracket(const DraftStepEvidence& ev);

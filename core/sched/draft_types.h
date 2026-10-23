@@ -212,6 +212,16 @@ inline const char* draft_replay_name(DraftReplay r) {
         default:                  return "unknown";
     }
 }
+inline const char* draft_sampling_name(DraftSampling s) {
+    return s == DraftSampling::Sampled ? "sampled" : "greedy";
+}
+inline const char* draft_drafter_name(DraftDrafter d) {
+    switch (d) {
+        case DraftDrafter::Serial: return "serial";
+        case DraftDrafter::Ngram:  return "ngram";
+        default:                   return "none";
+    }
+}
 
 /* A cost sample's attribution. Only a sample with kDraftSampleValid and none of the disturbing
  * flags may update a measured bucket (draft_sample_attributable). */
