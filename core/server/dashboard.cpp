@@ -276,12 +276,13 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
          * prefill step cannot overwrite the last real decision, and they appear only once such a
          * plan was issued: a valid all-K0 plan is one (`last_k` 0 with `last_rows > 0`), an empty
          * ledger is not. `tiers_priced` is the last Cost plan's evidence that the shallower depths
-         * were actually weighed, not merely absent from the choice. `calib_forced`/`calib_cut` are
-         * the calibration's own counts: forced plans **with rows** (an empty forced plan is
-         * `empty`), and of them the ones a plan-time resource cut touched (which is not
-         * `Shortened`, a bracket that stopped below its plan). `reference_skipped` is the
-         * reference table's own count and stands on its own, because a no-loan run absorbs nothing
-         * and would otherwise publish no block at all; the per-cycle discard is
+         * were actually weighed, not merely absent from the choice -- a search metric, so a
+         * resource cut that changes the issued depth does not change it.
+         * `calib_forced`/`calib_cut` are the calibration's own counts: forced plans **with rows**
+         * (an empty forced plan is `empty`), and of them the ones a plan-time resource cut touched
+         * (which is not `Shortened`, a bracket that stopped below its plan). `reference_skipped` is
+         * the reference table's own count and stands on its own, because a no-loan run absorbs
+         * nothing and would otherwise publish no block at all; the per-cycle discard is
          * `disposition=reference` on the trace's sample line. */
         if (m.draft_cost_cycles > 0 || m.draft_cost_reference_skipped > 0) {
             json dc;

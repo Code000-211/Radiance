@@ -127,7 +127,10 @@ public:
      * tier plus every shallower one the model priced, whether or not it won (0 when the deepest
      * was unpriced). This is what makes "both alternatives were compared" checkable from the
      * ledger -- a Cost plan at the deep tier alone does not show whether the shallow one lost or
-     * was never priced. Reset to 0 by reset() and by a plan that is not a Cost decision. */
+     * was never priced. A search metric, not an output one: a resource cut or the hysteresis can
+     * change the issued depth afterwards without changing how many depths the search weighed, so
+     * read the issued depth from last_k() and its own price from last_price(). Reset to 0 by
+     * reset() and by a plan that is not a Cost decision. */
     int32_t last_tiers_priced() const { return last_tiers_priced_; }
 
     /* The prices the last choose() actually asked for, in ladder order: validity and the estimate
@@ -179,7 +182,9 @@ private:
     /* The frozen plan's K for the view's row i, 0 when it names none. */
     int32_t frozen_k_of(const DraftBatchView& view, int32_t i) const;
     /* The shape assignment `k[]` verifies (clamped to `clamp_to` when that is >= 0), with the
-     * history the paired step owes and the drafter that is loaded. */
+     * history the paired step owes and the drafter that is loaded. Under issue_ahead() a row's
+     * verify is the frozen plan's K capped to this candidate's own K -- the executable form the
+     * step runs (Scheduler::draft_cap); a deeper key is one no bucket can hold. */
     void    shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
                      DraftVerifyShape* s) const;
     void    remember(const DraftBatchView& view, const int32_t* k);

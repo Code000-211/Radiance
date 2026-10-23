@@ -183,7 +183,10 @@ struct SchedMetrics {
     /* The last issued Cost plan's priced-tier count: the deepest offered tier plus every
      * shallower one the model priced, whether or not it won (0 when the last plan was not a Cost
      * decision). "Both depths were compared" is not visible from `priced` alone -- Stage 1 issues
-     * a Cost plan at the deep tier even when only that tier had a price. */
+     * a Cost plan at the deep tier even when only that tier had a price. A **search** metric, not
+     * an output one: the resource cut and the re-price that follow the search change what is
+     * issued, not what was weighed, so this count is not the issued depth (`draft_cost_last_k`)
+     * and does not change when a cut reprices the plan. */
     int64_t draft_cost_tiers_priced = 0;
     /* Calibration plans (`--draft-calib-k`, DraftPlanSource::Calibration) with rows, cumulative:
      * forced measurements, never a decision, so `priced`/`fallback` stay 0 for them. A forced plan
@@ -192,7 +195,8 @@ struct SchedMetrics {
     int64_t draft_calib_forced = 0;
     /* Forced plans that a plan-time resource cut touched (a row's remaining output, the token
      * budget or the pool): not kDraftSampleShortened, which is the bracket stopping below the
-     * plan, but the "no cut in the target buckets" claim has to be measurable somewhere. */
+     * plan, but the "no cut in the target buckets" claim has to be measurable somewhere. Counted
+     * per cycle, once, however many rows the cut marked. */
     int64_t draft_calib_cut = 0;
     /* Cycles observed against a loaded reference (DraftCostBasis::NoLoan) and therefore not
      * absorbed: the table is immutable, so the count is the only trace the measurement left. Zero

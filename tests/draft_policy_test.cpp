@@ -14,6 +14,7 @@
 
 #include "draft_fakes.h"
 #include "sched/draft.h"
+#include "sched/draft_cost.h"
 #include "sched/draft_policy.h"
 
 #include <cmath>
@@ -136,6 +137,93 @@ int log_estimate(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* ou
     out->valid = true;
     return RAD_OK;
 }
+
+/* The four-prompt calibration's shape: every row reaches every round, the serial head loaded
+ * (history = verify tokens), the cycle played. `draft_k` is what this plan drafts, `verify_k`
+ * what the paired step verifies -- under issue_ahead() the two differ. */
+DraftVerifyShape key_shape(int32_t n_rows, int32_t draft_k, int32_t verify_k, int32_t depth) {
+    DraftVerifyShape s;
+    s.n_rows = n_rows;
+    s.ctx_class = draft_ctx_class(1024);
+    s.sampling = DraftSampling::Greedy;
+    s.replay = DraftReplay::Play;
+    s.drafter = DraftDrafter::Serial;
+    s.pipeline_depth = depth;
+    s.draft_k = draft_k;
+    s.verify_k = verify_k;
+    for (int32_t j = 1; j <= draft_k; ++j) s.draft_rows[j] = n_rows;
+    s.verify_tokens = n_rows;
+    for (int32_t j = 1; j <= verify_k; ++j) {
+        s.rows[j] = n_rows;
+        s.verify_tokens += n_rows;
+    }
+    s.history_tokens = s.verify_tokens;   /* one history row per verify row, no shared head */
+    return s;
+}
+
+/* A four-prompt batch at `depth`, played, with the serial head loaded. */
+void four_rows(draft_fake::Fixture* f, draft_fake::Predictor* pred, int32_t depth) {
+    f->view.k_ceiling = 6;
+    f->view.pipeline_depth = depth;
+    f->view.replay = DraftReplay::Play;
+    for (int32_t i = 0; i < 4; ++i) f->add(i, (uint64_t)(i + 1));
+    draft_fake::predict(pred, f->view, &f->pred);
+}
+
+/* A loaded no-loan reference: the real DraftCostTable, exact buckets only. There is no
+ * interpolation and no heuristic fallback behind it, so a shape that is not in this table is not
+ * priceable at all -- which is what makes the lookup key itself testable. */
+struct ReferenceTable {
+    DraftCostProfile p;
+    DraftCostTable t;
+
+    void add(const DraftVerifyShape& key, double ms) {
+        DraftCostBucket b;
+        b.shape = key;
+        b.rounds = key.draft_k;
+        b.draft_rows_total = 0;
+        for (int32_t j = 1; j <= key.draft_k; ++j) {
+            b.draft_round_rows[j] = key.draft_rows[j];
+            b.draft_rows_total += key.draft_rows[j];
+        }
+        b.mean_ms = ms;
+        b.unc_ms = 0.5;
+        b.n = 3;
+        p.buckets.push_back(b);
+    }
+    void build() {
+        p.execution = DraftCostExecution::Rectangular;
+        p.fingerprint.basis = DraftCostBasis::NoLoan;
+        DraftCostRuntime rt;
+        rt.execution = DraftCostExecution::Rectangular;
+        rt.fingerprint.basis = DraftCostBasis::NoLoan;
+        CHECK_EQ(t.configure(p, rt), RAD_OK);
+        CHECK(t.active());
+        CHECK(t.reference());
+    }
+};
+
+/* The reference table asked through a log: every key the policy really requested, priced by the
+ * real table. "The lookup asked for the executable shape" is then an assertion about the query
+ * itself, not about the plan that happened to come out. */
+struct SpiedTable {
+    const DraftCostTable* t = nullptr;
+    ShapeLog log;
+
+    void reset(const DraftCostTable* table) { t = table; log.n = 0; }
+    DraftCostModel model() { return DraftCostModel{this, &priced}; }
+    static int priced(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+        auto* self = static_cast<SpiedTable*>(ctx);
+        if (self->log.n < ShapeLog::kMax) self->log.shape[self->log.n++] = s;
+        return self->t->estimate(s, out);
+    }
+    const DraftVerifyShape* find(int32_t draft_k, int32_t verify_k) const {
+        for (int i = 0; i < log.n; ++i)
+            if (log.shape[i].draft_k == draft_k && log.shape[i].verify_k == verify_k)
+                return &log.shape[i];
+        return nullptr;
+    }
+};
 
 }  /* namespace */
 
@@ -718,6 +806,141 @@ TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
     CHECK(k.f.plan.source == DraftPlanSource::Calibration);
     CHECK(!k.planner.last_price_known());
     CHECK_EQ(k.planner.last_n_tier_prices(), 0);
+}
+
+/* The price lookup asks for the shape the step can execute. The step caps every row's
+ * publication to the plan's own K (`Scheduler::draft_cap`: min(previous K, this K)), so a K2
+ * candidate after a K3 plan verifies `(2,2)` -- the D bucket the calibration really measures, and
+ * the one a serving lookup has to find -- never the `(2,3)` form no run produces. The reference
+ * table is exact, so what it does not hold nothing prices: the query itself is what the test sees.
+ * The same cap is what makes a reduced plan re-priceable after a resource cut. */
+TEST(the_price_lookup_asks_for_the_verify_shape_the_step_can_execute) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.fallback_k = 3;
+
+    ReferenceTable a_d;   /* A (3,3) and D (2,2), plus the cold (3,0) of the first cycle */
+    a_d.add(key_shape(4, 3, 0, 1), 9.0);
+    a_d.add(key_shape(4, 3, 3, 1), 12.0);
+    a_d.add(key_shape(4, 2, 2, 1), 11.0);   /* measured, and does not beat the deep window */
+    a_d.build();
+    ReferenceTable a_only;
+    a_only.add(key_shape(4, 3, 3, 1), 12.0);
+    a_only.build();
+
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    four_rows(&f, &pred, /*depth=*/1);
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    SpiedTable spy;
+
+    /* Cycle 1: no frozen predecessor, so the deepest gate asks (3,0) and issues K3. */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK(f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK(spy.find(3, 0) != nullptr);
+
+    /* Cycle 2 against A-only: K2 after K3 asks exactly D -- four rows, verify 2, 12 verify and 12
+     * history tokens -- and not the phantom (2,3) with 16 of each. Nothing is priced for it, and
+     * the search says so instead of inventing a number. */
+    spy.reset(&a_only.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    const DraftVerifyShape* d = spy.find(2, 2);
+    REQUIRE(d != nullptr);
+    CHECK_EQ(d->n_rows, 4);
+    CHECK_EQ(d->verify_tokens, 12);
+    CHECK_EQ(d->history_tokens, 12);
+    CHECK_EQ(d->rows[1], 4);
+    CHECK_EQ(d->rows[2], 4);
+    CHECK_EQ(d->pipeline_depth, 1);
+    CHECK(spy.find(2, 3) == nullptr);   /* the phantom key is never asked */
+    CHECK_EQ(planner.last_tiers_priced(), 1);
+    CHECK(!planner.last_tier_prices()[1].valid);
+
+    /* Cycle 3 against A+D: the same query hits the measured D bucket. Both alternatives are
+     * priceable, and the deep one still wins. */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK(spy.find(2, 3) == nullptr);
+    CHECK_EQ(planner.last_tiers_priced(), 2);
+    CHECK_EQ(planner.last_tier_prices()[1].k, 2);
+    CHECK(planner.last_tier_prices()[1].valid);
+    CHECK_NEAR(planner.last_tier_prices()[1].ms, 11.0, 1e-9);
+    CHECK_EQ(planner.last_tier_prices()[2].k, 3);
+    CHECK(planner.last_tier_prices()[2].valid);
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK(f.plan.source == DraftPlanSource::Cost);
+
+    /* Cycle 4: the token budget cuts K3 to K2 before the plan is issued. The re-price asks D again
+     * and finds it, so the cut plan stays a Cost plan -- and `tiers_priced` keeps the search's
+     * count (two depths weighed), not the issued depth (last_k). */
+    f.view.token_budget = 8;   /* four rows at K3 sum to 12 */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 2);
+    CHECK(f.plan.why[0] == DraftFallback::Resources);
+    CHECK(f.plan.source == DraftPlanSource::Cost);
+    CHECK(spy.find(2, 2) != nullptr);
+    CHECK(planner.last_price().valid);
+    CHECK_EQ(planner.last_price().k, 2);
+    CHECK_NEAR(planner.last_price().ms, 11.0, 1e-9);
+    CHECK_EQ(planner.last_k(), 2);
+    CHECK_EQ(planner.last_tiers_priced(), 2);
+}
+
+/* The cap must not reach the other two cases: an upshift still verifies the frozen window, and at
+ * pipeline_depth 0 the candidate's own K is the verify window, as before. */
+TEST(an_upshift_and_a_pipeline_zero_cycle_keep_the_verify_window_they_had) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.fallback_k = 2;
+
+    /* Upshift: a K2 plan is issued first (the named baseline, the table is empty), so the next
+     * cycle weighs K3 against a frozen 2. */
+    ReferenceTable none;
+    none.build();
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    four_rows(&f, &pred, /*depth=*/1);
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    SpiedTable spy;
+    spy.reset(&none.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK(f.plan.source == DraftPlanSource::Fallback);
+    CHECK_EQ(f.plan.max_k, 2);
+
+    spy.reset(&none.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    const DraftVerifyShape* up = spy.find(3, 2);
+    REQUIRE(up != nullptr);      /* frozen 2, candidate 3: the frozen window is still the bound */
+    CHECK_EQ(up->verify_tokens, 12);
+    CHECK_EQ(up->history_tokens, 12);
+    CHECK(spy.find(3, 3) == nullptr);
+    CHECK(spy.find(2, 3) == nullptr);
+    CHECK_EQ(f.plan.verify_k, 2);   /* the declared window is the frozen one, unchanged */
+
+    /* Pipeline 0: the paired step verifies what this cycle drafts, so the candidate's own K is
+     * the key -- untouched by the cap. */
+    ReferenceTable in_step;
+    in_step.add(key_shape(4, 3, 3, 0), 12.0);
+    in_step.add(key_shape(4, 2, 2, 0), 11.0);
+    in_step.build();
+    draft_fake::Fixture g;
+    draft_fake::Predictor pred2;
+    four_rows(&g, &pred2, /*depth=*/0);
+    DraftPlanner p0;
+    REQUIRE_EQ(p0.configure(cfg), RAD_OK);
+    spy.reset(&in_step.t);
+    CHECK_EQ(p0.choose(g.view, g.pred, spy.model(), &g.plan), RAD_OK);
+    const DraftVerifyShape* own = spy.find(2, 2);
+    REQUIRE(own != nullptr);
+    CHECK_EQ(own->verify_tokens, 12);
+    CHECK_EQ(p0.last_tiers_priced(), 2);
+    CHECK_EQ(g.plan.max_k, 3);
+    CHECK(spy.find(2, 3) == nullptr);
 }
 
 TEST(the_documented_c8_pair_prices_depth_three_ahead_of_depth_five) {

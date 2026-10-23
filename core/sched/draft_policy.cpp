@@ -6,6 +6,7 @@
  */
 #include "draft_policy.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -184,8 +185,10 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
         for (int32_t j = 1; j <= ki; ++j) ++s->draft_rows[j];
         /* At pipeline_depth 0 the paired step verifies exactly what this cycle drafts; only when
          * the plan is issued ahead (publish-then-verify) does it verify the frozen previous
-         * plan's window instead. */
-        const int32_t fk = view.pipeline_depth > 0 ? frozen_k_of(view, i) : ki;
+         * plan's window instead. That window is capped to this candidate's own K, the executable
+         * form the step runs (Scheduler::draft_cap): a candidate below the frozen depth publishes
+         * at most its own K, so a deeper verify shape is one no bucket can hold. */
+        const int32_t fk = view.pipeline_depth > 0 ? std::min(frozen_k_of(view, i), ki) : ki;
         if (fk > s->verify_k) s->verify_k = fk;
         s->verify_tokens += 1 + fk;
         for (int32_t j = 1; j <= fk; ++j) ++s->rows[j];
@@ -331,9 +334,11 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
      * the paired step verifies what this cycle drafts, the frozen plan's window otherwise. */
 
     /* --draft-calib-k: the operator's sequence, taken and not chosen. Nothing below this branch
-     * runs for it -- no price, no ranking, no predictor read, no hysteresis -- and it holds no
-     * state beyond its own position. The resource budget still applies: a plan may never ask for
-     * more drafts than the step or the pool was given, calibration or not. */
+     * runs for it -- no price, no ranking, no hysteresis -- and it holds no state beyond its own
+     * position. The planner still reads no prediction, but the controller's open_cycle calls
+     * predictor.predict for the cycle either way: the set belongs to the cycle, not to this plan.
+     * The resource budget still applies: a plan may never ask for more drafts than the step or
+     * the pool was given, calibration or not. */
     if (c_.n_calib_k > 0) {
         const int32_t want = c_.calib_k[calib_pos_ % c_.n_calib_k];
         for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -445,7 +450,10 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     /* The deepest tier priced (or the code above would have returned), and every shallower one
      * that did. Counted whether or not it wins: the question the ledger answers is "were both
      * depths compared", not "which one won" -- a Cost plan at the deep tier alone cannot say
-     * whether the shallow alternative lost or was never priced. */
+     * whether the shallow alternative lost or was never priced. It is a search metric: the
+     * resource cut and the re-price below change what is issued, not what the search weighed, so
+     * the count is not the issued depth (that is last_k, and the price of the plan as issued is
+     * last_price()). */
     int32_t tiers_priced = 1;
     for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
         for (int32_t i = 0; i < view.n_seq; ++i) {

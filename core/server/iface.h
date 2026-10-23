@@ -141,7 +141,8 @@ struct SchedMetrics {
     int64_t draft_cost_last_rows = 0;
     /* The last issued Cost plan's priced-tier count: how many of the ladder's depths had a price
      * when it was chosen, so "both depths compared" is distinguishable from "only the deepest
-     * was priced" (rad::SchedMetrics::draft_cost_tiers_priced). 0 unless the last plan was Cost. */
+     * was priced" (rad::SchedMetrics::draft_cost_tiers_priced). A search metric: a later resource
+     * cut or re-price does not change it. 0 unless the last plan was Cost. */
     int64_t draft_cost_tiers_priced = 0;
     /* Forced calibration plans, and of them the ones a plan-time resource cut touched
      * (rad::SchedMetrics::draft_calib_forced / draft_calib_cut). Not cost decisions. */
