@@ -624,10 +624,16 @@ private:
     /* A cycle wider than the format's widest window was dropped; said once, counted after. */
     bool    draft_record_over_rows_warned_ = false;
 
-    /* What every pass of this deployment does at the tape, from runtime evidence: `None` when the
-     * backend cannot record (every pass runs unkeyed), `Unknown` when a pass may play, record or
-     * audit. Copied into each cost cycle's view; see DraftBatchView::replay. */
-    DraftReplay draft_pass_replay_ = DraftReplay::Unknown;
+    /* The state the last completed bracket actually ran under, as the ranks froze it
+     * (DraftStepEvidence), starting from what the runtime proves about its own tape: `None` when
+     * no rank can record (every pass runs unkeyed), `Unknown` when a pass may play, record or
+     * audit -- the cold-start answer, and all a run with no completed bracket can know. The next
+     * cycle's plan names it as its *candidate* -- a prognosis, not a certificate: the next pass
+     * has its own key, so a new or audited key records where the last bracket played. Nothing
+     * reads it back as a measurement: the sample is filed, gated and priced under the state the
+     * bracket was observed to run (step_finished, draft_cost_observe), and a Record/Audit bucket
+     * is never a price (draft_bucket_usable). */
+    DraftReplay draft_cycle_replay_ = DraftReplay::Unknown;
 
     /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so

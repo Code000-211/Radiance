@@ -16,6 +16,11 @@
 
 #include "rad_internal.h"
 
+/* The plan ledger below names the candidate by the policy's own enum, so the page never repeats
+ * the numeric order of DraftReplay by hand. Header-only, and only this translation unit needs it:
+ * iface.h stays free of core/sched (adapters.h: the HTTP layer is built against fakes). */
+#include "sched/draft_types.h"
+
 #include <nlohmann/json.hpp>
 
 #include <vector>
@@ -255,6 +260,29 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             pos.push_back(std::move(p));
         }
         o["draft_positions"] = std::move(pos);
+
+        /* The cost policy's plan ledger: whether cycles are being priced or are taking the named
+         * fallback, and what the last plan asked for. `last_replay` is the candidate the plan
+         * declared -- the state the previous bracket ran under, which the next key may not share --
+         * so a run that prices at `play` and a run that only ever sees `record` are told apart;
+         * what actually ran is in `passes` on the arena's sibling block and in the samples. */
+        if (m.draft_cost_cycles > 0) {
+            json dc;
+            dc["cycles"]   = m.draft_cost_cycles;
+            dc["priced"]   = m.draft_cost_priced;
+            dc["fallback"] = m.draft_cost_fallback;
+            dc["last_k"]   = m.draft_cost_last_k;
+            const char* rp = "unknown";
+            switch ((DraftReplay)m.draft_cost_last_replay) {
+                case DraftReplay::None:   rp = "none"; break;
+                case DraftReplay::Play:   rp = "play"; break;
+                case DraftReplay::Record: rp = "record"; break;
+                case DraftReplay::Audit:  rp = "audit"; break;
+                default: break;
+            }
+            dc["last_replay"] = rp;
+            o["draft_cost"] = std::move(dc);
+        }
 
         /* Live request table: counters and timestamps. `decode_tps` is the request's own average
          * since its first token. */

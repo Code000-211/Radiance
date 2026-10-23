@@ -219,6 +219,32 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
 }
 
+/* The cost policy's plan ledger. "The policy never priced" and "the ladder priced nothing" are
+ * different facts about a run, and a fallback-only run cannot tell them apart from its plans
+ * alone, so /stats carries both counts beside what the last plan asked for. The replay is named,
+ * never emitted as a number: it is the *candidate* the plan declared (the last bracket's observed
+ * state), so a page must not read it as what ran. No cycle yet means no object at all -- a zeroed
+ * ledger would look like a measurement of nothing. */
+TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
+    Dash d(false);
+    CHECK(!d.get("/stats").contains("draft_cost"));
+
+    const char* names[] = { "unknown", "none", "play", "record", "audit" };
+    for (int r = 0; r < (int)(sizeof(names) / sizeof(names[0])); ++r) {
+        d.sched.m.draft_cost_cycles      = 4;
+        d.sched.m.draft_cost_priced      = 3;
+        d.sched.m.draft_cost_fallback    = 1;
+        d.sched.m.draft_cost_last_k      = 2;
+        d.sched.m.draft_cost_last_replay = r;
+        const json dc = d.get("/stats")["draft_cost"];
+        CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)4);
+        CHECK_EQ(dc.value("priced", (int64_t)0), (int64_t)3);
+        CHECK_EQ(dc.value("fallback", (int64_t)0), (int64_t)1);
+        CHECK_EQ(dc.value("last_k", (int64_t)0), (int64_t)2);
+        CHECK_EQ(dc.value("last_replay", std::string()), std::string(names[r]));
+    }
+}
+
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds
  * it (each block once), the tiers' counters and the snapshot store. */
 TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {

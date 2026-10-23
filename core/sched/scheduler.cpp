@@ -54,7 +54,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (!kv || !pc) return RAD_E_INVAL;
     prog_ = &prog;
     cfg_ = cfg;
-    draft_pass_replay_ = pass_replay;
+    /* Nothing has run yet, so the candidate is the capability answer: `Unknown` on a recording
+     * deployment until a bracket completes, `None` where every pass is provably unkeyed. */
+    draft_cycle_replay_ = pass_replay;
     kv_ = kv;
     pc_ = pc;
 
@@ -2036,9 +2038,11 @@ void Scheduler::draft_cost_cycle() {
     /* Publish-then-verify: the step paired with this plan verifies what the previous cycle
      * published, so this plan's draft distribution reaches a verify one cycle later. */
     draft_view_.pipeline_depth = 1;
-    /* From the deployment, not this cycle: what its runtime can say about the tape is a fact of
-     * the backend, so every cycle of it runs under the same evidenced state (or none). */
-    draft_view_.replay         = draft_pass_replay_;
+    /* From the last bracket that completed, not from what the runtime *could* do: a recording
+     * deployment whose tape stays warm plays, and only an observed state can say so. The initial
+     * value is the capability answer (`draft_cycle_replay_`, set at init), and a bracket with no
+     * evidence leaves it as it was rather than claiming a state nobody saw. */
+    draft_view_.replay         = draft_cycle_replay_;
     /* The step this cycle pairs with may add the step budget; the KV lookahead may spend what the
      * pool has free. Both are bounds read here, not measurements (the step itself is planned
      * after this cycle opens). */
@@ -2082,8 +2086,17 @@ void Scheduler::draft_cost_cycle() {
         draft_cost_failed_ = false;
         /* The plan the next step's verify and this cycle's publications belong to; copied now,
          * because the controller reuses its two plan slots. */
-        draft_ring_cur_ = draft_.plan()->cycle_id;
-        draft_ring_open(*draft_.plan());
+        const DraftPlan* p = draft_.plan();
+        draft_ring_cur_ = p->cycle_id;
+        draft_ring_open(*p);
+        /* What the policy decided, for /stats: whether this cycle was priced at all and what it
+         * asked for. The replay is the candidate the plan declared -- the last bracket's observed
+         * state, not this cycle's (see draft_cycle_replay_). */
+        ++m_.draft_cost_cycles;
+        if (p->source == DraftPlanSource::Cost) ++m_.draft_cost_priced;
+        else if (p->source == DraftPlanSource::Fallback) ++m_.draft_cost_fallback;
+        m_.draft_cost_last_k      = p->max_k;
+        m_.draft_cost_last_replay = (int64_t)p->replay;
     }
 }
 
@@ -2876,6 +2889,13 @@ void Scheduler::step_finished(const DraftStepEvidence& ev) {
          * no measurement after the move describes the start residency, however clean it looks. */
         draft_drift_note(ev.moves_since_bind);
         if (DraftCycleRecord* r = draft_ring_cycle(draft_ring_cur_)) {
+            /* The candidate the next cycle may declare. This bracket is the newest observation
+             * the planner has, and it is still only a prognosis for the next key: the sample
+             * below stays the measurement, and the plan never becomes one (draft_cycle_replay_).
+             * A bracket the ranks could not evidence leaves the candidate alone -- `Unknown` is
+             * not a state they observed -- and so does a step with no cycle record, because no
+             * sample came of it either. */
+            if (ev.replay_known) draft_cycle_replay_ = ev.replay;
             r->timed          = ns > 0;
             r->total_ms       = (double)ns / 1e6;
             r->plan.timing_valid = r->timed;

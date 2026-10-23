@@ -135,6 +135,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_obs_rows_skipped     = m.draft_obs_skipped;
     o.draft_obs_cycles_discarded = m.draft_obs_discarded;
     o.draft_cost_observations_inactive = m.draft_obs_inactive;
+    o.draft_cost_cycles       = m.draft_cost_cycles;
+    o.draft_cost_priced       = m.draft_cost_priced;
+    o.draft_cost_fallback     = m.draft_cost_fallback;
+    o.draft_cost_last_k       = m.draft_cost_last_k;
+    o.draft_cost_last_replay  = m.draft_cost_last_replay;
     o.preemptions = m.preemptions;
     o.total_requests = m.admitted;
     o.steps = m.steps;

@@ -116,8 +116,10 @@ struct Fixture {
  * deployment with no measurements yet), whose samples land in `buckets()`, which is what a host
  * test can read without a profile file. `priced` installs one usable bucket instead, so a Cost
  * deployment is admitted on a measurement rather than on the named fallback, and
- * fallback_admitted() stays false for the test to check. */
-void activate_costs(Fixture& f, bool priced = false) {
+ * fallback_admitted() stays false for the test to check. `basis` NoLoan makes the loaded table
+ * the immutable reference (nothing a cycle observes is folded into it), Live the learning table. */
+void activate_costs(Fixture& f, bool priced = false,
+                    DraftCostBasis basis = DraftCostBasis::Live) {
     DraftCostProfile p;
     p.fingerprint.model     = "test";
     p.fingerprint.quant     = "q";
@@ -127,7 +129,7 @@ void activate_costs(Fixture& f, bool priced = false) {
     p.fingerprint.kv_format = "bf16";
     p.fingerprint.placement = "all_vram";
     p.fingerprint.tp        = 1;
-    p.fingerprint.basis     = DraftCostBasis::Live;
+    p.fingerprint.basis     = basis;
     p.fingerprint.arena     = "none";
     p.fingerprint.live_loan = "flex=0 lend=0";
     if (priced) {
@@ -2413,6 +2415,143 @@ TEST(a_fallback_cycle_measures_the_deepest_offered_plan_for_the_next_cycle) {
     CHECK(c->fallback == DraftFallback::None);
     CHECK_EQ(c->k[0], 6);
     CHECK_EQ(c->verify_k, 6);
+}
+
+/* The replay a cycle is priced under is the last bracket's *observation*, not a capability claim,
+ * and even then it is only a prognosis for the next key. A cold recording deployment cannot know
+ * what its first pass will do, so the first cycle is `Unknown`; every later one declares what the
+ * previous bracket's ranks were seen to run (`Engine::step_evidence`, merged Record > Audit >
+ * Play > None). A key or level change re-records the pass, a bracket no rank could evidence
+ * leaves the candidate alone, and a non-recording deployment's cold answer is already its steady
+ * one. The seam model here prices every shape, which is what makes the declared replay visible in
+ * the shape A is asked about; the real table's bucket rules are draft_cost_test.cpp's. */
+TEST(the_next_cycle_declares_the_last_brackets_observed_replay) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());                    /* the harness makes no claim about its tape */
+
+    Predictions pred;
+    const uint64_t id = f.submit(8);
+    pred.set(id, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
+    ShapeLog log;
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 6;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = DraftCostModel{ &log, price_and_record };
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    const int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    const SchedMetrics base = f.sch.metrics();   /* the prefill's own plan opened a cycle */
+
+    /* Read what the plan declares, before running anything under it. */
+    int k = 0;
+    auto open = [&]() -> DraftReplay {
+        CHECK(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        if (!p) return DraftReplay::Unknown;
+        CHECK_EQ(draft_plan_valid(*p), RAD_OK);
+        k = p->k[0];
+        return p->replay;
+    };
+    /* Run the bracket it names and report what the ranks saw in it. */
+    auto finish = [&](DraftReplay seen, bool known = true) {
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, six, k));
+        DraftStepEvidence ev;
+        ev.replay_known = known;
+        ev.replay       = seen;
+        f.sch.step_finished(ev);
+    };
+
+    /* Cold: nothing has run, so the plan declares the capability answer and the shape A is asked
+     * about carries the unknown dimension rather than a replay nobody established. */
+    CHECK(open() == DraftReplay::Unknown);
+    CHECK_EQ(log.last.unknown, (uint32_t)kDraftShapeReplayUnknown);
+    finish(DraftReplay::None);
+
+    /* The first bracket reported an unkeyed pass; the next plan declares it as its candidate. */
+    CHECK(open() == DraftReplay::None);
+    CHECK_EQ(log.last.unknown, 0u);
+    CHECK(log.last.replay == DraftReplay::None);
+    finish(DraftReplay::Record);
+
+    /* A key or level change re-records: the pass this bracket ran is not the one the last did. */
+    CHECK(open() == DraftReplay::Record);
+    CHECK(log.last.replay == DraftReplay::Record);
+    finish(DraftReplay::Play);
+
+    /* The tape has warmed up and the pass plays. */
+    CHECK(open() == DraftReplay::Play);
+    CHECK(log.last.replay == DraftReplay::Play);
+    finish(DraftReplay::Audit);
+
+    /* A bracket no rank evidenced (this rank never ran the step) says nothing about the next
+     * key: the candidate keeps the last observation instead of inventing `Unknown`. */
+    CHECK(open() == DraftReplay::Audit);
+    finish(DraftReplay::Unknown, false);
+    CHECK(open() == DraftReplay::Audit);
+
+    /* The plan ledger tells "priced" from "fell back" and names the candidate it used. */
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_cycles, base.draft_cost_cycles + 6);
+    CHECK_EQ(m.draft_cost_priced, base.draft_cost_priced + 6);   /* this model prices every shape */
+    CHECK_EQ(m.draft_cost_fallback, base.draft_cost_fallback);
+    CHECK_EQ(m.draft_cost_last_k, k);
+    CHECK_EQ(m.draft_cost_last_replay, (int64_t)DraftReplay::Audit);
+}
+
+/* A reference table is the run's yardstick, not its notebook: the cycles the new candidate prices
+ * are still only compared against it. The observed replay reaches the plan -- and through it the
+ * shape A is asked about -- and never observe(): the bucket is exactly what was loaded, and each
+ * valid observation is counted apart instead of folded in. */
+TEST(an_observed_replay_never_writes_into_a_reference_table) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true, DraftCostBasis::NoLoan);
+    CHECK_OK(f.start(DraftReplay::None));
+    REQUIRE(f.sch.draft_costs().reference());
+
+    const DraftCostBucket before = f.sch.draft_costs().buckets()[0];
+
+    const uint64_t id = f.submit(160);
+    f.prefill(id);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    for (DraftReplay seen : { DraftReplay::None, DraftReplay::Play, DraftReplay::Audit }) {
+        REQUIRE(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, six, p->k[0]));
+        DraftStepEvidence ev;
+        ev.replay_known = true;
+        ev.replay       = seen;
+        f.sch.step_finished(ev);
+    }
+
+    /* The last bracket is delivered when the next cycle opens, so open one more. */
+    REQUIRE(f.sch.step() != nullptr);
+
+    /* The file's bucket is what it measured: same mean, same width, same count. */
+    const std::vector<DraftCostBucket>& after = f.sch.draft_costs().buckets();
+    REQUIRE_EQ(after.size(), (size_t)1);
+    CHECK(after[0].mean_ms == before.mean_ms);
+    CHECK(after[0].unc_ms == before.unc_ms);
+    CHECK_EQ(after[0].n, before.n);
+    CHECK_EQ(f.sch.draft_costs().reference_skipped(), 3);
 }
 
 /* The other side of the same gate: one bucket estimate() would price from (no disturbing flag, a
