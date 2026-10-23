@@ -144,6 +144,23 @@ struct LiveSnapshot {
     ExpertPlane           experts;
     LinkStat              link;
     PassStat              passes;
+
+    /* The activation arena's levels (Engine::arena_rows_), largest step first, and the one the
+     * engine chose for the last batch it prepared: `arena_level` is its index into `arena_levels`
+     * and `arena_level_rows` the step size that level serves. That is a capacity, not the batch's
+     * token count, and not a step known to have finished on a card. 0 rows mean no batch has been
+     * prepared yet; `arena_level` is then the initial 0, a nominal index and not a choice, and the
+     * two say nothing about each other.
+     *
+     * The list is empty when nothing is lent, for four different reasons, each with its own
+     * startup line: the plugin answers no sizing declare ("activation arena: not lent -- ..."),
+     * the step budget is below the smallest level (silent), the plan has nothing movable to lend
+     * to ("heat engine: ..."), or a level would not bind ("a level would not bind; nothing is
+     * lent"). /stats then omits the block, so its absence alone does not mean the plugin is at
+     * fault. */
+    std::vector<int64_t> arena_levels;
+    int64_t              arena_level_rows = 0;
+    int                  arena_level      = 0;
 };
 
 void snapshot_from(const SchedMetrics& m, LiveSnapshot* out);

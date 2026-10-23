@@ -2611,9 +2611,10 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
  *              fingerprint or execution difference -- so the log's no-loan binding line says the
  *              file was measured on exactly this deployment.
  *
- * The plugin declares no level plan for the activation arena (`RadArchProbe::shape_probe_ok`), so
- * `arena` is "none" in the file -- the file's own name for a deployment with no level plan, not a
- * missing field, and not a statement about the KV loan. The loan is the separate `live_loan` field,
+ * This deployment has no activation-arena level: the plugin answers a sizing declare, but a level
+ * is only planned above 256 rows and the budget here is 64. So `arena` is "none" in the file --
+ * the name for a deployment with no level, not a missing field, and not a statement about the KV
+ * loan. The loan is the separate `live_loan` field,
  * which a no-loan reference omits by construction; `placement` names the plan it was derived
  * under.
  *
@@ -2788,6 +2789,208 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
                 rst["experts"].dump().c_str());
     CHECK(rst["experts"].value("flex_bytes", 0.0) > 0.0);
 }
+
+/* The activation arena's levels, and the identity they hand a profile.
+ *
+ * A level is the plugin declaring its graph again at a smaller step (RadBuildCtx::shape_probe);
+ * Engine::probe_arena_levels keeps the answers plan_level accepts and records their rows in the
+ * profile's identity. Until this plugin declared that it can answer one, every identity this tree
+ * wrote said `arena "none"` -- the case above, and the depth case below, still do at 64 batched
+ * tokens. A level needs a budget above 256 rows: `lo` is the smallest power of two at or above
+ * max_seqs * (1 + n_spec), never below 256, and the levels are lo, 4 * lo, ... under max_tok. At
+ * 512 that is one level, 256.
+ *
+ * Three starts on the same checkpoint and the same tiered deployment as the case above:
+ *   wide      512 batched tokens, a no-loan reference with the profile out: the levels exist, the
+ *             identity names them, and nothing is lent while the file is measured.
+ *   reload    the same 512 budget in normal operation, loading that file: the arena identity is
+ *             part of the fingerprint, so this bind is the file's level set matching a live one,
+ *             and a completion then has its batches prepared at the level it names (/stats
+ *             publishes the level chosen for the last prepared batch).
+ *   control   the same file with one field changed -- `arena` set to "none", the identity of a
+ *             deployment with no level plan -- loaded on the same deployment. Every earlier field
+ *             of the fingerprint still matches, so the refusal names the arena level set and
+ *             nothing else. No fingerprint exception is granted here; the refusal is the point.
+ *
+ * The 64-token case above is the other half of the control: it runs this same deployment at a
+ * budget with no level and its file says `arena "none"`, so the levels at 512 are the budget's
+ * doing and not a constant of the plugin. */
+TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
+    tiny::TempDir dir("qmoe_arena");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    const std::vector<std::string> common = { "--num-speculative-tokens", "2",
+                                              "--placement", "expert_tiered",
+                                              "--host-pool-mib", "96",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+    auto at_budget = [&](int64_t tok) {
+        std::vector<std::string> a = common;
+        for (size_t i = 0; i + 1 < a.size(); ++i)
+            if (a[i] == "--max-num-batched-tokens") a[i + 1] = std::to_string(tok);
+        return a;
+    };
+
+    /* ---- wide: the reference records the level set in the identity ---- */
+    const std::string profile = dir.path + "/arena-reference.json";
+    std::vector<std::string> ref = at_budget(512);
+    ref.insert(ref.end(), { "--draft-reference", "--draft-policy", "cost", "--draft-profile-out",
+                            profile });
+    Server basis;
+    REQUIRE(basis.start(dir.path, ref, device_env(32)));
+    int status = 0;
+    std::string why;
+    const json reply =
+        post(basis.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(reply).size() != 24)
+        fprintf(stderr, "    the 512 reference answered status %d (%s): %s\n", status,
+                why.c_str(), reply.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
+    const int ref_exit = basis.stop();
+    const std::string ref_log = basis.output();
+    CHECK_EQ(ref_exit, 0);
+    CHECK(ref_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+    /* The engine says which level it kept, and it is the 256-row one; a refused level warns here
+     * instead ("no level for 256-token steps"), and the identity below would say "none". */
+    if (ref_log.find("while steps are at most 256 tokens") == std::string::npos)
+        fprintf(stderr, "    no arena level was recorded:\n%s\n", tail(ref_log).c_str());
+    CHECK(ref_log.find("activation arena: reference calibration -- levels") != std::string::npos);
+    CHECK(ref_log.find("while steps are at most 256 tokens") != std::string::npos);
+    CHECK(ref_log.find("no level for 256-token steps") == std::string::npos);
+
+    const std::string body = tiny::read_text(profile);
+    REQUIRE(!body.empty());
+    const json p = json::parse(body, nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", ""), std::string("no-loan"));
+    CHECK_EQ(fp.value("model", ""), std::string("qwen35moe"));
+    /* The level set, largest step first: the plan's own budget and the level below it. */
+    if (fp.value("arena", "") != std::string("512,256"))
+        fprintf(stderr, "    the identity's arena is '%s'\n", fp.value("arena", "").c_str());
+    CHECK_EQ(fp.value("arena", ""), std::string("512,256"));
+    CHECK(fp.value("placement", "").rfind("expert_tiered ", 0) == 0);
+    CHECK(fp.value("placement", "").find("dyn=1") != std::string::npos);
+    /* Nothing was lent, so nothing drifted: the start cycle the levels were measured under is
+     * still the plan the fingerprint names. */
+    bool start_priced = false;
+    for (const json& b : p.value("buckets", json::array())) {
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0 || shape.value("verify_tokens", -1) != 1 ||
+            shape.value("history_tokens", -1) != 1 || shape.value("draft_k", -1) != 2 ||
+            shape.value("drafter", std::string()) != std::string("serial"))
+            continue;
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        start_priced = start_priced ||
+                       (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
+    }
+    CHECK(start_priced);
+
+    /* ---- reload: a live 512 run binds the file, arena included, and serves a request ---- */
+    std::vector<std::string> live = at_budget(512);
+    live.insert(live.end(), { "--draft-policy", "cost", "--draft-profile", profile });
+    Server run;
+    REQUIRE(run.start(dir.path, live, device_env(32)));
+    const std::string run_log = run.output();
+    if (run_log.find("basis no-loan -- an optimisation basis") == std::string::npos)
+        fprintf(stderr, "    the 512 reload did not bind the profile:\n%s\n",
+                tail(run_log).c_str());
+    CHECK(run_log.find("basis no-loan -- an optimisation basis") != std::string::npos);
+    CHECK(run_log.find("is not used for this deployment") == std::string::npos);
+    CHECK(run_log.find("while steps are at most 256 tokens") != std::string::npos);
+
+    /* Before any request: no batch has been prepared, so the snapshot publishes 0 rows -- "nothing
+     * prepared yet" -- and index 0. That index is the nominal 0 of an empty choice, not a level
+     * the engine picked, and the rows/index pairing asserted after the completion does not apply
+     * here. */
+    const json fresh = stats(run.port);
+    REQUIRE(fresh.is_object() && fresh.contains("arena"));
+    if (fresh["arena"].value("level_rows", -1.0) != 0.0 ||
+        fresh["arena"].value("level", -1) != 0)
+        fprintf(stderr, "    the idle engine published %s\n", fresh["arena"].dump().c_str());
+    CHECK_EQ(fresh["arena"].value("level_rows", -1.0), 0.0);
+    CHECK_EQ(fresh["arena"].value("level", -1), 0);
+
+    /* A real completion, so the levels are exercised and not only bound: the prompt and every
+     * decode step of it are far under 256 tokens, so the engine chooses the 256-row level for
+     * every batch of it and may lend the arena above that level to the slab. /stats publishes
+     * that choice (Engine::arena_step, LiveSnapshot) as the level index and that level's
+     * capacity -- the step size it serves, not the batch's token count and not a step known to
+     * have finished on the card. A batch that had needed the full plan would have published 512
+     * at index 0. */
+    int status_live = 0;
+    std::string why_live;
+    const json live_reply = post(run.port, "/completion", completion(prompt_ids(7, 24), 24),
+                                 &status_live, &why_live);
+    if (status_live != 200 || tokens_of(live_reply).size() != 24)
+        fprintf(stderr, "    the 512 reload answered status %d (%s): %s\n", status_live,
+                why_live.c_str(), live_reply.dump().c_str());
+    REQUIRE_EQ(status_live, 200);
+    REQUIRE_EQ(tokens_of(live_reply).size(), (size_t)24);
+    const json rst = stats(run.port);
+    REQUIRE(rst.is_object() && rst.contains("arena"));
+    const json& ar = rst["arena"];
+    /* The level set this deployment declares, largest step first, and the pair the snapshot
+     * published for the batch it is about: the rows are exactly the capacity of the level index
+     * they are published with, so the two always belong to one batch. */
+    REQUIRE_EQ(ar["levels"].size(), (size_t)2);
+    CHECK_EQ(ar["levels"][0].get<int64_t>(), (int64_t)512);
+    CHECK_EQ(ar["levels"][1].get<int64_t>(), (int64_t)256);
+    const int lvl = ar.value("level", -1);
+    REQUIRE(lvl >= 0 && lvl < 2);
+    CHECK_EQ(ar["level_rows"].get<int64_t>(), ar["levels"][lvl].get<int64_t>());
+    if (ar.value("level_rows", 0.0) != 256.0)
+        fprintf(stderr, "    the reload's last prepared batch was prepared at %s\n",
+                ar.dump().c_str());
+    CHECK_EQ(ar.value("level_rows", 0.0), 256.0);
+    CHECK_EQ(lvl, 1);
+    CHECK_EQ(run.stop(), 0);
+
+    /* ---- control: the same file, one field changed to a different level set ---- */
+    json doctored = p;
+    doctored["fingerprint"]["arena"] = "none";
+    const std::string other = dir.path + "/arena-none.json";
+    REQUIRE(tiny::write_text(other, doctored.dump(2)));
+    std::vector<std::string> mismatch = at_budget(512);
+    /* The legacy policy: under `cost` a refused table is a refused start by design
+     * (Scheduler::init), which would stop the process before the refusal could be read. The bind
+     * and its reason are the same code either way. */
+    mismatch.insert(mismatch.end(), { "--draft-profile", other });
+    Server small;
+    REQUIRE(small.start(dir.path, mismatch, device_env(32)));
+    const std::string small_log = small.output();
+    /* The deployment is the one the file was measured on; the arena level set is the only field
+     * that differs, so the refusal has to name it (and nothing before it in the comparison). */
+    if (small_log.find("is not used for this deployment") == std::string::npos)
+        fprintf(stderr, "    the changed level set was not refused:\n%s\n", tail(small_log).c_str());
+    CHECK(small_log.find("is not used for this deployment") != std::string::npos);
+    CHECK(small_log.find("arena profile=\"none\" runtime=\"512,256\"") != std::string::npos);
+    CHECK(small_log.find("basis no-loan -- an optimisation basis") == std::string::npos);
+    CHECK_EQ(small.stop(), 0);
+}
+
 
 /* The depth decision, told apart from the fallback: a reload whose head can execute six positions
  * and whose ladder ends at two.

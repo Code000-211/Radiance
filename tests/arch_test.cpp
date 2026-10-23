@@ -6475,6 +6475,239 @@ TEST(qwen35moe_fp8_routes_every_expert_and_folds_the_shared_arm) {
     }
 }
 
+namespace {
+
+/* A buffer one row per routed (token, slot) pair -- the pass's planes -- rather than one row per
+ * step token; the rule is above the routed declarations in arch/qwen35_fp8/qwen35_fp8.cpp. */
+bool routed_plane(const std::string& name) {
+    for (const char* s : { "moe_sorted", "moe_gate_up", "moe_ffn", "moe_ffn.q", "moe_ffn.s",
+                           "moe_down" }) {
+        const size_t n = std::strlen(s);
+        if (name.size() >= n && name.compare(name.size() - n, n, s) == 0) return true;
+    }
+    return false;
+}
+
+/* A sizing declare held against the real one, op for op and buffer for buffer.
+ *
+ * plan_level() (core/build/rad_bufplan.cpp:151-215) checks the buffers: the same count, name,
+ * kind, domain, dtype and rank, the same extent in every dimension but the rows, rows that do not
+ * grow, and a packed plan that still ends inside the full arena. It takes the op list from the
+ * full plan as given and does not compare it, so the ops, their parameters and their use-sets are
+ * checked here -- a sizing declare that grew an op, dropped a read or re-pointed a weight would
+ * otherwise pass the engine's own check.
+ *
+ * Every buffer's row extent is held to an exact number, not to "not larger": a buffer one row a
+ * step token is `tok` rows, a routed plane one row a (token, slot) pair is `tok * top_k`, and
+ * every other buffer is the plan's own memory (tables, handles, a histogram over experts) and may
+ * not move at all. */
+void check_sizing_declare(const RadBuilder& full, const RadBuilder& small, int64_t real_tok,
+                          int64_t tok, int64_t top_k) {
+    REQUIRE_EQ(small.ops.size(), full.ops.size());
+    for (size_t i = 0; i < full.ops.size(); ++i) {
+        const RecOp& f = full.ops[i];
+        const RecOp& q = small.ops[i];
+        CHECK_EQ(q.op, f.op);
+        CHECK_EQ(q.resolved, f.resolved);
+        CHECK_EQ(q.uses_declared, f.uses_declared);
+        REQUIRE_EQ(q.w.size(), f.w.size());
+        for (size_t k = 0; k < f.w.size(); ++k) CHECK_EQ(q.w[k], f.w[k]);
+        REQUIRE_EQ(q.reads.size(), f.reads.size());
+        for (size_t k = 0; k < f.reads.size(); ++k) CHECK_EQ(q.reads[k], f.reads[k]);
+        REQUIRE_EQ(q.writes.size(), f.writes.size());
+        for (size_t k = 0; k < f.writes.size(); ++k) CHECK_EQ(q.writes[k], f.writes[k]);
+        REQUIRE_EQ(q.p.size(), f.p.size());
+        for (size_t k = 0; k < f.p.size(); ++k) {
+            const RecParam& a = f.p[k];
+            const RecParam& b = q.p[k];
+            if (a.kind == RAD_P_RANGE) continue;   /* the step's rows: plan_level checks the extent */
+            if (a.key != b.key || a.kind != b.kind || a.ival != b.ival || a.ihi != b.ihi ||
+                a.sval != b.sval || a.dval != b.dval)
+                fprintf(stderr, "    op %zu '%s': '%s' is %lld/%lld/'%s' at %lld rows and "
+                        "%lld/%lld/'%s' at %lld\n", i, f.op.c_str(), a.key.c_str(), a.ival, a.ihi,
+                        a.sval.c_str(), (long long)real_tok, b.ival, b.ihi, b.sval.c_str(),
+                        (long long)tok);
+            CHECK_EQ(a.key, b.key);
+            CHECK_EQ(a.ival, b.ival);
+            CHECK_EQ(a.ihi, b.ihi);
+            CHECK_EQ(a.sval, b.sval);
+            CHECK_EQ(a.dval, b.dval);
+        }
+    }
+
+    REQUIRE_EQ(small.bufs.size(), full.bufs.size());
+    int tok_rows = 0, slot_rows = 0, fixed = 0;
+    for (size_t i = 0; i < full.bufs.size(); ++i) {
+        const std::string& name = full.bufs[i].name;
+        const RadBufDecl&  f    = full.bufs[i].d;
+        const RadBufDecl&  q    = small.bufs[i].d;
+        CHECK_EQ(small.bufs[i].name, name);
+        CHECK_EQ(q.kind, f.kind);
+        CHECK_EQ(q.domain, f.domain);
+        CHECK_EQ(q.dtype, f.dtype);
+        CHECK_EQ(q.rank, f.rank);
+        if (q.rank != f.rank) continue;
+        for (uint32_t d = 1; d < f.rank; ++d) CHECK_EQ(q.shape[d], f.shape[d]);
+        int64_t want = f.shape[0];
+        if (routed_plane(name)) {
+            want = tok * top_k;
+            ++slot_rows;
+        } else if (f.shape[0] == real_tok) {
+            want = tok;
+            ++tok_rows;
+        } else {
+            ++fixed;
+        }
+        if (q.shape[0] != want)
+            fprintf(stderr, "    buffer '%s' is %lld rows at %lld, %lld at %lld; wanted %lld\n",
+                    name.c_str(), (long long)f.shape[0], (long long)real_tok,
+                    (long long)q.shape[0], (long long)tok, (long long)want);
+        CHECK_EQ(q.shape[0], want);
+    }
+    CHECK(tok_rows > 0);
+    CHECK(slot_rows > 0);
+    CHECK(fixed > 0);
+}
+
+}  /* namespace */
+
+/* The routed build answers a sizing declare, which is what gives a profile its arena levels.
+ *
+ * Engine::probe_arena_levels declares the plugin again at a smaller step (RadBuildCtx::shape_probe)
+ * whenever probe() reports shape_probe_ok; plan_level() keeps the answer if the buffers hold --
+ * what that check covers, and that it does not compare the ops, is in check_sizing_declare above.
+ * Until this plugin answered, every identity the tree wrote said `arena "none"`.
+ *
+ * This case pins the state separation the engine relies on: the sizing declare runs after the
+ * real one and writes its own Model, so `step()`, which reads the real one for the whole run, is
+ * unaffected. The two declares are then held to the same graph. That is shown here on the host,
+ * for one serial rank, for one rank of a TP2 pair and for the DFlash2 drafter; nothing here ran a
+ * card, and it is not a claim about modes of the plugin the engine offers that this case does not
+ * build.
+ * The dense build keeps its own answer below: probe() reports no level plan there, so a dense
+ * qwen35 deployment gains nothing from this and its identity is unchanged. */
+TEST(the_routed_qwen35_declares_its_graph_at_a_smaller_step) {
+    MetaKV mk = q35moe_meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen35moe_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.shape_probe_ok, 1);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok  = 512;
+    c.max_seqs = 4;
+    c.max_spec = 2;
+    c.max_ctx  = 4096;
+    RadBuilder full;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&full, mk.meta(), &c), RAD_OK);
+
+    const qwen35moe_fp8::Model& m = qwen35moe_fp8::g_model[0];
+    const int64_t    real_tok    = m.g.max_tok;
+    const size_t     real_layers = m.layers.size();
+    const rad_buf    real_x      = m.b_x;
+    const rad_weight real_tok_w  = m.w_tok;
+    REQUIRE_EQ(real_tok, (int64_t)512);
+    REQUIRE_EQ(m.moecfg.top_k, (int64_t)4);
+    CHECK(real_layers > 0);
+    const size_t real_ops = full.ops.size();
+
+    RadBuildCtx p = c;
+    p.max_tok     = 256;
+    p.shape_probe = 1;
+    RadBuilder small;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&small, mk.meta(), &p), RAD_OK);
+
+    /* The step's state is still the real declare's: same rows, same handles. */
+    CHECK_EQ(m.g.max_tok, real_tok);
+    CHECK_EQ(m.layers.size(), real_layers);
+    CHECK_EQ(m.b_x, real_x);
+    CHECK_EQ(m.w_tok, real_tok_w);
+    CHECK_EQ(full.ops.size(), real_ops);
+
+    check_sizing_declare(full, small, real_tok, 256, 4);
+}
+
+/* The same at rank 1 of a two-rank deploy: the engine declares every rank's level on that rank's
+ * own thread, so a sizing declare must not touch the Model this rank's step runs. */
+TEST(the_routed_qwen35_sizes_a_second_rank_without_touching_its_state) {
+    MetaKV mk = q35moe_meta();
+    RadBuildCtx c = build_ctx(1, 2);
+    c.max_tok  = 512;
+    c.max_seqs = 4;
+    c.max_spec = 2;
+    c.max_ctx  = 4096;
+    RadBuilder full;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&full, mk.meta(), &c), RAD_OK);
+
+    const qwen35moe_fp8::Model& m = qwen35moe_fp8::g_model[1];
+    const int64_t    real_tok    = m.g.max_tok;
+    const size_t     real_layers = m.layers.size();
+    const rad_buf    real_x      = m.b_x;
+    const rad_weight real_tok_w  = m.w_tok;
+    REQUIRE_EQ(real_tok, (int64_t)512);
+    CHECK(real_layers > 0);
+
+    RadBuildCtx p = c;
+    p.max_tok     = 256;
+    p.shape_probe = 1;
+    RadBuilder small;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&small, mk.meta(), &p), RAD_OK);
+
+    CHECK_EQ(m.g.max_tok, real_tok);
+    CHECK_EQ(m.layers.size(), real_layers);
+    CHECK_EQ(m.b_x, real_x);
+    CHECK_EQ(m.w_tok, real_tok_w);
+
+    check_sizing_declare(full, small, real_tok, 256, 4);
+}
+
+/* A DFlash2 drafter is declared by the same call and its Model is the same one a sizing declare
+ * would otherwise reset; the drafter's own buffers are part of the level's plan too. */
+TEST(the_routed_qwen35_sizes_a_dflash2_drafter_without_touching_it) {
+    MetaKV mk = with_dflash2(q35moe_meta());
+    RadArchProbe pb{};
+    CHECK_OK(qwen35moe_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.shape_probe_ok, 1);
+    CHECK_EQ(pb.draft_depth, 7);   /* block_size 8: the probe took the DFlash2 branch */
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok  = 512;
+    c.max_seqs = 4;
+    c.max_spec = 7;   /* the trained block: DFlash2 refuses a query block that is not a power of two */
+    c.max_ctx  = 4096;
+    RadBuilder full;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&full, mk.meta(), &c), RAD_OK);
+
+    const qwen35moe_fp8::Model& m = qwen35moe_fp8::g_model[0];
+    const int64_t    real_tok    = m.g.max_tok;
+    const size_t     real_layers = m.layers.size();
+    const rad_buf    real_x      = m.b_x;
+    const rad_weight real_tok_w  = m.w_tok;
+    REQUIRE_EQ(real_tok, (int64_t)512);
+    REQUIRE(m.have_df);   /* the drafter is declared here, and its buffers are in `full` */
+    CHECK(real_layers > 0);
+
+    RadBuildCtx p = c;
+    p.max_tok     = 256;
+    p.shape_probe = 1;
+    RadBuilder small;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&small, mk.meta(), &p), RAD_OK);
+
+    CHECK_EQ(m.g.max_tok, real_tok);
+    CHECK_EQ(m.layers.size(), real_layers);
+    CHECK_EQ(m.b_x, real_x);
+    CHECK_EQ(m.w_tok, real_tok_w);
+
+    check_sizing_declare(full, small, real_tok, 256, 4);
+}
+
+/* The dense build declares no level plan: its identity and its step stay as they were. */
+TEST(the_dense_qwen35_keeps_its_identity) {
+    MetaKV mk = q35fp8_meta();
+    RadArchProbe pb{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &pb));
+    CHECK_EQ(pb.shape_probe_ok, 0);
+}
+
 /* The routed model's engine steps, its routed MTP head included, lint clean at one and two
  * ranks. */
 TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {

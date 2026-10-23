@@ -366,6 +366,20 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["stream_bytes"]   = s.link.stream_bytes;
             o["link"] = std::move(l);
         }
+        /* The activation arena's levels and the one chosen for the last prepared batch (see
+         * LiveSnapshot): `level_rows` is that level's capacity, not the batch's token count. A
+         * reader polling during a request can see which level is in force; before the first
+         * batch `level_rows` is 0 -- nothing prepared yet -- and `level` is then the nominal 0 of
+         * an empty choice, not a level the engine picked. Omitted when nothing is lent, for any of
+         * the reasons the field's comment lists. */
+        if (!s.arena_levels.empty()) {
+            json a;
+            a["level"]      = s.arena_level;
+            a["level_rows"] = (double)s.arena_level_rows;
+            a["levels"]     = s.arena_levels;
+            o["arena"] = std::move(a);
+        }
+
         if (s.passes.present) {
             json p;
             p["played"]         = s.passes.played;
