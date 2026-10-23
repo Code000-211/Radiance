@@ -894,6 +894,26 @@ struct Config {
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
 
+    /* ---------------- THE ENGINE MEASURES ITSELF (core/diagnose.h) ----------------
+     *
+     * A mode, like KL: the engine starts as it would to serve, then runs a fixed serving workload
+     * through its own scheduler instead of listening, and writes DIR/diagnose.json and
+     * DIR/diagnose.md. Step times, tokens per step and the interval between bursts come from the
+     * scheduler's own records (core/sched/steplog.h): a client measuring the same workload measures
+     * the socket as well. Draft acceptance is reported by category and by draft position, and every
+     * generated token is in the report, so `--diagnose-baseline` can say whether this build says the
+     * same words as an earlier one. */
+    std::string diagnose_dir;           /* --diagnose DIR */
+    std::string diagnose_baseline;      /* --diagnose-baseline FILE: an earlier report's JSON */
+    /* The token sequence every prompt is salted with, so nothing in the workload has ever been in
+     * the prefix cache. Fixed rather than clock-derived: a rerun of the same build has to be the
+     * same run for its tokens to mean anything. */
+    int64_t diagnose_salt = 1;          /* --diagnose-salt N */
+    /* Pooled draft acceptance has to fall by more than this, as a fraction of what it was, before a
+     * baseline run says it fell: below it, acceptance moves with the machine. */
+    double diagnose_acceptance_drop = 0.10;   /* --diagnose-acceptance-drop FRAC */
+    bool diagnose() const { return !diagnose_dir.empty(); }
+
     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
      * (one image is one pass) and sizes the encoder's activations. -1 is `auto`: the default below
      * when the container carries a vision tower and 0 when it does not. 0 serves text only and

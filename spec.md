@@ -1512,6 +1512,53 @@ Normal operation prints a few lines. Everything below is off by default.
   coloured by tier, residency per tier in units and bytes, and the interconnect split between the
   tensor-parallel all-reduce and the expert mover's traffic. Redirected, it prints one greppable
   `key=value` line instead.
+- `--diagnose DIR`: run a fixed serving workload through the engine instead of listening, and write
+  the measurement to `DIR` (§16.1).
+
+### 16.1 The self-measurement mode
+
+`radiance --diagnose DIR` starts the deployment as a serve would -- the same plugins, the same
+placement, the same scheduler -- then runs one fixed workload through its own scheduler without
+listening on a port, writes `DIR/diagnose.json` and `DIR/diagnose.md`, and exits. It measures the
+engine rather than a client's view of it: the numbers come from the scheduler's own step records, so
+the wait behind a prefill chunk, the interval between the steps that put tokens on the wire and how
+much of it the engine spent waiting, and the cost of a draft pass are all in them, which a client's
+throughput figure cannot separate.
+
+The workload belongs to the engine and not to a script, because a workload that moves with the
+change being tested measures nothing. It is a fixed table of prompts, held as token-id spans so that
+what ran does not depend on a tokeniser, and a fixed table of points that combine them at a
+concurrency, a request count and a generation length: single-sequence decode, decode at several
+concurrencies, prose, code, structured output, long-context recall and long-form generation, prefill
+at several lengths, and the cost an arrival adds to streams already decoding. Everything else --
+chunk geometry, speculation, cache settings -- comes from the command line, because that is what is
+under test.
+
+The report gives, per point and pooled: step time by step shape; the interval from one step that
+emitted tokens to the next, and the part of it the engine spent not running a step; tokens and rows
+per step; throughput; prefix-cache hits and reuse; draft acceptance pooled, per request category and
+per draft position; preemption counts; the step counts as the scheduler phased them and as the
+records shaped them; and every generated token id.
+
+- A quantity that could not be measured is absent, with the reason it is absent, and never zero. A
+  point this deployment cannot hold says what would have to change to hold it, and does not fail the
+  run.
+- Nothing is served from the prefix cache. Every prompt is salted from `--diagnose-salt`, the cache
+  is dropped before each point, and a point whose prompt was nonetheless a cache hit is reported as
+  not a measurement rather than as a fast one.
+- Sampling is greedy with `ignore_eos` and every request generates to its point's length, so two runs
+  of one build write the same tokens: a build that says different words shows as a token difference
+  instead of hiding inside a timing difference.
+- `--diagnose-baseline FILE` compares the run against an earlier report. The workload's identity and
+  its salt have to match, or the comparison is refused with both values named. Token parity is a
+  failure, reported as the point, the request and the first token where the two disagree, with every
+  point whose tokens still match kept in the report. Pooled draft acceptance -- per point, per
+  category and per draft position -- is reported when it falls by more than
+  `--diagnose-acceptance-drop` of what it was.
+- The report reviews itself before it is written: a run that generated no token, a point that was not
+  a measurement, step records dropped because the ring was too small, a cache hit, or a distribution
+  whose percentiles do not order are printed to the log, and the ones that mean nothing was measured
+  exit non-zero.
 
 ---
 

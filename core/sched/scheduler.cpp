@@ -405,6 +405,73 @@ int64_t Scheduler::reset_prefix_cache() {
     return dropped;
 }
 
+/* ------------------------------------------------------------------ the step record (steplog.h)
+ *
+ * The engine's self-measurement (--diagnose) turns this on for its own run and off again; nothing
+ * else ever does, so a serving process neither holds the ring nor writes it. */
+void Scheduler::enable_step_log(size_t steps) {
+    std::lock_guard<std::mutex> lk(mu_);
+    step_log_.enable(steps);
+    step_log_last_ = {};
+}
+
+void Scheduler::disable_step_log() {
+    std::lock_guard<std::mutex> lk(mu_);
+    step_log_.disable();
+}
+
+bool Scheduler::step_log_enabled() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return step_log_.enabled();
+}
+
+uint64_t Scheduler::drain_step_log(std::vector<StepRecord>* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    out->clear();
+    return step_log_.drain(out);
+}
+
+bool Scheduler::step_quiet() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return !step_open_ && !next_open_ && !commit_reported_;
+}
+
+/* The step whose bracket just closed, as one record. `end` is the clock reading step_finished()
+ * took, so the record's own span is the same span step_ns accumulated. mu_ held. */
+void Scheduler::record_step(const std::chrono::steady_clock::time_point& end) {
+    if (!step_log_.enabled()) return;
+    StepRecord r;
+    r.step     = step_;
+    r.begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     step_start_.time_since_epoch()).count();
+    r.end_ns   = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     end.time_since_epoch()).count();
+    if (step_log_last_.time_since_epoch().count() != 0)
+        r.since_prev_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              step_start_ - step_log_last_).count();
+    step_log_last_ = end;
+
+    r.n_tok    = (int32_t)(plan_.n_tok > INT32_MAX ? INT32_MAX : plan_.n_tok);
+    r.n_decode = (int32_t)(plan_.n_seq_decode > INT32_MAX ? INT32_MAX : plan_.n_seq_decode);
+    /* The plan is sorted decode rows first, so what is not a decode row is a prefill chunk. */
+    r.n_prefill = (int32_t)((int64_t)plan_.e.size() - plan_.n_seq_decode);
+    r.n_seq    = (int32_t)plan_.e.size();
+    r.phase    = plan_.phase;
+    r.draft_pass = plan_.draft_pass;
+    /* What the step put on the wire, not what it computed: a prefill chunk of a thousand rows
+     * emits nothing, and a step that reads it as a thousand tokens would make the burst interval
+     * mean the gap between prefills (steplog.h, core/diagnose.h). */
+    r.tok_out  = (int32_t)step_emit_tok_;
+    r.n_accepted = (int32_t)step_accepted_tok_;
+    /* A step that samples nothing (a mid-prompt chunk, a draft pass) has no logits rows; the
+     * entries that produce one carry 1 + n_spec each, which is what the engine read back. */
+    for (const StepEntry& e : plan_.e)
+        if (e.produces_token) r.n_out += 1 + e.n_spec;
+    r.issued_ahead = step_ahead_;
+    r.prefill_held = held_prefill_ > 0;
+    step_log_.push(r);
+}
+
 void Scheduler::trim_prefix_cache() {
     if (!pc_ || !cfg_.prefix_cache) return;
     const std::vector<int32_t>& cg = pc_->cached_groups();
@@ -1157,6 +1224,12 @@ const RadBatch* Scheduler::step() {
     plan_.reset();
     step_prefill_tok_ = 0;
     step_decode_tok_ = 0;
+    /* Two places a step's counters open: here, and promote_next() for a step issued ahead. A step
+     * record that missed this one carries its predecessors' emissions, and `tok_out` is the quantity
+     * the self-measurement's burst interval is made of. */
+    step_emit_tok_    = 0;
+    step_accepted_tok_ = 0;
+    step_ahead_ = false;
 
     int64_t budget = cfg_.max_tok;
     bool preempted_here = false;
@@ -1785,6 +1858,9 @@ void Scheduler::promote_next() {
     plan_next_.reset();
     step_prefill_tok_ = 0;
     step_decode_tok_  = 0;
+    step_emit_tok_    = 0;
+    step_accepted_tok_ = 0;
+    step_ahead_ = true;   /* the record says so: its bracket covers only the host's part */
     for (size_t i = 0; i < plan_.e.size(); ++i) {
         SchedReq& s = *reqs_[(size_t)plan_.e[i].slot];
         s.entry      = (int32_t)i;
@@ -1817,6 +1893,10 @@ int Scheduler::commit(const StepResult& res) {
         return RAD_E_INVAL;
     }
     step_open_ = false;
+    /* This step's record is written by the step_finished() that follows (engine.cpp drives commit and
+     * step_finished in order, under separate acquisitions of this lock). Until then a reader can see
+     * the step's tokens but not its record. */
+    commit_reported_ = true;
 
     /* What the serial bind reads after commit, copied here while the Requests are still held:
      * reap() may release a finished one before finish_serial_drafter runs. */
@@ -1887,7 +1967,8 @@ int Scheduler::commit(const StepResult& res) {
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                         ? &res.lp[res.first_row[i]] : nullptr;
                 if (lp && lp->token < 0) lp_failed = true;
-                else overflowed = !server::sink_push(r.sink, res.token[i], lp);
+                else if (!server::sink_push(r.sink, res.token[i], lp)) overflowed = true;
+                else ++step_emit_tok_;
                 /* The conv window absorbed this chunk; the cursor advances one committed
                  * position, as in decode. */
                 s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
@@ -1940,6 +2021,7 @@ int Scheduler::commit(const StepResult& res) {
                         ? &res.lp[res.first_row[i] + j] : nullptr;
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
                 if (!server::sink_push(r.sink, t, lp)) overflowed = true;
+                else ++step_emit_tok_;   /* the step's own count of what reached the sinks */
             };
             for (int32_t j = 0; j < a; ++j) emit(s.draft[j], j);
             if (res.token) emit(res.token[i], a);
@@ -1969,6 +2051,7 @@ int Scheduler::commit(const StepResult& res) {
                 }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
+                step_accepted_tok_ += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
             }
         }
@@ -2031,6 +2114,8 @@ int Scheduler::commit(const StepResult& res) {
  * mover's slot supply, so profiled runs are not comparable (spec §16). */
 void Scheduler::step_finished() {
     std::lock_guard<std::mutex> lk(mu_);
+    /* The record of the step this commit reported is written below, in this call. */
+    commit_reported_ = false;
     if (step_start_.time_since_epoch().count() == 0) return;   /* no step has run */
 
     const auto step_end = std::chrono::steady_clock::now();
@@ -2080,6 +2165,9 @@ void Scheduler::step_finished() {
         for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
         draft_.step_time((int)plan_.n_spec, rows, wall * 1e3);
     }
+    /* The step's own record, for --diagnose: what it carried and how long it took, from the same
+     * bracket. Written only when the engine enabled the log (steplog.h). */
+    record_step(step_end);
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};

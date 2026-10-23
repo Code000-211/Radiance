@@ -258,6 +258,22 @@ static const Flag g_flags[] = {
     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
     "                                    rest run as the base, in the same steps (a mixed batch)" },
 
+    { "--diagnose",           "DIR",    "instead of serving, run a fixed serving workload through the engine's\n"
+    "                                    own scheduler and write DIR/diagnose.json and DIR/diagnose.md: step\n"
+    "                                    time by shape, tokens and rows per step, the interval between\n"
+    "                                    the steps that emitted tokens and how much of it was waiting, draft\n"
+    "                                    acceptance by category and draft position, and every generated token.\n"
+    "                                    Nothing is served from the prefix cache: each prompt is salted, and a\n"
+    "                                    point the cache served is reported as not a measurement" },
+    { "--diagnose-baseline",  "FILE",   "an earlier DIR/diagnose.json: token parity over the workload (any\n"
+    "                                    difference fails the run) and a drop check on acceptance by category\n"
+    "                                    and position; refuses a report of another workload or salt" },
+    { "--diagnose-salt",      "N",      "the counter --diagnose salts every prompt with, so no two runs share a\n"
+    "                                    cached prefix (default 1); two runs compare only with the same N" },
+    { "--diagnose-acceptance-drop", "FRAC",
+    "how far pooled draft acceptance has to fall, as a fraction of what it\n"
+    "                                    was, before a baseline run says it fell (default 0.10)" },
+
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
@@ -834,6 +850,25 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
         else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--kld-lora-sources"))      { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora_sources = v; }
+        /* The self-measurement, and the report to measure against. A mode rather than a flag on
+         * serving, so an unbootable deployment is caught by the same startup that catches it for a
+         * serving run, and the workload runs against the engine's real configuration. */
+        else if (S("--diagnose"))           { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_dir = v; }
+        else if (S("--diagnose-baseline"))  { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_baseline = v; }
+        else if (S("--diagnose-salt")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t s = 0;
+            if (!parse_int(a.c_str(), v, 1, INT64_MAX, &s)) return RAD_E_INVAL;
+            c->diagnose_salt = s;
+        }
+        else if (S("--diagnose-acceptance-drop")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            /* A fraction of what acceptance was, so 1.0 means "only a fall to nothing counts" and 0
+             * means "say so for any fall at all". */
+            if (!parse_num(a.c_str(), v, &d) || d < 0 || d > 1) return RAD_E_INVAL;
+            c->diagnose_acceptance_drop = d;
+        }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
@@ -890,6 +925,14 @@ int config_parse(int argc, char** argv, Config* c) {
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
         RAD_ERR("--kld-out is the --kld-ref report");
+        return RAD_E_INVAL;
+    }
+    /* The self-measurement. `--diagnose-baseline` without `--diagnose` would be a flag on serving
+     * that serving does not read, which is how a run that measured nothing comes to look like a run
+     * that passed. */
+    if (!c->diagnose_baseline.empty() && c->diagnose_dir.empty()) {
+        RAD_ERR("--diagnose-baseline compares a run against an earlier report, and --diagnose is "
+                "what makes the run");
         return RAD_E_INVAL;
     }
 
@@ -1134,6 +1177,16 @@ const ShowRow kShow[] = {
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
     { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--kld-lora-sources",   [](const Config& c) { return or_none(c.kld_lora_sources, "every document"); } },
+    { "--diagnose",           [](const Config& c) { return or_none(c.diagnose_dir, "off (the engine serves)"); } },
+    { "--diagnose-baseline",  [](const Config& c) { return or_none(c.diagnose_baseline, "none (this run is the record)"); } },
+    { "--diagnose-salt",      [](const Config& c) { return num(c.diagnose_salt); } },
+    { "--diagnose-acceptance-drop", [](const Config& c) {
+          /* Two decimals, because the help states the default as 0.10 and a default the help
+           * states has to be the one the report prints. */
+          char b[32];
+          std::snprintf(b, sizeof b, "%.2f", c.diagnose_acceptance_drop);
+          return std::string(b);
+      } },
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
