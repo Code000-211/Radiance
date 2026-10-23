@@ -626,7 +626,8 @@ private:
     bool    draft_record_ = false;
     /* The serial head's executed depth: min(--num-speculative-tokens, the drafter's own). The
      * recording synthesises each cycle's plan at this bound, because that is the deepest round
-     * the head can publish. */
+     * the head can publish; a cost cycle with no plan freezes the same bound as the window its
+     * step will verify. */
     int32_t draft_head_depth_ = 0;
     /* The depth the previous recording cycle drafted, -1 before the first: the paired step verifies
      * that window, which is what the record's plan carries as history rows. */

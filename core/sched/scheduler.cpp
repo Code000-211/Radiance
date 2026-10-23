@@ -318,10 +318,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * nothing. The file can name only the serial head, so a deployment without one cannot be
      * recorded (refused by name there); the depth is the deepest round the head can publish. */
     draft_record_ = !cfg.draft_profile_out.empty();
-    draft_head_depth_ = 0;
     draft_record_prev_k_ = -1;
-    if (draft_record_)
-        draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
+    /* The deepest round the head can publish: the recording synthesises each cycle's plan at this
+     * bound, and a cost cycle that got no plan records it as the legacy window its step verifies. */
+    draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
@@ -2240,6 +2240,12 @@ void Scheduler::draft_cost_cycle(bool direct_step) {
             draft_cost_aborted_ = true;
             return;
         }
+        /* The cycle runs legacy and publishes at the executable head depth, so the step paired with
+         * the next plan verifies that window. Record it in the frozen state, per row bounded by its
+         * own cap: otherwise the plan before the failure keeps naming the verify, and the next cycle
+         * asks a price for a window its step does not run. Not a measurement -- no plan is issued,
+         * no ring record opens, and the depth decision and the calibration sequence do not move. */
+        draft_.planner().remember_legacy(draft_view_, draft_head_depth_);
         /* No plan this cycle: draft_cap() falls back to next_depth() and the cycle runs legacy.
          * Logged once, so a broken hook does not flood the log every step. */
         if (!draft_cost_failed_)

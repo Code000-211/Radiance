@@ -198,7 +198,7 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
     s->sampling = sampled ? DraftSampling::Sampled : DraftSampling::Greedy;
 }
 
-void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
+void DraftPlanner::fit_frozen(const DraftBatchView& view) {
     const size_t n = (size_t)view.n_seq;
     if (fr_id_.size() < n) {   /* only when the caller did not size the storage at configure() */
         fr_id_.resize(n);
@@ -210,9 +210,20 @@ void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
         fr_id_[j]   = view.seq[j].req_id;
         fr_slot_[j] = view.seq[j].slot;
         fr_gen_[j]  = view.seq[j].slot_gen;
-        fr_k_[j]    = k[j];
     }
     fr_n_ = n;
+}
+
+void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
+    fit_frozen(view);
+    for (size_t j = 0; j < fr_n_; ++j) fr_k_[j] = k[j];
+}
+
+void DraftPlanner::remember_legacy(const DraftBatchView& view, int32_t head_depth) {
+    if (head_depth > c_.k_ceiling) head_depth = c_.k_ceiling;
+    if (head_depth < 0) head_depth = 0;
+    fit_frozen(view);
+    for (size_t j = 0; j < fr_n_; ++j) fr_k_[j] = cap_of(view.seq[j], head_depth);
 }
 
 double DraftPlanner::expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k) {
