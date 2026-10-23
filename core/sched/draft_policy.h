@@ -8,7 +8,9 @@
  * Welle 1 is deliberately ragged: one cycle verifies every row at its own K (which
  * StepEntry::n_spec already carries). The scheduler bounds the serial rounds to the rows that
  * still draft (Scheduler::serial_begin); the engine's rounds loop is not yet wired to that bound.
- * `verify_k` in the plan is the window the frozen previous plan issued; `max_k` is this cycle's.
+ * `verify_k` in the plan is the window the paired step runs, per row: this cycle's own K at
+ * pipeline_depth 0, the frozen previous plan's K ahead, and on the direct step() path that K
+ * re-capped to the candidate's own K (Scheduler::draft_cap). `max_k` is this cycle's draft depth.
  *
  * The search is a heuristic, not an optimum: a few homogeneous baselines, then at most
  * `passes` deterministic coordinate passes over the requests, each change judged by the new
@@ -25,11 +27,14 @@
  * the paired step verifies is the previous, frozen plan's distribution, and under issue_ahead()
  * the two are different. The planner keeps that frozen distribution keyed by
  * (req_id, slot, slot_gen) -- a recycled slot with another generation is another request -- and
- * stamps the plan's `verify_k` from the rows that are still present. A `DraftVerifyShape` can
- * carry one distribution, so the search still prices every candidate on the shape it verifies;
- * when the two windows differ the draft half of that shape is not in its own estimate, and a
- * depth change under issue_ahead() is priced on the verify window until the shared contract
- * carries both (see the cost request in the issue).
+ * stamps the plan's `verify_k` from the rows that are still present. The view names which step path
+ * opened the cycle (`DraftBatchView::direct_step`): a step issued ahead verifies the frozen window
+ * as declared, while the step() path builds its step after the plan and re-caps each row to that
+ * plan's own K (Scheduler::draft_cap), so only there the priced verify is the capped window. A
+ * `DraftVerifyShape` can carry one distribution, so the search still prices every candidate on the
+ * shape its paired step verifies; when the draft and verify windows differ the draft half of that
+ * shape is not in its own estimate, and a depth change under issue_ahead() is priced on the verify
+ * window until the shared contract carries both (see the cost request in the issue).
  *
  * The priced shape is written down, not left at its defaults. `history_tokens` is the history the
  * paired step owes per row (one row for the verified token plus one per draft it verifies, the

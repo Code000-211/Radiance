@@ -1415,6 +1415,18 @@ DraftVerifyShape row_key(int32_t draft_k, int32_t verify_k) {
     return s;
 }
 
+/* The same key for `n` identical rows: the batch the budget-cut run plans over. */
+DraftVerifyShape rows_key(int32_t n, int32_t draft_k, int32_t verify_k) {
+    DraftVerifyShape s = row_key(draft_k, verify_k);
+    s.n_rows        = n;
+    s.verify_tokens = 0;
+    for (int32_t j = 1; j <= draft_k; ++j) s.draft_rows[j] = n;
+    for (int32_t j = 1; j <= verify_k; ++j) s.rows[j] = n;
+    s.verify_tokens = n * (1 + verify_k);
+    s.history_tokens = s.verify_tokens;
+    return s;
+}
+
 void add_bucket(DraftCostProfile* p, const DraftVerifyShape& key, double ms) {
     DraftCostBucket b;
     b.shape  = key;
@@ -1485,6 +1497,19 @@ void install_upshift_table(Fixture& f) {
     install_table(f, p);
 }
 
+/* The budget cut's table, for the six-row run: K3 wins the cold cycle and the uncut search after
+ * it, so the plan the policy would issue is K3 there; what actually runs is the cut K2, re-priced
+ * on the window its step verifies -- (2,3) ahead, (2,2) on the direct path. */
+void install_budget_cut_table(Fixture& f) {
+    DraftCostProfile p = cost_profile();
+    add_bucket(&p, rows_key(6, 3, 0),  6.0);   /* cold: 3.439 / 6.0 beats 2.71 / 5.0 */
+    add_bucket(&p, rows_key(6, 2, 0),  5.0);
+    add_bucket(&p, rows_key(6, 3, 3),  8.0);   /* after K3: the uncut winner at 3.439 / 8.0 ... */
+    add_bucket(&p, rows_key(6, 2, 3),  9.0);   /* ... and the cut re-price ahead ... */
+    add_bucket(&p, rows_key(6, 2, 2),  8.0);   /* ... and on the direct path */
+    install_table(f, p);
+}
+
 /* What the two cycles saw, in the three places the contract has to agree: the last price the
  * planner asked for (the issued plan's own estimate), the verify batch the engine was handed, and
  * the key of the bucket the cycle's sample was actually filed under. */
@@ -1500,6 +1525,9 @@ struct Coupled {
     DraftTierPrice issued;
     int32_t batch_spec = 0;
     int32_t entry_spec = 0;
+    int32_t tiers_priced = 0;
+    int32_t uncut_k = 0;
+    double  uncut_ms = 0.0;
     DraftCostObserve observe;
     DraftVerifyShape recorded;
     int32_t recorded_rounds = 0;
@@ -1696,6 +1724,115 @@ void upshift(Fixture& f, bool ahead, Coupled& c) {
     }
 }
 
+/* A genuine KV budget cut with its re-price, on the real pipeline. Six rows run cycle A uncut at
+ * K3; before B opens the pool is left with one free block -- sixteen tokens against the uncut six
+ * times three -- so `apply_draft_budget` scales every K to two and the plan says why. The search
+ * still weighs the uncut K3 (and would issue it); the cut plan is re-priced on the window its
+ * step really runs, and that is the shape the batch and the sample carry. `ahead` runs the
+ * engine's other order: the step built under A is the one B's cycle measures. */
+void budget_cut(Fixture& f, bool ahead, Coupled& c) {
+    /* The six 160-token prompts must prefill in one step: a split would open row-bearing cycles of
+     * its own before the two this test reads. */
+    f.build(4096, 64, /*max_tok=*/1024);
+    f.cfg.n_spec = 3;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    install_budget_cut_table(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    Predictions& pred = c.pred;
+    uint64_t ids[6];
+    for (int i = 0; i < 6; ++i) ids[i] = f.submit(160);
+    for (uint64_t id : ids) pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+
+    QueryLog& log = c.log;
+    log.table = &f.sch.draft_costs();
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 3;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = log.model();
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    for (uint64_t id : ids) f.prefill(id);
+    for (uint64_t id : ids) f.sch.find(id)->speculation_fixed = true;
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    const int32_t three[3] = { 21, 22, 23 };
+    const int32_t two[2]   = { 21, 22 };
+
+    /* Cycle A: uncut. The cold bucket prices K3 and issues it; the pool is still wide. */
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy a = copy_plan(f.sch);
+    REQUIRE_EQ(a.n_seq, 6);
+    CHECK_EQ(a.max_k, 3);
+    CHECK_EQ(a.verify_k, 0);
+    for (uint64_t id : ids) CHECK_EQ(a.at(id), 3);
+
+    if (ahead) {
+        for (uint64_t id : ids) f.sch.expect_draft(id, 3);
+        const RadBatch* built = f.sch.step_next();
+        REQUIRE(built != nullptr);
+        CHECK_EQ(built->n_spec, 3);
+        /* This is the step that runs once promote_next() makes it current: B's batch. */
+        c.batch_spec = built->n_spec;
+        f.commit_plain(11);
+    } else {
+        f.commit_plain(11);
+    }
+    for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, three, 3));
+    f.sch.step_finished(live);
+
+    /* One free block is sixteen tokens; six rows at K3 want eighteen. */
+    REQUIRE(f.kv.free_blocks(0) >= 1);
+    f.kv.unbacked = f.kv.free_blocks(0) - 1;
+
+    if (ahead) {
+        f.sch.promote_next();
+    } else {
+        const RadBatch* built = f.sch.step();
+        REQUIRE(built != nullptr);
+        c.batch_spec = built->n_spec;
+    }
+
+    const DraftPlan* b = f.sch.draft().plan();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_seq, 6);
+    c.plan_k = b->max_k;
+    c.source = b->source;
+    c.tiers_priced = f.sch.draft().planner().last_tiers_priced();
+    const DraftTierPrice* tp = f.sch.draft().planner().last_tier_prices();
+    const int32_t ntp = f.sch.draft().planner().last_n_tier_prices();
+    if (ntp > 0) { c.uncut_k = tp[ntp - 1].k; c.uncut_ms = tp[ntp - 1].ms; }
+    c.query  = log.last;   /* the issued plan's own estimate, the cycle's last estimate call */
+    c.issued = f.sch.draft().planner().last_price();
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)6);
+    c.entry_spec = f.sch.plan().e[0].n_spec;
+
+    f.commit_plain(11);
+    for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, two, 2));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    const DraftCostTable& t = f.sch.draft_costs();
+    c.observe = t.last_observe();
+    if (c.observe.what == DraftCostDisposition::Recorded && c.observe.bucket >= 0 &&
+        (size_t)c.observe.bucket < t.buckets().size()) {
+        const DraftCostBucket& bkt = t.buckets()[(size_t)c.observe.bucket];
+        c.recorded        = bkt.shape;
+        c.recorded_rounds = bkt.rounds;
+    }
+}
+
 }  /* namespace */
 
 /* The coupled proof, ahead path. B's plan is opened after the step that verifies A's three drafts
@@ -1859,6 +1996,45 @@ TEST(a_remaining_output_bound_caps_the_same_window_on_both_paths) {
         CHECK_EQ(c.recorded.draft_k, 2);
         CHECK_EQ(c.recorded.verify_k, 2);
         CHECK_EQ(c.recorded.verify_tokens, 3);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+        CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+    }
+}
+
+/* A real token/KV budget cut, not a remaining-output clamp: the pool is left with a single free
+ * block, so `apply_draft_budget` scales the uncut six-times-three to two per row. The plan the
+ * search would have issued (K3) is still weighed, the issued plan is the cut and says why, and the
+ * cut plan's own re-price, the batch built for it and the recorded sample name the window its step
+ * runs -- (2,3) ahead, (2,2) on the direct path. */
+TEST(a_cost_budget_cut_prices_the_window_its_step_runs_on_both_paths) {
+    for (bool ahead : { false, true }) {
+        Coupled c;
+        Fixture f;
+        budget_cut(f, ahead, c);
+
+        /* The uncut search weighed both depths and would have issued K3. */
+        CHECK_EQ(c.uncut_k, 3);
+        CHECK_NEAR(c.uncut_ms, 8.0, 1e-9);
+        CHECK_EQ(c.tiers_priced, 2);
+        /* The issued plan is the cut, and it says why. */
+        CHECK_EQ(c.plan_k, 2);
+        CHECK(c.source == DraftPlanSource::Cost);
+        /* Its own price is the cut window's, not the uncut plan's. */
+        CHECK_EQ(c.query.draft_k, 2);
+        CHECK_EQ(c.query.verify_k, ahead ? 3 : 2);
+        CHECK_EQ(c.query.verify_tokens, ahead ? 24 : 18);
+        CHECK(c.issued.valid);
+        CHECK_EQ(c.issued.k, 2);
+        CHECK_NEAR(c.issued.ms, ahead ? 9.0 : 8.0, 1e-9);
+        /* The step that runs spends exactly that plan. The ahead step was built under the uncut
+         * plan before the cycle opened; the direct one is built after it and re-capped. */
+        CHECK_EQ(c.batch_spec, ahead ? 3 : 2);
+        CHECK_EQ(c.entry_spec, c.query.verify_k);
+        CHECK(c.observe.what == DraftCostDisposition::Recorded);
+        CHECK_EQ(c.recorded.draft_k, 2);
+        CHECK_EQ(c.recorded.verify_k, ahead ? 3 : 2);
+        CHECK_EQ(c.recorded.verify_tokens, ahead ? 24 : 18);
+        CHECK_EQ(c.recorded_rounds, 2);
         CHECK_EQ(c.query.verify_k, c.entry_spec);
         CHECK_EQ(c.recorded.verify_k, c.entry_spec);
     }
@@ -3949,6 +4125,134 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
     CHECK_EQ(m.draft_cost_no_plan, 0);
     CHECK_EQ(m.draft_cost_empty, prefilled.draft_cost_cycles);
     CHECK_EQ(m.draft_calib_forced, 6);   /* the five loop cycles and the retiring open */
+    CHECK_EQ(m.draft_cost_tiers_priced, 0);
+    CHECK_EQ(m.draft_calib_cut, 0);
+    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
+                 m.draft_cost_empty + m.draft_cost_no_plan,
+             m.draft_cost_cycles);
+    CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Calibration);
+    CHECK_EQ(m.draft_cost_last_rows, 4);
+    CHECK_EQ(m.draft_cost_last_k, 2);
+}
+
+/* The forced sequence down the ahead path, across the period boundary. From the second row-bearing
+ * cycle on, every plan is opened by promote_next(), after the step that verifies the previous plan's
+ * drafts was built; that step is the one the cycle runs, so each plan's `verify_k` is the frozen
+ * window forced[c-1], not its own K. The period still turns: the fifth row-bearing plan takes the
+ * first element again and the sixth the second. Because the drafted and verified windows differ,
+ * every cycle is its own bucket -- unlike the direct run, where the two K2 cycles share one. */
+TEST(a_calibration_sequence_issued_ahead_runs_across_the_period_boundary) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.cfg.draft_calib_k[0] = 3;
+    f.cfg.draft_calib_k[1] = 2;
+    f.cfg.draft_calib_k[2] = 2;
+    f.cfg.draft_calib_k[3] = 3;
+    f.cfg.draft_calib_n    = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    uint64_t ids[4];
+    for (int i = 0; i < 4; ++i) ids[i] = f.submit(32);
+    for (int i = 0; i < 4; ++i) f.prefill(ids[i]);
+    for (int i = 0; i < 4; ++i) f.sch.find(ids[i])->speculation_fixed = true;
+
+    /* The prefill planned over no rows; the sequence did not move. */
+    const DraftPlan* p0 = f.sch.draft().plan();
+    REQUIRE(p0 != nullptr);
+    CHECK_EQ(p0->n_seq, 0);
+    CHECK(p0->source == DraftPlanSource::Calibration);
+    const SchedMetrics prefilled = f.sch.metrics();
+    CHECK_EQ(prefilled.draft_cost_empty, prefilled.draft_cost_cycles);
+    CHECK_EQ(prefilled.draft_calib_forced, 0);
+
+    const int32_t forced[5] = { 3, 2, 2, 3, 3 };
+    /* What the step of a cycle runs: the plan before it drafted at this depth. The first
+     * row-bearing cycle has no predecessor. */
+    const int32_t verifies[5] = { 0, 3, 2, 2, 3 };
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    /* Cycle 0 is the one open that cannot be issued ahead: no step existed before it. */
+    REQUIRE(f.sch.step() != nullptr);
+    {
+        const PlanCopy p = copy_plan(f.sch);
+        REQUIRE(p.n_seq == 4);
+        CHECK_EQ(p.max_k, 3);
+        CHECK_EQ(p.verify_k, 0);
+        CHECK_EQ(p.pipeline_depth, 1);
+        for (uint64_t id : ids) CHECK_EQ(p.at(id), 3);
+    }
+
+    for (int c = 0; c < 5; ++c) {
+        if (c > 0) {
+            const PlanCopy p = copy_plan(f.sch);
+            REQUIRE(p.n_seq == 4);
+            CHECK_EQ(p.max_k, forced[c]);
+            CHECK_EQ(p.verify_k, verifies[c]);
+            CHECK_EQ(p.pipeline_depth, 1);
+            for (uint64_t id : ids) CHECK_EQ(p.at(id), forced[c]);
+        }
+        /* The step that runs in this cycle was built under the plan before it, so it verifies
+         * that plan's publication -- the window `verify_k` declares. */
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)4);
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, verifies[c]);
+        /* The next cycle's step verifies what this plan's rounds publish. */
+        for (uint64_t id : ids) f.sch.expect_draft(id, forced[c]);
+        const RadBatch* built = f.sch.step_next();
+        REQUIRE(built != nullptr);
+        CHECK_EQ(built->n_spec, forced[c]);
+        f.commit(11, 0, [&](const StepEntry&) { return verifies[c]; });
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, six, forced[c]));
+        f.sch.step_finished(live);
+        f.sch.promote_next();
+    }
+
+    /* The sixth row-bearing plan, opened ahead at the end of the fifth cycle: the period wrapped,
+     * so it takes the second element, and the step that runs in it verifies the three the fifth
+     * published. */
+    {
+        const PlanCopy p = copy_plan(f.sch);
+        REQUIRE(p.n_seq == 4);
+        CHECK_EQ(p.max_k, 2);
+        CHECK_EQ(p.verify_k, 3);
+    }
+
+    /* Every cycle is its own bucket: (drafted, verified) never repeats, because on this path the
+     * verify window lags the draft window by one plan. */
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 5);
+    const int32_t ran_k[5] = { 3, 2, 2, 3, 3 };
+    const int32_t ran_v[5] = { 0, 3, 2, 2, 3 };
+    for (int c = 0; c < 5; ++c) {
+        const DraftCostBucket& b = bs[(size_t)c];
+        CHECK_EQ(b.flags, 0);
+        CHECK_EQ(b.n, 1);
+        CHECK_EQ(b.rounds, ran_k[c]);
+        CHECK_EQ(b.shape.draft_k, ran_k[c]);
+        CHECK_EQ(b.shape.verify_k, ran_v[c]);
+        CHECK_EQ(b.shape.n_rows, 4);
+        CHECK_EQ(b.shape.verify_tokens, 4 * (1 + ran_v[c]));
+        CHECK_EQ(b.shape.history_tokens, 4 * (1 + ran_v[c]));
+        CHECK_EQ(b.draft_rows_total, 4 * ran_k[c]);
+        for (int32_t j = 1; j <= ran_k[c]; ++j) CHECK_EQ(b.draft_round_rows[j], 4);
+    }
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    CHECK_EQ(f.sch.draft_costs().ignored(), 0);
+
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_priced, 0);
+    CHECK_EQ(m.draft_cost_fallback, 0);
+    CHECK_EQ(m.draft_cost_no_plan, 0);
+    CHECK_EQ(m.draft_cost_empty, prefilled.draft_cost_cycles);
+    CHECK_EQ(m.draft_calib_forced, 6);   /* the five loop cycles and the sixth open */
     CHECK_EQ(m.draft_cost_tiers_priced, 0);
     CHECK_EQ(m.draft_calib_cut, 0);
     CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
