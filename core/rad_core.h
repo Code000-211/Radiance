@@ -908,6 +908,14 @@ struct Config {
     int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
     int     draft_n_tiers = 5;
     bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */
+    /* --draft-calib-k: the calibration's fixed depth sequence, in the given order, duplicates
+     * allowed, 2..kDraftMaxTiers values, e.g. 3,2,2,3. Not a ladder: every value must be one of
+     * the effective --draft-depth-tiers, checked at startup against the list the scheduler
+     * really offers. Only a reference calibration may set it (--draft-profile-out,
+     * --draft-reference, --draft-policy cost); a serving run must let the cost policy decide,
+     * and Engine::begin_draft_calibration refuses the flag without them. Empty: off. */
+    int     draft_calib_k[kDraftMaxTiers] = {};
+    int     draft_calib_n = 0;
     /* --draft-reference: this run calibrates the no-loan reference. Both lenders stay off for the
      * whole run, so the buckets are the plan's start placement without borrowed copies; the file
      * is stamped with that basis and a serving run may load it while its own loans stay dynamic.

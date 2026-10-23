@@ -152,15 +152,16 @@ struct SchedMetrics {
      * offered" cannot be read as the same fact. */
     int64_t draft_obs_inactive = 0;
     /* The cost policy's plan ledger, cumulative: cycles it opened, how they ended (`priced` --
-     * `source` Cost -- `fallback` for the named baseline, `no_plan` for a cycle the policy opened
-     * and could not plan at all), plus what the last plan asked for and why. `priced + fallback +
-     * no_plan == cycles` holds for every run: a cycle counted without one of the three would be
-     * one whose end nothing names. `draft_cost_last_replay` is the *candidate* the plan declared
-     * (DraftReplay as a number), not what ran -- the bracket's own state is reported by `passes`
-     * and keys its sample. `draft_cost_last_*` stay 0 until a plan is issued, so an empty ledger
-     * reads as "no plan yet", never as a plan at K=0. Together they separate "the policy never
-     * priced" from "the ladder priced nothing", which is the question a fallback-only run cannot
-     * answer on its own. */
+     * `source` Cost -- `fallback` for the named baseline, `calib_forced` for a forced calibration
+     * depth, `no_plan` for a cycle the policy opened and could not plan at all), plus what the
+     * last plan asked for and why. `priced + fallback + calib_forced + no_plan == cycles` holds for
+     * every run: a cycle counted without one of the four would be one whose end nothing names.
+     * `draft_cost_last_replay` is the *candidate* the plan declared (DraftReplay as a number), not
+     * what ran -- the bracket's own state is reported by `passes` and keys its sample.
+     * `draft_cost_last_*` stay 0 until a plan is issued, so an empty ledger reads as "no plan
+     * yet", never as a plan at K=0. Together they separate "the policy never priced" from "the
+     * ladder priced nothing", which is the question a fallback-only run cannot answer on its
+     * own. */
     int64_t draft_cost_cycles = 0;
     int64_t draft_cost_priced = 0;
     int64_t draft_cost_fallback = 0;
@@ -169,6 +170,20 @@ struct SchedMetrics {
     int64_t draft_cost_last_replay = 0;
     int64_t draft_cost_last_source = 0;   /* DraftPlanSource of the last issued plan */
     int64_t draft_cost_last_fallback = 0; /* DraftFallback of the last issued plan */
+    /* The last issued Cost plan's priced-tier count: the deepest offered tier plus every
+     * shallower one the model priced, whether or not it won (0 when the last plan was not a Cost
+     * decision). "Both depths were compared" is not visible from `priced` alone -- Stage 1 issues
+     * a Cost plan at the deep tier even when only that tier had a price. */
+    int64_t draft_cost_tiers_priced = 0;
+    /* Calibration plans (`--draft-calib-k`, DraftPlanSource::Calibration), cumulative: forced
+     * measurements, never a decision, so `priced`/`fallback` stay 0 for them. A plan over an empty
+     * view is forced too and is counted, which keeps `priced + fallback + calib_forced + no_plan
+     * == cycles` true; only a plan with rows advances the sequence. */
+    int64_t draft_calib_forced = 0;
+    /* Forced plans that a plan-time resource cut touched (a row's remaining output, the token
+     * budget or the pool): not kDraftSampleShortened, which is the bracket stopping below the
+     * plan, but the "no cut in the target buckets" claim has to be measurable somewhere. */
+    int64_t draft_calib_cut = 0;
     /* Cycles observed against a loaded reference (DraftCostBasis::NoLoan) and therefore not
      * absorbed: the table is immutable, so the count is the only trace the measurement left. Zero
      * while the table learns, so "nothing reached the reference" and "the reference refused

@@ -1939,6 +1939,11 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
  * prices nothing from the buckets it is still filling. */
 int Engine::begin_draft_calibration() {
     if (cfg_.draft_profile_out.empty()) {
+        if (cfg_.draft_calib_n > 0) {
+            RAD_ERR("--draft-calib-k forces a fixed depth sequence and needs --draft-profile-out: "
+                    "a serving run lets the unchanged cost policy decide the depths");
+            return RAD_E_INVAL;
+        }
         if (cfg_.draft_reference) {
             RAD_ERR("--draft-reference runs a calibration and needs --draft-profile-out: a serving "
                     "run keeps its loans dynamic and does not measure a reference");
@@ -1956,6 +1961,16 @@ int Engine::begin_draft_calibration() {
     if (!cfg_.draft_profile.empty()) {
         RAD_ERR("--draft-profile-out with --draft-profile: a calibration run measures its own "
                 "profile and does not read one; pass only one of the two");
+        return RAD_E_INVAL;
+    }
+    /* The forced sequence is a measurement switch, never a serving one: it has a meaning only in
+     * the reference calibration (the depths it forces must be the ones the serving ladder offers,
+     * and only the cost policy has a ladder). Refused here, at startup, so no serving run can
+     * carry it and mistake a forced depth for a decision. */
+    if (cfg_.draft_calib_n > 0 &&
+        (cfg_.draft_policy != DraftPolicyKind::Cost || !cfg_.draft_reference)) {
+        RAD_ERR("--draft-calib-k needs --draft-policy cost and --draft-reference: it forces the "
+                "calibration's depths, and a serving run decides them by cost");
         return RAD_E_INVAL;
     }
     const bool cost = cfg_.draft_policy == DraftPolicyKind::Cost;

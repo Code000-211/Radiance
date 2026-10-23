@@ -82,6 +82,13 @@ struct DraftPolicyConfig {
      * budget. The budget bounds a large batch's per-cycle host time. */
     int32_t passes = 2;
     int32_t max_evals = 136;
+    /* --draft-calib-k: a fixed sequence of depths, one per non-empty cycle, taken in the order
+     * given (duplicates allowed, unsorted) and never priced. Only a calibration run sets it
+     * (Engine::begin_draft_calibration refuses it everywhere else), and configure() checks every
+     * value against the effective ladder -- the trimmed, deduplicated list the serving policy
+     * offers -- so no sample is ever measured at a depth the ladder never offers. */
+    int32_t calib_k[RAD_DRAFT_MAX_TIERS] = {};
+    int32_t n_calib_k = 0;
 };
 
 class DraftPlanner {
@@ -104,6 +111,13 @@ public:
 
     /* The last chosen `max_k`; for tests and logs. */
     int32_t last_k() const { return last_k_; }
+
+    /* How many of the ladder's depths the last choose() found a price for: the deepest offered
+     * tier plus every shallower one the model priced, whether or not it won (0 when the deepest
+     * was unpriced). This is what makes "both alternatives were compared" checkable from the
+     * ledger -- a Cost plan at the deep tier alone does not show whether the shallow one lost or
+     * was never priced. Reset to 0 by reset() and by a plan that is not a Cost decision. */
+    int32_t last_tiers_priced() const { return last_tiers_priced_; }
 
     /* This choose() call was refused by the explicit-ladder coverage gap, not by the hook: the
      * cycle has no plan for a reason no later cycle can fix. Cleared at every entry. */
@@ -148,6 +162,12 @@ private:
     int32_t last_k_ = 0;     /* the previous cycle's depth; 0 until one was chosen */
     int32_t held_   = 0;     /* cycles since it last moved */
     bool    chosen_ = false;
+    /* The calibration sequence's position. It advances only on a cycle that has rows: an empty
+     * view has no depth to measure, and stepping on it would put every later depth one place off
+     * the rotation. reset() and configure() start it at 0. */
+    int32_t calib_pos_ = 0;
+    /* Tiers the last Cost search found priced (see last_tiers_priced()). */
+    int32_t last_tiers_priced_ = 0;
     /* The explicit-ladder coverage gap was diagnosed; once per priced/unpriced transition. */
     bool    gap_reported_ = false;
     /* This choose() call returned RAD_E_UNSUPPORTED from the coverage gap. */

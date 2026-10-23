@@ -131,6 +131,14 @@ struct SchedMetrics {
     int64_t draft_cost_last_replay = 0;
     int64_t draft_cost_last_source = 0;
     int64_t draft_cost_last_fallback = 0;
+    /* The last issued Cost plan's priced-tier count: how many of the ladder's depths had a price
+     * when it was chosen, so "both depths compared" is distinguishable from "only the deepest
+     * was priced" (rad::SchedMetrics::draft_cost_tiers_priced). 0 unless the last plan was Cost. */
+    int64_t draft_cost_tiers_priced = 0;
+    /* Forced calibration plans, and of them the ones a plan-time resource cut touched
+     * (rad::SchedMetrics::draft_calib_forced / draft_calib_cut). Not cost decisions. */
+    int64_t draft_cost_calibration = 0;
+    int64_t draft_cost_calibration_cut = 0;
     /* Cycles a no-loan reference table refused to absorb (rad::SchedMetrics::draft_ref_skipped). */
     int64_t draft_cost_reference_skipped = 0;
     int64_t preemptions = 0;

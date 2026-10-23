@@ -3327,4 +3327,173 @@ TEST(a_publication_cut_below_the_executed_rounds_keeps_the_executed_extent) {
     CHECK_EQ(hit->shape.verify_tokens, 4);       /* one row, 1 + three verified positions */
 }
 
+/* The forced sequence through the real cycle path. A prefill step opens a zero-row cycle first --
+ * no row is decoding yet, so the sequence must not spend a depth on it -- and the decode cycles
+ * that follow take 3, 2, 2, 3 in that order, the last wrapping to 3. Each plan names the window the
+ * cycle before it drafted (`verify_k`); the step verifies what its own plan's per-row cap allows --
+ * the previous publication on a rise, and on a fall capped to this plan's own K. Nothing is priced:
+ * every plan is `Calibration`, and the samples are the ordinary ones, one clean bucket per shape
+ * that ran. */
+TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.cfg.draft_calib_k[0] = 3;
+    f.cfg.draft_calib_k[1] = 2;
+    f.cfg.draft_calib_k[2] = 2;
+    f.cfg.draft_calib_k[3] = 3;
+    f.cfg.draft_calib_n    = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    uint64_t ids[4];
+    for (int i = 0; i < 4; ++i) ids[i] = f.submit(32);
+    for (int i = 0; i < 4; ++i) f.prefill(ids[i]);
+
+    /* The prefill step(s) opened a forced plan over no rows, and the sequence did not move: the
+     * next row-bearing plan still takes its first element. */
+    const DraftPlan* p0 = f.sch.draft().plan();
+    REQUIRE(p0 != nullptr);
+    CHECK_EQ(p0->n_seq, 0);
+    CHECK(p0->source == DraftPlanSource::Calibration);
+    CHECK_EQ(p0->max_k, 0);
+    const SchedMetrics prefilled = f.sch.metrics();
+    CHECK(prefilled.draft_cost_cycles >= 1);
+    CHECK_EQ(prefilled.draft_calib_forced, prefilled.draft_cost_cycles);
+    CHECK_EQ(prefilled.draft_cost_last_k, 0);
+
+    const int32_t forced[5] = { 3, 2, 2, 3, 3 };
+    /* The window the plan names for its paired step: the previous cycle's drafted depth, and 0
+     * for the first row-bearing cycle. */
+    const int32_t declares[5] = { 0, 3, 2, 2, 3 };
+    /* What the step verifies: the previous cycle's publication, capped to this plan's own K. */
+    const int32_t verifies[5] = { 0, 2, 2, 2, 3 };
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    for (int c = 0; c < 5; ++c) {
+        REQUIRE(f.sch.step() != nullptr);
+        const PlanCopy p = copy_plan(f.sch);
+        REQUIRE(p.n_seq == 4);
+        CHECK_EQ(p.max_k, forced[c]);
+        CHECK_EQ(p.verify_k, declares[c]);
+        CHECK_EQ(p.pipeline_depth, 1);
+        for (uint64_t id : ids) CHECK_EQ(p.at(id), forced[c]);
+        f.commit(11, 0, [&](const StepEntry&) { return verifies[c]; });
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, six, forced[c]));
+        f.sch.step_finished(live);
+    }
+
+    /* One more open retires the fifth cycle; the period is four, so the sixth plan takes the
+     * second element again. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(copy_plan(f.sch).max_k, 2);
+
+    /* The shapes that ran, in order: the v0 cycle (verifies nothing), the two K2 cycles, the
+     * K3 cycle after a K2 one (its step verifies the two the fall published), and the K3 steady
+     * cycle. The two K2 cycles are one bucket. */
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 4);
+    const int32_t ran_k[4]  = { 3, 2, 3, 3 };
+    const int32_t ran_v[4]  = { 0, 2, 2, 3 };
+    const int64_t ran_n[4]  = { 1, 2, 1, 1 };
+    for (int c = 0; c < 4; ++c) {
+        const DraftCostBucket& b = bs[(size_t)c];
+        CHECK_EQ(b.flags, 0);                  /* a clean measurement, whatever was forced */
+        CHECK_EQ(b.n, ran_n[c]);
+        CHECK_EQ(b.rounds, ran_k[c]);
+        CHECK_EQ(b.shape.draft_k, ran_k[c]);
+        CHECK_EQ(b.shape.verify_k, ran_v[c]);
+        CHECK_EQ(b.shape.n_rows, 4);
+        CHECK_EQ(b.draft_rows_total, 4 * ran_k[c]);
+        for (int32_t j = 1; j <= ran_k[c]; ++j) CHECK_EQ(b.draft_round_rows[j], 4);
+    }
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+    CHECK_EQ(f.sch.draft_costs().ignored(), 0);
+
+    /* The ledger: every opened cycle was a forced calibration plan, none a decision, and the four
+     * ends still account for every cycle that opened. */
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_cost_priced, 0);
+    CHECK_EQ(m.draft_cost_fallback, 0);
+    CHECK_EQ(m.draft_cost_no_plan, 0);
+    CHECK_EQ(m.draft_calib_forced, m.draft_cost_cycles);
+    CHECK_EQ(m.draft_cost_tiers_priced, 0);
+    CHECK_EQ(m.draft_calib_cut, 0);
+    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_calib_forced +
+                 m.draft_cost_no_plan,
+             m.draft_cost_cycles);
+    CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Calibration);
+    CHECK_EQ(m.draft_cost_last_k, 2);
+}
+
+/* A plan-time budget cut is not a shortened bracket: the sequence asks for K3 over twenty-four
+ * rows but the step was given sixty-four tokens, so the plan itself is scaled to two per row and
+ * says why. The cycle executes exactly that, files a clean bucket at the depth that ran, and the
+ * next plan verifies the cut window -- while `calib_cut` (not `Shortened`) is what records the cut. */
+TEST(a_budget_cut_shortens_a_forced_plan_and_the_next_cycle_verifies_it) {
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/64);   /* the geometry's floor: a chunk needs at least 64 */
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.cfg.draft_calib_k[0] = 3;
+    f.cfg.draft_calib_k[1] = 2;
+    f.cfg.draft_calib_n    = 2;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    /* 24 x 3 = 72 forced drafts against a 64-token step budget. */
+    uint64_t ids[24];
+    for (int i = 0; i < 24; ++i) ids[i] = f.submit(2);
+    for (int i = 0; i < 24; ++i) f.prefill(ids[i]);
+
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    /* Cycle 1: every row scaled from 3 to 2, and the plan says why on each. */
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy cut = copy_plan(f.sch);
+    REQUIRE(cut.n_seq == 24);
+    CHECK_EQ(cut.max_k, 2);
+    CHECK_EQ(cut.verify_k, 0);
+    for (uint64_t id : ids) CHECK_EQ(cut.at(id), 2);
+    const DraftPlan* pc = f.sch.draft().plan();
+    REQUIRE(pc != nullptr);
+    for (int32_t i = 0; i < pc->n_seq; ++i) CHECK(pc->why[i] == DraftFallback::Resources);
+    CHECK_EQ(f.sch.metrics().draft_calib_cut, 1);
+    CHECK_EQ(f.sch.metrics().draft_cost_tiers_priced, 0);
+
+    f.commit(11, 0, [](const StepEntry&) { return 0; });
+    for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, six, 2));
+    f.sch.step_finished(live);
+
+    /* Cycle 2: the next element, K2, fits the budget and is not cut; its paired step verifies the
+     * two the cut plan drafted. The cut plan's own sample was clean. */
+    REQUIRE(f.sch.step() != nullptr);
+    const PlanCopy next = copy_plan(f.sch);
+    REQUIRE(next.n_seq == 24);
+    CHECK_EQ(next.max_k, 2);
+    CHECK_EQ(next.verify_k, 2);
+    CHECK_EQ(f.sch.metrics().draft_calib_cut, 1);      /* the second plan was not cut */
+
+    const std::vector<DraftCostBucket>& bs = f.sch.draft_costs().buckets();
+    REQUIRE(bs.size() == 1);
+    CHECK_EQ(bs[0].flags, 0);                           /* the plan-time cut is not Shortened */
+    CHECK_EQ(bs[0].shape.draft_k, 2);
+    CHECK_EQ(bs[0].shape.verify_k, 0);
+    CHECK_EQ(bs[0].rounds, 2);
+    CHECK_EQ(bs[0].draft_rows_total, 24 * 2);
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);
+}
+
 RAD_TEST_MAIN()

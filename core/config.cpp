@@ -168,6 +168,13 @@ static const Flag g_flags[] = {
     { "--draft-depth-tiers",  "LIST",   "the K values the cost policy chooses between, ascending\n"
     "                                    and unique, e.g. 0,2,3,4,6; each must be <= the executable\n"
     "                                    head depth. Default 0,2,3,4,6 (trimmed to that depth)" },
+    { "--draft-calib-k",      "LIST",   "force this fixed sequence of depths, one per non-empty\n"
+    "                                    cycle, e.g. 3,2,2,3; order and duplicates are kept, and\n"
+    "                                    every value must be one of the effective\n"
+    "                                    --draft-depth-tiers. A calibration switch, refused unless\n"
+    "                                    --draft-profile-out, --draft-reference and\n"
+    "                                    --draft-policy cost are all given; a serving run always\n"
+    "                                    lets the cost policy decide" },
     { "--draft-profile",      "PATH",   "a rad-draft-profile/4 file measured on this deployment,\n"
     "                                    read before the scheduler starts; a fingerprint or\n"
     "                                    execution mismatch disables it and is named in the log.\n"
@@ -703,6 +710,34 @@ int config_parse(int argc, char** argv, Config* c) {
             c->draft_n_tiers = n;
             c->draft_tiers_set = true;
         }
+        else if (S("--draft-calib-k")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* A sequence, not a ladder: order and duplicates are the point (3,2,2,3), so only
+             * the count and the values are checked here. Whether each value is one of the
+             * effective ladder's depths is DraftPlanner::configure's check, at startup, where
+             * the trimmed ladder is known. */
+            const std::string all = v;
+            size_t at = 0;
+            int n = 0;
+            while (at <= all.size()) {
+                const size_t end = std::min(all.find(',', at), all.size());
+                const std::string one = all.substr(at, end - at);
+                int64_t t = 0;
+                if (!parse_int(a.c_str(), one.c_str(), 0, INT32_MAX, &t)) return RAD_E_INVAL;
+                if (n >= kDraftMaxTiers) {
+                    RAD_ERR("--draft-calib-k takes at most %d K values", kDraftMaxTiers);
+                    return RAD_E_INVAL;
+                }
+                c->draft_calib_k[n++] = (int)t;
+                at = end + 1;
+            }
+            if (n < 2) {
+                RAD_ERR("--draft-calib-k takes at least 2 K values: a single depth is not a "
+                        "sequence");
+                return RAD_E_INVAL;
+            }
+            c->draft_calib_n = n;
+        }
         else if (S("--draft-reference")) {
             /* A flag, not a mode: it says how this calibration measures, and the writer stamps
              * the file with that basis. Whether the run may use it (a profile out, a policy that
@@ -1145,6 +1180,11 @@ const ShowRow kShow[] = {
         std::string s;
         for (int i = 0; i < c.draft_n_tiers; ++i) s += (i ? "," : "") + num(c.draft_tiers[i]);
         return s;
+    } },
+    { "--draft-calib-k",      [](const Config& c) {
+        std::string s;
+        for (int i = 0; i < c.draft_calib_n; ++i) s += (i ? "," : "") + num(c.draft_calib_k[i]);
+        return s.empty() ? std::string("none") : s;
     } },
     { "--draft-profile",      [](const Config& c) { return or_none(c.draft_profile, "none"); } },
     { "--draft-profile-out",  [](const Config& c) { return or_none(c.draft_profile_out, "none"); } },

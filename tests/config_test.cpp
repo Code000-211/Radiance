@@ -436,6 +436,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
         { "--draft-policy", { "cost" } }, { "--draft-depth-tiers", { "0,2" } },
+        { "--draft-calib-k", { "3,2,2,3" } },
         { "--draft-profile", { "/p.json" } },
         { "--draft-profile-out", { "/out.json" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
@@ -770,6 +771,29 @@ TEST(the_draft_depth_tiers_are_an_ascending_unique_list) {
     CHECK_EQ(parse({ "--draft-depth-tiers", "-1,2" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-depth-tiers", "high" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-depth-tiers" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-calib-k is a sequence, not a ladder: order and duplicates are what it is for, so the
+ * parser checks only the count and the values. Whether each depth is one the effective ladder
+ * offers is DraftPlanner::configure's check at startup, where the trimmed ladder is known. */
+TEST(the_calibration_sequence_keeps_its_order_and_its_duplicates) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_calib_n, 0);
+    Config c;
+    CHECK_EQ(parse({ "--draft-calib-k", "3,2,2,3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_n, 4);
+    CHECK_EQ(c.draft_calib_k[0], 3);
+    CHECK_EQ(c.draft_calib_k[1], 2);
+    CHECK_EQ(c.draft_calib_k[2], 2);
+    CHECK_EQ(c.draft_calib_k[3], 3);
+    CHECK_EQ(parse({ "--draft-calib-k", "0,6,0" }, &c), RAD_OK);   /* unsorted, repeated */
+    CHECK_EQ(c.draft_calib_n, 3);
+    CHECK_EQ(parse({ "--draft-calib-k", "3" }, &c), RAD_E_INVAL);  /* a depth is not a sequence */
+    CHECK_EQ(parse({ "--draft-calib-k", "3,2,2,3,2,3,3,2,3" }, &c), RAD_E_INVAL);   /* > 8 */
+    CHECK_EQ(parse({ "--draft-calib-k", "3,,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-calib-k", "-1,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-calib-k" }, &c), RAD_E_INVAL);
 }
 
 /* --draft-profile is a path, read by the engine once the deployment is up. Nothing parses the file

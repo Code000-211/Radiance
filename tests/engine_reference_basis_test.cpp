@@ -309,6 +309,46 @@ TEST(a_reference_calibration_needs_an_output_path_and_the_cost_policy) {
     CHECK_EQ(EngineTestPeer::begin_calibration(c), RAD_E_STATE);
 }
 
+/* --draft-calib-k forces the depths of a measurement, so the engine refuses it outside the
+ * reference calibration -- before anything starts, and whether or not a plan resolves, so a
+ * serving run cannot carry it. The refusals run before the identity is derived, as above. */
+TEST(the_forced_calibration_sequence_is_refused_outside_a_reference_calibration) {
+    /* A serving run: no output path, so no calibration at all. */
+    Config serving;
+    serving.draft_calib_k[0] = 3;
+    serving.draft_calib_k[1] = 2;
+    serving.draft_calib_n    = 2;
+    Engine a(serving);
+    CHECK_EQ(EngineTestPeer::begin_calibration(a), RAD_E_INVAL);
+    CHECK(!EngineTestPeer::sched(a).draft_costs().active());
+
+    /* An output path alone is not enough: the sequence belongs to the reference run that measures
+     * the ladder, so a plain cost calibration is refused. */
+    Config no_reference;
+    no_reference.draft_calib_k[0]  = 3;
+    no_reference.draft_calib_k[1]  = 2;
+    no_reference.draft_calib_n     = 2;
+    no_reference.draft_profile_out = radtest::tmp_path("engine_calib_noref.json");
+    no_reference.draft_policy      = DraftPolicyKind::Cost;
+    Engine b(no_reference);
+    CHECK_EQ(EngineTestPeer::begin_calibration(b), RAD_E_INVAL);
+    CHECK(!EngineTestPeer::sched(b).draft_costs().active());
+
+    /* With both satisfied the flag passes this gate; the refusal is then the deployment's, exactly
+     * as for any calibration with no resolved plan. */
+    Config calib;
+    calib.draft_calib_k[0]  = 3;
+    calib.draft_calib_k[1]  = 2;
+    calib.draft_calib_n     = 2;
+    calib.draft_profile_out = radtest::tmp_path("engine_calib_noplan.json");
+    calib.draft_reference   = true;
+    calib.draft_policy      = DraftPolicyKind::Cost;
+    calib.n_spec            = 6;
+    Engine c(calib);
+    EngineTestPeer::drafter(c, serial_head(6));
+    CHECK_EQ(EngineTestPeer::begin_calibration(c), RAD_E_STATE);
+}
+
 /* The reference run's ranks. Both lenders stay off -- no strip is registered, no loan is offered
  * and nothing is filled -- while the run still arms its calibration, and the table it records into
  * is the writer, not a loaded reference. The identity says so: basis no-loan, no live_loan, and

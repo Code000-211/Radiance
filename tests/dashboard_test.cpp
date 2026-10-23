@@ -262,6 +262,25 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     CHECK_EQ(dc.value("last_source", std::string()), std::string("cost"));
     CHECK_EQ(dc.value("last_fallback", std::string()), std::string("unknown_shape"));
 
+    /* The four ends and the two counts that qualify them: a forced calibration plan is neither a
+     * price nor a fallback, and `tiers_priced` says whether the search weighed a shallower depth
+     * instead of never measuring it. */
+    d.sched.m.draft_cost_cycles       = 4;
+    d.sched.m.draft_cost_priced       = 2;
+    d.sched.m.draft_cost_fallback     = 0;
+    d.sched.m.draft_cost_no_plan      = 0;
+    d.sched.m.draft_cost_calibration  = 2;
+    d.sched.m.draft_cost_calibration_cut = 1;
+    d.sched.m.draft_cost_tiers_priced = 1;
+    d.sched.m.draft_cost_last_k       = 2;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("calib_forced", (int64_t)0), (int64_t)2);
+    CHECK_EQ(dc.value("calib_cut", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("tiers_priced", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("priced", (int64_t)0) + dc.value("fallback", (int64_t)0) +
+                 dc.value("calib_forced", (int64_t)0) + dc.value("no_plan", (int64_t)0),
+             dc.value("cycles", (int64_t)0));
+
     /* The reference's own count stands alone: a no-loan run absorbs nothing, so this is the only
      * thing it publishes -- and it must publish it, or "nothing reached the reference" and "the
      * reference refused nothing" are the same silence. */
@@ -269,6 +288,8 @@ TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     d.sched.m.draft_cost_priced            = 0;
     d.sched.m.draft_cost_fallback          = 0;
     d.sched.m.draft_cost_no_plan           = 0;
+    d.sched.m.draft_cost_calibration       = 0;
+    d.sched.m.draft_cost_calibration_cut   = 0;
     d.sched.m.draft_cost_reference_skipped = 2;
     dc = d.get("/stats")["draft_cost"];
     CHECK_EQ(dc.value("reference_skipped", (int64_t)0), (int64_t)2);

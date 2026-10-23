@@ -21,6 +21,32 @@ int32_t cap_of(const DraftSeqView& v, int32_t ceiling) {
     return cap > RAD_SCHED_MAX_SPEC ? RAD_SCHED_MAX_SPEC : cap;
 }
 
+/* The one resource cut, shared by the cost search and the calibration sequence: a positive token or
+ * KV budget caps the summed drafts, and scaling every K down proportionally is the cut that may
+ * happen at once. Only the assignment is shared -- the Cost path's repricing of the reduced plan
+ * stays in choose(), where the hysteresis needs the price of the plan that will actually be
+ * issued. Returns whether anything was cut; a cut row is marked DraftFallback::Resources. */
+bool apply_draft_budget(const DraftBatchView& view, int32_t* k, DraftFallback* why) {
+    int32_t budget = -1;
+    if (view.token_budget > 0) budget = view.token_budget;
+    if (view.kv_budget > 0 && (budget < 0 || view.kv_budget < budget)) budget = view.kv_budget;
+    if (budget < 0) return false;
+    int32_t sum = 0;
+    for (int32_t i = 0; i < view.n_seq; ++i) sum += k[i];
+    if (sum <= budget || sum <= 0) return false;
+    bool cut = false;
+    for (int32_t i = 0; i < view.n_seq; ++i) {
+        if (k[i] <= 0) continue;
+        const int32_t scaled = (int32_t)((int64_t)k[i] * budget / sum);
+        if (scaled < k[i]) {
+            k[i] = scaled;
+            why[i] = DraftFallback::Resources;
+            cut = true;
+        }
+    }
+    return cut;
+}
+
 }  /* namespace */
 
 int DraftPlanner::configure(const DraftPolicyConfig& c) {
@@ -50,6 +76,33 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
             }
         }
         if (c.fallback_k < 0 || c.fallback_k > c.k_ceiling) return RAD_E_INVAL;
+        /* The calibration sequence runs only under Cost, and every value must be one of the
+         * effective tiers: those are inside 0..ceiling already, and a depth the serving ladder
+         * never offers must not be measured into a profile (the coverage invariant). Duplicates
+         * and order are the sequence's, so they are not checked. */
+        if (c.n_calib_k > 0) {
+            if (c.n_calib_k < 2 || c.n_calib_k > RAD_DRAFT_MAX_TIERS) {
+                RAD_ERR("draft policy: %d calibration depths, outside 2..%d", (int)c.n_calib_k,
+                        (int)RAD_DRAFT_MAX_TIERS);
+                return RAD_E_INVAL;
+            }
+            for (int32_t i = 0; i < c.n_calib_k; ++i) {
+                const int32_t k = c.calib_k[i];
+                bool offered = false;
+                for (int32_t t = 0; t < c.n_tiers; ++t)
+                    if (c.tiers[t] == k) { offered = true; break; }
+                if (!offered) {
+                    RAD_ERR("draft policy: calibration K%d is not one of the offered tiers "
+                            "(%d..%d, %d values); a calibration measures only depths the serving "
+                            "ladder offers", (int)k, (int)c.tiers[0],
+                            (int)c.tiers[c.n_tiers - 1], (int)c.n_tiers);
+                    return RAD_E_INVAL;
+                }
+            }
+        }
+    } else if (c.n_calib_k > 0) {
+        RAD_ERR("draft policy: a calibration sequence needs --draft-policy cost");
+        return RAD_E_INVAL;
     }
     if (c.passes < 0 || c.passes > 8 || c.max_evals < 1) return RAD_E_INVAL;
     if (!std::isfinite(c.hyst) || c.hyst < 0.0 || c.hold < 0) return RAD_E_INVAL;
@@ -75,6 +128,8 @@ void DraftPlanner::reset() {
     chosen_ = false;
     gap_reported_ = false;
     gap_refused_  = false;
+    calib_pos_ = 0;      /* the sequence starts over; configure() starts it here too */
+    last_tiers_priced_ = 0;
     fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
 }
 
@@ -251,6 +306,7 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
 int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pred,
                          const DraftCostModel& costs, DraftPlan* out) {
     gap_refused_ = false;
+    last_tiers_priced_ = 0;   /* only a Cost search below fills this */
     if (!out || !out->k || !out->rows || !out->req_id || !out->slot || !out->slot_gen ||
         !out->why || !out->fill || !out->ctx_class || !out->history_tokens)
         return RAD_E_INVAL;
@@ -267,6 +323,27 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     }
     /* verify_k is set in finish(), where max_k is known: it is this plan's own deepest draft when
      * the paired step verifies what this cycle drafts, the frozen plan's window otherwise. */
+
+    /* --draft-calib-k: the operator's sequence, taken and not chosen. Nothing below this branch
+     * runs for it -- no price, no ranking, no predictor read, no hysteresis -- and it holds no
+     * state beyond its own position. The resource budget still applies: a plan may never ask for
+     * more drafts than the step or the pool was given, calibration or not. */
+    if (c_.n_calib_k > 0) {
+        const int32_t want = c_.calib_k[calib_pos_ % c_.n_calib_k];
+        for (int32_t i = 0; i < view.n_seq; ++i) {
+            const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+            out->k[i] = want < c ? want : c;
+            if (view.seq[i].eligibility == DraftEligibility::Eligible && c < want)
+                out->why[i] = DraftFallback::Resources;
+        }
+        apply_draft_budget(view, out->k, out->why);
+        int32_t top = 0;
+        total_k(out->k, view.n_seq, &top);
+        /* Only a cycle with rows moves the sequence on: an empty view has no depth to measure,
+         * and advancing here would shift every later depth off its rotation. */
+        if (view.n_seq > 0) calib_pos_ = (calib_pos_ + 1) % c_.n_calib_k;
+        return finish(view, top, DraftPlanSource::Calibration, DraftFallback::None, out);
+    }
 
     if (c_.mode == DraftPolicyMode::Legacy) {
         const int32_t want = c_.legacy_k > 0 ? c_.legacy_k : c_.k_ceiling;
@@ -347,6 +424,11 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
 
     gap_reported_ = false;   /* a priced cycle re-arms the one diagnosis */
 
+    /* The deepest tier priced (or the code above would have returned), and every shallower one
+     * that did. Counted whether or not it wins: the question the ledger answers is "were both
+     * depths compared", not "which one won" -- a Cost plan at the deep tier alone cannot say
+     * whether the shallow alternative lost or was never priced. */
+    int32_t tiers_priced = 1;
     for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
@@ -355,11 +437,14 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         Priced p;
         const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
         if (rc < 0) return rc;
-        if (p.valid && p.yield / p.ms > best_p.yield / best_p.ms) {
+        if (!p.valid) continue;
+        ++tiers_priced;
+        if (p.yield / p.ms > best_p.yield / best_p.ms) {
             best_p    = p;
             best_tier = c_.tiers[t];
         }
     }
+    last_tiers_priced_ = tiers_priced;
 
     /* Take the winning baseline as the search's starting assignment. */
     for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -397,26 +482,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     }
 
     /* Budgets: a positive token or KV budget caps the summed drafts. Scaling every K down is
-     * the resource cut that may happen at once. */
-    int32_t budget = -1;
-    bool    cut    = false;
-    if (view.token_budget > 0) budget = view.token_budget;
-    if (view.kv_budget > 0 && (budget < 0 || view.kv_budget < budget)) budget = view.kv_budget;
-    if (budget >= 0) {
-        int32_t top = 0;
-        const int32_t sum = total_k(out->k, view.n_seq, &top);
-        if (sum > budget && sum > 0) {
-            for (int32_t i = 0; i < view.n_seq; ++i) {
-                if (out->k[i] <= 0) continue;
-                const int32_t scaled = (int32_t)((int64_t)out->k[i] * budget / sum);
-                if (scaled < out->k[i]) {
-                    out->k[i] = scaled;
-                    out->why[i] = DraftFallback::Resources;
-                    cut = true;
-                }
-            }
-        }
-    }
+     * the resource cut that may happen at once (apply_draft_budget, shared with calibration). */
+    const bool cut = apply_draft_budget(view, out->k, out->why);
 
     int32_t top = 0;
     total_k(out->k, view.n_seq, &top);

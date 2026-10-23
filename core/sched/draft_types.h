@@ -118,8 +118,12 @@ enum class DraftDrafter : uint8_t {
 
 /* Where a cycle-level plan came from. `Fallback` is a fixed baseline chosen because the cost
  * path could not price the shape (see DraftFallback for why); it is a visible answer, not a
- * pretend-selection. */
-enum class DraftPlanSource : uint8_t { Legacy = 0, Cost = 1, Fallback = 2, Probe = 3 };
+ * pretend-selection. `Calibration` is a depth the operator's sequence forced (`--draft-calib-k`),
+ * not one the policy chose: it exists so a measured bucket can be attributed to a forced
+ * measurement instead of reading as a cost decision. Runtime only -- the profile format carries no
+ * source, and a serving run never issues one. */
+enum class DraftPlanSource : uint8_t { Legacy = 0, Cost = 1, Fallback = 2, Probe = 3,
+                                       Calibration = 4 };
 
 /* An exploratory probe's reason; probes are bounded and rate-limited by B. */
 enum class DraftProbe : uint8_t { None = 0, Recovery = 1, Uncertainty = 2, Age = 3 };
@@ -186,6 +190,7 @@ inline const char* draft_plan_source_name(DraftPlanSource s) {
         case DraftPlanSource::Cost:     return "cost";
         case DraftPlanSource::Fallback: return "fallback";
         case DraftPlanSource::Probe:    return "probe";
+        case DraftPlanSource::Calibration: return "calibration";
         default:                        return "legacy";
     }
 }

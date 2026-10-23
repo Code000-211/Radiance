@@ -508,6 +508,152 @@ TEST(config_validation_refuses_a_tier_list_it_cannot_use) {
     CHECK_EQ(p.configure(dup), RAD_E_INVAL);
 }
 
+/* A calibration sequence is not a ladder: order and duplicates are kept (`3,2,2,3` is the point),
+ * but every value must be one of the depths the deployment actually offers -- the effective
+ * ladder after the trim/dedup -- so no sample is filed at a depth serving never offers. */
+TEST(config_validation_refuses_a_calibration_sequence_it_cannot_use) {
+    DraftPlanner p;
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.calib_k[0] = 3; cfg.calib_k[1] = 2; cfg.calib_k[2] = 2; cfg.calib_k[3] = 3;
+    cfg.n_calib_k = 4;
+    CHECK_EQ(p.configure(cfg), RAD_OK);   /* duplicates, unsorted: accepted */
+
+    DraftPolicyConfig shallow = cost_config(3);
+    shallow.tiers[0] = 0; shallow.tiers[1] = 2; shallow.tiers[2] = 3; shallow.n_tiers = 3;
+    shallow.calib_k[0] = 3; shallow.calib_k[1] = 4;   /* 4 is in no offered tier */
+    shallow.n_calib_k = 2;
+    CHECK_EQ(p.configure(shallow), RAD_E_INVAL);
+
+    DraftPolicyConfig legacy;   /* a sequence has no meaning without the cost policy */
+    legacy.k_ceiling = 6;
+    legacy.calib_k[0] = 3; legacy.calib_k[1] = 2;
+    legacy.n_calib_k = 2;
+    CHECK_EQ(p.configure(legacy), RAD_E_INVAL);
+
+    DraftPolicyConfig single = cfg;
+    single.n_calib_k = 1;   /* one depth is not a sequence */
+    CHECK_EQ(p.configure(single), RAD_E_INVAL);
+}
+
+/* `3,2,2,3` over five non-empty cycles: A (3->3), B (3->2), D (2->2), C (2->3), A. The verify
+ * depth of each plan is the frozen previous plan's -- the declared window; what the step really
+ * verifies is the executed shape (sched_draft_test.cpp, `draft_cap` caps it on a fall). The branch
+ * never prices and never consults the predictor. */
+TEST(a_calibration_sequence_forces_its_depths_and_only_rows_advance_it) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.calib_k[0] = 3; cfg.calib_k[1] = 2; cfg.calib_k[2] = 2; cfg.calib_k[3] = 3;
+    cfg.n_calib_k = 4;
+    Cycle c(6, cfg);
+    for (int i = 0; i < 4; ++i) c.add(i, (uint64_t)(i + 1));
+    c.f.view.pipeline_depth = 1;   /* the scheduler issues ahead: the step verifies the last plan */
+
+    const int32_t want[5]   = { 3, 2, 2, 3, 3 };
+    const int32_t verify[5] = { 0, 3, 2, 2, 3 };
+    for (int n = 0; n < 5; ++n) {
+        c.f.view.cycle_id = (uint64_t)(n + 1);
+        CHECK_EQ(c.choose(), RAD_OK);
+        CHECK(c.f.plan.source == DraftPlanSource::Calibration);
+        CHECK(c.f.plan.fallback == DraftFallback::None);
+        CHECK_EQ(c.f.plan.max_k, want[n]);
+        CHECK_EQ(c.f.plan.verify_k, verify[n]);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(c.f.plan.k[i], want[n]);
+        CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
+        /* Forced, not chosen: no tier was priced and this cycle is not a cost decision. */
+        CHECK_EQ(c.planner.last_tiers_priced(), 0);
+    }
+    CHECK_EQ(c.costs.calls, 0);   /* the branch never asks for a price */
+
+    /* reset() starts the rotation over, as configure() does. */
+    c.planner.reset();
+    c.f.view.cycle_id = 6;
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 3);
+    CHECK_EQ(c.f.plan.verify_k, 0);   /* reset also forgets the frozen window */
+}
+
+/* An empty view -- the prefill cycle before the first decode, or an idle planning site -- is
+ * forced too, but it is no depth measurement: it must not step the sequence, or every later depth
+ * lands one place off the rotation. */
+TEST(an_empty_cycle_does_not_advance_the_calibration_sequence) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.calib_k[0] = 3; cfg.calib_k[1] = 2; cfg.calib_k[2] = 2; cfg.calib_k[3] = 3;
+    cfg.n_calib_k = 4;
+    Cycle c(6, cfg);
+    for (int i = 0; i < 4; ++i) c.add(i, (uint64_t)(i + 1));
+    c.f.view.pipeline_depth = 1;
+
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 3);
+
+    /* The prefill step: nothing runs yet. */
+    c.f.view.cycle_id = 2;
+    c.f.view.n_seq = 0;
+    draft_fake::predict(&c.pred, c.f.view, &c.f.pred);
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 0);
+    CHECK(c.f.plan.source == DraftPlanSource::Calibration);
+
+    /* The first decode cycle is still the sequence's second depth, not its third. The empty
+     * cycle cleared the frozen window (existing remember() semantics), so it verifies 0. */
+    c.f.view.cycle_id = 3;
+    c.f.view.n_seq = 4;
+    draft_fake::predict(&c.pred, c.f.view, &c.f.pred);
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 2);
+    CHECK_EQ(c.f.plan.verify_k, 0);
+}
+
+/* The same budget cut the cost path applies, applied to a forced depth: the plan never asks for
+ * more drafts than the step was given, and says on the row why. */
+TEST(a_budget_cuts_a_forced_depth_and_marks_the_row) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.calib_k[0] = 3; cfg.calib_k[1] = 2;
+    cfg.n_calib_k = 2;
+    Cycle c(6, cfg);
+    for (int i = 0; i < 4; ++i) c.add(i, (uint64_t)(i + 1));
+    c.f.view.token_budget = 8;   /* 4 rows at K3 want 12 */
+
+    CHECK_EQ(c.choose(), RAD_OK);
+    CHECK(c.f.plan.source == DraftPlanSource::Calibration);
+    CHECK_EQ(c.f.plan.max_k, 2);
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(c.f.plan.k[i], 2);
+        CHECK(c.f.plan.why[i] == DraftFallback::Resources);
+    }
+    CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
+}
+
+/* K2: "both depths were priced" has to be readable, not assumed. Stage 1 issues a Cost plan at
+ * the deepest tier even when only that tier had a price, so the plan's source alone cannot tell
+ * an alternative that lost from one that was never measured. */
+TEST(the_ledger_shows_how_many_depths_the_cost_search_priced) {
+    DraftPolicyConfig cfg = cost_config(3);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+
+    Cycle deep_only(3, cfg);
+    deep_only.pred.a = 0.95f;
+    deep_only.add(0, 1);
+    deep_only.costs.measured = true;
+    deep_only.costs.ms[3] = 3.0;
+    CHECK_EQ(deep_only.choose(), RAD_OK);
+    CHECK(deep_only.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(deep_only.planner.last_tiers_priced(), 1);
+
+    Cycle both(3, cfg);
+    both.pred.a = 0.95f;
+    both.add(0, 1);
+    both.costs.measured = true;
+    both.costs.ms[3] = 3.0;
+    both.costs.ms[2] = 2.9;   /* priced, and still not enough to beat the deep window */
+    CHECK_EQ(both.choose(), RAD_OK);
+    CHECK(both.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(both.f.plan.max_k, 3);
+    CHECK_EQ(both.planner.last_tiers_priced(), 2);
+}
+
 TEST(the_documented_c8_pair_prices_depth_three_ahead_of_depth_five) {
     /* core/rad_core.h documents C8 at depth 5: 43.0 ms, 23.3 tokens; at depth 3: 36.3 ms,
      * 22.3 tokens -- 0.542 against 0.614 tokens per millisecond. The acceptance below is chosen

@@ -498,6 +498,7 @@ parses and does nothing would be the fabricated success the contracts forbid.
 | `--draft-profile` | path | none | accepted; a `rad-draft-profile/4` file, read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. A `no-loan` file is a reference: it loads on a serving run whose loans stay dynamic, is immutable and prices only exact measured buckets. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. The bound is the executable head depth (`min(ceiling, drafter depth)`), not the ceiling alone: a plan above it would execute fewer rounds than it planned and record a shortened bucket. An explicit list with a tier above that depth is refused by name; otherwise the list is the whole ladder. A top **below** it is left as given: when the active profile prices that top, the cycle runs it (a valid reload). Only a cycle whose top is unpriced while the named baseline would run deeper is refused, by the policy that can see the shape, with a one-time diagnostic -- nothing is learnt at a depth the ladder never offers, and the run stops on the fail-closed latch (`draft_cost_aborted` -> `Engine::fail_loop`) instead of drafting on at the ceiling. The default ladder is trimmed to the depth (its deepest value replaced by the depth), so a shallow head does not lock out valid tiers |
 | `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall) and expert placement stays frozen at the one bringup settled (no swap, fill or drop), so the written profile is the plan's start placement without borrowed copies; no cycle is marked for a mover move, but a staged bracket or another placement-marked cycle is still left out at export. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
+| `--draft-calib-k` | K sequence, e.g. `3,2,2,3` | none | calibration only: force this fixed sequence of depths, one per **non-empty** cycle, in the given order and keeping duplicates. Needs `--draft-profile-out`, `--draft-reference` and `--draft-policy cost` together, and every value must be one of the **effective** `--draft-depth-tiers` after the trim/dedup `Scheduler::init` applies -- both are refused by name at startup, so neither a serving run nor a depth the ladder never offers can carry it. Plans are `source=calibration` (runtime only, never serialized), not cost decisions: no price, no ranking, no predictor read, no hysteresis. The shared token/KV budget cut still applies, and `calib_cut` counts the forced plans it touched. An empty view is forced too and counted in `calib_forced`, but does not advance the sequence; `priced`/`fallback` stay 0 for forced plans |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
 `cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
@@ -510,6 +511,55 @@ and it is measured separately from a process started with `--num-speculative-tok
 drafter. Initialisation is explicitly not depth 0. A speculation-off plan is never filled by the
 n-gram fallback: its `fill[]` is `None` for every request and `draft_plan_bars_fill` says so;
 "MTP off, n-gram allowed" would be a separate state with its own costs and labels.
+
+## The calibration sequence (`--draft-calib-k`)
+
+A cost run with `--draft-profile-out` records what it runs, but it runs the named baseline until a
+cycle is measured, and after that it runs what its own table prices. It therefore cannot reliably
+produce the buckets a serving run needs to **choose** between two neighbouring depths. The
+sequence flag closes that gap: it forces a depth per non-empty cycle, so a calibration measures a
+depth it would otherwise never pick.
+
+The sequence is a rotation, not a ladder: `3,2,2,3` (order and duplicates kept) visits the
+transitions A `3->3`, B `3->2`, C `2->3`, D `2->2` exactly once per period. A four-cycle period is
+minimal -- with L cycles there are L transitions, and fewer than four cannot contain all four.
+Every rotation of it contains all four; the planner-local index starts at 0 and only advances on a
+cycle with rows, so the first row-bearing cycle is deterministically the first element.
+
+- **Verify on a fall.** A plan's `verify_k` names the window the cycle before it drafted, but the
+  step caps every row's publication to *this* plan's own K (`draft_cap`), so a falling transition
+  verifies `min(previous K, this K)`. `3,2,2,3` therefore measures four shapes -- `(3,0)`,
+  `(2,2)` twice, `(3,2)`, `(3,3)` -- and the two K2 cycles file into one bucket. The plan's
+  `verify_k` is the declared window; the sample is keyed by the one that ran.
+
+What the serving ladder can use afterwards, and what it cannot:
+
+- **v0.** The first row-bearing cycle has no frozen predecessor, so its paired step verifies
+  nothing (`verify_k = 0`). Its plan's replay candidate is `Unknown` while a rank may record, so
+  the cost path would not price it; the sample is still filed under the state the bracket was
+  observed to run. A later wave of entirely new identities can produce a played v0 bucket, but one
+  wave cannot.
+- **K0.** K0 stays in the ladder and the search iterates it, but a profile without a priceable
+  K0 verify shape never chooses it, and the sequence does not force it. There is no K0 transition
+  in the A-D set.
+- **Tail.** `cap_of` clamps a row by its remaining output, so cycles that lose or nearly exhaust a
+  row produce extents the sequence did not plan. Those samples are filed under their executed
+  extent (the key is the executed distribution), but they are resource clamps, not depth choices;
+  a serving run falls back there, and the evidence window is the unclamped four-row cycles.
+- **`n_rows`.** The key is per row count. A sequence run at four rows closes the choice at four
+  rows only: a serving batch that loses a row next to a K2 plan has no C/D bucket at three rows
+  and falls back to the named baseline. Extending that needs the same transitions measured at
+  three and two rows -- six more buckets, not part of the minimum.
+- **One file, no merge.** All four buckets come from one run with one fingerprint and one basis;
+  a hand-merged file would be a claim about a deployment nobody measured.
+
+**Plan-time cuts are not `Shortened`.** `kDraftSampleShortened` is set when the bracket stopped
+below the plan's deepest round (`rounds < plan.max_k`) or a row was lost -- the cost of stopping
+early. A `cap_of` clamp or a `token_budget`/`kv_budget` scaling changes the plan before it is
+issued, so the cycle executes exactly what it planned and files a clean bucket under the executed
+extent. Such a plan-time cut is visible in `/stats` as `draft_cost.calib_cut` (and as
+`why = resources` in the plan), not in the sample flag; "the target buckets were not cut" must be
+read from that counter, not inferred from an absence of `Shortened`.
 
 ## Draft profile format, version 4
 

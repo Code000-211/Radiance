@@ -337,6 +337,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
      * depth is the executable one, or a cost deployment would plan past what the head can run. */
     dp.policy.fallback_k = exec_depth;
+    /* --draft-calib-k: copied as given; DraftPlanner::configure() checks every value against the
+     * effective ladder above (after the trim and dedup), which is the list the serving policy
+     * offers. Engine::begin_draft_calibration refuses the flag outside a reference calibration. */
+    for (int i = 0; i < cfg.draft_calib_n; ++i)
+        dp.policy.calib_k[i] = cfg.draft_calib_k[i];
+    dp.policy.n_calib_k = cfg.draft_calib_n;
     if (cfg.max_seqs > 0) {
         draft_predict_state_.assign((size_t)cfg.max_seqs, DraftPredictState{});
         DraftPredictModel::Params pp;
@@ -2199,8 +2205,26 @@ void Scheduler::draft_cost_cycle() {
         /* What the policy decided, for /stats: whether this cycle was priced at all, what it asked
          * for and why, and under which candidate. The replay is the candidate the plan declared --
          * the last bracket's observed state, not this cycle's (see draft_cycle_replay_). */
-        if (p->source == DraftPlanSource::Cost) ++m_.draft_cost_priced;
-        else if (p->source == DraftPlanSource::Fallback) ++m_.draft_cost_fallback;
+        if (p->source == DraftPlanSource::Cost) {
+            ++m_.draft_cost_priced;
+            /* The comparison the ledger has to show: how many of the ladder's depths were priced
+             * on this cycle (deepest plus shallower ones that priced), so "the shallow depth lost"
+             * is distinguishable from "it was never measured". */
+            m_.draft_cost_tiers_priced = draft_.planner().last_tiers_priced();
+        } else if (p->source == DraftPlanSource::Fallback) {
+            ++m_.draft_cost_fallback;
+            m_.draft_cost_tiers_priced = 0;
+        } else if (p->source == DraftPlanSource::Calibration) {
+            /* A forced plan, counted apart from both decision sources so a measurement never reads
+             * as a cost choice. A plan over an empty view is forced too (it has no rows and does
+             * not advance the sequence), and is counted here: the ledger's ends sum to `cycles`. */
+            ++m_.draft_calib_forced;
+            m_.draft_cost_tiers_priced = 0;
+            /* A plan-time resource cut (cap_of or the token/KV budget) is not kDraftSampleShortened
+             * -- that flag is the bracket stopping below its plan. It is visible here instead. */
+            for (int32_t i = 0; i < p->n_seq; ++i)
+                if (p->why[i] == DraftFallback::Resources) { ++m_.draft_calib_cut; break; }
+        }
         m_.draft_cost_last_k        = p->max_k;
         m_.draft_cost_last_replay   = (int64_t)p->replay;
         m_.draft_cost_last_source   = (int64_t)p->source;
