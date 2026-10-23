@@ -157,12 +157,12 @@ public:
      * cycle has no plan for a reason no later cycle can fix. Cleared at every entry. */
     bool coverage_gap_refused() const { return gap_refused_; }
 
-    /* A cycle that got no plan still publishes at the legacy window, and the next plan's paired
-     * step verifies that window. Remember it in the frozen state -- per row its own cap below
-     * `head_depth`, the executable depth the caller names -- so the next plan's verify_k describes
-     * the step that runs instead of the plan before the failure. Not a plan and not a measurement:
-     * no price is issued, no depth or sequence position moves, and no ring record opens. */
-    void remember_legacy(const DraftBatchView& view, int32_t head_depth);
+    /* One row's publication under a cycle that got no plan. The step paired with the next plan
+     * verifies exactly these drafts, so the next plan declares and prices that window instead of
+     * the plan before the failure. A row this cycle did not publish for keeps the entry it had:
+     * the paired step still verifies those drafts. Not a plan and not a measurement -- no price is
+     * issued, no depth or sequence position moves, and no ring record opens. */
+    void remember_published(uint64_t req_id, int32_t slot, uint32_t slot_gen, int32_t k);
 
 private:
     /* One candidate assignment's expected tokens and price. `valid` false: nothing to compare. */

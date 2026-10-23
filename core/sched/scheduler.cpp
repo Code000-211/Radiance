@@ -320,8 +320,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_record_ = !cfg.draft_profile_out.empty();
     draft_record_prev_k_ = -1;
     /* The deepest round the head can publish: the recording synthesises each cycle's plan at this
-     * bound, and a cost cycle that got no plan records it as the legacy window its step verifies. */
-    draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
+     * bound. */
+    if (draft_record_)
+        draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
@@ -681,6 +682,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
      * the n-gram fallback. */
     if (!s.req->may_speculate) {
         s.n_draft = 0; s.req->n_draft = 0; s.req->draft = nullptr;
+        draft_freeze_published(s, 0);
         return RAD_OK;
     }
 
@@ -692,7 +694,31 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     s.req->n_draft = n;
     s.req->draft = s.draft;
     draft_ring_publish(s, n, n, DraftOrigin::Head);
+    draft_freeze_published(s, n);
     return RAD_OK;
+}
+
+void Scheduler::draft_freeze_published(SchedReq& s, int n) {
+    /* A cycle that opened a plan froze its own K (DraftPlanner::finish), and a step issued ahead
+     * freezes the window it was built with (draft_freeze_ahead). This is the direct path: the next
+     * step is built after the next plan opens, from what this cycle published. */
+    if (!draft_.cost_policy() || draft_.plan()) return;
+    if (n < 0) n = 0;
+    draft_.planner().remember_published(s.req->id, s.slot, s.gen, n);
+}
+
+void Scheduler::draft_freeze_ahead(const StepPlan& p) {
+    /* A step issued ahead under a cycle that got no plan verifies exactly the window it was just
+     * built with -- per row its own n_spec, which expect_draft() cut to this row and which a row
+     * that never publishes still runs. Freeze that, so the next plan declares and prices this step
+     * instead of the plan before the failure. */
+    if (!draft_.cost_policy() || draft_.plan()) return;
+    for (const StepEntry& e : p.e) {
+        if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) continue;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (!s.req) continue;
+        draft_.planner().remember_published(s.req->id, s.slot, s.gen, e.n_spec);
+    }
 }
 
 /* ------------------------------------------------------------------ cancellation */
@@ -2240,14 +2266,9 @@ void Scheduler::draft_cost_cycle(bool direct_step) {
             draft_cost_aborted_ = true;
             return;
         }
-        /* The cycle runs legacy and publishes at the executable head depth, so the step paired with
-         * the next plan verifies that window. Record it in the frozen state, per row bounded by its
-         * own cap: otherwise the plan before the failure keeps naming the verify, and the next cycle
-         * asks a price for a window its step does not run. Not a measurement -- no plan is issued,
-         * no ring record opens, and the depth decision and the calibration sequence do not move. */
-        draft_.planner().remember_legacy(draft_view_, draft_head_depth_);
-        /* No plan this cycle: draft_cap() falls back to next_depth() and the cycle runs legacy.
-         * Logged once, so a broken hook does not flood the log every step. */
+        /* No plan this cycle: draft_cap() falls back to next_depth() and the cycle runs legacy,
+         * publishing at the executable head depth. What it publishes is what the step paired with
+         * the next plan verifies; set_draft() freezes that per row. */
         if (!draft_cost_failed_)
             RAD_ERR("draft policy: cycle %llu has no plan (%s); drafting at the ceiling %d",
                     (unsigned long long)draft_view_.cycle_id, rad_strerror(rc), cfg_.n_spec);
@@ -2753,6 +2774,7 @@ const RadBatch* Scheduler::step_next_locked() {
     }
     const RadBatch* b = builder_.build(plan_next_, *kv_, step_);
     if (!b) { plan_next_.reset(); return nullptr; }
+    draft_freeze_ahead(plan_next_);
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;

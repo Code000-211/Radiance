@@ -219,11 +219,25 @@ void DraftPlanner::remember(const DraftBatchView& view, const int32_t* k) {
     for (size_t j = 0; j < fr_n_; ++j) fr_k_[j] = k[j];
 }
 
-void DraftPlanner::remember_legacy(const DraftBatchView& view, int32_t head_depth) {
-    if (head_depth > c_.k_ceiling) head_depth = c_.k_ceiling;
-    if (head_depth < 0) head_depth = 0;
-    fit_frozen(view);
-    for (size_t j = 0; j < fr_n_; ++j) fr_k_[j] = cap_of(view.seq[j], head_depth);
+void DraftPlanner::remember_published(uint64_t req_id, int32_t slot, uint32_t slot_gen, int32_t k) {
+    if (k > c_.k_ceiling) k = c_.k_ceiling;
+    if (k < 0) k = 0;
+    for (size_t j = 0; j < fr_n_; ++j) {
+        if (fr_id_[j] != req_id || fr_slot_[j] != slot || fr_gen_[j] != slot_gen) continue;
+        fr_k_[j] = k;
+        return;
+    }
+    if (fr_id_.size() <= fr_n_) {   /* only when configure() did not size the storage */
+        fr_id_.resize(fr_n_ + 1);
+        fr_slot_.resize(fr_n_ + 1);
+        fr_gen_.resize(fr_n_ + 1);
+        fr_k_.resize(fr_n_ + 1);
+    }
+    fr_id_[fr_n_]   = req_id;
+    fr_slot_[fr_n_] = slot;
+    fr_gen_[fr_n_]  = slot_gen;
+    fr_k_[fr_n_]    = k;
+    ++fr_n_;
 }
 
 double DraftPlanner::expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k) {

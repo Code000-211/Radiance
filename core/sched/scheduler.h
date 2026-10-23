@@ -623,11 +623,19 @@ private:
     /* One view per decode row at this cycle's open; the cost policy's cycle and the recording
      * read the same rows. Caller holds mu_. */
     int32_t draft_fill_view();
+    /* A cycle with no plan publishes legacy drafts; the step paired with the next plan verifies
+     * them. Freeze the count this row really published (DraftPlanner::remember_published), so the
+     * next plan declares and prices the step that runs, not the plan before the failure. Caller
+     * holds mu_. */
+    void    draft_freeze_published(SchedReq& s, int n);
+    /* The ahead path's side of the same freeze: the step built under a cycle with no plan verifies
+     * exactly its own per-row n_spec, whether or not the head publishes for that row. Caller holds
+     * mu_. */
+    void    draft_freeze_ahead(const StepPlan& p);
     bool    draft_record_ = false;
     /* The serial head's executed depth: min(--num-speculative-tokens, the drafter's own). The
      * recording synthesises each cycle's plan at this bound, because that is the deepest round
-     * the head can publish; a cost cycle with no plan freezes the same bound as the window its
-     * step will verify. */
+     * the head can publish. */
     int32_t draft_head_depth_ = 0;
     /* The depth the previous recording cycle drafted, -1 before the first: the paired step verifies
      * that window, which is what the record's plan carries as history rows. */

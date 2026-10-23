@@ -1856,23 +1856,56 @@ void install_no_plan_table(Fixture& f) {
     install_table(f, p);
 }
 
+/* Engine::issue_serial_drafter's host half, for the step that was just built: what the driver asks
+ * for, the passes the card builds, and the deepest round any row was still in -- which is what
+ * issue_ahead() hands expect_draft(), per drafting row, before the step after this one is built.
+ * Every gate is the scheduler's own: serial_begin() decides the rounds and each row's depth,
+ * serial_batch() decides which passes exist. Nothing here names a depth the run would not take. */
+int32_t serial_ran(Fixture& f, int step) {
+    int rounds = f.prog.drafter.depth;
+    Scheduler::SerialRow rows[RAD_SCHED_MAX_SPEC];
+    const int n = f.sch.serial_begin(&rounds, rows, RAD_SCHED_MAX_SPEC);
+    if (rounds <= 0) return 0;
+    int32_t done = 0;
+    for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
+        if (rd > 0 && n <= 0) break;
+        const RadBatch* db = f.sch.serial_batch(rd, step);
+        if (!db) continue;
+        const int drafted = rd == 0 ? (int)db->n_draft_out : (int)db->n_seq;
+        if (drafted > 0) done = rd == 0 ? 1 : rd;
+    }
+    for (int i = 0; i < n; ++i) f.sch.expect_draft(rows[i].seq, done);
+    return done;
+}
+
 /* A planned cycle, `fails` refused opens, and the plan after them. Cycle A takes K2 from the cold
- * bucket. Each refused open runs legacy at the executable head depth -- no ring record, no sample,
- * no price -- and the plan after them must name the window those legacy steps really verify. The
- * table prices K3 only on that window, so a plan still naming the pre-failure K2 would ask for
- * (3,2) instead. `ineligible` turns the row into one that may not speculate just before the
- * refused opens: its legacy window is then zero, and the plan after them must verify nothing. */
-void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool ineligible = false) {
+ * bucket. Each refused open runs legacy -- no ring record, no sample, no price -- and the plan after
+ * them must name the window those legacy steps really verify. The table prices K3 only on that
+ * window, so a plan still naming the pre-failure K2 would ask for (3,2) instead.
+ *
+ * `ineligible` turns the row into one that may not speculate just before the refused opens: the
+ * engine publishes nothing for it (finish_serial_drafter's allows_speculation gate), while the
+ * serial drafter still proposes for it, so only the built window says what its step verifies.
+ * `max_tokens` bounds the row's output, and with it the window cap_of() would grant it. */
+struct FailOpts {
+    bool ahead = false;
+    int  fails = 1;
+    bool ineligible = false;
+    int  max_tokens = 64;
+    int  head_depth = 3;   /* the drafter's own depth; below cfg.n_spec it binds the rounds */
+};
+
+void failed_opens(Fixture& f, Coupled& c, const FailOpts& o) {
     f.build();
     f.cfg.n_spec = 3;
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
-    f.prog.drafter.depth = 3;
+    f.prog.drafter.depth = o.head_depth;
     install_no_plan_table(f);
     CHECK_OK(f.start(DraftReplay::None));
 
     Predictions& pred = c.pred;
-    const uint64_t id = f.submit(160);
+    const uint64_t id = f.submit(160, o.max_tokens);
     c.id = id;
     pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
 
@@ -1899,9 +1932,6 @@ void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool inelig
 
     const int32_t two[2]   = { 21, 22 };
     const int32_t three[3] = { 21, 22, 23 };
-    /* What a legacy cycle publishes and the next step verifies: the executable head depth, or
-     * nothing for a row that may not speculate. */
-    const int32_t legacy = ineligible ? 0 : 3;
 
     /* Cycle A: the cold bucket's K2, and its two drafts after the step. */
     REQUIRE(f.sch.step() != nullptr);
@@ -1911,8 +1941,9 @@ void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool inelig
         CHECK_EQ(a.k[0], 2);
         CHECK_EQ(a.verify_k, 0);
     }
-    if (ahead) {
-        f.sch.expect_draft(id, 2);
+    if (o.ahead) {
+        const int32_t ran = serial_ran(f, 1);
+        CHECK_EQ(ran, 2);                 /* the plan's own window, not the head's three */
         const RadBatch* built = f.sch.step_next();
         REQUIRE(built != nullptr);
         CHECK_EQ(built->n_spec, 2);
@@ -1923,41 +1954,49 @@ void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool inelig
     CHECK_OK(f.sch.set_draft(id, two, 2));
     f.sch.step_finished(live);
 
-    if (ineligible) f.sch.find(id)->may_speculate = false;
+    if (o.ineligible) f.sch.find(id)->may_speculate = false;
 
     const int64_t calls_before = log.calls;
-    for (int k = 0; k < fails; ++k) {
+    int32_t ran = 0;
+    for (int k = 0; k < o.fails; ++k) {
         pred.fail_next = 1;   /* the one-time model error */
-        if (ahead) {
+        if (o.ahead) {
             /* The step this cycle runs was built before its open, under the plan before it: that
-             * is the window it verifies. The step after it is built now, under no plan. */
+             * is the window it verifies. The step after it is built now, under no plan, from the
+             * rounds the serial drafter really ran. */
             f.sch.promote_next();
-            f.sch.expect_draft(id, legacy);
+            ran = serial_ran(f, 2 + k);
             const RadBatch* built = f.sch.step_next();
             REQUIRE(built != nullptr);
-            CHECK_EQ(built->n_spec, legacy);
+            CHECK_EQ(built->n_spec, ran);
             c.batch_spec = built->n_spec;
         } else {
             /* step() opens (and refuses) the plan, then builds the step after it: A's two first,
-             * the legacy depth from the second refused cycle on. */
+             * this cycle's publication from the next refused cycle on. */
             const RadBatch* built = f.sch.step();
             REQUIRE(built != nullptr);
-            CHECK_EQ(built->n_spec, k == 0 ? 2 : legacy);
+            /* A row that may not speculate is refused by the build itself, whatever it published. */
+            const int32_t want = o.ineligible ? 0 : (k == 0 ? 2 : f.sch.find(id)->n_draft);
+            CHECK_EQ(built->n_spec, want);
             c.batch_spec = built->n_spec;
+            ran = serial_ran(f, 2 + k);
         }
         f.commit_plain(11);
-        CHECK_OK(f.sch.set_draft(id, three, legacy));
+        /* The engine publishes a row the sampler will speculate on and skips the one it will not
+         * (finish_serial_drafter); the window the step verifies is the same either way. */
+        if (!o.ineligible) CHECK_OK(f.sch.set_draft(id, three, ran));
+        f.sch.serial_end(ran, true);
         f.sch.step_finished(live);
     }
 
     /* Counted apart, and none of them opened a record, asked a price or failed a sample. */
-    CHECK_EQ(f.sch.metrics().draft_cost_no_plan, fails);
+    CHECK_EQ(f.sch.metrics().draft_cost_no_plan, o.fails);
     CHECK_EQ(f.sch.draft_cycles_done(), 1);   /* A's record, closed at the first refused open */
     CHECK_EQ(log.calls, calls_before);
     CHECK_EQ(f.sch.draft_cost_refused(), 0);
 
     /* The plan after the refused opens: priced on the window the legacy steps really ran. */
-    if (ahead) {
+    if (o.ahead) {
         f.sch.promote_next();
         c.batch_spec = f.sch.plan().e.empty() ? 0 : f.sch.plan().e[0].n_spec;
     } else {
@@ -1977,7 +2016,7 @@ void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool inelig
 
     /* The cycle's own sample, filed under the same window. */
     f.commit_plain(11);
-    CHECK_OK(f.sch.set_draft(id, three, legacy));
+    if (!o.ineligible) CHECK_OK(f.sch.set_draft(id, three, ran));
     f.sch.step_finished(live);
     f.sch.flush_draft_observations();
     CHECK_EQ(f.sch.draft_cycles_done(), 2);
@@ -2001,7 +2040,7 @@ void failed_opens(Fixture& f, bool ahead, Coupled& c, int fails = 1, bool inelig
 TEST(a_cycle_with_no_plan_freezes_the_window_its_legacy_step_verifies) {
     Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
     Fixture f;
-    failed_opens(f, /*ahead=*/false, c);
+    failed_opens(f, c, FailOpts{});
 
     CHECK_EQ(c.plan_k, 3);   /* K3 priced on (3,3) beats K2 on (2,3) */
     CHECK(c.source == DraftPlanSource::Cost);
@@ -2029,7 +2068,7 @@ TEST(a_cycle_with_no_plan_freezes_the_window_its_legacy_step_verifies) {
 TEST(a_cycle_with_no_plan_freezes_the_window_its_legacy_step_verifies_ahead) {
     Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
     Fixture f;
-    failed_opens(f, /*ahead=*/true, c);
+    failed_opens(f, c, FailOpts{ .ahead = true });
 
     CHECK_EQ(c.plan_k, 3);
     CHECK(c.source == DraftPlanSource::Cost);
@@ -2056,7 +2095,7 @@ TEST(repeated_cycles_with_no_plan_keep_the_synced_legacy_window_on_both_paths) {
     {
         Coupled c;
         Fixture f;
-        failed_opens(f, /*ahead=*/false, c, /*fails=*/2);
+        failed_opens(f, c, FailOpts{ .ahead = false, .fails = 2 });
 
         CHECK_EQ(c.plan_k, 3);
         CHECK(c.source == DraftPlanSource::Cost);
@@ -2069,7 +2108,7 @@ TEST(repeated_cycles_with_no_plan_keep_the_synced_legacy_window_on_both_paths) {
     {
         Coupled c;
         Fixture f;
-        failed_opens(f, /*ahead=*/true, c, /*fails=*/2);
+        failed_opens(f, c, FailOpts{ .ahead = true, .fails = 2 });
 
         CHECK_EQ(c.plan_k, 3);
         CHECK(c.source == DraftPlanSource::Cost);
@@ -2081,22 +2120,144 @@ TEST(repeated_cycles_with_no_plan_keep_the_synced_legacy_window_on_both_paths) {
     }
 }
 
-/* A row that may not speculate publishes nothing in the legacy cycle, so the frozen window for it
- * is zero and the plan after the refusal must verify nothing for it -- not the K2 the plan before
- * the failure named. On the ahead path that window is the plan's declared verify, so this is what
- * keeps the query from asking for a verify row the step never runs. */
-TEST(a_row_that_may_not_speculate_freezes_no_verify_window) {
-    Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
-    Fixture f;
-    failed_opens(f, /*ahead=*/true, c, /*fails=*/1, /*ineligible=*/true);
+/* A row that may not speculate publishes nothing in a legacy cycle -- finish_serial_drafter skips
+ * it, and the direct path's set_draft takes nothing -- but that is not the window its step
+ * verifies. The serial drafter proposes for it like any other row (only the block drafter and the
+ * step's own speculation gate refuse it), so the step issued ahead verifies the rounds the head
+ * really ran, and the plan after the refusal must name them. The direct path is the other half:
+ * there the step itself refuses the row, so its window is zero. */
+TEST(a_row_that_may_not_speculate_freezes_the_window_its_step_verifies) {
+    {
+        Coupled c;   /* destroyed after `f`: the planner points into `c` until fini() */
+        Fixture f;
+        failed_opens(f, c, FailOpts{ .ahead = true, .ineligible = true });
 
-    CHECK_EQ(c.plan_k, 0);
-    CHECK_EQ(c.query.verify_k, 0);   /* not the pre-failure two */
-    CHECK_EQ(c.query.verify_tokens, 1);
-    CHECK_EQ(c.batch_spec, 0);
+        CHECK_EQ(c.batch_spec, 3);       /* the head ran its three rounds for the row ... */
+        CHECK_EQ(c.query.verify_k, 3);   /* ... and the plan after it names them, not the zero a
+                                          * publication-based window would */
+        CHECK_EQ(c.query.verify_tokens, 4);
+        CHECK_EQ(c.plan_k, 0);           /* the plan still drafts nothing for it */
+        CHECK_EQ(c.entry_spec, 3);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+    }
+    {
+        Coupled c;
+        Fixture f;
+        failed_opens(f, c, FailOpts{ .ahead = false, .ineligible = true });
+
+        CHECK_EQ(c.batch_spec, 0);       /* the direct step refuses the row */
+        CHECK_EQ(c.query.verify_k, 0);
+        CHECK_EQ(c.entry_spec, 0);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+    }
+}
+
+/* The output budget is not the verify window. A row with two tokens left may draft nothing under
+ * the plan's own budget (cap_of), while the legacy cycle's rounds are bounded only by the head's
+ * depth: the step issued ahead verifies all three, and the plan after the refusal must say three.
+ * `drafter.depth < n_spec` is the other bound: the head's own depth is what runs, so the window
+ * there is the head's two and not the ceiling's three. */
+TEST(the_frozen_window_is_the_one_the_legacy_step_was_built_with) {
+    {
+        Coupled c;
+        Fixture f;
+        /* Four tokens out of five are committed by the time the plan after the refusal opens: the
+         * row's cap_of() is one, and the step it is paired with verifies three. */
+        failed_opens(f, c, FailOpts{ .ahead = true, .max_tokens = 5 });
+
+        CHECK_EQ(c.batch_spec, 3);
+        CHECK_EQ(c.query.draft_k, 1);
+        CHECK_EQ(c.query.verify_k, 3);   /* not the two the row's remaining output would cap */
+        CHECK_EQ(c.entry_spec, 3);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+    }
+    {
+        Coupled c;
+        Fixture f;
+        /* A head two rounds deep under a ceiling of three runs two, on both paths. */
+        failed_opens(f, c, FailOpts{ .ahead = true, .head_depth = 2 });
+
+        CHECK_EQ(c.batch_spec, 2);
+        CHECK_EQ(c.query.verify_k, 2);   /* the head's depth, not the ceiling's three */
+        CHECK_EQ(c.entry_spec, 2);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+    }
+}
+
+/* A frozen window belongs to the slot's generation, not to the slot. A new request admitted into a
+ * recycled slot verifies its own publication (none yet), not the window the request before it left
+ * in that slot. The frozen list is also re-keyed at every plan open, so an entry can never outlive
+ * the cycle that wrote it by more than one open; the generation keeps the last window from naming a
+ * different request's rows inside that one. */
+TEST(a_recycled_slot_does_not_inherit_the_frozen_window) {
+    Coupled c;
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    install_no_plan_table(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    QueryLog& log = c.log;
+    log.table = &f.sch.draft_costs();
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 3;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &c.pred, predict };
+    dp.costs     = log.model();
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    const int32_t three[3] = { 21, 22, 23 };
+
+    const uint64_t a = f.submit(160);
+    c.pred.set(a, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    f.prefill(a);
+    REQUIRE(f.sch.step() != nullptr);
+    const int32_t a_slot = f.sch.draft().plan()->slot[0];
+    const uint32_t a_gen = f.sch.draft().plan()->slot_gen[0];
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, three, 3));
+
+    /* A refused cycle publishes the legacy three, which is what the next request must not see. */
+    c.pred.fail_next = 1;
+    const RadBatch* built = f.sch.step();
+    REQUIRE(built != nullptr);
+    CHECK_EQ(built->n_spec, 2);   /* A's own publication, capped by its plan */
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, three, 3));
+    f.sch.step_finished(live);
+
+    /* The first request ends and its slot goes back to the pool. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.commit(99, /*eos=*/1), RAD_OK);
+    CHECK_OK(f.sch.reap(a));
+    CHECK(f.sch.find(a) == nullptr);
+
+    /* A new request lands in that slot with a new generation, and verifies nothing. */
+    const uint64_t b = f.submit(160);
+    c.pred.set(b, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    f.prefill(b);
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* p = f.sch.draft().plan();
+    REQUIRE(p != nullptr);
+    REQUIRE_EQ(p->n_seq, 1);
+    CHECK_EQ(p->req_id[0], b);
+    CHECK_EQ(p->slot[0], a_slot);      /* the slot really is the one the request before it used */
+    CHECK(p->slot_gen[0] != a_gen);
+    c.entry_spec = f.sch.plan().e[0].n_spec;
     CHECK_EQ(c.entry_spec, 0);
-    CHECK_EQ(c.query.verify_k, c.entry_spec);
-    if (c.observe.what == DraftCostDisposition::Recorded) CHECK_EQ(c.recorded.verify_k, 0);
+    CHECK_EQ(p->verify_k, 0);   /* not the three the previous request in this slot left */
+    CHECK_EQ(c.log.last.verify_k, 0);
 }
 
 /* A refused open takes no calibration position. The sequence is [2, 3]: the first row-bearing cycle
