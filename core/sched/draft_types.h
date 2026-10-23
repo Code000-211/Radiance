@@ -270,6 +270,12 @@ struct DraftBatchView {
                                    * drafter loaded, which is a process, not a temporary K0 */
     int32_t pipeline_depth = 0;  /* cycles this plan is issued ahead of its verification; 0 = the
                                    * paired step verifies exactly what this cycle drafts */
+    /* This cycle was opened by step(), which builds the paired step *after* the plan and re-caps
+     * every row's publication to the plan's own K (Scheduler::draft_cap). A cycle opened by
+     * promote_next() was issued ahead: its step was built under the plan that published the
+     * drafts, so it verifies the frozen window as declared. The key and the plan's verify/history
+     * fields name the window the paired step executes. Ignored at pipeline_depth 0. */
+    bool    direct_step = false;
     int32_t token_budget = 0;     /* draft/verify tokens this cycle may add */
     int32_t kv_budget = 0;        /* KV tokens available for draft lookahead */
     int32_t prefill_tokens = 0;   /* prefill tokens sharing the step; 0 decode-only */

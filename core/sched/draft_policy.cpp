@@ -136,18 +136,13 @@ void DraftPlanner::reset() {
     fr_n_   = 0;   /* the storage stays: configure() reserved it, or the first cycle grew it */
 }
 
-int32_t DraftPlanner::frozen_verify_k(const DraftBatchView& view) const {
-    int32_t top = 0;
-    for (int32_t i = 0; i < view.n_seq; ++i) {
-        const DraftSeqView& v = view.seq[i];
-        for (size_t j = 0; j < fr_n_; ++j) {
-            if (fr_id_[j] != v.req_id || fr_slot_[j] != v.slot || fr_gen_[j] != v.slot_gen)
-                continue;
-            if (fr_k_[j] > top) top = fr_k_[j];
-            break;
-        }
-    }
-    return top;
+int32_t DraftPlanner::verify_k_of(const DraftBatchView& view, int32_t i, int32_t ki) const {
+    if (view.pipeline_depth <= 0) return ki;
+    const int32_t frozen = frozen_k_of(view, i);
+    /* Only a step() cycle is built after this plan opened, so only there does Scheduler::draft_cap
+     * re-cap the frozen window to the plan's own K. A step issued ahead was built under the plan
+     * that published the drafts and verifies the frozen window as declared. */
+    return view.direct_step && frozen > ki ? ki : frozen;
 }
 
 int32_t DraftPlanner::frozen_k_of(const DraftBatchView& view, int32_t i) const {
@@ -184,11 +179,10 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
         for (int32_t j = 1; j <= ki; ++j) ++s->draft_rows[j];
         /* At pipeline_depth 0 the paired step verifies exactly what this cycle drafts; only when
          * the plan is issued ahead (publish-then-verify) does it verify the frozen previous
-         * plan's window instead. The key names that window as the plan declares it. On the direct
-         * step() path the step re-caps it to the plan it now runs (Scheduler::draft_cap), so the
-         * lookup may ask for a window the step does not execute; keying the capped form instead
-         * would hide that mismatch rather than expose it. */
-        const int32_t fk = view.pipeline_depth > 0 ? frozen_k_of(view, i) : ki;
+         * plan's window instead. The key names the window the paired step executes: the declared
+         * frozen window on the ahead path, that window re-capped per row to this candidate's own
+         * K on the direct path (Scheduler::draft_cap). */
+        const int32_t fk = verify_k_of(view, i, ki);
         if (fk > s->verify_k) s->verify_k = fk;
         s->verify_tokens += 1 + fk;
         for (int32_t j = 1; j <= fk; ++j) ++s->rows[j];
@@ -292,17 +286,18 @@ int DraftPlanner::finish(const DraftBatchView& view, int32_t max_k, DraftPlanSou
     out->prefill_tokens = view.prefill_tokens;
     out->pipeline_depth = view.pipeline_depth;
     if (out->cap < view.n_seq) return RAD_E_INVAL;
-    /* The window the paired step verifies: this plan's own deepest draft when it verifies what
-     * this cycle drafts, the frozen previous plan's otherwise. */
-    out->verify_k = view.pipeline_depth > 0 ? frozen_verify_k(view) : max_k;
-    /* The shape the plan priced, per row; `k[]` is the budget for whichever drafter may fill it,
-     * and a K0 row has none. The history is the one the paired step owes (shape_of). */
+    /* The window the paired step verifies, per row: this plan's own deepest draft when it verifies
+     * what this cycle drafts, the frozen previous plan's otherwise -- re-capped to the plan's own K
+     * on the direct path, where the step is built after the plan opened (Scheduler::draft_cap). */
+    int32_t verify_top = 0;
     for (int32_t i = 0; i < view.n_seq; ++i) {
         out->ctx_class[i]      = view.seq[i].ctx_class;
-        const int32_t verifies = view.pipeline_depth > 0 ? frozen_k_of(view, i) : out->k[i];
+        const int32_t verifies = verify_k_of(view, i, out->k[i]);
+        if (verifies > verify_top) verify_top = verifies;
         out->history_tokens[i] = view.k_ceiling > 0 ? 1 + verifies : 0;
         out->fill[i] = out->k[i] > 0 ? DraftDrafter::Serial : DraftDrafter::None;
     }
+    out->verify_k = verify_top;
     if (draft_plan_rows(*out) < 0) return RAD_E_INVAL;
     const int rc = draft_plan_valid(*out);
     if (rc == RAD_OK) remember(view, out->k);
@@ -330,8 +325,9 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         out->why[i]      = DraftFallback::None;
         out->k[i]        = 0;
     }
-    /* verify_k is set in finish(), where max_k is known: it is this plan's own deepest draft when
-     * the paired step verifies what this cycle drafts, the frozen plan's window otherwise. */
+    /* verify_k is set in finish(), once the issued k[] is final: it is this plan's own deepest
+     * draft when the paired step verifies what this cycle drafts, the frozen plan's window
+     * otherwise (re-capped to the plan's own K on the direct path). */
 
     /* --draft-calib-k: the operator's sequence, taken and not chosen. Nothing below this branch
      * runs for it -- no price, no ranking, no hysteresis -- and it holds no state beyond its own

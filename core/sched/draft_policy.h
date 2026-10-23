@@ -176,15 +176,16 @@ private:
     int    finish(const DraftBatchView& view, int32_t max_k, DraftPlanSource src,
                   DraftFallback fb, DraftPlan* out);
 
-    /* The deepest K the frozen plan issued among the rows this view still holds; 0 when it names
-     * none of them. Identity, never an index. */
-    int32_t frozen_verify_k(const DraftBatchView& view) const;
+    /* The verify window row `i` runs at this plan's own depth `ki`: its own K at pipeline_depth 0,
+     * the frozen plan's K ahead, and that K re-capped to `ki` on the direct step() path, whose
+     * paired step is built after the plan (Scheduler::draft_cap). */
+    int32_t verify_k_of(const DraftBatchView& view, int32_t i, int32_t ki) const;
     /* The frozen plan's K for the view's row i, 0 when it names none. */
     int32_t frozen_k_of(const DraftBatchView& view, int32_t i) const;
     /* The shape assignment `k[]` verifies (clamped to `clamp_to` when that is >= 0), with the
-     * history the paired step owes and the drafter that is loaded. Under issue_ahead() a row's
-     * verify is the frozen plan's K, as that plan declared it: the window the cycle is priced on
-     * is the contract's, not the one a particular step path later clamps it to. */
+     * history the paired step owes and the drafter that is loaded. A row's verify is
+     * verify_k_of(): the frozen plan's window, re-capped to this candidate's K on the direct
+     * path only. */
     void    shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
                      DraftVerifyShape* s) const;
     void    remember(const DraftBatchView& view, const int32_t* k);

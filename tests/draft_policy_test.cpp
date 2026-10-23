@@ -811,9 +811,11 @@ TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
 
 /* The price lookup asks for the window the plan declares: the frozen previous cycle's K. A K2
  * candidate after a K3 plan therefore asks `(2,3)` -- four rows at verify 3 and 16 verify/history
- * tokens -- whether or not a given step path later re-caps what it executes (the direct step()
- * path does; the ahead path does not, and there the query is exact). The reference table is exact,
- * so what it does not hold nothing prices: the query itself is what the test sees. */
+ * tokens. This view is the ahead path (promote_next()), whose step was built under the publishing
+ * plan and verifies the frozen window as declared; the direct step() path prices the window its
+ * step will really run, which the_direct_step_prices_the_window_the_step_will_re_cap covers. The
+ * reference table is exact, so what it does not hold nothing prices: the query itself is what the
+ * test sees. */
 TEST(the_price_lookup_asks_for_the_frozen_verify_window_and_the_cut_reprices_it) {
     DraftPolicyConfig cfg = cost_config(6);
     cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
@@ -939,6 +941,65 @@ TEST(an_upshift_and_a_pipeline_zero_cycle_keep_the_verify_window_they_had) {
     CHECK_EQ(p0.last_tiers_priced(), 2);
     CHECK_EQ(g.plan.max_k, 3);
     CHECK(spy.find(2, 3) == nullptr);
+}
+
+TEST(the_direct_step_prices_the_window_the_step_will_re_cap) {
+    /* A step() cycle builds its step after the plan, so Scheduler::draft_cap re-caps each row's
+     * frozen window to the candidate's own K. The lookup follows the caller: a K2 candidate after
+     * a frozen K3 asks `(2,2)`, never the ahead path's declared `(2,3)` -- and the resource cut
+     * re-prices the same window it will run. */
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.fallback_k = 3;
+
+    ReferenceTable a_d;   /* the cold (3,0) gate, the re-capped (2,2), the K3 window (3,3) */
+    a_d.add(key_shape(4, 3, 0, 1), 9.0);
+    a_d.add(key_shape(4, 3, 3, 1), 12.0);
+    a_d.add(key_shape(4, 2, 2, 1), 11.0);
+    a_d.build();
+
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    four_rows(&f, &pred, /*depth=*/1);
+    f.view.direct_step = true;
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    SpiedTable spy;
+
+    /* Cycle 1: nothing frozen, so the gate asks (3,0) and issues K3 on either path. */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.source, DraftPlanSource::Cost);
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK(spy.find(3, 0) != nullptr);
+
+    /* Cycle 2: K2 after a frozen K3 asks the re-capped (2,2) -- four rows, 12 verify and 12
+     * history tokens -- and the ahead path's (2,3) is never asked. */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    const DraftVerifyShape* d2 = spy.find(2, 2);
+    REQUIRE(d2 != nullptr);
+    CHECK_EQ(d2->n_rows, 4);
+    CHECK_EQ(d2->verify_tokens, 12);
+    CHECK_EQ(d2->history_tokens, 12);
+    CHECK(spy.find(2, 3) == nullptr);
+    CHECK_EQ(planner.last_tiers_priced(), 2);
+    CHECK_EQ(f.plan.max_k, 3);
+
+    /* Cycle 3: the token budget cuts K3 to K2. The re-price asks the same re-capped window and
+     * finds its own bucket: the issued plan is priced as its step will run. */
+    f.view.token_budget = 8;   /* four rows at K3 sum to 12 */
+    spy.reset(&a_d.t);
+    CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 2);
+    CHECK(f.plan.why[0] == DraftFallback::Resources);
+    CHECK_EQ(f.plan.verify_k, 2);
+    CHECK_EQ(f.plan.history_tokens[0], 3);
+    CHECK(spy.find(2, 2) != nullptr);
+    CHECK(spy.find(2, 3) == nullptr);
+    CHECK(planner.last_price().valid);
+    CHECK_EQ(planner.last_price().k, 2);
+    CHECK_NEAR(planner.last_price().ms, 11.0, 1e-9);
 }
 
 TEST(the_documented_c8_pair_prices_depth_three_ahead_of_depth_five) {

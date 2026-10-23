@@ -1479,8 +1479,9 @@ void Scheduler::undo_hit(SchedReq& s) {
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
-    /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
-    draft_cycle();
+    /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). This is
+     * the direct path: the paired step is built after the plan and re-caps the frozen window. */
+    draft_cycle(/*direct_step=*/true);
     /* The cycle was refused (a drifted residency, or a shape the ladder cannot price): nothing is
      * planned, and the engine stops on the latch instead of letting the step run at the ceiling. */
     if (draft_cost_aborted_) return nullptr;
@@ -2011,8 +2012,8 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 }
 
 /* ------------------------------------------------------------------ the step's head depth */
-void Scheduler::draft_cycle() {
-    if (draft_.cost_policy()) { draft_cost_cycle(); return; }
+void Scheduler::draft_cycle(bool direct_step) {
+    if (draft_.cost_policy()) { draft_cost_cycle(direct_step); return; }
     if (draft_.adaptive()) {
         /* The rows the opening step will decode: every running sequence past its prompt. Those
          * that may speculate choose D through their estimates; the rest emit one token each, which
@@ -2161,7 +2162,7 @@ void Scheduler::draft_record_cycle() {
 /* The cost policy opens its cycle here: one view of the decode rows, one frozen plan. The plan
  * decides each row's K for the whole cycle, K=0 included: a speculation-off decision is not a
  * vacancy the n-gram fallback may fill (docs/ADAPTIVE-MTP.md). */
-void Scheduler::draft_cost_cycle() {
+void Scheduler::draft_cost_cycle(bool direct_step) {
     if (!draft_.cost_policy()) return;
     /* After a divergence there is no cycle this profile may price: it was measured on a placement
      * the run has left. Opening the cycle anyway would leave draft_cap() at the ceiling, which is
@@ -2192,6 +2193,9 @@ void Scheduler::draft_cost_cycle() {
     /* Publish-then-verify: the step paired with this plan verifies what the previous cycle
      * published, so this plan's draft distribution reaches a verify one cycle later. */
     draft_view_.pipeline_depth = 1;
+    /* Who opened this cycle: step() builds the paired step after the plan and re-caps the frozen
+     * window, promote_next()'s step was already built under the publishing plan. */
+    draft_view_.direct_step    = direct_step;
     /* From the last bracket that completed, not from what the runtime *could* do: a recording
      * deployment whose tape stays warm plays, and only an observed state can say so. The initial
      * value is the capability answer (`draft_cycle_replay_`, set at init), and a bracket with no
@@ -2755,8 +2759,9 @@ void Scheduler::promote_next() {
     /* The other place a cycle opens: the step issued ahead becomes current without step(). Its
      * proposals were counted under the last cycle's D; the next ones are drafted under this one.
      * A refused cycle (a drifted residency) leaves the ahead plan unexecuted: what it was planned
-     * under no longer describes the run, and the engine stops on the latch. */
-    draft_cycle();
+     * under no longer describes the run, and the engine stops on the latch. This is the ahead
+     * path: the step was built before this cycle opened, under the plan that published it. */
+    draft_cycle(/*direct_step=*/false);
     if (draft_cost_aborted_) return;
     std::swap(plan_, plan_next_);
     plan_next_.reset();

@@ -1433,7 +1433,9 @@ void add_bucket(DraftCostProfile* p, const DraftVerifyShape& key, double ms) {
  * lets Config admit Cost (scheduler.cpp), `recording` keeps it writable, and the four buckets price
  * both alternatives of the cold cycle and of the cycle after a K3 plan. The deep verify window is
  * dearer per token, so the table -- not a predictor change -- decides the fall. */
-void install_cost_table(Fixture& f) {
+/* The identity every table here is filed under: a no-loan reference for this fixture's
+ * fingerprint, so the run prices from the buckets and absorbs none of its own cycles. */
+DraftCostProfile cost_profile() {
     DraftCostProfile p;
     p.fingerprint.model     = "test";
     p.fingerprint.quant     = "q";
@@ -1447,10 +1449,10 @@ void install_cost_table(Fixture& f) {
     p.fingerprint.arena     = "none";
     p.fingerprint.live_loan = "flex=0 lend=0";
     p.execution = DraftCostExecution::Rectangular;
-    add_bucket(&p, row_key(3, 0),  6.0);   /* cold cycle: 3.439 tokens / 6.0 ms beat K2 */
-    add_bucket(&p, row_key(2, 0),  5.0);
-    add_bucket(&p, row_key(3, 3), 12.0);   /* after K3: 3.439 / 12.0 ... */
-    add_bucket(&p, row_key(2, 3),  9.0);   /* ... loses to 2.71 / 9.0 */
+    return p;
+}
+
+void install_table(Fixture& f, const DraftCostProfile& p) {
     DraftCostRuntime rt;
     rt.fingerprint = p.fingerprint;
     rt.execution   = p.execution;
@@ -1460,13 +1462,37 @@ void install_cost_table(Fixture& f) {
     CHECK(!f.sch.draft_costs().reference());
 }
 
+/* The fall's table: K3 wins the cold cycle, K2 the cycle after it -- on the ahead path from the
+ * declared (2,3), on the direct path from the capped (2,2) that cycle executes. */
+void install_cost_table(Fixture& f) {
+    DraftCostProfile p = cost_profile();
+    add_bucket(&p, row_key(3, 0),  6.0);   /* cold cycle: 3.439 tokens / 6.0 ms beat K2 */
+    add_bucket(&p, row_key(2, 0),  5.0);
+    add_bucket(&p, row_key(3, 3), 12.0);   /* after K3: 3.439 / 12.0 ... */
+    add_bucket(&p, row_key(2, 3),  9.0);   /* ... loses to 2.71 / 9.0 ahead ... */
+    add_bucket(&p, row_key(2, 2),  8.0);   /* ... and to 2.71 / 8.0 on the direct path */
+    install_table(f, p);
+}
+
+/* The upshift's table: K2 wins the cold cycle and K3 the cycle after it (after K2 both paths
+ * verify two, so the two price the same shape). */
+void install_upshift_table(Fixture& f) {
+    DraftCostProfile p = cost_profile();
+    add_bucket(&p, row_key(2, 0),  4.0);   /* cold: 2.71 / 4.0 beats 3.439 / 20.0 */
+    add_bucket(&p, row_key(3, 0), 20.0);
+    add_bucket(&p, row_key(2, 2),  8.0);
+    add_bucket(&p, row_key(3, 2),  6.0);   /* after K2: 3.439 / 6.0 beats 2.71 / 8.0 */
+    install_table(f, p);
+}
+
 /* What the two cycles saw, in the three places the contract has to agree: the last price the
  * planner asked for (the issued plan's own estimate), the verify batch the engine was handed, and
  * the key of the bucket the cycle's sample was actually filed under. */
 struct Coupled {
-    /* Owned here, not in the helper: the planner keeps the model's `self` pointer, so the log must
-     * outlive the cycles the caller runs after `downshift` returns. */
+    /* Owned here, not in the helper: the planner keeps the model's and the predictor's `self`
+     * pointers, so both must outlive the cycles the caller runs after the helper returned. */
     QueryLog log;
+    Predictions pred;
     uint64_t id = 0;
     int32_t plan_k = 0;
     DraftPlanSource source = DraftPlanSource::Fallback;
@@ -1481,8 +1507,10 @@ struct Coupled {
 
 /* Two cycles of the real pipeline: A at K3 (nothing frozen, the cold bucket decides), then B after
  * A published three, where the table prices K2 as the cheaper plan. `ahead` runs the engine's other
- * order, in which the step is issued before the next plan opens. */
-void downshift(Fixture& f, bool ahead, Coupled& c) {
+ * order, in which the step is issued before the next plan opens. `max_tokens` bounds the row's
+ * output, and with it the drafts: a value just above what the two cycles emit makes the second
+ * plan resource-bound rather than price-bound. */
+void downshift(Fixture& f, bool ahead, Coupled& c, int max_tokens = 64) {
     f.build();
     f.cfg.n_spec = 3;
     f.cfg.draft_policy = DraftPolicyKind::Cost;
@@ -1491,8 +1519,8 @@ void downshift(Fixture& f, bool ahead, Coupled& c) {
     install_cost_table(f);
     CHECK_OK(f.start(DraftReplay::None));
 
-    Predictions pred;
-    const uint64_t id = f.submit(160);
+    Predictions& pred = c.pred;
+    const uint64_t id = f.submit(160, max_tokens);
     c.id = id;
     pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
 
@@ -1578,6 +1606,96 @@ void downshift(Fixture& f, bool ahead, Coupled& c) {
     }
 }
 
+/* The other direction on the same pipeline: A at K2 (the cold bucket keeps it there), B at K3
+ * after A published two. Both paths verify the frozen two, so both price (3,2). */
+void upshift(Fixture& f, bool ahead, Coupled& c) {
+    f.build();
+    f.cfg.n_spec = 3;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    install_upshift_table(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    Predictions& pred = c.pred;
+    const uint64_t id = f.submit(160);
+    c.id = id;
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+
+    QueryLog& log = c.log;
+    log.table = &f.sch.draft_costs();
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 3;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = log.model();
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    const int32_t two[2]   = { 21, 22 };
+    const int32_t three[3] = { 21, 22, 23 };
+
+    /* Cycle A: K2, the cold price's choice. It publishes two after its step. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* a = f.sch.draft().plan();
+    REQUIRE(a != nullptr);
+    REQUIRE_EQ(a->n_seq, 1);
+    REQUIRE_EQ(a->k[0], 2);
+
+    if (ahead) {
+        f.sch.expect_draft(id, 2);
+        const RadBatch* built = f.sch.step_next();
+        REQUIRE(built != nullptr);
+        c.batch_spec = built->n_spec;
+        f.commit_plain(11);
+    } else {
+        f.commit_plain(11);
+    }
+    CHECK_OK(f.sch.set_draft(id, two, 2));
+    f.sch.step_finished(live);
+    if (ahead) {
+        f.sch.promote_next();
+    } else {
+        const RadBatch* built = f.sch.step();
+        REQUIRE(built != nullptr);
+        c.batch_spec = built->n_spec;
+    }
+
+    const DraftPlan* b = f.sch.draft().plan();
+    REQUIRE(b != nullptr);
+    c.plan_k = b->k[0];
+    c.source = b->source;
+    c.query  = log.last;
+    c.issued = f.sch.draft().planner().last_price();
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+    c.entry_spec = f.sch.plan().e[0].n_spec;
+
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, three, 3));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    const DraftCostTable& t = f.sch.draft_costs();
+    c.observe = t.last_observe();
+    if (c.observe.what == DraftCostDisposition::Recorded && c.observe.bucket >= 0 &&
+        (size_t)c.observe.bucket < t.buckets().size()) {
+        const DraftCostBucket& bkt = t.buckets()[(size_t)c.observe.bucket];
+        c.recorded        = bkt.shape;
+        c.recorded_rounds = bkt.rounds;
+    }
+}
+
 }  /* namespace */
 
 /* The coupled proof, ahead path. B's plan is opened after the step that verifies A's three drafts
@@ -1590,8 +1708,8 @@ TEST(a_fall_issued_ahead_prices_the_window_the_ahead_step_verifies) {
 
     CHECK_EQ(c.plan_k, 2);   /* the table's price decided the fall */
     CHECK(c.source == DraftPlanSource::Cost);
-    /* The lookup named the declared window: a K2 plan that verifies the three drafts the K3 cycle
-     * published before it existed -- four verify and four history tokens. */
+    /* The lookup named the window the ahead step verifies: a K2 plan that verifies the three
+     * drafts the K3 cycle published before it existed -- four verify and four history tokens. */
     CHECK_EQ(c.query.draft_k, 2);
     CHECK_EQ(c.query.verify_k, 3);
     CHECK_EQ(c.query.verify_tokens, 4);
@@ -1613,30 +1731,30 @@ TEST(a_fall_issued_ahead_prices_the_window_the_ahead_step_verifies) {
     CHECK_EQ(c.recorded.verify_k, c.entry_spec);
 }
 
-/* The same two cycles on the direct path, where step() opens B's plan before building the step:
- * the published three are re-capped to K2, so the step verifies two while the lookup asked for
- * three. Query and execution disagree here, and the sample follows what ran. That is the
- * diagnostic; a fix belongs in the scheduler (which path's window to price), not in the key. */
-TEST(the_step_built_after_the_plan_verifies_less_than_the_lookup_asked_for) {
+/* The same two cycles on the direct path, where step() opens B's plan before building the step
+ * and draft_cap re-caps the published three to K2. The cycle view names that path, so the lookup
+ * asks for the capped window and query, batch and sample name it too: (2,2), 3 verify and 3
+ * history tokens. */
+TEST(the_step_built_after_the_plan_prices_the_window_it_verifies) {
     Coupled c;   /* destroyed after `f`: the planner's model points into `c.log` until fini() */
     Fixture f;
     downshift(f, /*ahead=*/false, c);
 
     CHECK_EQ(c.plan_k, 2);
     CHECK(c.source == DraftPlanSource::Cost);
-    /* The same declared window as on the ahead path ... */
+    /* The capped window, priced from its own bucket ... */
     CHECK_EQ(c.query.draft_k, 2);
-    CHECK_EQ(c.query.verify_k, 3);
-    CHECK_EQ(c.query.verify_tokens, 4);
+    CHECK_EQ(c.query.verify_k, 2);
+    CHECK_EQ(c.query.verify_tokens, 3);
+    CHECK_EQ(c.query.history_tokens, 3);
     CHECK(c.issued.valid);
     CHECK_EQ(c.issued.k, 2);
-    CHECK_NEAR(c.issued.ms, 9.0, 1e-9);
-    /* ... against a step that runs two. */
+    CHECK_NEAR(c.issued.ms, 8.0, 1e-9);
+    /* ... against a step that runs exactly that. */
     CHECK_EQ(c.batch_spec, 2);
     CHECK_EQ(c.entry_spec, 2);
-    CHECK(c.query.verify_k != c.entry_spec);
-    /* The sample is filed under what ran: (2,2) is a bucket the calibration's D cycle also files,
-     * and the (2,3) query above is not what this cycle measured. */
+    CHECK_EQ(c.query.verify_k, c.entry_spec);
+    /* And the sample is filed under the same key. */
     CHECK(c.observe.what == DraftCostDisposition::Recorded);
     CHECK_EQ(c.recorded.draft_k, 2);
     CHECK_EQ(c.recorded.verify_k, 2);
@@ -1644,6 +1762,106 @@ TEST(the_step_built_after_the_plan_verifies_less_than_the_lookup_asked_for) {
     CHECK_EQ(c.recorded.history_tokens, 3);
     CHECK_EQ(c.recorded_rounds, 2);
     CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+}
+
+/* An upshift: K2's two drafts are verified by the K3 cycle after it. The frozen window is two on
+ * both paths (the cap never raises it), and the lookup, the batch and the sample name (3,2). */
+TEST(an_upshift_prices_the_frozen_window_on_the_ahead_path) {
+    Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
+    Fixture f;
+    upshift(f, /*ahead=*/true, c);
+
+    CHECK_EQ(c.plan_k, 3);
+    CHECK(c.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.query.draft_k, 3);
+    CHECK_EQ(c.query.verify_k, 2);
+    CHECK_EQ(c.query.verify_tokens, 3);
+    CHECK_EQ(c.query.history_tokens, 3);
+    CHECK(c.issued.valid);
+    CHECK_EQ(c.issued.k, 3);
+    CHECK_NEAR(c.issued.ms, 6.0, 1e-9);
+    CHECK_EQ(c.batch_spec, 2);
+    CHECK_EQ(c.entry_spec, 2);
+    CHECK_EQ(c.query.verify_k, c.entry_spec);
+    CHECK(c.observe.what == DraftCostDisposition::Recorded);
+    CHECK_EQ(c.recorded.draft_k, 3);
+    CHECK_EQ(c.recorded.verify_k, 2);
+    CHECK_EQ(c.recorded.verify_tokens, 3);
+    CHECK_EQ(c.recorded.history_tokens, 3);
+    CHECK_EQ(c.recorded_rounds, 3);
+    CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+}
+
+TEST(an_upshift_prices_the_frozen_window_on_the_direct_path) {
+    Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
+    Fixture f;
+    upshift(f, /*ahead=*/false, c);
+
+    CHECK_EQ(c.plan_k, 3);
+    CHECK(c.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.query.draft_k, 3);
+    CHECK_EQ(c.query.verify_k, 2);
+    CHECK_EQ(c.query.verify_tokens, 3);
+    CHECK_EQ(c.query.history_tokens, 3);
+    CHECK(c.issued.valid);
+    CHECK_EQ(c.issued.k, 3);
+    CHECK_NEAR(c.issued.ms, 6.0, 1e-9);
+    CHECK_EQ(c.batch_spec, 2);
+    CHECK_EQ(c.entry_spec, 2);
+    CHECK_EQ(c.query.verify_k, c.entry_spec);
+    CHECK(c.observe.what == DraftCostDisposition::Recorded);
+    CHECK_EQ(c.recorded.draft_k, 3);
+    CHECK_EQ(c.recorded.verify_k, 2);
+    CHECK_EQ(c.recorded.verify_tokens, 3);
+    CHECK_EQ(c.recorded.history_tokens, 3);
+    CHECK_EQ(c.recorded_rounds, 3);
+    CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+}
+
+/* The same fall with the row's remaining output, not its price, capping the second plan: the
+ * first cycle emits a token, so the second may draft one fewer than the frozen three. A resource
+ * clamp is not a price choice, but it goes through the same key: query, batch and sample agree. */
+TEST(a_remaining_output_bound_caps_the_same_window_on_both_paths) {
+    {
+        Coupled c;
+        Fixture f;
+        downshift(f, /*ahead=*/true, c, /*max_tokens=*/5);
+
+        CHECK_EQ(c.plan_k, 2);
+        CHECK(c.source == DraftPlanSource::Cost);
+        CHECK_EQ(c.query.draft_k, 2);
+        CHECK_EQ(c.query.verify_k, 3);
+        CHECK_EQ(c.query.verify_tokens, 4);
+        CHECK_EQ(c.issued.k, 2);
+        CHECK_EQ(c.batch_spec, 3);
+        CHECK_EQ(c.entry_spec, 3);
+        CHECK(c.observe.what == DraftCostDisposition::Recorded);
+        CHECK_EQ(c.recorded.draft_k, 2);
+        CHECK_EQ(c.recorded.verify_k, 3);
+        CHECK_EQ(c.recorded.verify_tokens, 4);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+        CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+    }
+    {
+        Coupled c;
+        Fixture f;
+        downshift(f, /*ahead=*/false, c, /*max_tokens=*/5);
+
+        CHECK_EQ(c.plan_k, 2);
+        CHECK(c.source == DraftPlanSource::Cost);
+        CHECK_EQ(c.query.draft_k, 2);
+        CHECK_EQ(c.query.verify_k, 2);
+        CHECK_EQ(c.query.verify_tokens, 3);
+        CHECK_EQ(c.issued.k, 2);
+        CHECK_EQ(c.batch_spec, 2);
+        CHECK_EQ(c.entry_spec, 2);
+        CHECK(c.observe.what == DraftCostDisposition::Recorded);
+        CHECK_EQ(c.recorded.draft_k, 2);
+        CHECK_EQ(c.recorded.verify_k, 2);
+        CHECK_EQ(c.recorded.verify_tokens, 3);
+        CHECK_EQ(c.query.verify_k, c.entry_spec);
+        CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+    }
 }
 
 /* The ledger an empty planning point must leave alone. After a cycle the policy priced, an idle
@@ -3673,10 +3891,9 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
     CHECK_EQ(prefilled.draft_cost_last_k, 0);
 
     const int32_t forced[5] = { 3, 2, 2, 3, 3 };
-    /* The window the plan names for its paired step: the previous cycle's drafted depth, and 0
-     * for the first row-bearing cycle. */
-    const int32_t declares[5] = { 0, 3, 2, 2, 3 };
-    /* What the step verifies: the previous cycle's publication, capped to this plan's own K. */
+    /* What the plan names and what the step verifies: the previous cycle's drafted depth, capped
+     * to this plan's own K -- every cycle here is opened by step(), the direct path. The first
+     * row-bearing cycle has no predecessor. */
     const int32_t verifies[5] = { 0, 2, 2, 2, 3 };
     int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
     DraftStepEvidence live;
@@ -3688,7 +3905,7 @@ TEST(a_calibration_sequence_runs_through_the_real_cycle_after_an_empty_one) {
         const PlanCopy p = copy_plan(f.sch);
         REQUIRE(p.n_seq == 4);
         CHECK_EQ(p.max_k, forced[c]);
-        CHECK_EQ(p.verify_k, declares[c]);
+        CHECK_EQ(p.verify_k, verifies[c]);
         CHECK_EQ(p.pipeline_depth, 1);
         for (uint64_t id : ids) CHECK_EQ(p.at(id), forced[c]);
         f.commit(11, 0, [&](const StepEntry&) { return verifies[c]; });

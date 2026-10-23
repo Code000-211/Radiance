@@ -609,7 +609,10 @@ private:
      * `draft_est_` is the list plan_step reads, reserved at init so the step path does not
      * allocate. */
     std::vector<DraftAdapt*> draft_est_;
-    void    draft_cycle();
+    /* `direct_step` is the caller: true from step(), false from promote_next(). The cycle's key and
+     * its verify/history fields name the window the paired step executes, and only step() builds
+     * that step after the plan (Scheduler::draft_cap re-caps it). */
+    void    draft_cycle(bool direct_step);
 
     /* The calibration recording (--draft-profile-out): the same decode rows and the same
      * observation ring as the cost policy, opened under the legacy/adaptive decision instead.
@@ -645,7 +648,7 @@ private:
     /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
      * the step path does not allocate. */
-    void    draft_cost_cycle();
+    void    draft_cost_cycle(bool direct_step);
     std::vector<DraftSeqView>    draft_view_seq_;
     std::vector<DraftPrediction> draft_pred_seq_;
     std::vector<uint64_t>        draft_pred_id_;

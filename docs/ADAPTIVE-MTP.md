@@ -522,7 +522,7 @@ parses and does nothing would be the fabricated success the contracts forbid.
 | `--draft-profile` | path | none | accepted; a `rad-draft-profile/4` file, read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. A `no-loan` file is a reference: it loads on a serving run whose loans stay dynamic, is immutable and prices only exact measured buckets. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. The bound is the executable head depth (`min(ceiling, drafter depth)`), not the ceiling alone: a plan above it would execute fewer rounds than it planned and record a shortened bucket. An explicit list with a tier above that depth is refused by name; otherwise the list is the whole ladder. A top **below** it is left as given: when the active profile prices that top, the cycle runs it (a valid reload). Only a cycle whose top is unpriced while the named baseline would run deeper is refused, by the policy that can see the shape, with a one-time diagnostic -- nothing is learnt at a depth the ladder never offers, and the run stops on the fail-closed latch (`draft_cost_aborted` -> `Engine::fail_loop`) instead of drafting on at the ceiling. The default ladder is trimmed to the depth (its deepest value replaced by the depth), so a shallow head does not lock out valid tiers |
 | `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall) and expert placement stays frozen at the one bringup settled (no swap, fill or drop), so the written profile is the plan's start placement without borrowed copies; no cycle is marked for a mover move, but a staged bracket or another placement-marked cycle is still left out at export. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
-| `--draft-calib-k` | K sequence, e.g. `3,2,2,3` | none | calibration only: force this fixed sequence of depths, one per **non-empty** cycle, in the given order and keeping duplicates. Needs `--draft-profile-out`, `--draft-reference` and `--draft-policy cost` together, and every value must be one of the **effective** `--draft-depth-tiers` after the trim/dedup `Scheduler::init` applies -- both are refused by name at startup, so neither a serving run nor a depth the ladder never offers can carry it. The check is on the nominal value: `cap_of` can still clamp a row by its remaining output, so an executed cycle may land on a depth the ladder does not list (a resource clamp, counted in `calib_cut`). Plans are `source=calibration` (runtime only, never serialized), not cost decisions: no price, no ranking, no hysteresis, and the planner reads no predictor -- but the controller's `open_cycle` still runs `predictor.predict` for the cycle, because the prediction set is the cycle's, not the plan's. The shared token/KV budget cut still applies, and `calib_cut` counts forced **cycles** (not rows) whose plan a plan-time cut touched -- `cap_of` clamps included, not only the budget scaling. An empty view is forced too and counted in `calib_forced`, but does not advance the sequence; `priced`/`fallback` stay 0 for forced plans |
+| `--draft-calib-k` | K sequence, e.g. `3,2,2,3` | none | calibration only: force this fixed sequence of depths, one per **non-empty** cycle, in the given order and keeping duplicates. Needs `--draft-profile-out`, `--draft-reference` and `--draft-policy cost` together, and every value must be one of the **effective** `--draft-depth-tiers` after the trim/dedup `Scheduler::init` applies -- both are refused by name at startup, so neither a serving run nor a depth the ladder never offers can carry it. The check is on the nominal value: `cap_of` can still clamp a row by its remaining output, so an executed cycle may land on a depth the ladder does not list (a resource clamp, counted in `calib_cut`). Plans are `source=calibration` (runtime only, never serialized), not cost decisions: no price, no ranking, no hysteresis, and the planner reads no predictor -- but the controller's `open_cycle` still runs `predictor.predict` for the cycle, because the prediction set is the cycle's, not the plan's. The shared token/KV budget cut still applies, and `calib_cut` counts forced **cycles** (not rows) whose plan a plan-time cut touched -- `cap_of` clamps included, not only the budget scaling. An empty view is planned as `empty`, not `calib_forced` -- the controller issues the fallback branch's valid K0 plan for it, the sequence does not advance, and no calibration plan exists to count; `priced`/`fallback` stay 0 for forced plans |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
 
 `cost` is accepted only with a serial drafter, a valid ceiling contract and, for the runtime's
@@ -551,23 +551,27 @@ Every rotation of it contains all four; the planner-local index starts at 0 and 
 cycle with rows, so the first row-bearing cycle is deterministically the first element.
 
 - **Verify on a fall.** A plan's `verify_k` names the window the cycle before it drafted, and the
-  price lookup asks for exactly that declared window. What the paired step then verifies depends on
-  the path that built it. A step issued ahead is built before the next plan opens, under the plan
-  that published the drafts, so it verifies the full frozen window and the lookup is exact. A step
-  that `step()` builds opens the next plan first and caps every row's publication to *this* plan's
-  own K (`draft_cap`), so a falling transition executes `min(previous K, this K)` there while the
-  lookup asked for `previous K`. `3,2,2,3` therefore declares `(3,0)`, `(2,3)`, `(3,2)`, `(3,3)`:
-  the ahead path runs those four shapes, the direct path runs `(2,2)` on the `3->2` cycle and its
-  `(2,3)` query names a shape that cycle does not execute. The sample is keyed by what ran, so the
-  ahead path files `(2,3)` and the direct path files `(2,2)`. Which of the two the scheduler should
-  price is a path-specific decision that needs a fix in the scheduler, not in the key; until then
-  the lookup keeps naming the window the plan declares.
-- **The acceptance set is not settled.** The earlier claim that a rotation needs only A/C/D
-  (`(3,0)`, `(3,3)`, `(3,2)`) because a fall executes D's `(2,2)` held only while the lookup capped
-  the frozen window to the candidate's K. Without that cap the ahead path really verifies `(2,3)`,
-  so a rotation covering both paths needs A, B, C and D. Acceptance is suspended until the path
-  question above is decided. The first row-bearing cycle adds the cold `(3,0)` bucket, which is a
-  start state, not a transition.
+  price lookup asks for exactly that window. What the paired step then verifies depends on the
+  path that built it, and the cycle view names that path (`DraftBatchView::direct_step`). A step
+  issued ahead (`promote_next()`) is built before the next plan opens, under the plan that
+  published the drafts, so it verifies the full frozen window and the lookup is exact. A step that
+  `step()` builds opens the next plan first and caps every row's publication to *this* plan's own
+  K (`draft_cap`), so a falling transition executes `min(previous K, this K)`. The key and the
+  plan's `verify_k`/`history_tokens` follow the executed window: the frozen K ahead, the capped
+  window on the direct path. Query, verify batch and recorded sample name the same shape on both
+  paths.
+- **The rotation, in full.** `3,2,2,3` over its four cycles, plus the next period's first cycle
+  (the K3 that follows it), executes `(3,0)`, `(2,3)`, `(2,2)`, `(3,2)` and `(3,3)`: the cold
+  `(3,0)` start bucket, then B (`3->2`), D (`2->2`), C (`2->3`) and finally A (`3->3`) -- the
+  four-cycle period itself contains no `3->3` transition, so A needs that additional cycle. A
+  direct-path cycle (an admission, grammar, context or KV limit forced it) executes `(2,2)` where
+  B would execute `(2,3)`, because the frozen three are re-capped to its plan's K2; everything
+  else is unchanged, and query, batch and sample still name the same shape.
+- **The acceptance set is A, B, C and D plus the cycle that measures A.** The ahead path, which is
+  how the calibration must run, executes B's `(2,3)` for real; the four-cycle period already
+  covers B, C and D, and `(3,3)` needs one more cycle (the period wrap). The start bucket
+  `(3,0)` is a start state, not a transition. A direct-path cycle files `(2,2)` where B would
+  file `(2,3)` -- it is a second measurement of D, not of B, and cannot stand in for one.
 
 What the serving ladder can use afterwards, and what it cannot:
 
