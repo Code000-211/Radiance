@@ -1528,6 +1528,7 @@ struct Coupled {
     int32_t tiers_priced = 0;
     int32_t uncut_k = 0;
     double  uncut_ms = 0.0;
+    int32_t cut_rows = 0;   /* rows the plan says the budget scaled */
     DraftCostObserve observe;
     DraftVerifyShape recorded;
     int32_t recorded_rounds = 0;
@@ -1813,6 +1814,8 @@ void budget_cut(Fixture& f, bool ahead, Coupled& c) {
     const DraftTierPrice* tp = f.sch.draft().planner().last_tier_prices();
     const int32_t ntp = f.sch.draft().planner().last_n_tier_prices();
     if (ntp > 0) { c.uncut_k = tp[ntp - 1].k; c.uncut_ms = tp[ntp - 1].ms; }
+    for (int32_t i = 0; i < b->n_seq; ++i)
+        if (b->why[i] == DraftFallback::Resources) ++c.cut_rows;
     c.query  = log.last;   /* the issued plan's own estimate, the cycle's last estimate call */
     c.issued = f.sch.draft().planner().last_price();
     REQUIRE_EQ(f.sch.plan().e.size(), (size_t)6);
@@ -2016,9 +2019,11 @@ TEST(a_cost_budget_cut_prices_the_window_its_step_runs_on_both_paths) {
         CHECK_EQ(c.uncut_k, 3);
         CHECK_NEAR(c.uncut_ms, 8.0, 1e-9);
         CHECK_EQ(c.tiers_priced, 2);
-        /* The issued plan is the cut, and it says why. */
+        /* The issued plan is the cut, and it says why on every row: the search's K2 candidate lost
+         * on its own price, so only the budget can have lowered the assignment. */
         CHECK_EQ(c.plan_k, 2);
         CHECK(c.source == DraftPlanSource::Cost);
+        CHECK_EQ(c.cut_rows, 6);
         /* Its own price is the cut window's, not the uncut plan's. */
         CHECK_EQ(c.query.draft_k, 2);
         CHECK_EQ(c.query.verify_k, ahead ? 3 : 2);
