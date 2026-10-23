@@ -845,12 +845,14 @@ TEST(a_reference_calibration_exports_the_cycles_the_run_played) {
 
     /* The same cycles serving: the heat does move the placement there, and the export drops the
      * brackets it disturbed -- which is what makes the case above a regression and not a
-     * tautology. */
+     * tautology. The export still has to succeed with its one clean cycle; an export that refused
+     * or wrote nothing would otherwise leave both checks green at played == 0. */
     {
         PlayedExport srv(kExperts, /*reference*/ false);
         REQUIRE_EQ(srv.run(kCycles), RAD_OK);
         CHECK(srv.moves > 0);
-        CHECK(srv.played < kCycles);
+        REQUIRE_EQ(srv.export_rc, RAD_OK);
+        CHECK_EQ(srv.played, 1);
     }
 }
 
