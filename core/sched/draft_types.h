@@ -179,6 +179,35 @@ inline DraftReplay draft_replay_evidence(int32_t n_ranks, int32_t n_recording) {
     return DraftReplay::None;
 }
 
+/* One spelling for the ledger, /stats and the trace. A number in one place and a name in another
+ * is how two readers come to disagree about the same cycle. */
+inline const char* draft_plan_source_name(DraftPlanSource s) {
+    switch (s) {
+        case DraftPlanSource::Cost:     return "cost";
+        case DraftPlanSource::Fallback: return "fallback";
+        case DraftPlanSource::Probe:    return "probe";
+        default:                        return "legacy";
+    }
+}
+inline const char* draft_fallback_name(DraftFallback f) {
+    switch (f) {
+        case DraftFallback::NoProfile:    return "no_profile";
+        case DraftFallback::UnknownShape: return "unknown_shape";
+        case DraftFallback::Resources:    return "resources";
+        case DraftFallback::Unsupported:  return "unsupported";
+        default:                          return "none";
+    }
+}
+inline const char* draft_replay_name(DraftReplay r) {
+    switch (r) {
+        case DraftReplay::None:   return "none";
+        case DraftReplay::Play:   return "play";
+        case DraftReplay::Record: return "record";
+        case DraftReplay::Audit:  return "audit";
+        default:                  return "unknown";
+    }
+}
+
 /* A cost sample's attribution. Only a sample with kDraftSampleValid and none of the disturbing
  * flags may update a measured bucket (draft_sample_attributable). */
 enum DraftSampleFlag : uint16_t {

@@ -151,17 +151,29 @@ struct SchedMetrics {
      * learning. Zero while a profile is installed, so "nothing was absorbed" and "nothing was
      * offered" cannot be read as the same fact. */
     int64_t draft_obs_inactive = 0;
-    /* The cost policy's plan ledger, cumulative: cycles it opened, how many of them were priced
-     * (`source` Cost) and how many took the named fallback, plus what the last plan asked for.
-     * `draft_cost_last_replay` is the *candidate* the plan declared (DraftReplay as a number), not
-     * what ran -- the bracket's own state is reported by `passes` and keys its sample. Together
-     * they separate "the policy never priced" from "the ladder priced nothing", which is the
-     * question a fallback-only run cannot answer on its own. */
+    /* The cost policy's plan ledger, cumulative: cycles it opened, how they ended (`priced` --
+     * `source` Cost -- `fallback` for the named baseline, `no_plan` for a cycle the policy opened
+     * and could not plan at all), plus what the last plan asked for and why. `priced + fallback +
+     * no_plan == cycles` holds for every run: a cycle counted without one of the three would be
+     * one whose end nothing names. `draft_cost_last_replay` is the *candidate* the plan declared
+     * (DraftReplay as a number), not what ran -- the bracket's own state is reported by `passes`
+     * and keys its sample. `draft_cost_last_*` stay 0 until a plan is issued, so an empty ledger
+     * reads as "no plan yet", never as a plan at K=0. Together they separate "the policy never
+     * priced" from "the ladder priced nothing", which is the question a fallback-only run cannot
+     * answer on its own. */
     int64_t draft_cost_cycles = 0;
     int64_t draft_cost_priced = 0;
     int64_t draft_cost_fallback = 0;
+    int64_t draft_cost_no_plan = 0;
     int64_t draft_cost_last_k = 0;
     int64_t draft_cost_last_replay = 0;
+    int64_t draft_cost_last_source = 0;   /* DraftPlanSource of the last issued plan */
+    int64_t draft_cost_last_fallback = 0; /* DraftFallback of the last issued plan */
+    /* Cycles observed against a loaded reference (DraftCostBasis::NoLoan) and therefore not
+     * absorbed: the table is immutable, so the count is the only trace the measurement left. Zero
+     * while the table learns, so "nothing reached the reference" and "the reference refused
+     * nothing" cannot be read as the same fact. */
+    int64_t draft_ref_skipped = 0;
 };
 
 

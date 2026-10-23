@@ -135,6 +135,13 @@ struct DraftStepEvidence {
     DraftReplay replay       = DraftReplay::Unknown;
     bool        staged       = false;  /* the trunk pass armed the pooled experts through the ring */
     bool        moved        = false;  /* the placement engine promoted or demoted */
+    /* Per-rank tape classes for the same step, for the trace only (RADIANCE_DRAFT_TRACE): which
+     * rank ran what is invisible in the merged state above, and a mixed bracket -- one rank
+     * playing, one unevidenced -- is exactly the case the merge rule has to be read against. Never
+     * read by the policy or the sample gate. */
+    enum { kEvidenceRanks = 8, kEvidenceAbsent = 255 };
+    int32_t     n_ranks = 0;                        /* ranks in the deployment */
+    uint8_t     tape[kEvidenceRanks] = {};         /* Ctx::StepTape, kEvidenceAbsent if it did not run */
     /* Placement moves on every rank since the cost profile was bound, cumulative. The per-step
      * `moved` above only covers the bracket it names: the scheduler's tier and arena ticks run
      * after step_finished, so a move between two brackets would otherwise never be stamped on the
@@ -647,6 +654,13 @@ private:
     uint64_t                     draft_cycle_id_ = 0;
     uint32_t                     slot_gen_ = 0;
     bool                         draft_cost_failed_ = false;
+    /* RADIANCE_DRAFT_TRACE: a bounded per-cycle trace of what was planned, what the ranks ran and
+     * which shape the sample was filed under. Off by default, and silent again after this many
+     * lines -- a diagnostic for one run, not a log stream. */
+    int32_t                      draft_trace_left_ = 64;
+    void draft_trace_plan(const DraftPlan& p);
+    void draft_trace_bracket(const DraftStepEvidence& ev);
+    void draft_trace_sample(const DraftCostSample& s, int rc);
 
     /* The cost policy's two hooks, owned here: A's table and B's per-request predictor. The
      * predictor keeps one state per request slot; `slot` is the request's for its whole life

@@ -119,14 +119,20 @@ struct SchedMetrics {
     int64_t draft_obs_rows_skipped = 0;
     int64_t draft_obs_cycles_discarded = 0;
     int64_t draft_cost_observations_inactive = 0;
-    /* The cost policy's plan ledger (rad::SchedMetrics::draft_cost_*): cycles opened, how many
-     * were priced and how many took the named fallback, and the last plan's depth and replay
-     * candidate. `last_replay` is one of the profile's replay names, never numeric. */
+    /* The cost policy's plan ledger (rad::SchedMetrics::draft_cost_*): cycles opened, how they
+     * ended -- priced, the named fallback, or no plan at all -- and the last plan's depth, replay
+     * candidate, source and fallback reason. `last_replay`, `last_source` and `last_fallback` are
+     * the names draft_types.h spells them by, never numbers. */
     int64_t draft_cost_cycles = 0;
     int64_t draft_cost_priced = 0;
     int64_t draft_cost_fallback = 0;
+    int64_t draft_cost_no_plan = 0;
     int64_t draft_cost_last_k = 0;
     int64_t draft_cost_last_replay = 0;
+    int64_t draft_cost_last_source = 0;
+    int64_t draft_cost_last_fallback = 0;
+    /* Cycles a no-loan reference table refused to absorb (rad::SchedMetrics::draft_ref_skipped). */
+    int64_t draft_cost_reference_skipped = 0;
     int64_t preemptions = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step

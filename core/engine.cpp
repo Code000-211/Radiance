@@ -464,6 +464,11 @@ void Engine::rank_loop(int index) {
 bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
     if (!out) return false;
     bool known = false;
+    out->n_ranks = (int32_t)ranks_.size();
+    for (int32_t i = 0; i < out->n_ranks && i < DraftStepEvidence::kEvidenceRanks; ++i) {
+        const Rank::StepSnap& s = ranks_[(size_t)i]->ev[(uint32_t)step & 3u];
+        out->tape[i] = s.step == step ? s.tape : DraftStepEvidence::kEvidenceAbsent;
+    }
     for (const auto& r : ranks_) {
         const Rank::StepSnap& s = r->ev[(uint32_t)step & 3u];
         if (s.step != step) continue;   /* this rank never ran the step: not evidence of None */

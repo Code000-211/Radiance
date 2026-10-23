@@ -260,25 +260,39 @@ prediction and sample.
   play. Which bracket lands on which key is the run's to decide, so no batch count is promised:
   a cold deployment may spend its warming brackets on different levels, a key change (a new
   level, a different token budget) starts that key over, and a rank that did not run the step is
-  not evidence of anything. A mixed rank set is declared under the strongest state any rank ran
-  -- one recording rank keeps a play-looking bracket out of the play buckets. `None` is the one
-  state that survives all of it: a non-recording deployment's cold answer is already its steady
-  answer, because every pass is unkeyed for good. A run that never gets to a priced `play` takes
+  not evidence of anything. A mixed rank set is declared under the strongest state any rank ran:
+  `Record`/`Audit` win, and a `None` rank never devalues a `Play` rank. So one recording rank does
+  keep a play-looking bracket out of the play buckets, but a silent one does not -- a bracket in
+  which one rank played and another is unevidenced is `Play`, and can be priced and learned.
+  `None` is the one state that survives all of it: a non-recording deployment's cold answer is
+  already its steady answer, because every pass is unkeyed for good. A run that never gets to a priced `play` takes
   the named fallback throughout, which is why the plan ledger below reports both and not just the
   choice.
 - **Nothing reads the candidate back as a measurement.** The plan's declared `replay` is never
   copied into the sample: `draft_cost_observe` files the bracket under `ev.replay`, the sample
   gate (`sample.replay != Unknown`, `sample.shape.replay == sample.replay`) and the bucket's
   disturbing flags are unchanged, and a `Record`/`Audit` bucket is still never a price
-  (`draft_bucket_usable`). A wrong prognosis therefore costs a fallback or a refused sample, never
-  a wrong bucket entry.
+  (`draft_bucket_usable`). A wrong prognosis therefore never files a sample in a bucket that did
+  not run: the sample is keyed by the bracket's own state, so the cost lands in the *plan* -- a
+  fallback, or a price read from a bucket that does not describe this cycle -- and never in the
+  table's key.
 - **The plan ledger names the choice, not the measurement.** `SchedMetrics` counts the cycles the
-  policy opened (`draft_cost_cycles`), how many were priced (`draft_cost_priced`, `source` Cost)
-  and how many took the named fallback (`draft_cost_fallback`), and carries the last plan's depth
-  and declared replay (`draft_cost_last_k`, `draft_cost_last_replay`). That tells a policy which
-  never saw a priceable shape apart from a ladder that had nothing measured -- a distinction a
-  fallback-only run cannot make from its plans. `/stats` publishes the block as `draft_cost`, with
-  the replay **by name**, and emits nothing until a cycle has opened.
+  policy opened (`draft_cost_cycles`) and how each ended: priced (`draft_cost_priced`, `source`
+  Cost), the named fallback (`draft_cost_fallback`), or no plan at all (`draft_cost_no_plan`, the
+  controller refused the view); the three always sum to `draft_cost_cycles`. It also carries the
+  last plan's source, fallback reason, depth and declared replay (`draft_cost_last_source`,
+  `draft_cost_last_fallback`, `draft_cost_last_k`, `draft_cost_last_replay`), which stay 0 until a
+  plan is issued. A no-loan reference table absorbs nothing, so it reports what it refused instead
+  (`draft_ref_skipped`). Together these separate a policy which never saw a priceable shape from a
+  ladder that had nothing measured -- a distinction a fallback-only run cannot make from its
+  plans. `cycles` advances at the planning sites: an idle run leaves it flat, so it is not a step
+  or a time measure. `/stats` publishes the block as `draft_cost`, with the last plan's replay,
+  source and fallback **by name**, and no `last_*` field until a plan has been issued.
+- **The per-cycle trace is a diagnostic, not a ledger.** `RADIANCE_DRAFT_TRACE=1` logs, for the
+  first 64 lines of a run, each issued plan (source, fallback reason, per-row K and downgrade),
+  each bracket's per-rank tape classes, and each completed sample's full price shape with its
+  filing result. That is what ties a plan to a shape and a rank set; it is off by default, bounded,
+  and reads nothing the policy does not already decide.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.

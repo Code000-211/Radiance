@@ -528,6 +528,11 @@ TEST(a_cost_drift_stop_leaves_the_step_issued_ahead_uncommitted_and_drains_it) {
     /* The rank's frozen record for that step still names it: the pass really executed. */
     rad::DraftStepEvidence ahead_ev{};
     CHECK(EngineTestPeer::step_evidence(e, ahead_step, &ahead_ev));
+    /* The per-rank classes behind the merge, which the trace prints: the fixture's one rank ran
+     * the step, and the host backend has no tape, so its class is the measured `none` -- not the
+     * `-` a rank that never ran the step leaves. */
+    CHECK_EQ(ahead_ev.n_ranks, 1);
+    CHECK(ahead_ev.tape[0] != rad::DraftStepEvidence::kEvidenceAbsent);
 
     /* And no step ever collected or committed it: one step point per committed step, one evidence
      * record per commit, none for the ahead step. */

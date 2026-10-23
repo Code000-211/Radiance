@@ -227,22 +227,52 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
  * ledger would look like a measurement of nothing. */
 TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
     Dash d(false);
-    CHECK(!d.get("/stats").contains("draft_cost"));
+    CHECK(!d.get("/stats").contains("draft_cost"));   /* no cycle, no reference observation */
 
+    /* A cycle that opened and got no plan: counted, named, and nothing claims a plan was issued --
+     * a `last_k` of 0 there would read as a policy that chose K=0. */
+    d.sched.m.draft_cost_cycles  = 1;
+    d.sched.m.draft_cost_no_plan = 1;
+    json dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("no_plan", (int64_t)0), (int64_t)1);
+    CHECK(!dc.contains("last_k"));
+    CHECK(!dc.contains("last_replay"));
+    CHECK(!dc.contains("last_source"));
+    CHECK(!dc.contains("last_fallback"));
+
+    /* The last plan: all four dimensions by name, and the three ends summing to the cycles. */
+    d.sched.m.draft_cost_cycles      = 4;
+    d.sched.m.draft_cost_no_plan     = 0;
+    d.sched.m.draft_cost_priced      = 3;
+    d.sched.m.draft_cost_fallback    = 1;
+    d.sched.m.draft_cost_last_k      = 2;
+    d.sched.m.draft_cost_last_source = 1;   /* DraftPlanSource::Cost */
+    d.sched.m.draft_cost_last_fallback = 2; /* DraftFallback::UnknownShape */
     const char* names[] = { "unknown", "none", "play", "record", "audit" };
     for (int r = 0; r < (int)(sizeof(names) / sizeof(names[0])); ++r) {
-        d.sched.m.draft_cost_cycles      = 4;
-        d.sched.m.draft_cost_priced      = 3;
-        d.sched.m.draft_cost_fallback    = 1;
-        d.sched.m.draft_cost_last_k      = 2;
         d.sched.m.draft_cost_last_replay = r;
-        const json dc = d.get("/stats")["draft_cost"];
+        dc = d.get("/stats")["draft_cost"];
         CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)4);
         CHECK_EQ(dc.value("priced", (int64_t)0), (int64_t)3);
         CHECK_EQ(dc.value("fallback", (int64_t)0), (int64_t)1);
         CHECK_EQ(dc.value("last_k", (int64_t)0), (int64_t)2);
         CHECK_EQ(dc.value("last_replay", std::string()), std::string(names[r]));
     }
+    CHECK_EQ(dc.value("last_source", std::string()), std::string("cost"));
+    CHECK_EQ(dc.value("last_fallback", std::string()), std::string("unknown_shape"));
+
+    /* The reference's own count stands alone: a no-loan run absorbs nothing, so this is the only
+     * thing it publishes -- and it must publish it, or "nothing reached the reference" and "the
+     * reference refused nothing" are the same silence. */
+    d.sched.m.draft_cost_cycles            = 0;
+    d.sched.m.draft_cost_priced            = 0;
+    d.sched.m.draft_cost_fallback          = 0;
+    d.sched.m.draft_cost_no_plan           = 0;
+    d.sched.m.draft_cost_reference_skipped = 2;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("reference_skipped", (int64_t)0), (int64_t)2);
+    CHECK(!dc.contains("last_k"));
 }
 
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds

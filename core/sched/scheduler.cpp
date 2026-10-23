@@ -26,6 +26,108 @@ static int64_t mono_us() {
 static constexpr int kEvictRounds = 256;
 static constexpr int kEvictBlocks = 256;
 
+/* The cost trace is a diagnostic for one run, off unless the deployment asks for it by name. Read
+ * once: a run must not change what it logs halfway through. */
+static bool draft_trace_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("RADIANCE_DRAFT_TRACE");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
+/* A cycle's plan as issued: what the policy chose, why, and for which rows. Bounded to the first
+ * rows of the batch; the price shape itself is logged from the sample, where it is exact. */
+void Scheduler::draft_trace_plan(const DraftPlan& p) {
+    if (!draft_trace_on() || draft_trace_left_ <= 0) return;
+    std::string s;
+    char b[256];
+    snprintf(b, sizeof b, "cycle=%llu source=%s fallback=%s rows=%d max_k=%d verify_k=%d replay=%s "
+             "pipeline=%d prefill=%d k=[", (unsigned long long)p.cycle_id,
+             draft_plan_source_name(p.source), draft_fallback_name(p.fallback), p.n_seq, p.max_k,
+             p.verify_k, draft_replay_name(p.replay), p.pipeline_depth, p.prefill_tokens);
+    s += b;
+    const int32_t shown = p.n_seq < 16 ? p.n_seq : 16;
+    for (int32_t i = 0; i < shown && p.k; ++i) {
+        snprintf(b, sizeof b, "%s%d", i ? "," : "", p.k[i]);
+        s += b;
+    }
+    if (p.n_seq > shown) s += ",+";
+    s += "] why=[";
+    for (int32_t i = 0; i < shown && p.why; ++i) {
+        snprintf(b, sizeof b, "%s%s", i ? "," : "", draft_fallback_name(p.why[i]));
+        s += b;
+    }
+    if (p.n_seq > shown) s += ",+";
+    s += "]";
+    if (p.n_seq > shown) s += " (first 16 rows)";
+    RAD_INFO("draft trace: plan %s", s.c_str());
+    if (--draft_trace_left_ == 0)
+        RAD_INFO("draft trace: further trace lines are suppressed (64 written)");
+}
+
+/* Ctx::StepTape's numbering is not DraftReplay's -- None is 0 there and Unknown is 0 here -- so a
+ * cast would rename every class by one. The scheduler has no runtime dependency to import, hence
+ * the values by hand; DraftStepEvidence::tape says what they are. */
+static const char* step_tape_name(uint8_t t) {
+    switch (t) {
+        case 1:  return "play";
+        case 2:  return "record";
+        case 3:  return "audit";
+        default: return "none";
+    }
+}
+
+/* The bracket's own evidence, rank by rank: the merge rule the candidate lives under is only
+ * checkable when the ranks that disagreed are visible. */
+void Scheduler::draft_trace_bracket(const DraftStepEvidence& ev) {
+    if (!draft_trace_on() || draft_trace_left_ <= 0) return;
+    std::string s;
+    char b[256];
+    snprintf(b, sizeof b, "cycle=%llu step=%lld known=%d replay=%s ranks=%d tape=[",
+             (unsigned long long)draft_ring_cur_, (long long)step_, ev.replay_known ? 1 : 0,
+             draft_replay_name(ev.replay), ev.n_ranks);
+    s += b;
+    const int32_t n = ev.n_ranks < DraftStepEvidence::kEvidenceRanks
+                          ? ev.n_ranks : DraftStepEvidence::kEvidenceRanks;
+    for (int32_t i = 0; i < n; ++i) {
+        const char* t = ev.tape[i] == DraftStepEvidence::kEvidenceAbsent ? "-"
+                        : step_tape_name(ev.tape[i]);
+        snprintf(b, sizeof b, "%s%s", i ? "," : "", t);
+        s += b;
+    }
+    snprintf(b, sizeof b, "] staged=%d moved=%d moves_since_bind=%lld", ev.staged ? 1 : 0,
+             ev.moved ? 1 : 0, (long long)ev.moves_since_bind);
+    s += b;
+    RAD_INFO("draft trace: bracket %s", s.c_str());
+    if (--draft_trace_left_ == 0)
+        RAD_INFO("draft trace: further trace lines are suppressed (64 written)");
+}
+
+/* The completed price shape a sample was filed (or refused) under, so a plan can be followed to
+ * the bucket that answered it. */
+void Scheduler::draft_trace_sample(const DraftCostSample& s, int rc) {
+    if (!draft_trace_on() || draft_trace_left_ <= 0) return;
+    const DraftVerifyShape& sh = s.shape;
+    std::string line;
+    char b[256];
+    snprintf(b, sizeof b, "cycle=%llu rc=%s flags=0x%x replay=%s n_rows=%d ctx_class=%d verify_k=%d "
+             "verify_tokens=%d history=%d prefill=%d draft_k=%d rounds=%d drafted=%d draft_rows=[",
+             (unsigned long long)s.cycle_id, rc == RAD_OK ? "ok" : rad_strerror(rc),
+             (unsigned)s.flags, draft_replay_name(s.replay), sh.n_rows, sh.ctx_class, sh.verify_k,
+             sh.verify_tokens, sh.history_tokens, sh.prefill_tokens, sh.draft_k, s.rounds,
+             s.drafted);
+    line += b;
+    for (int32_t j = 0; j <= sh.draft_k && j <= RAD_SCHED_MAX_SPEC; ++j) {
+        snprintf(b, sizeof b, "%s%d", j ? "," : "", sh.draft_rows[j]);
+        line += b;
+    }
+    line += "]";
+    RAD_INFO("draft trace: sample %s", line.c_str());
+    if (--draft_trace_left_ == 0)
+        RAD_INFO("draft trace: further trace lines are suppressed (64 written)");
+}
+
 /* ------------------------------------------------------------------ ordering */
 /* Priority first, then arrival. A preempted request keeps its original arrival number, so it
  * re-enters at the front of its priority class instead of the back. */
@@ -2066,7 +2168,12 @@ void Scheduler::draft_cost_cycle() {
     draft_view_.ngram_allowed  = true;
 
     const int rc = draft_.open_cycle(draft_view_, &draft_preds_);
+    /* Opened, planned or not: the three ends below (priced, fallback, no plan) sum to this. */
+    ++m_.draft_cost_cycles;
     if (rc < 0) {
+        /* Counted apart from both a priced cycle and a fallback, so "the controller refused this
+         * view" never reads as "the policy chose something". The cycle itself runs legacy. */
+        ++m_.draft_cost_no_plan;
         /* A coverage gap is not a broken hook: no later cycle of this deployment can price the
          * offered top, so running on without a plan would draft at the ceiling and present the
          * very depth the ladder never offers. Latch the existing fail-closed abort instead: step()
@@ -2089,14 +2196,16 @@ void Scheduler::draft_cost_cycle() {
         const DraftPlan* p = draft_.plan();
         draft_ring_cur_ = p->cycle_id;
         draft_ring_open(*p);
-        /* What the policy decided, for /stats: whether this cycle was priced at all and what it
-         * asked for. The replay is the candidate the plan declared -- the last bracket's observed
-         * state, not this cycle's (see draft_cycle_replay_). */
-        ++m_.draft_cost_cycles;
+        /* What the policy decided, for /stats: whether this cycle was priced at all, what it asked
+         * for and why, and under which candidate. The replay is the candidate the plan declared --
+         * the last bracket's observed state, not this cycle's (see draft_cycle_replay_). */
         if (p->source == DraftPlanSource::Cost) ++m_.draft_cost_priced;
         else if (p->source == DraftPlanSource::Fallback) ++m_.draft_cost_fallback;
-        m_.draft_cost_last_k      = p->max_k;
-        m_.draft_cost_last_replay = (int64_t)p->replay;
+        m_.draft_cost_last_k        = p->max_k;
+        m_.draft_cost_last_replay   = (int64_t)p->replay;
+        m_.draft_cost_last_source   = (int64_t)p->source;
+        m_.draft_cost_last_fallback = (int64_t)p->fallback;
+        draft_trace_plan(*p);
     }
 }
 
@@ -2449,6 +2558,7 @@ void Scheduler::draft_cost_observe(DraftCycleRecord& r) {
     o.seq            = r.seq.data();
     o.complete       = true;
     const int rc = draft_costs_.observe(o, s);
+    draft_trace_sample(s, rc);
     if (rc < 0) {
         if (!draft_cost_warned_) {
             draft_cost_warned_ = true;
@@ -2896,6 +3006,7 @@ void Scheduler::step_finished(const DraftStepEvidence& ev) {
              * not a state they observed -- and so does a step with no cycle record, because no
              * sample came of it either. */
             if (ev.replay_known) draft_cycle_replay_ = ev.replay;
+            draft_trace_bracket(ev);
             r->timed          = ns > 0;
             r->total_ms       = (double)ns / 1e6;
             r->plan.timing_valid = r->timed;
@@ -3639,6 +3750,9 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.draft_obs_skipped   = (int64_t)dc.rows_skipped;
     m.draft_obs_discarded = draft_cycles_dropped_;
     m.draft_obs_inactive  = draft_costs_.inactive();
+    /* The reference's own count: a no-loan table absorbs nothing, so a cycle reaching it leaves
+     * this number and nothing else. */
+    m.draft_ref_skipped   = draft_costs_.reference_skipped();
     return m;
 }
 

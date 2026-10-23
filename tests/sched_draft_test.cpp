@@ -2239,6 +2239,7 @@ TEST(an_unpriced_explicit_ladder_below_the_executable_depth_stops_the_run) {
     const Request* r = f.sch.find(id);
     REQUIRE(r != nullptr);
     CHECK_EQ(r->n_computed, (int64_t)r->prompt.size());   /* decoding, so the cycle sees it */
+    const SchedMetrics before = f.sch.metrics();
 
     const std::string gap = stderr_of([&] { CHECK(f.sch.step() == nullptr); });
     CHECK(has(gap, "deepest offered tier K2"));
@@ -2248,9 +2249,25 @@ TEST(an_unpriced_explicit_ladder_below_the_executable_depth_stops_the_run) {
     CHECK_EQ(f.sch.draft_cycles_done(), 0);              /* no ring record was completed */
     CHECK(f.sch.draft_costs().buckets().empty());        /* nothing learnt at K6 */
 
-    /* The latch holds: no later step plans a batch, so nothing drafts at the ceiling. */
+    /* The refused cycle is in the ledger, as a cycle without a plan -- not as a fallback, and not
+     * as a plan at K0. The cycle before it (the prefill's own) is untouched by the refusal. */
+    const SchedMetrics ledger = f.sch.metrics();
+    CHECK_EQ(ledger.draft_cost_cycles, before.draft_cost_cycles + 1);
+    CHECK_EQ(ledger.draft_cost_no_plan, before.draft_cost_no_plan + 1);
+    CHECK_EQ(ledger.draft_cost_priced, before.draft_cost_priced);
+    CHECK_EQ(ledger.draft_cost_fallback, before.draft_cost_fallback);
+    CHECK_EQ(ledger.draft_cost_last_k, before.draft_cost_last_k);
+    CHECK_EQ(ledger.draft_cost_last_source, before.draft_cost_last_source);
+    CHECK_EQ(ledger.draft_cost_last_fallback, before.draft_cost_last_fallback);
+
+    /* The latch holds: no later step plans a batch, so nothing drafts at the ceiling. The ledger
+     * keeps counting what the planning site keeps opening -- a refused cycle is an opened cycle --
+     * and every one of them ends in `no_plan`. */
     CHECK(f.sch.step() == nullptr);
     CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    const SchedMetrics again = f.sch.metrics();
+    CHECK_EQ(again.draft_cost_cycles, ledger.draft_cost_cycles + 1);
+    CHECK_EQ(again.draft_cost_no_plan, ledger.draft_cost_no_plan + 1);
 }
 
 /* The gap belongs to the batch, not to one row: if any row's own remaining budget would run past
@@ -2506,8 +2523,15 @@ TEST(the_next_cycle_declares_the_last_brackets_observed_replay) {
     CHECK_EQ(m.draft_cost_cycles, base.draft_cost_cycles + 6);
     CHECK_EQ(m.draft_cost_priced, base.draft_cost_priced + 6);   /* this model prices every shape */
     CHECK_EQ(m.draft_cost_fallback, base.draft_cost_fallback);
+    CHECK_EQ(m.draft_cost_no_plan, base.draft_cost_no_plan);
     CHECK_EQ(m.draft_cost_last_k, k);
     CHECK_EQ(m.draft_cost_last_replay, (int64_t)DraftReplay::Audit);
+    CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Cost);
+    CHECK_EQ(m.draft_cost_last_fallback, (int64_t)DraftFallback::None);
+    /* Every opened cycle has exactly one named end, so none of them can go missing. */
+    CHECK_EQ(m.draft_cost_priced + m.draft_cost_fallback + m.draft_cost_no_plan,
+             m.draft_cost_cycles);
+    CHECK_EQ(m.draft_ref_skipped, (int64_t)0);   /* a live table learns; nothing is refused */
 }
 
 /* A reference table is the run's yardstick, not its notebook: the cycles the new candidate prices
@@ -2552,6 +2576,8 @@ TEST(an_observed_replay_never_writes_into_a_reference_table) {
     CHECK(after[0].unc_ms == before.unc_ms);
     CHECK_EQ(after[0].n, before.n);
     CHECK_EQ(f.sch.draft_costs().reference_skipped(), 3);
+    /* The same count is what /stats publishes: the refusal is visible, not internal. */
+    CHECK_EQ(f.sch.metrics().draft_ref_skipped, (int64_t)3);
 }
 
 /* The other side of the same gate: one bucket estimate() would price from (no disturbing flag, a
