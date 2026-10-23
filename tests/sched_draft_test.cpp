@@ -1885,8 +1885,9 @@ int32_t serial_ran(Fixture& f, int step) {
  *
  * `ineligible` turns the row into one that may not speculate just before the refused opens: the
  * engine publishes nothing for it (finish_serial_drafter's allows_speculation gate), while the
- * serial drafter still proposes for it, so only the built window says what its step verifies.
- * `max_tokens` bounds the row's output, and with it the window cap_of() would grant it. */
+ * serial drafter still proposes for it, so only the built window says what its step verifies. A
+ * state today's backends cannot produce (see the defensive test below), so the flag is set
+ * directly. `max_tokens` bounds the row's output, and with it the window cap_of() would grant it. */
 struct FailOpts {
     bool ahead = false;
     int  fails = 1;
@@ -2120,13 +2121,17 @@ TEST(repeated_cycles_with_no_plan_keep_the_synced_legacy_window_on_both_paths) {
     }
 }
 
-/* A row that may not speculate publishes nothing in a legacy cycle -- finish_serial_drafter skips
- * it, and the direct path's set_draft takes nothing -- but that is not the window its step
- * verifies. The serial drafter proposes for it like any other row (only the block drafter and the
- * step's own speculation gate refuse it), so the step issued ahead verifies the rounds the head
- * really ran, and the plan after the refusal must name them. The direct path is the other half:
- * there the step itself refuses the row, so its window is zero. */
-TEST(a_row_that_may_not_speculate_freezes_the_window_its_step_verifies) {
+/* DEFENSIVE: a state today's sampler/builder contract excludes, kept so the window rule stays
+ * checked if that contract changes. A row may not speculate only under a constraining grammar that
+ * cannot snapshot its state (Sampler::allows_speculation); the GBNF backend can snapshot, and a
+ * backend that cannot is refused the ahead step outright (step_next_locked's !speculation_fixed
+ * gate), so no engine run reaches either half below -- the test sets the flags directly.
+ *
+ * Should such a row ever exist: it publishes nothing in a legacy cycle -- finish_serial_drafter
+ * skips it, and set_draft takes nothing -- but that is not the window its step verifies. Ahead,
+ * the step was built with the rounds the head really ran, and the plan after the refusal must name
+ * them. Direct, the step itself refuses the row, so there its window is zero. */
+TEST(a_row_that_may_not_speculate_is_defensive_and_its_window_follows_the_built_step) {
     {
         Coupled c;   /* destroyed after `f`: the planner points into `c` until fini() */
         Fixture f;
@@ -2181,6 +2186,221 @@ TEST(the_frozen_window_is_the_one_the_legacy_step_was_built_with) {
         CHECK_EQ(c.query.verify_k, 2);   /* the head's depth, not the ceiling's three */
         CHECK_EQ(c.entry_spec, 2);
         CHECK_EQ(c.query.verify_k, c.entry_spec);
+    }
+}
+
+/* A valid plan does not promise a full publication. The head can finish fewer rounds than the
+ * plan's K, or none, and the paired step runs what it published. The bracket then files itself as
+ * Shortened and is kept unpriced -- never a price for a plan deliberately drawn at that extent.
+ * The next plan still declares the frozen K (the pre-existing direct-path edge this commit does
+ * not change); its own sample records the window the step really verified, so no wrong bucket is
+ * created. */
+TEST(a_shortened_publication_under_a_valid_plan_is_kept_unpriced) {
+    Coupled c;   /* destroyed after `f`: the planner and the predictor point into `c` until fini() */
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 3;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    {
+        DraftCostProfile p = cost_profile();
+        add_bucket(&p, row_key(3, 0), 5.0);   /* the cold cycle plans K3 */
+        add_bucket(&p, row_key(2, 0), 7.0);
+        add_bucket(&p, row_key(3, 3), 6.0);   /* after it: K3 on the frozen three */
+        add_bucket(&p, row_key(2, 2), 7.0);
+        install_table(f, p);
+    }
+    CHECK_OK(f.start(DraftReplay::None));
+
+    const uint64_t id = f.submit(160);
+    c.pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    QueryLog& log = c.log;
+    log.table = &f.sch.draft_costs();
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 3;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &c.pred, predict };
+    dp.costs     = log.model();
+    CHECK_OK(f.sch.draft().configure(dp));
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+    const int32_t one[1]   = { 21 };
+    const int32_t three[3] = { 21, 22, 23 };
+
+    /* Cycle 1 plans K3 and publishes one round: the plan did not cover what ran. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(copy_plan(f.sch).max_k, 3);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, one, 1));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    const DraftCostTable& t = f.sch.draft_costs();
+    DraftCostObserve o = t.last_observe();
+    REQUIRE(o.what == DraftCostDisposition::Recorded);
+    REQUIRE(o.bucket >= 0);
+    {
+        const DraftCostBucket& b = t.buckets()[(size_t)o.bucket];
+        CHECK(b.flags & kDraftSampleShortened);
+        CHECK(b.flags & kDraftBucketUnpriced);   /* kept for diagnosis, never priced or anchored */
+        CHECK_EQ(b.rounds, 1);
+        CHECK_EQ(b.shape.draft_k, 3);
+        CHECK_EQ(b.shape.verify_k, 0);
+        CHECK_EQ(b.draft_rows_total, 1);
+    }
+    CHECK_EQ(f.sch.draft_cost_refused(), 0);
+
+    /* The next cycle still declares the frozen three; its step verifies the one that ran. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* p2 = f.sch.draft().plan();
+    REQUIRE(p2 != nullptr);
+    CHECK_EQ(p2->max_k, 3);
+    CHECK_EQ(p2->verify_k, 3);
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 1);
+
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, three, 3));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    /* What it records is the window the step ran. */
+    o = t.last_observe();
+    REQUIRE(o.what == DraftCostDisposition::Recorded);
+    REQUIRE(o.bucket >= 0);
+    {
+        const DraftCostBucket& b = t.buckets()[(size_t)o.bucket];
+        CHECK_EQ(b.flags, 0);
+        CHECK_EQ(b.rounds, 3);
+        CHECK_EQ(b.shape.draft_k, 3);
+        CHECK_EQ(b.shape.verify_k, 1);
+    }
+
+    /* And a publication that does not happen at all files the same way. */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, nullptr, 0));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+    o = t.last_observe();
+    REQUIRE(o.what == DraftCostDisposition::Recorded);
+    REQUIRE(o.bucket >= 0);
+    {
+        const DraftCostBucket& b = t.buckets()[(size_t)o.bucket];
+        CHECK(b.flags & kDraftSampleShortened);
+        CHECK(b.flags & kDraftBucketUnpriced);
+        CHECK_EQ(b.rounds, 0);
+        CHECK_EQ(b.draft_rows_total, 0);
+    }
+}
+
+/* After a refused open the row drafts again, but its paired step verifies what the refused cycle
+ * published -- nothing, when the head finished no round for it. The direct freeze takes that zero,
+ * so the plan that follows drafts a fresh K under an empty verify window instead of the K of the
+ * plan before the failure. Both ways a row reaches zero are covered: a publication call carrying 0
+ * (a mixed batch, where another row kept the head running) and set_draft's early return for a row
+ * that may not speculate -- the latter a state today's backends cannot produce, set directly. */
+TEST(a_row_that_publishes_nothing_in_a_refused_cycle_comes_back_with_an_empty_window) {
+    const int32_t two[2]   = { 21, 22 };
+    const int32_t three[3] = { 21, 22, 23 };
+    for (int variant = 0; variant < 2; ++variant) {
+        Coupled c;   /* destroyed after `f`: the planner points into `c` until fini() */
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 3;
+        f.cfg.draft_policy = DraftPolicyKind::Cost;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 3;
+        install_no_plan_table(f);
+        CHECK_OK(f.start(DraftReplay::None));
+
+        const uint64_t id = f.submit(160);
+        c.pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+        QueryLog& log = c.log;
+        log.table = &f.sch.draft_costs();
+        DraftController::Params dp = f.sch.draft().params();
+        dp.policy.mode     = DraftPolicyMode::Cost;
+        dp.policy.tiers[0] = 0;
+        dp.policy.tiers[1] = 2;
+        dp.policy.tiers[2] = 3;
+        dp.policy.n_tiers  = 3;
+        dp.policy.hold     = 0;
+        dp.policy.hyst     = 0.0;
+        dp.predictor = DraftPredictor{ &c.pred, predict };
+        dp.costs     = log.model();
+        CHECK_OK(f.sch.draft().configure(dp));
+        f.prefill(id);
+        f.sch.find(id)->speculation_fixed = true;
+
+        DraftStepEvidence live;
+        live.replay_known = true;
+        live.replay = DraftReplay::None;
+
+        /* Cycle A: the cold K2, published in full. */
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(copy_plan(f.sch).max_k, 2);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, two, 2));
+        f.sch.step_finished(live);
+
+        /* The refused cycle builds its step from A's two and publishes nothing for this row. */
+        c.pred.fail_next = 1;
+        const RadBatch* built = f.sch.step();
+        REQUIRE(built != nullptr);
+        CHECK_EQ(built->n_spec, 2);
+        f.commit_plain(11);
+        if (variant == 0) {
+            CHECK_OK(f.sch.set_draft(id, nullptr, 0));   /* the row that finished no round */
+        } else {
+            f.sch.find(id)->may_speculate = false;
+            CHECK_OK(f.sch.set_draft(id, three, 3));     /* the early return takes nothing */
+            f.sch.find(id)->may_speculate = true;        /* and the row is eligible again */
+        }
+        f.sch.serial_end(0, true);
+        f.sch.step_finished(live);
+
+        /* The next plan drafts again, on the window the step will really verify: zero. */
+        REQUIRE(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr);
+        CHECK(p->source == DraftPlanSource::Cost);
+        CHECK_EQ(p->max_k, 2);        /* the cold price again, not a stale three */
+        CHECK_EQ(p->verify_k, 0);     /* not the K of the plan before the failure */
+        CHECK_EQ(log.last.verify_k, 0);
+        CHECK_EQ(c.query.verify_k, 0);
+        /* The plan declares the published window -- zero -- where the plan before the failure
+         * would have been kept at two. The build then fills the vacancy with one lookup draft
+         * (the plan lets the row draft, the head published nothing, and this history has a 2-gram
+         * match), bounded by this plan's own K, not by the frozen window: the step verifies one
+         * round the plan's estimate did not carry. That is a lookup row, which no plan prices, and the cycle files as Shortened and
+         * unpriced because the head ran no round -- the gap never becomes a price. */
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 1);
+        CHECK(f.sch.plan().e[0].ngram);
+
+        f.commit_plain(11);
+        f.sch.step_finished(live);
+        f.sch.flush_draft_observations();
+        const DraftCostTable& t = f.sch.draft_costs();
+        const DraftCostObserve o = t.last_observe();
+        REQUIRE(o.what == DraftCostDisposition::Recorded);
+        REQUIRE(o.bucket >= 0);
+        const DraftCostBucket& b = t.buckets()[(size_t)o.bucket];
+        CHECK(b.flags & kDraftSampleShortened);
+        CHECK(b.flags & kDraftBucketUnpriced);
+        CHECK_EQ(b.rounds, 0);
+        CHECK_EQ(b.shape.verify_k, 1);   /* the lookup draft the step really verified */
+        CHECK_EQ(f.sch.draft_cost_refused(), 0);
     }
 }
 

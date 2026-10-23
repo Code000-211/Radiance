@@ -629,7 +629,9 @@ private:
      * holds mu_. */
     void    draft_freeze_published(SchedReq& s, int n);
     /* The ahead path's side of the same freeze: the step built under a cycle with no plan verifies
-     * exactly its own per-row n_spec, whether or not the head publishes for that row. Caller holds
+     * exactly its own per-row n_spec, whether or not the head publishes for that row. That second
+     * case needs a row the sampler will not speculate on -- a state today's backends cannot
+     * produce, so the rule is kept as a guard rather than as something a run reaches. Caller holds
      * mu_. */
     void    draft_freeze_ahead(const StepPlan& p);
     bool    draft_record_ = false;

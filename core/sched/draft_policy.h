@@ -157,11 +157,14 @@ public:
      * cycle has no plan for a reason no later cycle can fix. Cleared at every entry. */
     bool coverage_gap_refused() const { return gap_refused_; }
 
-    /* One row's publication under a cycle that got no plan. The step paired with the next plan
-     * verifies exactly these drafts, so the next plan declares and prices that window instead of
-     * the plan before the failure. A row this cycle did not publish for keeps the entry it had:
-     * the paired step still verifies those drafts. Not a plan and not a measurement -- no price is
-     * issued, no depth or sequence position moves, and no ring record opens. */
+    /* One row's verify window under a cycle that got no plan, so the next plan declares and prices
+     * the step that runs instead of the plan before the failure. Called where that window is made:
+     * ahead, after the build, with each row's own n_spec -- a step issued under a refused cycle
+     * verifies that many rounds even for a row the head publishes nothing for (a state today's
+     * sampler contract excludes; Scheduler::draft_freeze_ahead); direct, with the count
+     * set_draft() accepted, 0 included (Scheduler::draft_freeze_published). Not a plan and not a
+     * measurement -- no price is issued, no depth or sequence position moves, and no ring record
+     * opens. */
     void remember_published(uint64_t req_id, int32_t slot, uint32_t slot_gen, int32_t k);
 
 private:
