@@ -247,10 +247,38 @@ prediction and sample.
   sufficient: a cycle whose shape the file does not hold still falls back -- a request's first
   cycle verifies nothing, so it is keyed `verify_k = 0`, and a legacy calibration files only cycles
   that verify the window it already published; a `cost` calibration (record-only) files the start
-  cycle itself. A recording deployment stays `Unknown`, because which of play, record and audit a
-  pass does exists only once that pass runs, after its plan was issued; the shape is then
-  unpriceable and the named fallback is issued. The default is `Unknown`, so a caller that says
-  nothing never asserts a plain run.
+  cycle itself. The default is `Unknown`, so a caller that says nothing never asserts a plain run.
+- **What the view carries is the last bracket's observation, not this cycle's.** The planner
+  cannot know a pass's tape state before the pass runs: `play`, `record` and `audit` are decided
+  inside `Ctx` at issue time, from an entry that this key may not even have yet. So the cycle is
+  keyed and priced under the state the previous bracket was *observed* to run --
+  `Scheduler::draft_cycle_replay_`, seeded at `init` with the capability answer above and replaced
+  in `step_finished` from the ranks' frozen evidence (`Engine::step_evidence`, merged Record >
+  Audit > Play > None) whenever that bracket produced a cycle record. That state is a
+  **prognosis, not a certificate**: the next pass has its own key, and a key's tape walk is the
+  runtime's (`Ctx`): its first pass records, the second audits, and only from the third can it
+  play. Which bracket lands on which key is the run's to decide, so no batch count is promised:
+  a cold deployment may spend its warming brackets on different levels, a key change (a new
+  level, a different token budget) starts that key over, and a rank that did not run the step is
+  not evidence of anything. A mixed rank set is declared under the strongest state any rank ran
+  -- one recording rank keeps a play-looking bracket out of the play buckets. `None` is the one
+  state that survives all of it: a non-recording deployment's cold answer is already its steady
+  answer, because every pass is unkeyed for good. A run that never gets to a priced `play` takes
+  the named fallback throughout, which is why the plan ledger below reports both and not just the
+  choice.
+- **Nothing reads the candidate back as a measurement.** The plan's declared `replay` is never
+  copied into the sample: `draft_cost_observe` files the bracket under `ev.replay`, the sample
+  gate (`sample.replay != Unknown`, `sample.shape.replay == sample.replay`) and the bucket's
+  disturbing flags are unchanged, and a `Record`/`Audit` bucket is still never a price
+  (`draft_bucket_usable`). A wrong prognosis therefore costs a fallback or a refused sample, never
+  a wrong bucket entry.
+- **The plan ledger names the choice, not the measurement.** `SchedMetrics` counts the cycles the
+  policy opened (`draft_cost_cycles`), how many were priced (`draft_cost_priced`, `source` Cost)
+  and how many took the named fallback (`draft_cost_fallback`), and carries the last plan's depth
+  and declared replay (`draft_cost_last_k`, `draft_cost_last_replay`). That tells a policy which
+  never saw a priceable shape apart from a ladder that had nothing measured -- a distinction a
+  fallback-only run cannot make from its plans. `/stats` publishes the block as `draft_cost`, with
+  the replay **by name**, and emits nothing until a cycle has opened.
 - **Non-play buckets have their own path.** A record or audit bracket is stored through
   `draft_sample_storable` with its flag, in the bucket that names it, and never folded into a play
   bucket; there is no flag combination that makes it attributable.

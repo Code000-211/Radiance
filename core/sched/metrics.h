@@ -151,6 +151,17 @@ struct SchedMetrics {
      * learning. Zero while a profile is installed, so "nothing was absorbed" and "nothing was
      * offered" cannot be read as the same fact. */
     int64_t draft_obs_inactive = 0;
+    /* The cost policy's plan ledger, cumulative: cycles it opened, how many of them were priced
+     * (`source` Cost) and how many took the named fallback, plus what the last plan asked for.
+     * `draft_cost_last_replay` is the *candidate* the plan declared (DraftReplay as a number), not
+     * what ran -- the bracket's own state is reported by `passes` and keys its sample. Together
+     * they separate "the policy never priced" from "the ladder priced nothing", which is the
+     * question a fallback-only run cannot answer on its own. */
+    int64_t draft_cost_cycles = 0;
+    int64_t draft_cost_priced = 0;
+    int64_t draft_cost_fallback = 0;
+    int64_t draft_cost_last_k = 0;
+    int64_t draft_cost_last_replay = 0;
 };
 
 
