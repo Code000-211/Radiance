@@ -1377,6 +1377,302 @@ TEST(a_step_issued_ahead_keeps_its_frozen_depth_when_the_next_cycle_changes_the_
     CHECK_EQ(entry_of(f.sch, id)->n_spec, 0);
 }
 
+/* ================================================================== the key, ahead and direct */
+
+namespace {
+
+/* The run's own table behind a log: the price comes from the table the run also records into, and
+ * the last key the planner asked for is kept, so the query is asserted and not inferred. */
+struct QueryLog {
+    DraftCostTable* table = nullptr;
+    DraftVerifyShape last;
+    int calls = 0;
+    DraftCostModel model() { return DraftCostModel{ this, &priced }; }
+    static int priced(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+        QueryLog* self = static_cast<QueryLog*>(ctx);
+        self->last = s;
+        ++self->calls;
+        return self->table->estimate(s, out);
+    }
+};
+
+/* One row's key as this fixture runs it: the request samples, the serial head is loaded, the
+ * cycle publishes before the next step verifies, and the 160-token prompt is context class 0. */
+DraftVerifyShape row_key(int32_t draft_k, int32_t verify_k) {
+    DraftVerifyShape s;
+    s.n_rows         = 1;
+    s.ctx_class      = draft_ctx_class(160);
+    s.sampling       = DraftSampling::Sampled;
+    s.replay         = DraftReplay::None;
+    s.drafter        = DraftDrafter::Serial;
+    s.pipeline_depth = 1;
+    s.draft_k        = draft_k;
+    s.verify_k       = verify_k;
+    s.verify_tokens  = 1;
+    for (int32_t j = 1; j <= draft_k; ++j) s.draft_rows[j] = 1;
+    for (int32_t j = 1; j <= verify_k; ++j) { s.rows[j] = 1; ++s.verify_tokens; }
+    s.history_tokens = s.verify_tokens;
+    return s;
+}
+
+void add_bucket(DraftCostProfile* p, const DraftVerifyShape& key, double ms) {
+    DraftCostBucket b;
+    b.shape  = key;
+    b.rounds = key.draft_k;
+    for (int32_t j = 1; j <= key.draft_k; ++j) {
+        b.draft_round_rows[j] = key.draft_rows[j];
+        b.draft_rows_total += key.draft_rows[j];
+    }
+    b.mean_ms = ms;
+    b.unc_ms  = 0.2;
+    b.n       = 3;
+    p->buckets.push_back(b);
+}
+
+/* A no-loan profile installed before init() as this run's own recording target: the match is what
+ * lets Config admit Cost (scheduler.cpp), `recording` keeps it writable, and the four buckets price
+ * both alternatives of the cold cycle and of the cycle after a K3 plan. The deep verify window is
+ * dearer per token, so the table -- not a predictor change -- decides the fall. */
+void install_cost_table(Fixture& f) {
+    DraftCostProfile p;
+    p.fingerprint.model     = "test";
+    p.fingerprint.quant     = "q";
+    p.fingerprint.tp_wire   = "w";
+    p.fingerprint.gpus      = "g";
+    p.fingerprint.kernels   = "k";
+    p.fingerprint.kv_format = "bf16";
+    p.fingerprint.placement = "all_vram";
+    p.fingerprint.tp        = 1;
+    p.fingerprint.basis     = DraftCostBasis::NoLoan;
+    p.fingerprint.arena     = "none";
+    p.fingerprint.live_loan = "flex=0 lend=0";
+    p.execution = DraftCostExecution::Rectangular;
+    add_bucket(&p, row_key(3, 0),  6.0);   /* cold cycle: 3.439 tokens / 6.0 ms beat K2 */
+    add_bucket(&p, row_key(2, 0),  5.0);
+    add_bucket(&p, row_key(3, 3), 12.0);   /* after K3: 3.439 / 12.0 ... */
+    add_bucket(&p, row_key(2, 3),  9.0);   /* ... loses to 2.71 / 9.0 */
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    rt.execution   = p.execution;
+    rt.recording   = true;
+    CHECK_EQ(f.sch.draft_costs().configure(p, rt), RAD_OK);
+    REQUIRE(f.sch.draft_costs().active());
+    CHECK(!f.sch.draft_costs().reference());
+}
+
+/* What the two cycles saw, in the three places the contract has to agree: the last price the
+ * planner asked for (the issued plan's own estimate), the verify batch the engine was handed, and
+ * the key of the bucket the cycle's sample was actually filed under. */
+struct Coupled {
+    /* Owned here, not in the helper: the planner keeps the model's `self` pointer, so the log must
+     * outlive the cycles the caller runs after `downshift` returns. */
+    QueryLog log;
+    uint64_t id = 0;
+    int32_t plan_k = 0;
+    DraftPlanSource source = DraftPlanSource::Fallback;
+    DraftVerifyShape query;
+    DraftTierPrice issued;
+    int32_t batch_spec = 0;
+    int32_t entry_spec = 0;
+    DraftCostObserve observe;
+    DraftVerifyShape recorded;
+    int32_t recorded_rounds = 0;
+};
+
+/* Two cycles of the real pipeline: A at K3 (nothing frozen, the cold bucket decides), then B after
+ * A published three, where the table prices K2 as the cheaper plan. `ahead` runs the engine's other
+ * order, in which the step is issued before the next plan opens. */
+void downshift(Fixture& f, bool ahead, Coupled& c) {
+    f.build();
+    f.cfg.n_spec = 3;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 3;
+    install_cost_table(f);
+    CHECK_OK(f.start(DraftReplay::None));
+
+    Predictions pred;
+    const uint64_t id = f.submit(160);
+    c.id = id;
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+
+    QueryLog& log = c.log;
+    log.table = &f.sch.draft_costs();
+    DraftController::Params dp = f.sch.draft().params();
+    dp.policy.mode     = DraftPolicyMode::Cost;
+    dp.policy.tiers[0] = 0;
+    dp.policy.tiers[1] = 2;
+    dp.policy.tiers[2] = 3;
+    dp.policy.n_tiers  = 3;
+    dp.policy.hold     = 0;
+    dp.policy.hyst     = 0.0;
+    dp.predictor = DraftPredictor{ &pred, predict };
+    dp.costs     = log.model();
+    CHECK_OK(f.sch.draft().configure(dp));
+
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+
+    /* The evidence a backend without a tape reports: a live pass, unkeyed. Without it no cycle's
+     * bracket is attributable and no sample is filed. */
+    DraftStepEvidence live;
+    live.replay_known = true;
+    live.replay = DraftReplay::None;
+
+    const int32_t three[3] = { 21, 22, 23 };
+    const int32_t two[2]   = { 21, 22 };
+
+    /* Cycle A: the cold cycle. The deepest offered tier is priced and wins, the step verifies
+     * nothing, and A publishes its three drafts after it. */
+    REQUIRE(f.sch.step() != nullptr);
+    const DraftPlan* a = f.sch.draft().plan();
+    REQUIRE(a != nullptr);
+    REQUIRE_EQ(a->n_seq, 1);
+    REQUIRE_EQ(a->k[0], 3);
+
+    if (ahead) {
+        /* The engine's order: expect_draft and the step issued ahead happen under A, before its
+         * commit; promote_next() is what opens B's plan afterwards. */
+        f.sch.expect_draft(id, 3);
+        const RadBatch* built = f.sch.step_next();
+        REQUIRE(built != nullptr);
+        c.batch_spec = built->n_spec;
+        f.commit_plain(11);
+    } else {
+        f.commit_plain(11);
+    }
+    CHECK_OK(f.sch.set_draft(id, three, 3));
+    f.sch.step_finished(live);
+    if (ahead) {
+        f.sch.promote_next();
+    } else {
+        /* The direct order: step() opens B's plan and only then builds the step that verifies
+         * A's three. */
+        const RadBatch* built = f.sch.step();
+        REQUIRE(built != nullptr);
+        c.batch_spec = built->n_spec;
+    }
+
+    const DraftPlan* b = f.sch.draft().plan();
+    REQUIRE(b != nullptr);
+    c.plan_k = b->k[0];
+    c.source = b->source;
+    c.query  = log.last;   /* the issued plan's own estimate, the cycle's last estimate call */
+    c.issued = f.sch.draft().planner().last_price();
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+    c.entry_spec = f.sch.plan().e[0].n_spec;
+
+    /* B's step commits, the head publishes under B's own K, and the bracket closes the cycle. */
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, two, 2));
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    const DraftCostTable& t = f.sch.draft_costs();
+    c.observe = t.last_observe();
+    if (c.observe.what == DraftCostDisposition::Recorded && c.observe.bucket >= 0 &&
+        (size_t)c.observe.bucket < t.buckets().size()) {
+        const DraftCostBucket& bkt = t.buckets()[(size_t)c.observe.bucket];
+        c.recorded        = bkt.shape;
+        c.recorded_rounds = bkt.rounds;
+    }
+}
+
+}  /* namespace */
+
+/* The coupled proof, ahead path. B's plan is opened after the step that verifies A's three drafts
+ * was built, so the step really verifies three. The lookup asks for exactly that window, the batch
+ * carries it, and the sample is filed under the same key: query, execution and measurement agree. */
+TEST(a_fall_issued_ahead_prices_the_window_the_ahead_step_verifies) {
+    Coupled c;   /* destroyed after `f`: the planner's model points into `c.log` until fini() */
+    Fixture f;
+    downshift(f, /*ahead=*/true, c);
+
+    CHECK_EQ(c.plan_k, 2);   /* the table's price decided the fall */
+    CHECK(c.source == DraftPlanSource::Cost);
+    /* The lookup named the declared window: a K2 plan that verifies the three drafts the K3 cycle
+     * published before it existed -- four verify and four history tokens. */
+    CHECK_EQ(c.query.draft_k, 2);
+    CHECK_EQ(c.query.verify_k, 3);
+    CHECK_EQ(c.query.verify_tokens, 4);
+    CHECK_EQ(c.query.history_tokens, 4);
+    CHECK(c.issued.valid);
+    CHECK_EQ(c.issued.k, 2);
+    CHECK_NEAR(c.issued.ms, 9.0, 1e-9);
+    /* The ahead step was built before the plan and verifies 3; so does the step that runs. */
+    CHECK_EQ(c.batch_spec, 3);
+    CHECK_EQ(c.entry_spec, 3);
+    /* And the cycle's measurement is filed under the same key. */
+    CHECK(c.observe.what == DraftCostDisposition::Recorded);
+    CHECK_EQ(c.recorded.draft_k, 2);
+    CHECK_EQ(c.recorded.verify_k, 3);
+    CHECK_EQ(c.recorded.verify_tokens, 4);
+    CHECK_EQ(c.recorded.history_tokens, 4);
+    CHECK_EQ(c.recorded_rounds, 2);
+    CHECK_EQ(c.query.verify_k, c.entry_spec);
+    CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+}
+
+/* The same two cycles on the direct path, where step() opens B's plan before building the step:
+ * the published three are re-capped to K2, so the step verifies two while the lookup asked for
+ * three. Query and execution disagree here, and the sample follows what ran. That is the
+ * diagnostic; a fix belongs in the scheduler (which path's window to price), not in the key. */
+TEST(the_step_built_after_the_plan_verifies_less_than_the_lookup_asked_for) {
+    Coupled c;   /* destroyed after `f`: the planner's model points into `c.log` until fini() */
+    Fixture f;
+    downshift(f, /*ahead=*/false, c);
+
+    CHECK_EQ(c.plan_k, 2);
+    CHECK(c.source == DraftPlanSource::Cost);
+    /* The same declared window as on the ahead path ... */
+    CHECK_EQ(c.query.draft_k, 2);
+    CHECK_EQ(c.query.verify_k, 3);
+    CHECK_EQ(c.query.verify_tokens, 4);
+    CHECK(c.issued.valid);
+    CHECK_EQ(c.issued.k, 2);
+    CHECK_NEAR(c.issued.ms, 9.0, 1e-9);
+    /* ... against a step that runs two. */
+    CHECK_EQ(c.batch_spec, 2);
+    CHECK_EQ(c.entry_spec, 2);
+    CHECK(c.query.verify_k != c.entry_spec);
+    /* The sample is filed under what ran: (2,2) is a bucket the calibration's D cycle also files,
+     * and the (2,3) query above is not what this cycle measured. */
+    CHECK(c.observe.what == DraftCostDisposition::Recorded);
+    CHECK_EQ(c.recorded.draft_k, 2);
+    CHECK_EQ(c.recorded.verify_k, 2);
+    CHECK_EQ(c.recorded.verify_tokens, 3);
+    CHECK_EQ(c.recorded.history_tokens, 3);
+    CHECK_EQ(c.recorded_rounds, 2);
+    CHECK_EQ(c.recorded.verify_k, c.entry_spec);
+}
+
+/* The ledger an empty planning point must leave alone. After a cycle the policy priced, an idle
+ * step has no request rows to plan over; it is counted as `empty` and nothing else, so a snapshot
+ * taken during an idle gap still shows what the last plan compared and asked for. Blanking the
+ * priced-tier count there would make "the last priced plan weighed two depths" unreadable exactly
+ * when the engine is between requests. */
+TEST(an_empty_planning_point_leaves_the_priced_ledger_alone) {
+    Coupled c;   /* destroyed after `f`: the planner's model points into `c.log` until fini() */
+    Fixture f;
+    downshift(f, /*ahead=*/true, c);
+
+    const SchedMetrics before = f.sch.metrics();
+    REQUIRE(before.draft_cost_tiers_priced > 0);
+    CHECK_OK(f.sch.cancel(c.id));
+
+    CHECK(f.sch.step() == nullptr);   /* nothing to plan over */
+    const SchedMetrics after = f.sch.metrics();
+    CHECK_EQ(after.draft_cost_cycles, before.draft_cost_cycles + 1);
+    CHECK_EQ(after.draft_cost_empty, before.draft_cost_empty + 1);
+    CHECK_EQ(after.draft_cost_priced, before.draft_cost_priced);
+    CHECK_EQ(after.draft_cost_tiers_priced, before.draft_cost_tiers_priced);
+    CHECK_EQ(after.draft_cost_last_k, before.draft_cost_last_k);
+    CHECK_EQ(after.draft_cost_last_rows, before.draft_cost_last_rows);
+    CHECK_EQ(after.draft_cost_last_source, before.draft_cost_last_source);
+    CHECK_EQ(after.draft_cost_last_fallback, before.draft_cost_last_fallback);
+    CHECK_EQ(after.draft_cost_last_replay, before.draft_cost_last_replay);
+}
+
 /* An admission is a decision about the pool and the queue, so no step is issued ahead while one
  * is pending: the request would be sized against a running set it is not in. */
 TEST(an_admission_in_flight_keeps_the_next_step_from_being_issued_ahead) {

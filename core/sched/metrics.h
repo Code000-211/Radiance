@@ -186,7 +186,8 @@ struct SchedMetrics {
      * a Cost plan at the deep tier even when only that tier had a price. A **search** metric, not
      * an output one: the resource cut and the re-price that follow the search change what is
      * issued, not what was weighed, so this count is not the issued depth (`draft_cost_last_k`)
-     * and does not change when a cut reprices the plan. */
+     * and does not change when a cut reprices the plan. Like the `last_*` scalars, an empty
+     * planning point does not touch it. */
     int64_t draft_cost_tiers_priced = 0;
     /* Calibration plans (`--draft-calib-k`, DraftPlanSource::Calibration) with rows, cumulative:
      * forced measurements, never a decision, so `priced`/`fallback` stay 0 for them. A forced plan

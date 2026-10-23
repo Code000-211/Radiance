@@ -550,20 +550,24 @@ minimal -- with L cycles there are L transitions, and fewer than four cannot con
 Every rotation of it contains all four; the planner-local index starts at 0 and only advances on a
 cycle with rows, so the first row-bearing cycle is deterministically the first element.
 
-- **Verify on a fall.** A plan's `verify_k` names the window the cycle before it drafted, but the
-  step caps every row's publication to *this* plan's own K (`draft_cap`), so a falling transition
-  verifies `min(previous K, this K)` -- and the price lookup has to ask for that same executable
-  shape (`DraftPlanner::shape_of` caps the frozen depth to the candidate's K; without it a K2
-  candidate after a K3 plan asked for a `(2,3)` form no run produces and no bucket holds, so the
-  downshift was never priced). `3,2,2,3` therefore measures four shapes -- `(3,0)`, `(2,2)`
-  twice, `(3,2)`, `(3,3)` -- and the two K2 cycles file into one bucket. The plan's `verify_k` is
-  the declared window; the sample is keyed by the one that ran.
-- **The acceptance set is A/C/D, not A/B/C/D.** After the cap, transition B (`3->2`) executes the
-  same `(2,2)` shape as D, so D is measured twice per rotation and A (`(3,3)`) and C (`(3,2)`)
-  once each; B's declared `(2,3)` is neither executable nor needed, and no run can produce it.
-  The first row-bearing cycle adds the cold `(3,0)` bucket, which is a start state, not a
-  transition. An acceptance that demanded a `(2,3)` bucket would ask the run for a shape the
-  scheduler can never verify.
+- **Verify on a fall.** A plan's `verify_k` names the window the cycle before it drafted, and the
+  price lookup asks for exactly that declared window. What the paired step then verifies depends on
+  the path that built it. A step issued ahead is built before the next plan opens, under the plan
+  that published the drafts, so it verifies the full frozen window and the lookup is exact. A step
+  that `step()` builds opens the next plan first and caps every row's publication to *this* plan's
+  own K (`draft_cap`), so a falling transition executes `min(previous K, this K)` there while the
+  lookup asked for `previous K`. `3,2,2,3` therefore declares `(3,0)`, `(2,3)`, `(3,2)`, `(3,3)`:
+  the ahead path runs those four shapes, the direct path runs `(2,2)` on the `3->2` cycle and its
+  `(2,3)` query names a shape that cycle does not execute. The sample is keyed by what ran, so the
+  ahead path files `(2,3)` and the direct path files `(2,2)`. Which of the two the scheduler should
+  price is a path-specific decision that needs a fix in the scheduler, not in the key; until then
+  the lookup keeps naming the window the plan declares.
+- **The acceptance set is not settled.** The earlier claim that a rotation needs only A/C/D
+  (`(3,0)`, `(3,3)`, `(3,2)`) because a fall executes D's `(2,2)` held only while the lookup capped
+  the frozen window to the candidate's K. Without that cap the ahead path really verifies `(2,3)`,
+  so a rotation covering both paths needs A, B, C and D. Acceptance is suspended until the path
+  question above is decided. The first row-bearing cycle adds the cold `(3,0)` bucket, which is a
+  start state, not a transition.
 
 What the serving ladder can use afterwards, and what it cannot:
 
@@ -574,7 +578,7 @@ What the serving ladder can use afterwards, and what it cannot:
   wave cannot.
 - **K0.** K0 stays in the ladder and the search iterates it, but a profile without a priceable
   K0 verify shape never chooses it, and the sequence does not force it. There is no K0 transition
-  in the A/C/D set.
+  in a `3,2,2,3` rotation.
 - **Tail.** `cap_of` clamps a row by its remaining output, so cycles that lose or nearly exhaust a
   row produce extents the sequence did not plan. Those samples are filed under their executed
   extent (the key is the executed distribution), but they are resource clamps, not depth choices;

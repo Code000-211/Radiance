@@ -624,9 +624,10 @@ TEST(config_validation_refuses_a_calibration_sequence_it_cannot_use) {
 }
 
 /* `3,2,2,3` over five non-empty cycles: A (3->3), B (3->2), D (2->2), C (2->3), A. The verify
- * depth of each plan is the frozen previous plan's -- the declared window; what the step really
- * verifies is the executed shape (sched_draft_test.cpp, `draft_cap` caps it on a fall). The branch
- * never prices and never consults the predictor. */
+ * depth of each plan is the frozen previous plan's -- the declared window. What the paired step
+ * really verifies is the executed shape (sched_draft_test.cpp); on the direct step() path
+ * `draft_cap` cuts a fall below that window, on the ahead path it does not. The branch never
+ * prices and never consults the predictor. */
 TEST(a_calibration_sequence_forces_its_depths_and_only_rows_advance_it) {
     DraftPolicyConfig cfg = cost_config(6);
     cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
@@ -808,21 +809,20 @@ TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
     CHECK_EQ(k.planner.last_n_tier_prices(), 0);
 }
 
-/* The price lookup asks for the shape the step can execute. The step caps every row's
- * publication to the plan's own K (`Scheduler::draft_cap`: min(previous K, this K)), so a K2
- * candidate after a K3 plan verifies `(2,2)` -- the D bucket the calibration really measures, and
- * the one a serving lookup has to find -- never the `(2,3)` form no run produces. The reference
- * table is exact, so what it does not hold nothing prices: the query itself is what the test sees.
- * The same cap is what makes a reduced plan re-priceable after a resource cut. */
-TEST(the_price_lookup_asks_for_the_verify_shape_the_step_can_execute) {
+/* The price lookup asks for the window the plan declares: the frozen previous cycle's K. A K2
+ * candidate after a K3 plan therefore asks `(2,3)` -- four rows at verify 3 and 16 verify/history
+ * tokens -- whether or not a given step path later re-caps what it executes (the direct step()
+ * path does; the ahead path does not, and there the query is exact). The reference table is exact,
+ * so what it does not hold nothing prices: the query itself is what the test sees. */
+TEST(the_price_lookup_asks_for_the_frozen_verify_window_and_the_cut_reprices_it) {
     DraftPolicyConfig cfg = cost_config(6);
     cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
     cfg.fallback_k = 3;
 
-    ReferenceTable a_d;   /* A (3,3) and D (2,2), plus the cold (3,0) of the first cycle */
+    ReferenceTable a_d;   /* A (3,3), B (2,3) and the cold (3,0) of the first cycle */
     a_d.add(key_shape(4, 3, 0, 1), 9.0);
     a_d.add(key_shape(4, 3, 3, 1), 12.0);
-    a_d.add(key_shape(4, 2, 2, 1), 11.0);   /* measured, and does not beat the deep window */
+    a_d.add(key_shape(4, 2, 3, 1), 11.0);   /* measured, and does not beat the deep window */
     a_d.build();
     ReferenceTable a_only;
     a_only.add(key_shape(4, 3, 3, 1), 12.0);
@@ -842,28 +842,26 @@ TEST(the_price_lookup_asks_for_the_verify_shape_the_step_can_execute) {
     CHECK_EQ(f.plan.max_k, 3);
     CHECK(spy.find(3, 0) != nullptr);
 
-    /* Cycle 2 against A-only: K2 after K3 asks exactly D -- four rows, verify 2, 12 verify and 12
-     * history tokens -- and not the phantom (2,3) with 16 of each. Nothing is priced for it, and
-     * the search says so instead of inventing a number. */
+    /* Cycle 2 against A-only: K2 after K3 asks the declared (2,3) -- four rows, 16 verify and 16
+     * history tokens -- and nothing is priced for it, so the search says so instead of inventing
+     * a number. */
     spy.reset(&a_only.t);
     CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
-    const DraftVerifyShape* d = spy.find(2, 2);
-    REQUIRE(d != nullptr);
-    CHECK_EQ(d->n_rows, 4);
-    CHECK_EQ(d->verify_tokens, 12);
-    CHECK_EQ(d->history_tokens, 12);
-    CHECK_EQ(d->rows[1], 4);
-    CHECK_EQ(d->rows[2], 4);
-    CHECK_EQ(d->pipeline_depth, 1);
-    CHECK(spy.find(2, 3) == nullptr);   /* the phantom key is never asked */
+    const DraftVerifyShape* b = spy.find(2, 3);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_rows, 4);
+    CHECK_EQ(b->verify_tokens, 16);
+    CHECK_EQ(b->history_tokens, 16);
+    CHECK_EQ(b->rows[1], 4);
+    CHECK_EQ(b->rows[3], 4);
+    CHECK_EQ(b->pipeline_depth, 1);
     CHECK_EQ(planner.last_tiers_priced(), 1);
     CHECK(!planner.last_tier_prices()[1].valid);
 
-    /* Cycle 3 against A+D: the same query hits the measured D bucket. Both alternatives are
+    /* Cycle 3 against A+B: the same query hits the measured bucket. Both alternatives are
      * priceable, and the deep one still wins. */
     spy.reset(&a_d.t);
     CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
-    CHECK(spy.find(2, 3) == nullptr);
     CHECK_EQ(planner.last_tiers_priced(), 2);
     CHECK_EQ(planner.last_tier_prices()[1].k, 2);
     CHECK(planner.last_tier_prices()[1].valid);
@@ -873,16 +871,15 @@ TEST(the_price_lookup_asks_for_the_verify_shape_the_step_can_execute) {
     CHECK_EQ(f.plan.max_k, 3);
     CHECK(f.plan.source == DraftPlanSource::Cost);
 
-    /* Cycle 4: the token budget cuts K3 to K2 before the plan is issued. The re-price asks D again
-     * and finds it, so the cut plan stays a Cost plan -- and `tiers_priced` keeps the search's
-     * count (two depths weighed), not the issued depth (last_k). */
+    /* Cycle 4: the token budget cuts K3 to K2 before the plan is issued. The re-price asks the
+     * same window again and finds it, so the cut plan stays a Cost plan -- and `tiers_priced`
+     * keeps the search's count (two depths weighed), not the issued depth (last_k). */
     f.view.token_budget = 8;   /* four rows at K3 sum to 12 */
     spy.reset(&a_d.t);
     CHECK_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
     CHECK_EQ(f.plan.max_k, 2);
     CHECK(f.plan.why[0] == DraftFallback::Resources);
     CHECK(f.plan.source == DraftPlanSource::Cost);
-    CHECK(spy.find(2, 2) != nullptr);
     CHECK(planner.last_price().valid);
     CHECK_EQ(planner.last_price().k, 2);
     CHECK_NEAR(planner.last_price().ms, 11.0, 1e-9);
@@ -890,8 +887,9 @@ TEST(the_price_lookup_asks_for_the_verify_shape_the_step_can_execute) {
     CHECK_EQ(planner.last_tiers_priced(), 2);
 }
 
-/* The cap must not reach the other two cases: an upshift still verifies the frozen window, and at
- * pipeline_depth 0 the candidate's own K is the verify window, as before. */
+/* An upshift and a pipeline-0 cycle are not affected by the two-window rule: a candidate at or
+ * above the frozen depth verifies the frozen window, and at pipeline_depth 0 the candidate's own K
+ * is the window. */
 TEST(an_upshift_and_a_pipeline_zero_cycle_keep_the_verify_window_they_had) {
     DraftPolicyConfig cfg = cost_config(6);
     cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
@@ -923,7 +921,7 @@ TEST(an_upshift_and_a_pipeline_zero_cycle_keep_the_verify_window_they_had) {
     CHECK_EQ(f.plan.verify_k, 2);   /* the declared window is the frozen one, unchanged */
 
     /* Pipeline 0: the paired step verifies what this cycle drafts, so the candidate's own K is
-     * the key -- untouched by the cap. */
+     * the key. */
     ReferenceTable in_step;
     in_step.add(key_shape(4, 3, 3, 0), 12.0);
     in_step.add(key_shape(4, 2, 2, 0), 11.0);

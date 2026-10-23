@@ -6,7 +6,6 @@
  */
 #include "draft_policy.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -185,10 +184,11 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
         for (int32_t j = 1; j <= ki; ++j) ++s->draft_rows[j];
         /* At pipeline_depth 0 the paired step verifies exactly what this cycle drafts; only when
          * the plan is issued ahead (publish-then-verify) does it verify the frozen previous
-         * plan's window instead. That window is capped to this candidate's own K, the executable
-         * form the step runs (Scheduler::draft_cap): a candidate below the frozen depth publishes
-         * at most its own K, so a deeper verify shape is one no bucket can hold. */
-        const int32_t fk = view.pipeline_depth > 0 ? std::min(frozen_k_of(view, i), ki) : ki;
+         * plan's window instead. The key names that window as the plan declares it. On the direct
+         * step() path the step re-caps it to the plan it now runs (Scheduler::draft_cap), so the
+         * lookup may ask for a window the step does not execute; keying the capped form instead
+         * would hide that mismatch rather than expose it. */
+        const int32_t fk = view.pipeline_depth > 0 ? frozen_k_of(view, i) : ki;
         if (fk > s->verify_k) s->verify_k = fk;
         s->verify_tokens += 1 + fk;
         for (int32_t j = 1; j <= fk; ++j) ++s->rows[j];

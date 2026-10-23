@@ -2252,11 +2252,11 @@ void Scheduler::draft_cost_cycle() {
         /* An empty planning point: every step opens a cycle, and a pure prefill or idle step has
          * no decode rows to plan over, so the controller issues the valid K0 plan for an empty
          * view. It is neither a decision nor a measurement -- no ring record, no bracket, no
-         * sample -- so it is counted apart, leaves the `last_*` plan alone and spends no trace
-         * line. A valid all-K0 plan over real rows is still a decision (`last_rows > 0`). */
+         * sample -- so it is counted apart, leaves the last plan's ledger alone (the `last_*`
+         * scalars and the priced-tier count) and spends no trace line. A valid all-K0 plan over
+         * real rows is still a decision (`last_rows > 0`). */
         if (p->n_seq <= 0) {
             ++m_.draft_cost_empty;
-            m_.draft_cost_tiers_priced = 0;
             return;
         }
         /* What the policy decided, for /stats: whether this cycle was priced at all, what it asked

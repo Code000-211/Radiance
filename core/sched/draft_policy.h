@@ -183,8 +183,8 @@ private:
     int32_t frozen_k_of(const DraftBatchView& view, int32_t i) const;
     /* The shape assignment `k[]` verifies (clamped to `clamp_to` when that is >= 0), with the
      * history the paired step owes and the drafter that is loaded. Under issue_ahead() a row's
-     * verify is the frozen plan's K capped to this candidate's own K -- the executable form the
-     * step runs (Scheduler::draft_cap); a deeper key is one no bucket can hold. */
+     * verify is the frozen plan's K, as that plan declared it: the window the cycle is priced on
+     * is the contract's, not the one a particular step path later clamps it to. */
     void    shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
                      DraftVerifyShape* s) const;
     void    remember(const DraftBatchView& view, const int32_t* k);
