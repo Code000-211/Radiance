@@ -21,7 +21,8 @@ core/plugin/      plugin loader, kernel registry, op schemas, selector, bucket t
 core/build/       the declare phase: builder, weight manifest, buffer plan, graph dump
 core/runtime/     the run phase: RadCtx, rad_issue, the arena
 core/mem/         pools, slab, KV block manager, prefix cache
-core/sched/       scheduler, RadBatch construction, request lifecycle
+core/sched/       scheduler, RadBatch construction, request lifecycle, and the step log the
+                  self-measurement reads (one record per step, kept only while it runs)
 core/place/       placement planner, the mover, the heat engine
 core/sample/      device sampler dispatch, the host reference chain, grammar bitmask
 core/text/        tokeniser, chat template, tool parsing, detokenisation
@@ -31,6 +32,8 @@ core/format/      the .rad reader and writer, safetensors, recipes, the imatrix,
 core/server/      HTTP: the OpenAI, Anthropic and llama-server endpoints, /metrics, the dashboard
 core/diag/        the startup report
 core/kld.*        the KL mode: --kld-record / --kld-ref
+core/diagnose.*   the self-measurement mode: --diagnose / --diagnose-baseline, its fixed workload,
+                  and the report's arithmetic
 core/engine*      the engine that ties them together; core/main.cpp is the `radiance` binary
 libref/           every op, naively and correctly, host domain: the oracle and last resort
 libr4d/           the RDNA4 (gfx12xx) kernel library: kernels, rows, layouts, fusion claims

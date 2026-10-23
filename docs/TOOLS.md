@@ -15,6 +15,7 @@ live in `scripts/`:
 | [`rad-schemas`](#rad-schemas) | print and diff the op schemas plugins declare |
 | [`rad-tokcheck`](#rad-tokcheck) | compare the tokeniser with its reference encoder and with HuggingFace's ids over real text, and time it |
 | [`radiance --kld-*`](#the-kl-mode) | KL divergence of a quantised model against the bf16 one, at every position of a corpus |
+| [`radiance --diagnose`](#the-self-measurement-mode) | the engine measured against a fixed serving workload instead of serving: step time by shape, the interval between the steps that emitted tokens, acceptance by draft position, and every generated token |
 | [`scripts/`](#the-shell-harnesses) | bring a model up, measure it, assert on what comes back |
 
 [`rad-avx-check`](#rad-avx-check), which checks a host kernel library against libref without a GPU,
@@ -808,6 +809,66 @@ runs every document through the adapter, against a reference recorded from the m
 with `PREFIX` through it and the rest as the base, in the same steps. The steps are those of the
 all-adapter and all-base runs with the same flags, so each document's rows should be byte for byte
 theirs: that is how a mixed batch is checked.
+
+---
+
+## The self-measurement mode
+
+```
+radiance --model M.rad ... --diagnose DIR [--diagnose-salt N]                    the run
+radiance --model M.rad ... --diagnose DIR --diagnose-baseline BEFORE.json        the same run, against BEFORE
+```
+
+Starts the deployment as a serve would and then, instead of listening, runs one fixed workload
+through the engine's own scheduler and writes `DIR/diagnose.json` and `DIR/diagnose.md`. The
+workload is in the engine (`core/diagnose.h`) and does not move with the change being tested:
+prompts held as token-id spans, and points that combine them at a concurrency, a request count and a
+generation length -- single-sequence decode, decode at 1, 4 and 8, prose, code, structured output,
+recall, long-context, prefill at 128, 512 and 2048 tokens, and one prompt arriving while streams are
+already decoding. Everything else comes from the command line, because the chunk geometry, the
+drafter and the cache settings are what is under test. [spec.md §16.1](../spec.md) is the contract.
+
+The numbers are the scheduler's and not a client's. Each step records its own time, the tokens it
+emitted and the gap since the previous step that emitted any (`core/sched/steplog.h`), which is what
+separates a long step from a starved scheduler, and what prices a draft pass and an arrival. The
+report is step time by step shape; the interval from one step that emitted tokens to the next, with
+the part of it the engine spent waiting; tokens and rows per step; throughput; cache hits; draft
+acceptance pooled and by category and by draft position; preemptions; and every generated token id.
+
+```sh
+radiance --model w4nl64-i8lm.rad --tp 2 --num-speculative-tokens 4 \
+         --diagnose /tmp/diag-before --diagnose-salt 11
+# ... the change, and a rebuild ...
+radiance --model w4nl64-i8lm.rad --tp 2 --num-speculative-tokens 4 \
+         --diagnose /tmp/diag-after --diagnose-salt 11 \
+         --diagnose-baseline /tmp/diag-before/diagnose.json
+```
+
+Both runs write the same prompts, greedily and to the same lengths, so the second one's tokens are
+the first one's unless the build changed what the model says. `--diagnose-baseline` fails the run on
+any token difference, naming the point, the request and the first token where the two part, and keeps
+every point whose tokens still match. It reports pooled draft acceptance -- per point, per category,
+per draft position -- where it has fallen by more than `--diagnose-acceptance-drop`, a fraction of
+what it was, default `0.10`; below that acceptance moves with the machine. A baseline of another
+workload or a different salt is refused with both values named, because its tokens are not the ones
+this run would have written.
+
+Nothing in the workload is served from the prefix cache: every prompt is salted by `--diagnose-salt`,
+the cache is dropped before each point, and a point the cache served anyway is written up as *not a
+measurement* rather than as a fast one. A quantity that could not be measured -- a decode rate with
+no decode step, an acceptance with no drafter, a point whose KV the pool cannot hold -- is absent
+with the reason and what would have to change, never a zero. `DIR/diagnose.md` is the same content in
+tables, for reading; the JSON is for a script.
+
+Exit status is 0 for a run that measured, 2 for a refused command line (`--diagnose-baseline` with
+no `--diagnose`), and 1 for a deployment that did not boot, a report that could not be written, or a
+baseline that disagrees about the tokens. A point this deployment cannot hold is a line in the report
+and not a failure of the run.
+
+This is not the startup report (`core/diag/diag.h`), which every start prints: that one describes the
+machine, the configuration and the PCIe path, and it is in the log above a diagnose run's lines.
+[DEVLOG-self-measurement.md](DEVLOG-self-measurement.md) is the log of how the report's quantities
+got their definitions, what the mode last measured, and three numbers that were wrong at first.
 
 ---
 

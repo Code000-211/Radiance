@@ -472,6 +472,12 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-lora", { "a", "--lora", "a=/adapters/a", "--kld-ref", "/r" } },
         { "--kld-lora-sources", { "doc/", "--kld-lora", "a", "--lora", "a=/adapters/a",
                                   "--kld-ref", "/r" } },
+        /* The self-measurement is a mode, so the options that only mean something inside a run name
+         * the run beside them -- as --kld-out names --kld-ref. */
+        { "--diagnose", { "/d" } },
+        { "--diagnose-baseline", { "/d/diagnose.json", "--diagnose", "/d" } },
+        { "--diagnose-salt", { "7", "--diagnose", "/d" } },
+        { "--diagnose-acceptance-drop", { "0.1", "--diagnose", "/d" } },
     };
     return v;
 }

@@ -47,6 +47,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
+namespace diagnose { struct Point; struct PointReport; }   /* core/diagnose.h */
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
@@ -495,6 +496,19 @@ private:
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
      * block per rank, holding a step's tokens of that rank's logits columns. */
     int  run_kld();
+    /* The self-measurement (`--diagnose DIR`, core/diagnose.h): the fixed workload instead of the
+     * HTTP server, one point at a time, and the two files. */
+    int  run_diagnose();
+    /* One point of it: the prompts built and submitted, the point run to the last token, its share
+     * of the scheduler's counters and its own step records into `out`. Negative only when the run
+     * itself failed -- a prompt the scheduler would not take, a point whose prompts would not
+     * tokenise. A point this deployment cannot hold comes back RAD_OK and unmeasured, with the
+     * reason in the report. */
+    int  diagnose_point(const diagnose::Point& spec, int index, int64_t salt, const Tokenizer& tok,
+                        diagnose::PointReport* out, std::string* err);
+    /* Request ids for the workload. The server's come from the connection counter; these have no
+     * connection, and must still not collide with anything the scheduler still holds. */
+    uint64_t diag_id_ = 0;
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
