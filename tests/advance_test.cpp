@@ -9,6 +9,7 @@
 
 #include "sample/accept.h"
 #include "sched/advance_impl.h"
+#include "sched/tree_dispatch.h"
 
 #include <algorithm>
 #include <cstring>
@@ -40,7 +41,8 @@ struct Slab {
         USED  = SLOT + kGroups * kTok,          /* [kGroups][kSeq] */
         BT    = USED + kGroups * kSeq,          /* [kGroups][kSeq][kPitch] */
         FIRST = BT + kGroups * kSeq * kPitch,   /* [kGroups][kSeq] */
-        END   = FIRST + kGroups * kSeq
+        PAR   = FIRST + kGroups * kSeq,         /* [kTok] tree parent ids, ADV_TREE_ACCEPT */
+        END   = PAR + kTok
     };
     alignas(16) int32_t w[END] = {};
     StepSlot st[kSeq];
@@ -59,7 +61,7 @@ struct Slab {
         a.row_off = ROWS * 4;  a.row_pitch = kSeq;
         a.tok_off = TOK * 4;   a.pos_off = POS * 4; a.ctx_off = CTX * 4; a.acc_off = ACC * 4;
         a.out_off = OUT * 4;   a.sid_off = SID * 4; a.cu_off = CU * 4;   a.q_off = Q * 4;
-        a.grp_off = GRP * 4;
+        a.grp_off = GRP * 4;   a.parent_off = PAR * 4;
         a.st = st;
         a.src = src;
         a.eog = eog;
@@ -540,3 +542,91 @@ TEST(a_block_drafter_step_on_the_card_continues_where_the_verify_left_off) {
 }
 
 RAD_TEST_MAIN()
+
+/* ================================================================== ADV_TREE_ACCEPT */
+
+/* The card walks a tree verify's nodes exactly as the host does (tree_dispatch.h's
+ * tree_dispatch_commit, on verify_tree_greedy): the accepted children's tokens, the pick at the
+ * node the walk stops at, and the end-of-generation cut. A drift here emits another branch's
+ * tokens than the host streams, or leaves the draft head at a position the winner never reached.
+ * Seeded over random topologies, tokens, picks and stop sets. */
+TEST(the_cards_tree_walk_commits_the_hosts_winner_and_cuts_at_the_stop_token) {
+    CHECK_EQ(kAdvTreeMaxNodes, kTreeMaxNodes);
+    const uint32_t seed = 0x7ee1234u;
+    uint32_t rng = seed;
+    int bad = 0, deep = 0, cut_cases = 0, none = 0;
+    for (int c = 0; c < 4000 && !bad; ++c) {
+        Slab s(ADV_TREE_ACCEPT);
+        CandidateTree t;
+        CHECK(t.add(-1, 1 + lcg(rng) % 3));
+        const int n = 1 + (int)(lcg(rng) % 8);
+        for (int j = 1; j < n; ++j)
+            CHECK(t.add((int)(lcg(rng) % j), 1 + lcg(rng) % 3));
+
+        int32_t eog_ids[3];
+        int n_eog = 0;
+        for (int32_t tok : { 2, 3, 8 }) if (lcg(rng) % 3 == 0) eog_ids[n_eog++] = tok;
+        for (int j = 0; j < n_eog; ++j) s.eog[j] = eog_ids[j];
+        s.a.n_eog = n_eog;
+        auto is_eog = [&](int32_t x) {
+            return std::find(eog_ids, eog_ids + n_eog, x) != eog_ids + n_eog;
+        };
+
+        int32_t pick[kTreeMaxNodes];
+        for (int j = 0; j < n; ++j) {
+            s.w[Slab::TOK + j] = (int32_t)t[j].token;
+            s.w[Slab::PAR + j] = t[j].parent;
+            /* Mostly the parent's own pick, sometimes another token: both branches. */
+            pick[j] = (j > 0 && lcg(rng) % 10 < 7) ? (int32_t)t[j].token : 1 + (int32_t)(lcg(rng) % 3);
+            s.src[j] = pick[j];
+        }
+        const int ctx = 1 + (int)(lcg(rng) % 1000);
+        s.row(0, true, 0, n, ctx, 0, 0, 0, n);
+        s.run();
+
+        const StepSlot& S = s.st[0];
+        int32_t out[kTreeMaxNodes] = {};
+        int32_t path[kTreeMaxNodes] = {};
+        int32_t acc = 0;
+        CHECK_OK(accept_tree_greedy(t, pick, n, out, &acc, path));
+        const int32_t cut = accept_cut_at_eog(out, acc, is_eog);
+        cut_cases += cut < acc;
+        none += cut == 0;
+        deep += cut >= 2;
+        const bool ok = S.acc == cut && S.tok[0] == out[cut] && S.n_acc == cut + 1 &&
+                        S.head == ctx + cut && S.ctx == S.head + 1;
+        if (!ok) {
+            bad = 1;
+            CHECK(ok);
+            std::fprintf(stderr, "    seed 0x%x, case %d, %d nodes: card acc %d tok %d head %d "
+                         "ctx %d n_acc %d; host acc %d tok %d (cut %d)\n",
+                         seed, c, n, S.acc, S.tok[0], S.head, S.ctx, S.n_acc, cut, out[cut], cut);
+        }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK(deep > 100);
+    CHECK(cut_cases > 100);
+    CHECK(none > 100);
+
+    /* A row the host did not stage as a tree (no pick, or a node past the capacity) is refused by
+     * the host's cross-check instead of being committed. */
+    {
+        Slab s(ADV_TREE_ACCEPT);
+        s.w[Slab::TOK + 0] = 1;
+        s.w[Slab::TOK + 1] = 2;
+        s.w[Slab::PAR + 0] = -1;
+        s.w[Slab::PAR + 1] = 0;
+        s.row(0, true, 0, 2, 10, 0, 0, 0, 2);
+        s.run();
+        CHECK_EQ(s.st[0].acc, 0);
+        std::memset(&s.st[0], 0, sizeof s.st[0]);
+        s.w[Slab::Q + 0] = kTreeMaxNodes + 1;   /* a tree the row cannot hold */
+        s.run();
+        CHECK_EQ(s.st[0].acc, -1);   /* what the host refuses the step on */
+        std::memset(&s.st[0], 0, sizeof s.st[0]);
+        s.w[Slab::Q + 0] = 2;
+        s.src[0] = -1;   /* a node without a pick */
+        s.run();
+        CHECK_EQ(s.st[0].acc, -1);
+    }
+}
