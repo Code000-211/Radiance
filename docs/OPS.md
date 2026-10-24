@@ -2565,7 +2565,7 @@ order, not a slow one.
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused`, `selb`? |
 | `qsa_table` | `M`(range) `blocks` `topk` `tile` `ratio` `u_max` | `selb`, `nsel`, `pos` → `tab`, `tlen`, `mask`, `row_off` |
-| `qsa_attn` | `M`(range) `n_head` `head_dim` `gqa` `block_size` `ratio` `tile` `topk` `blocks` `max_seqs` `u_max` `scale`/opt `q_dtype` `kv_dtype` | `q`, `kv`, `tab`, `tlen`, `mask`, `row_off`, `pos`, `bt`, `cu` → `out` |
+| `qsa_attn` | `M`(range) `n_head` `head_dim` `gqa` `block_size` `ratio` `tile` `topk` `blocks` `max_seqs` `u_max` `row0`/opt `scale`/opt `q_dtype` `kv_dtype` | `q`, `kv`, `tab`, `tlen`, `mask`, `row_off`, `pos`, `bt`, `cu` → `out` |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
@@ -2730,7 +2730,7 @@ a masked read of it saves.
 - **The architecture declares it behind `RADIANCE_QSA_TABLE=1`, and only then.** With the switch on,
   `arch/qwen4exp_fp8` declares `qsa_selb`/`qsa_tab`/`qsa_tlen`/`qsa_mask`/`qsa_roff` in
   `QsaIndexer::Wire` and the sparse path in `arch/common/rad_block_attn_gated_fp8.h` issues
-  `qsa_table` once per chunk and `qsa_attn` once per chunk instead of `attn_paged` per query row;
+  `qsa_table` and `qsa_attn` once for the step instead of `attn_paged` per query row;
   with it unset, not one buffer or op of the path is declared and the control arm runs unchanged
   (`tests/arch_test.cpp`, `flashnext_reads_attention_through_the_shared_table_only_behind_its_switch`).
   A library that does not declare both ops sends the same rows down the row path: the ops the
@@ -2745,7 +2745,10 @@ through the row's block table, and appending the row's partial page last.
 - **The keys are the row path's keys in the row path's order**, which is the whole point: softmax is
   summed in table order and float addition is not associative, so a read that re-ordered a row's
   list would give a different sum. `tests/r4d_emu/test_qsa.cpp` (`masked read:`) requires byte
-  equality between a per-row table (tile 1) and the tile's union (tile 16) over the same rows.
+  equality between a per-row table (tile 1) and the tile's union (tile 16) over the same rows, and
+  (`row path:`) holds that read to `libref`'s `attn_paged` byte for byte as well, which is why the
+  kernel runs the row path's two passes -- max over the keys, then the sum -- in the row path's own
+  expressions instead of an online softmax.
 - **`tab` carries block indices, not page ids**, and the cache stride set is separate
   (`kv_sb`/`kv_sh`/`kv_so`/`kv_sd`) so the page layout is the attention group's, not this op's.
 - **The partial page is appended, never read off the table.** Its block index is `(pos + 1) / ratio`
@@ -2757,6 +2760,18 @@ through the row's block table, and appending the row's partial page last.
 - **`cu` is required and names the row's sequence**, which is where its `bt` slice comes from; there
   is no per-row sequence operand, and `cu` may describe sequences with no row in this chunk. `block_size` must equal `ratio`: the table's indices are blocks, so a page holding more or
   fewer tokens would read the wrong token range.
+- **`max_seqs` is the capacity `cu` was sized for, not how many rows the batch has.** The parser
+  checks `bt`'s rows against the live sequence count in `cu` (`cu`'s last entry's neighbours), so a
+  step of 32 rows in one sequence passes where a check against the declared capacity would reject
+  it; `cu`'s own width is still bounded by `max_seqs + 1`.
+- **`row0` is the one launch's first row in the batch's numbering**, default 0. A caller that hands
+  over the step's whole rows leaves it unset, which is what the architecture does; a caller that
+  slices passes its chunk's first row so the sequence lookup lands in the right range, and rebases
+  `row_off` to the plane it hands over, since `row_off` counts offsets into `tab`.
+- **One launch is the step's rows.** The architecture does not chunk this op: `cu` is the batch's, so
+  a chunk would look up its first row in the first sequence's range, and a declared op's parameters
+  are baked at declare, so a chunk's offset cannot be a parameter. The planes are `max_tok` rows wide,
+  so running the step whole costs nothing, and a step shorter than `tile` is one short tile.
 - **It takes the ungated epilogue**, because the fused `attn_paged_gate_quant` has no table form. Both
   write the same bytes, so which arm is on screen does not move a number.
 

@@ -66,7 +66,10 @@ int table_geometry(const RadParam* p, int n, bool range, RadQsaTableCall* c) {
     c->ratio  = rad_param_geti(p, n, "ratio", 0);
     if (c->M < 1 || c->M > INT32_MAX) return RAD_E_UNSUPPORTED;
     if (c->topk < 1 || c->topk > INT32_MAX) return RAD_E_UNSUPPORTED;
-    if (c->tile < 1 || c->tile > c->M || c->tile > 32) return RAD_E_UNSUPPORTED;
+    /* A step of fewer rows than a tile is one short tile, not an error: `tiles` is ceil(M/tile) and
+     * the plane's width is `u_max`, so nothing here assumes the last tile is full. A decode step of
+     * four rows goes through a tile of 16 like any other. */
+    if (c->tile < 1 || c->tile > 32) return RAD_E_UNSUPPORTED;
     if (c->ratio < 1 || c->ratio > INT32_MAX) return RAD_E_UNSUPPORTED;
     if (c->blocks < 1 || c->blocks > INT32_MAX) return RAD_E_UNSUPPORTED;
     c->tiles = (c->M + c->tile - 1) / c->tile;

@@ -20,6 +20,15 @@
  * byte for byte (docs/QSA.md, "Table order"). The op's host reference is run on the same operands and
  * compared, so the case holds the kernel to the definition of the op too.
  *
+ * Two cases hold the table path to what it replaces. `masked_read_case` is the read: a per-row table
+ * (tile 1) and the tile's union (tile 16) give the same bytes for the same rows, and both are held
+ * to libref's `attn_paged` -- the attention the architecture issues today, loaded from
+ * $RADIANCE_HOME -- byte for byte as well, over 8K and 32K histories, draft depth 3 and 6, rows with
+ * and without a partial page, ties at a coarse score grid and two prefill chunks. `parser_case` is the
+ * batch: two sequences in one step, a declared capacity of 256 sequences and a block table with the
+ * batch's two rows, so the parser's row check is held to the live sequence count rather than to the
+ * capacity, and the same rows as a chunk show that `row0` keeps them in their own sequence.
+ *
  * Fixtures marked signed run with the op's `signed` parameter: the kernels' signed key order,
  * against the port's signed ranking, over negative, mixed and the sweep's odd scores. The unsigned
  * fixtures are the same as without the parameter. */
@@ -35,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <functional>
 #include <map>
 #include <random>
@@ -750,6 +760,57 @@ int read_table(const Fix& f, const SharedTab& t, int64_t hd, int64_t nh, int64_t
     return ref ? rad_ref_qsa_attn(&args) : rad_qsa_attn_launch(&args, nullptr);
 }
 
+/* The row path as this build resolves it: libref's `attn_paged`, through the plugin's own exports,
+ * or null when $RADIANCE_HOME holds no libref (the case then reports that it covered only the
+ * oracle). */
+typedef int (*AttnLaunch)(const RadArgs*, RadStream);
+AttnLaunch load_row_path() {
+    const char* home = std::getenv("RADIANCE_HOME");
+    if (!home || !*home) return nullptr;
+    const std::string p = std::string(home) + "/kernels/libref.so";
+    void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) return nullptr;
+    auto open = (int (*)(void))dlsym(h, "rad_plugin_open");      /* as the loader does */
+    if (open && open() < 0) return nullptr;
+    auto cnt = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    if (!cnt || !at) return nullptr;
+    for (int i = 0; i < cnt(); ++i) {
+        const RadKernelInfo* k = at(i);
+        if (k && k->op && !std::strcmp(k->op, "attn_paged")) return k->launch;
+    }
+    return nullptr;
+}
+
+/* The row path's numbers for the same rows: `attn_paged` with `q_len` 1, so every query row is its
+ * own sequence, its selection (`selb`, the block table of the table path) as the block table and
+ * `seqused` as the row's key count. Block size is the QSA ratio, so key j of entry i is the cache's
+ * slot i * ratio + j -- the mapping the masked read walks. */
+int row_path_read(const Fix& f, const SelOut& got, int64_t hd, int64_t nh, int64_t gqa,
+                  const std::vector<uint16_t>& q, const std::vector<uint16_t>& kv, int64_t npages,
+                  AttnLaunch launch, std::vector<uint16_t>& out) {
+    const int M = f.M, W = f.topk + 1;
+    out.assign((size_t)(M * nh * hd), 0);
+    RadTensor none{};
+    RadTensor a[8] = {
+        tens((void*)q.data(), RAD_BF16, {M, nh * hd}),
+        tens((void*)kv.data(), RAD_BF16, {npages, nh / gqa, f.ratio, 2 * hd}),
+        tens((void*)got.se.data(), RAD_I32, {M, W}, f.o_ld), tens((void*)got.su.data(), RAD_I32, {M}),
+        none, none, none,                                       /* no descales, no cu_seqlens */
+        tens(out.data(), RAD_BF16, {M, nh * hd}),
+    };
+    RadParam p[13]{};
+    int n = 0;
+    auto pi = [&](const char* k, long long v) { RadParam x{}; x.key = k; x.kind = RAD_P_INT; x.ival = v; p[n++] = x; };
+    auto pf = [&](const char* k, double v) { RadParam x{}; x.key = k; x.kind = RAD_P_F64; x.dval = v; p[n++] = x; };
+    auto ps = [&](const char* k, const char* v) { RadParam x{}; x.key = k; x.kind = RAD_P_STR; x.sval = v; p[n++] = x; };
+    pi("q_len", 1); pi("head_dim", hd); pi("gqa", gqa); pi("block_size", f.ratio);
+    pi("causal", 1); pi("window", 0); ps("q_dtype", "bf16"); ps("kv_dtype", "bf16");
+    pf("scale", 1.0 / std::sqrt((double)hd)); pi("max_ctx", 0); pi("n_head", nh); pi("max_seqs", M);
+    RadArgs args{}; args.t = a; args.n_t = 8; args.p = p; args.n_p = n;
+    return launch(&args, nullptr);
+}
+
 int masked_read_case() {
     std::vector<Fix> fx = {
         fix_shared_scores("masked read: decode depth 3, 8K", 4, 2048, 512, 300, 0, 21),
@@ -762,7 +823,8 @@ int masked_read_case() {
     };
     /* A small head so the f64 reference stays cheap: the op's arithmetic does not depend on its width. */
     const int64_t hd = 32, nh = 4, gqa = 1;
-    int fails = 0;
+    AttnLaunch rowp = load_row_path();
+    int fails = 0, partial_rows = 0;
     for (Fix& f : fx) {
         SelOut got;
         if (run(f, kAuto, &got)) { std::printf("FAIL %-52s the selection\n", f.name.c_str()); ++fails; continue; }
@@ -775,7 +837,7 @@ int masked_read_case() {
 
         SharedTab per_row, shared;
         int rc = build_table(f, got, 1, per_row);
-        if (rc == RAD_OK) rc = build_table(f, got, std::min<int64_t>(M, 16), shared);
+        if (rc == RAD_OK) rc = build_table(f, got, 16, shared);  /* a tile, never clamped to M: a 4-row step is one short tile */
         if (rc != RAD_OK) { std::printf("FAIL %-52s build_table returned %d\n", f.name.c_str(), rc); ++fails; continue; }
 
         std::vector<uint16_t> own, uni, oracle;
@@ -804,16 +866,172 @@ int masked_read_case() {
             ++fails;
             continue;
         }
-        /* Report the sharing the read path actually walked. */
+        /* The measurement's claim: this read is the row path's read. `libref`'s `attn_paged` over the
+         * same rows, in this build, byte for byte -- not a tolerance, because both walk the row's keys
+         * in block order with the same expressions. */
+        if (rowp) {
+            std::vector<uint16_t> path;
+            rc = row_path_read(f, got, hd, nh, gqa, q, kv, npages, rowp, path);
+            if (rc != RAD_OK) {
+                std::printf("FAIL %-52s attn_paged returned %d\n", f.name.c_str(), rc);
+                ++fails;
+                continue;
+            }
+            if (path != own) {
+                int bad = 0, first = -1;
+                for (size_t i = 0; i < own.size(); ++i)
+                    if (own[i] != path[i]) { ++bad; if (first < 0) first = (int)i; }
+                std::printf("FAIL %-52s the row path differs in %d of %zu values, first %d: "
+                            "%g against %g\n",
+                            f.name.c_str(), bad, own.size(), first,
+                            rad_bf16_to_f32(own[(size_t)first]), rad_bf16_to_f32(path[(size_t)first]));
+                ++fails;
+                continue;
+            }
+        }
+        /* Report the sharing the read path actually walked, and how many rows carried a partial
+         * page (the one page the table does not hold). */
+        int partial = 0;
+        for (int m = 0; m < M; ++m) partial += (f.pos[(size_t)m] + 1) % ratio != 0;
+        partial_rows += partial;
         int64_t listed = 0, unioned = 0;
         for (int m = 0; m < M; ++m) listed += got.ns[(size_t)m];
         for (int64_t t = 0; t < shared.tiles; ++t) unioned += shared.tlen[(size_t)t];
         std::printf("  %-52s %d rows: %lld pages read -> %lld in %lld tile(s) (%.1fx fewer), "
-                    "byte-identical, %.1e from the oracle\n",
+                    "%d partial-page row(s), byte-identical, %.1e from the oracle, %s\n",
                     f.name.c_str(), M, (long long)listed, (long long)unioned,
-                    (long long)shared.tiles, unioned ? (double)listed / (double)unioned : 0.0, worst);
+                    (long long)shared.tiles, unioned ? (double)listed / (double)unioned : 0.0, partial,
+                    worst, rowp ? "byte-identical to the row path" : "row path not built");
     }
-    std::printf("masked read: %zu fixtures, %d failure(s)\n", fx.size(), fails);
+    std::printf("masked read: %zu fixtures, %d failure(s), %d partial-page row(s), row path: %s\n",
+                fx.size(), fails, partial_rows,
+                rowp ? "libref attn_paged, byte for byte"
+                     : "not covered ($RADIANCE_HOME has no libref; oracle only)");
+    return fails;
+}
+
+/* The architecture's own call, through the real argument parser and the real table op: two sequences
+ * in one step (`cu` = 0, 256, 512), a declared capacity of 256 sequences and a block table with the
+ * batch's two rows. The first sequence's blocks are all dead, so a row that resolves to the wrong
+ * sequence reads no key and comes out zero -- which is the failure this case exists for, and the one
+ * the capacity-for-live-count confusion produced (`max_seqs` is the chunk's row count, not the batch's
+ * sequence count). The batch again as a chunk starting at row 256 then shows the other half: without
+ * `row0` a chunk looks its rows up in the first sequence's interval. */
+int parser_case() {
+    const int64_t ratio = 4, tile = 16, topk = 4, blocks = 64, hd = 32, nh = 2, gqa = 1;
+    const int M = 512, S = 2, cap = 256;      /* `cap`: the capacity the architecture declares */
+    const int W = (int)topk + 1;
+    std::vector<int32_t> cu = { 0, M / 2, M };
+    std::vector<int32_t> bt((size_t)S * blocks, -1);       /* sequence 0 dead, sequence 1 identity */
+    for (int64_t b = 0; b < blocks; ++b) bt[(size_t)blocks + b] = (int32_t)b;
+    std::vector<int32_t> pos(M), selb((size_t)M * W, -1), nsel(M, 2);
+    for (int m = 0; m < M; ++m) {
+        pos[m] = (int32_t)(ratio * (30 + m % 5) + 2);      /* own 30..34, a partial page of 3 */
+        selb[(size_t)m * W] = 0;
+        selb[(size_t)m * W + 1] = 1;
+    }
+    const int64_t tiles = (M + tile - 1) / tile;
+    const int64_t u_max = rad_qsa_table_u_max(tile, topk, blocks);
+    std::vector<int32_t> tab((size_t)(tiles * u_max)), tlen((size_t)tiles),
+        mask((size_t)M * u_max), roff((size_t)M);
+    std::vector<uint16_t> q((size_t)(M * nh * hd)), kv((size_t)(blocks * (nh / gqa) * ratio * 2 * hd));
+    for (auto& v : q) v = bf16_of((float)(rnd() % 2001) / 1000.0f - 1.0f);
+    for (auto& v : kv) v = bf16_of((float)(rnd() % 2001) / 1000.0f - 1.0f);
+
+    RadTensor ta[7] = {
+        tens(selb.data(), RAD_I32, {M, W}), tens(nsel.data(), RAD_I32, {M}),
+        tens(pos.data(), RAD_I32, {M}), tens(tab.data(), RAD_I32, {tiles, u_max}),
+        tens(tlen.data(), RAD_I32, {tiles}), tens(mask.data(), RAD_I32, {M, u_max}),
+        tens(roff.data(), RAD_I32, {M}),
+    };
+    RadParam tp[6]{};
+    tp[0] = {"M", RAD_P_INT, M}; tp[1] = {"blocks", RAD_P_INT, (int)blocks};
+    tp[2] = {"topk", RAD_P_INT, (int)topk}; tp[3] = {"tile", RAD_P_INT, (int)tile};
+    tp[4] = {"ratio", RAD_P_INT, (int)ratio}; tp[5] = {"u_max", RAD_P_INT, (int)u_max};
+    RadArgs targs{}; targs.t = ta; targs.n_t = 7; targs.p = tp; targs.n_p = 6;
+    int rc = rad_qsa_table_launch(&targs, nullptr);
+    if (rc != RAD_OK) { std::printf("FAIL parsed: qsa_table returned %d\n", rc); return 1; }
+
+    /* A launch over `rows` rows starting at batch row `off`, with `cu` and the block table whole. */
+    auto attn = [&](int rows, int off, bool with_row0, const int32_t* roffs,
+                   std::vector<uint16_t>& o) -> int {
+        o.assign((size_t)(rows * nh * hd), 0);
+        const int64_t rt = (rows + tile - 1) / tile;
+        RadTensor a[10] = {
+            tens(q.data() + (size_t)off * nh * hd, RAD_BF16, {rows, nh * hd}),
+            tens(kv.data(), RAD_BF16, {blocks, nh / gqa, ratio, 2 * hd}),
+            tens(tab.data() + (size_t)(off / tile) * u_max, RAD_I32, {rt, u_max}),
+            tens(tlen.data() + off / tile, RAD_I32, {rt}),
+            tens(mask.data() + (size_t)off * u_max, RAD_I32, {rows, u_max}),
+            tens((void*)roffs, RAD_I32, {rows}), tens(pos.data() + off, RAD_I32, {rows}),
+            tens(bt.data(), RAD_I32, {S, blocks}, blocks), tens(cu.data(), RAD_I32, {S + 1}),
+            tens(o.data(), RAD_BF16, {rows, nh * hd}),
+        };
+        RadParam p[16]{};
+        int n = 0;
+        p[n++] = RAD_INT("M", rows); p[n++] = RAD_INT("n_head", nh);
+        p[n++] = RAD_INT("head_dim", hd); p[n++] = RAD_INT("gqa", gqa);
+        p[n++] = RAD_INT("block_size", ratio); p[n++] = RAD_INT("ratio", ratio);
+        p[n++] = RAD_INT("tile", tile); p[n++] = RAD_INT("topk", topk);
+        p[n++] = RAD_INT("blocks", blocks); p[n++] = RAD_INT("max_seqs", cap);
+        p[n++] = RAD_INT("u_max", u_max);
+        if (with_row0) p[n++] = RAD_INT("row0", off);
+        p[n++] = RAD_F64("scale", 1.0 / std::sqrt((double)hd));
+        p[n++] = RAD_STR("q_dtype", "bf16");
+        p[n++] = RAD_STR("kv_dtype", "bf16");
+        RadArgs args{}; args.t = a; args.n_t = 10; args.p = p; args.n_p = n;
+        return rad_qsa_attn_launch(&args, nullptr);
+    };
+
+    const int64_t rv = nh * hd;
+    int fails = 0;
+    auto nonzero = [&](const std::vector<uint16_t>& o, int m) {
+        for (int i = 0; i < rv; ++i)
+            if (o[(size_t)m * rv + i] != 0) return true;
+        return false;
+    };
+
+    /* The whole step: the live sequence reads, the dead one does not. */
+    std::vector<uint16_t> whole;
+    rc = attn(M, 0, false, roff.data(), whole);
+    if (rc != RAD_OK) { std::printf("FAIL parsed: the step's launch returned %d\n", rc); return 1; }
+    int wrong_seq = 0, empty_live = 0;
+    for (int m = 0; m < M; ++m) {
+        const bool nz = nonzero(whole, m);
+        if (m < M / 2 && nz) ++wrong_seq;        /* sequence 0 has no live block */
+        if (m >= M / 2 && !nz) ++empty_live;     /* sequence 1 owns every page */
+    }
+    if (wrong_seq || empty_live) {
+        std::printf("FAIL parsed: %d row(s) of the dead sequence read, %d row(s) of the live one did not\n",
+                    wrong_seq, empty_live);
+        ++fails;
+    }
+
+    /* The same rows as a chunk: `row0` is what keeps them in the second sequence, and `row_off` is
+     * rebased because it counts offsets into the tab plane the caller hands over, which the chunk
+     * hands over sliced (`qsaattn.h`). */
+    std::vector<int32_t> chunk_roff(roff.begin() + M / 2, roff.end());
+    for (auto& v : chunk_roff) v -= (int32_t)((M / 2 / tile) * u_max);
+    std::vector<uint16_t> chunk, nochunk;
+
+    rc = attn(M / 2, M / 2, true, chunk_roff.data(), chunk);
+    if (rc != RAD_OK) { std::printf("FAIL parsed: the chunked launch returned %d\n", rc); ++fails; }
+    else {
+        int empty = 0;
+        for (int m = 0; m < M / 2; ++m) empty += !nonzero(chunk, m);
+        if (empty) { std::printf("FAIL parsed: %d chunk row(s) read nothing with row0\n", empty); ++fails; }
+    }
+    rc = attn(M / 2, M / 2, false, chunk_roff.data(), nochunk);
+    if (rc != RAD_OK) { std::printf("FAIL parsed: the chunked launch without row0 returned %d\n", rc); ++fails; }
+    else {
+        int read = 0;
+        for (int m = 0; m < M / 2; ++m) read += nonzero(nochunk, m);
+        if (read) { std::printf("FAIL parsed: %d chunk row(s) read sequence 0 without row0\n", read); ++fails; }
+    }
+    std::printf("  parsed: %d rows, %d sequences, capacity %d, block table %d row(s): %d row(s) of the "
+                "live sequence read, the chunk reads with row0 and not without\n",
+                M, S, cap, S, M / 2);
+    std::printf("parsed: 1 batch of %d sequences, %d failure(s)\n", S, fails);
     return fails;
 }
 
@@ -993,6 +1211,7 @@ int main(int argc, char** argv) {
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
     }
     if (!sweep) fails += shared_table_case();
+    if (!sweep) fails += parser_case();
     fails += masked_read_case();
     if (sweep) {
         for (const auto& [p, c] : g_paths) std::printf("  %5d row(s): %s\n", c, p.c_str());

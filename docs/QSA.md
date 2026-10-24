@@ -179,20 +179,26 @@ the row's partial page last. Because the emit is one run in block order, the row
 subsequence of the union, so the masked read sums the same keys in the same order and gives the same
 bytes as the row path -- `tests/r4d_emu/test_qsa.cpp` (`masked read:`) runs the same rows through a
 table per row (tile 1) and through the tile's union and requires the two outputs to be equal byte for
-byte, and both within rounding of the op's f64 oracle. What the table saves there is what the
+byte, holds both to the op's f64 oracle within rounding, and holds the masked read to `libref`'s
+`attn_paged` -- the attention the architecture issues today, loaded from `$RADIANCE_HOME` -- byte for
+byte as well (`row path:`), over 8K and 32K histories, draft depth 3 and 6, rows with and without a
+partial page, ties at a coarse score grid and two prefill chunks. What the table saves there is what the
 measurement is for: 2.1x to 10x fewer entries for a tile of 4 to 32 rows.
 
 The sparse path in `arch/common/rad_block_attn_gated_fp8.h` now reads through them, behind
 `RADIANCE_QSA_TABLE=1` (read on every call, so a step is either fully on or fully off). With the
-switch on, a chunk of sparse query rows becomes one `qsa_table` launch building the union of its
-tiles and one `qsa_attn` launch reading it per row; with it unset, nothing of the path is declared
-and the row path runs unchanged. That is what makes the two arms a measurement inside one build
-rather than a comparison across builds, and it is also why the switch lives on the architecture side
-and not in the loader: `plugin/qsatable` is a plugin like any other and reads no switch.
+switch on, a sparse step becomes one `qsa_table` launch building the union of its tiles and one
+`qsa_attn` launch reading it per row; with it unset, nothing of the path is declared and the row path
+runs unchanged. That is what makes the two arms a measurement inside one build rather than a
+comparison across builds, and it is also why the switch lives on the architecture side and not in
+the loader: `plugin/qsatable` is a plugin like any other and reads no switch.
 
-A chunk narrower than one tile still runs on the row path: the table needs a whole tile, and the
-paths are byte-identical, so which arm a row lands in cannot move its number. A library that does not
-declare both ops sends the same rows down the row path too.
+The launch is the step's rows and not a chunk of them, for two reasons: `cu_seqlens` is the batch's,
+so a launch that started at row 256 would look its first row up in the first sequence's range; and a
+declared op's parameters are baked at declare, so a chunk's offset cannot be one of them. The planes
+are already `max_tok` rows wide, so the whole step costs nothing extra, and a step shorter than a
+tile is simply one short tile (`tiles = ceil(M/tile)`). A library that does not declare both ops
+sends the same rows down the row path.
 
 `qsa_select` grew a ninth operand for this (`selb`, the block indices above). Operands are
 positional, so its arrival moved every issue hash once; the graph is unchanged and
