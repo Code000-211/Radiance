@@ -1,0 +1,11 @@
+{
+  "numerics": "reordered",
+  "engine_env": {
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_POLICY": "pruned",
+    "RADIANCE_MTP_TREE_ROUNDS": "5",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1"
+  },
+  "engine_args": ["--num-speculative-tokens", "7"]
+}

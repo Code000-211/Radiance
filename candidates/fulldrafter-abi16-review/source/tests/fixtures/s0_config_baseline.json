@@ -1,0 +1,13 @@
+{
+  "target_model_id": "Qwen/Qwen3.5-0.8B",
+  "target_hidden_size": 1024,
+  "trunk_taps": [1, 11, 21],
+  "vocab_size": 248320,
+  "max_answer_tokens": 32768,
+  "max_update_steps": 100,
+  "learning_rate": 0.0003,
+  "context_projection": [3072, 768],
+  "input_projection": [1024, 768],
+  "output_projection": [768, 1024],
+  "clean_reinit_required": true
+}

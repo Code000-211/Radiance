@@ -1,0 +1,36 @@
+{
+  "total_score": 541.0,
+  "decode_med_tps": 176.5,
+  "prefill_med_tps": 5888.8,
+  "concurrency_tps": 453.9,
+  "c1_itl_p99_ms": 8.0,
+  "c8_itl_p99_ms": 16.01,
+  "ttft_p50_ms": 68.82,
+  "categories": {
+    "chat": 143.06885600749646,
+    "code": 184.33530607410674,
+    "file_edit": 194.91786135420764,
+    "json": 189.326041217457,
+    "math": 187.81665594570356,
+    "prose": 133.85126846995556,
+    "reasoning": 171.19430333312624,
+    "summarization": 160.9332494170215
+  },
+  "itl_med_ms": 5.923,
+  "itl_low1_ms": 8.005,
+  "tail_ratio": 0.7399,
+  "stability_factor": 0.922,
+  "guardrail": 0.937,
+  "subscores": {
+    "decode": 588.4,
+    "prefill": 588.9,
+    "concurrency": 648.4,
+    "tail": 739.9
+  },
+  "weights": {
+    "decode": 0.35,
+    "prefill": 0.25,
+    "concurrency": 0.25,
+    "tail": 0.15
+  }
+}

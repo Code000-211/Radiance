@@ -1,0 +1,13 @@
+{
+  "calls": 154,
+  "before_selector_us": 660.92,
+  "wave_lds_selector_us": 254.93,
+  "final_selector_us": 207.89,
+  "selector_speedup": 3.179181297801722,
+  "selector_time_reduction_pct": 68.54536101192276,
+  "response_identical": true,
+  "draft_n_before": 1365,
+  "draft_n_after": 1365,
+  "draft_accepted_before": 159,
+  "draft_accepted_after": 159
+}

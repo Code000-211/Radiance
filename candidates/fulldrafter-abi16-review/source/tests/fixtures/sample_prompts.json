@@ -1,0 +1,47 @@
+{
+  "dataset_id": "mlabonne/open-perfectblend",
+  "pinned_revision": "af60f3c18201652a83a93f46fcfee1b646ba3df7",
+  "seed": 42,
+  "dev_prompts": [
+    {"id": "dev_000", "prompt": "Explain the difference between synchronous and asynchronous execution in Python."},
+    {"id": "dev_001", "prompt": "Write a binary search algorithm in C++ with boundary safety checks."},
+    {"id": "dev_002", "prompt": "What are the core mathematical properties of orthogonal matrices?"},
+    {"id": "dev_003", "prompt": "Derive the gradient of cross-entropy loss with softmax activation."}
+  ],
+  "calibration_prompts": [
+    {"id": "calib_000", "prompt": "Describe the transformer multi-head attention mechanism and memory scaling."},
+    {"id": "calib_001", "prompt": "How does FlashAttention optimize SRAM memory traffic on modern GPUs?"},
+    {"id": "calib_002", "prompt": "What is the role of Gated DeltaNet in modern linear RNN architectures?"},
+    {"id": "calib_003", "prompt": "Explain temperature scaling and top-p sampling in language model decoding."}
+  ],
+  "test_prompts": [
+    {"id": "test_000", "prompt": "Synthesize a high-performance LRU cache implementation using hash map and doubly linked list in Rust."},
+    {"id": "test_001", "prompt": "Analyze the time complexity of Dijkstra's algorithm with Fibonacci heaps vs binary heaps."},
+    {"id": "test_002", "prompt": "Explain the speculative decoding verification step and why it preserves the target distribution."},
+    {"id": "test_003", "prompt": "Describe the mathematical foundation of SwiGLU activations compared to standard GeLU."}
+  ],
+  "raw_dialogue_samples": [
+    {
+      "conversations": [
+        {"from": "human", "value": "How do B-trees maintain balance during insertions?"},
+        {"from": "gpt", "value": "B-trees maintain balance by splitting nodes when they exceed maximum keys..."}
+      ]
+    },
+    {
+      "conversations": [
+        {"from": "gpt", "value": "Here is the previous summary."},
+        {"from": "human", "value": "Can you explain step 2?"}
+      ]
+    },
+    {
+      "conversations": [
+        {"from": "human", "value": "continue"}
+      ]
+    },
+    {
+      "conversations": [
+        {"from": "human", "value": "How do B-trees maintain balance during insertions?   "}
+      ]
+    }
+  ]
+}

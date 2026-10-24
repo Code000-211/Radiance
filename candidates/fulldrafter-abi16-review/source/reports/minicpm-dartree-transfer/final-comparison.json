@@ -1,0 +1,32 @@
+{
+  "dflash": {
+    "before": {
+      "total_score": 282.3,
+      "decode_med_tps": 98.4,
+      "prefill_med_tps": 4473.8,
+      "concurrency_tps": 148.2
+    },
+    "after": {
+      "total_score": 277.1,
+      "decode_med_tps": 101.2,
+      "prefill_med_tps": 4487.6,
+      "concurrency_tps": 145.0
+    },
+    "decode_delta_pct": 2.8455284552845406
+  },
+  "mtp": {
+    "before": {
+      "total_score": 350.1,
+      "decode_med_tps": 125.7,
+      "prefill_med_tps": 5452.5,
+      "concurrency_tps": 252.1
+    },
+    "after": {
+      "total_score": 351.1,
+      "decode_med_tps": 126.1,
+      "prefill_med_tps": 5446.8,
+      "concurrency_tps": 250.4
+    },
+    "decode_delta_pct": 0.31821797931581575
+  }
+}

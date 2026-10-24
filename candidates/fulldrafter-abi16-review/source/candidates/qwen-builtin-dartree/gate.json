@@ -1,0 +1,8 @@
+{
+  "numerics": "reordered",
+  "engine_env": {
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_ADAPTIVE_SPEC": "0"
+  },
+  "engine_args": ["--num-speculative-tokens", "15"]
+}

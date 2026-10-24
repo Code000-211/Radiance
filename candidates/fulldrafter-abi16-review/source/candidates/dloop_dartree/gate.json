@@ -1,0 +1,12 @@
+{
+  "description": "Five-layer DLoop+DFlash2 drafter with full verified-prefix FP32 KV, absolute-position RoPE and fixed/pruned DARTree proposals (at most 15 draft nodes plus anchor). Requires a version-2 L5/context_window=0 sidecar; no truncated-context fallback. TP2 exact row collectives and committed host tree verification; FP32 activations/accumulators over BF16 weights, reordered lossless reductions.",
+  "numerics": "reordered",
+  "engine_env": {
+    "RADIANCE_DLOOP_DRAFTER": "1",
+    "RADIANCE_DLOOP_SIDECAR": "/home/orca/FullDrafter/worktrees/dloop_dartree/reports/dloop_engine/sidecar_full_l5_bf16_step52500",
+    "RADIANCE_TEACHER_MATRICES": "/home/orca/drafter_data/teacher/teacher-matrices.safetensors",
+    "RADIANCE_DARTREE_VARIANT": "fixed",
+    "RADIANCE_DARTREE_BUDGET": "15",
+    "RADIANCE_FULLDRAFTER": "0"
+  }
+}

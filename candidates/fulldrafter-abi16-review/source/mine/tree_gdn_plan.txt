@@ -1,0 +1,318 @@
+DLoop GDN/PLE tree verification: integration and numerical contract
+
+numerik: verlustfrei-nicht-bitgenau
+
+Budget: RAD_TREE_MAX_NODES=16 remains unchanged: one root/anchor plus at most
+15 draft nodes. Ancestor masks remain uint16_t. Parents are sequence-local,
+root=-1, and parents precede children. A winner includes the forwarded root
+and accepted draft nodes, never the unforwarded correction/bonus token.
+
+Source: approved copy from RadianceMine/worktrees/tap_record/mine/tree_gdn.*,
+mine/ref_gdn_tree.*, tests/gdn_tree_ops_test.cpp. No fulldrafter_tree source
+was copied. Device plugin mine aggregates GDN/PLE tree rows and DLoop rows;
+mine_ref aggregates the corresponding schemas and portable host oracle rows.
+No existing op schema is changed. The five optional INT binding parameters
+state_group, conv_group, layer, raw_buffer, factor_buffer on the new tree ops
+connect a stateful layer to its verifier and commit using existing declaration
+geometry, without extending the ABI. Scheduler capability checks require all
+three resolved ops for every GDN state/conv layer; QSA tail layers require their
+persistent qsa_tree_qk winner-replay projection. PLE token/conv groups require
+their corresponding resolved tree verifier plus ple_tree_commit, explicitly
+bound by tok_group/conv_group/layer. Prefill-only PLE rows never satisfy these
+decode bindings. An unrelated tree kernel does not lift the stateful-model veto.
+
+Numerical evidence
+------------------
+Original decode arithmetic: libr4d/r4d_gdn_conv_w4_h128_bf16.hip and
+r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip. Tree arithmetic is in
+mine/tree_gdn.hip (conv_tree, recurrent_tree, commit_tree) and
+mine/ref_gdn_tree.cpp. The normalized-key STG=0 arm is the basis, not STG=2
+(which moves scales across sums). Raw inputs, conv history, conv outputs,
+output gate and final output stay BF16. A_log, dt_bias, output norm weights,
+recurrent state, compact factors and all accumulators stay F32. No quantizer,
+weight value, accumulator precision or intermediate format is reduced.
+Convolution walks ascending taps with FMA and the existing cp_silu expression.
+The GPU norm/dot uses two serial 64-element FMA sums followed by half exchange;
+RMS retains the descending XOR wave reduction and eight wave partials.
+The parent-dependent u is saved before the rank-one update; replay multiplies
+state by saved F32 exp(g), then applies FMA(u,k,state). BF16 conversion retains
+r4d_gdn_wmma.h::f2bf's +0x8000 rounding, not a replacement RN-even converter.
+
+GATE SIGN (2026-10-16 fix). The node exponent is g = -exp(A_log)*softplus(a+dt),
+exactly as the reference and the pre-tiling kernel computed it. The tiling commit
+had introduced a second negation -- alog held -exp(A_log) while g was written
+-alog*softplus(...) -- so exp(g) became exp(+|g|), every node multiplied the
+state up instead of decaying it, and the recurrent output left the host oracle by
+about 4%, far outside the one-ulp bound the harness allows. alog now holds
++exp(A_log) so the single minus in g is the only one. The conv and commit kernels
+never evaluate the gate and were unaffected.
+
+TILING (2026-10-16 optimization). The recurrent kernel gives one thread a QUARTER
+of a state row: 128 columns over 4 lanes, 128 rows, 512 threads, 32 F32 of state
+a thread, which keeps the whole state in registers with no spill and no scratch
+traffic. The old shape gave a lane 64 columns of state plus 64 of q and 64 of k
+and spilled 596 bytes a thread. The conv kernel assigns one thread per channel as
+before. Both conv and commit index q/k/v/history/state with the operand's own
+declared strides and use 128-bit loads only where a run of columns is contiguous,
+which changes no value. Per-thread the FMA order (columns ascending) is
+unchanged; a sum that spans a row's 128 columns is still a serial chain over the
+thread's own columns closed by XOR exchanges, and the RMS keeps the descending
+exchange over rows and the sixteen wave partials.
+
+MEASURED (2026-10-16, RADIANCE_DLOOP_BENCH=10, median of five batches, one run
+each, queue lock held, no other KFD client; "before" is kernel 5c29983 rebuilt
+from git into a separate mine.so, "after" is this branch):
+| op | geometry | before | after |
+|---|---|--:|--:|
+| gdn_conv_tree | harness (n_head_k=1, n_head_v=2) | 0.0512 | 0.0214 |
+| gdn_recurrent_tree | harness | 0.2855 | 0.1273 |
+| gdn_tree_commit | harness | 0.0738 | 0.0434 |
+| gdn_conv_tree | real trunk (n_head_k=8, n_head_v=24) | 0.0649 / 0.0451 (rank 0/1) | 0.0225 / 0.0221 |
+| gdn_recurrent_tree | real trunk | 0.5498 / 0.5550 | 0.1460 / 0.1462 (pre-barrier-change) |
+| gdn_tree_commit | real trunk | 0.0627 / 0.0628 | 0.0362 / 0.0327 |
+The recurrent kernel is 3.7x faster at the harness geometry (0.2855 -> 0.1273 ms)
+and 3.8x at the real trunk geometry (0.55 -> 0.146 ms per GDN layer) for the
+5c29983 baseline. What remains is not bandwidth: the block reads the state once
+(0.25 MB), writes its factors and outputs once, and every replay reads LDS.
+
+BARRIERS (2026-10-16 optimization). A node used to cost two block-wide syncs. The
+node's barrier has to publish the node's factors for the branches that replay them
+AND fence the sixteen wave partials between their writer and their readers; with a
+single partial buffer a second barrier was required before the next node's writes,
+or they land on partials a slow wave has not read. The buffer now alternates by
+node parity, so node n+2 rewrites what node n read only after every thread passed
+node n+1's barrier. The walk costs one sync a node, and the harness geometry moved
+0.1456 -> 0.1273 ms for that change alone.
+
+GRID SHAPE (considered, declined). One block a head is 96 blocks on 64 CUs -- a
+half-round tail. Splitting a head's 128 value rows over two blocks would give 192
+blocks of 256 threads at the same 8 waves a SIMD, but the head's RMS norm spans all
+128 output columns and is the one cross-half dependency. libr4d's own linear kernel
+refuses the same split whenever its fused norm is active (`if (!nm0) vs = 1` in
+r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip), and its comment on the
+marker case says why the split is not free. Doing it here would need either a
+device-wide spin between the halves -- the shape that deadlocks when a block faults,
+on a card this test shares with training -- or a two-pass launch adding a scratch
+buffer to the op and one launch per GDN layer per step (36 a step). Neither is worth
+it for the remaining gap, so the kernel stays one block a head with one barrier a
+node.
+
+FACTOR STAGING (2026-10-16 optimization). The recurrent kernel replayed each
+branch's ancestors by reading their saved factors back from global memory: 63
+ancestor replays in the golden tree times 64 KB of factor row per replay is
+4 MB of last-level traffic per block and layer for values the same block had just
+written. Each node's normalized k, its u row and its exp(g) now stay in a 16 KB
+LDS band for the block's whole walk, so a replay reads shared memory; the block's
+own write of the declared F32 factor output is unchanged and the LDS copy holds
+the identical bits. The commit kernel stages the winner path's factors into one
+LDS band per node for the same reason, replacing len global factor reads and len
+redundant state re-reads with one read and one write of the state slice. Both
+kernels' arithmetic, association and formats are untouched by this change. A node
+keeps its two block-wide syncs: the first publishes the factors and the RMS
+partials, the second closes the node so a fast wave cannot overwrite the next
+node's partials before slower waves have read this node's.
+
+The GPU norm/dot association therefore changes again relative to the host
+reference, which emulates its own split reductions with std::fma.
+
+Host transcendental functions and GPU intrinsics are not claimed bit-identical.
+Relative to the independent scalar oracle the sum association/gated-norm
+association changes. This is reordered arithmetic, not quantization or omitted
+model computation.
+Tree o is BF16 and feeds the already-declared QuantFP8 operation unchanged.
+Hardware parity and acceptance-rate effects require an isolated GPU run.
+
+Mode boundary and materialized state
+------------------------------------
+RADIANCE_DLOOP_DRAFTER=1 makes qwen4exp set GdnFP8::Config::tree_state,
+PleLayer::Config::tree_state, QsaIndexer::Config::tree_state and
+AttnGatedFP8::Config::tree_state. Blocks
+consume declared configuration, not environment variables. EVERY decode batch
+in that model instance uses
+the tree-state backend: branching, chains, and anchor-only. There is no bridge
+from the legacy deferred replay factors, and no alternating backend per step.
+Without the flag, legacy decode/fused kernels, operands, quantization, prefill,
+FullDrafter 2x4, MTP and no-drafter paths keep their existing arithmetic and
+kernel choices. Thus the legacy linear path stays bit-identical by code
+reasoning; no GPU execution proves that here. The new DLoop linear/anchor-only
+path belongs to the declared reordered-numerics backend.
+Tree-state declaration rejects max_spec>15 with RAD_E_UNSUPPORTED naming the
+16-row limit, before allocating buffers or declaring verifier ops. Long prefill
+chunks remain legal: GDN uses its existing chunked path, PLE its linear
+materializing mode described below.
+
+GDN prefill remains the existing chunked path. gdn_conv_prep writes canonical raw
+history into offsets [0,W-1); gdn_chunk_scan writes the fully materialized F32
+state into state_index column zero. The scan does not leave a deferred decode
+root in the private factor slot. Chunked prefill propagates these committed
+buffers through ctx_lens/state_index. The existing engine checkpoint restore
+runs before the forward on the same compute stream and restores all stateful
+KV groups, including conv history and QSA tail; snapshots are taken at prefill
+chunk boundaries. Tree verification reads column zero and history_ring=0,
+so prefix-cache restore/checkpoint slots enter the same materialized contract.
+No DLoop decode precedes the first tree-state decode using a legacy kernel.
+
+Mixed batches use the existing decode-first batch_split. Tree GDN ops run on
+[0,D) with token views [0,DT); the existing chunked ops run on [D,S), using
+absolute cu offsets and full-step token bases. Commit runs only on [0,D).
+Prefill needs no second recurrent commit. The scheduler resets the conv cursor
+to zero for this backend because the committed history is canonical, rather
+than a speculative rolling-window read offset.
+
+Persistent candidate state
+--------------------------
+Per GDN layer: saved_raw_x BF16[max_tok,D], D=128*(2*n_head_k+n_head_v), and
+factors F32[max_tok,n_head_v,257] = normalized k[128], u[128], exp(g).
+Bytes: 2*max_tok*D + 4*max_tok*n_head_v*257. No full per-node recurrent state.
+Committed state/history are read-only during GDN verification. Candidate
+buffers are PERSIST and survive sampling, winner replay and any drafter pass.
+Commit validates ancestry and disjoint slots and folds only the selected path.
+QSA additionally retains each indexer's full raw qk projection in a PERSIST
+buffer until winner replay. No step-path allocation is added.
+
+QSA exactness boundary
+----------------------
+Dense tree attention is permitted only while every visible block fits the
+existing QSA budget. Its exact bound is topk*ratio+ratio-1 (2051 tokens for
+this model), including when budget is not divisible by ratio. The public
+tree_qsa_exact_to(Program) helper reads declared topk/ratio and is shared by
+scheduler admission and engine fallback; QsaIndexer::Config::exact_to supplies
+the same formula inside architecture code. set_draft_tree rejects branches
+when root_pos+1+max_depth exceeds this bound.
+Publication above the bound selects the first-child chain instead (Slice E).
+A batch chooses one QSA route. Before staging, the scheduler linearizes all
+branches in a batch that would take the sparse route, including a short decode
+batched beside a long prefill. It repeatedly takes the lowest-index child,
+renumbers the chain, drops other rows, updates sampler/registry metadata and
+logs at debug level. The batch builder's same bucketed context ceiling is used;
+it may conservatively linearize before the per-sequence limit. Sparse attention
+never receives branching masks, and never gets replaced with above-budget
+dense attention. Existing attn_paged's mask operand handles the exact dense path.
+
+On a dense-exact DLoop tree batch QSA skips decode work/tail updates, preserving
+committed index state during verification. Mixed-batch prefill still updates
+its own QSA state via cu+D and matching index/table subranges (absolute token
+bases remain unchanged). At host acceptance QsaIndexer::commit replays the
+accepted raw keys one at a time with existing qsa_work/qsa_block_key/
+qsa_tail_store. This updates both pooled block keys and the tail ring before
+the next step. QsaIndexer::defer_decode is the single route predicate used by
+both verification and commit: anchor-only or sparse-chain steps that already
+materialized their decode state do NOT replay it a second time. Above the
+bound the submitted topology is a chain, and the existing sparse path alone
+updates its block keys/tail. The ring ratio+max_spec protects pre-step raw taps
+across speculative writes. Pooled kv_qsa_bkey is excluded from per-token
+attention-KV compaction; deferred routes rebuild it by logical block, not node id.
+
+PLE token and dilated-convolution state
+--------------------------------------
+PLE uses additive ngram_ids_tree, ple_conv_tree and ple_tree_commit schemas;
+no libr4d/libavx/libref operation or existing schema is changed. Every DLoop
+decode hashes current token plus its own ancestor tokens and committed token
+history, including EOS segment cutting. Dilated convolution similarly follows
+ancestors for each tap; verification writes only candidate output and a PERSIST
+BF16[max_tok,hc*n_embd] copy of its raw input. Accepted-path commit updates both
+KV groups using the original tokens and selected raw rows, excluding siblings
+and the bonus token.
+
+The two PLE histories intentionally have DIFFERENT layouts. Token history is
+canonical oldest-to-newest in cells [0,ngram-1); existing ngram_ids prefill
+already materializes that layout on host and GPU. Convolution uses the
+absolute-position ring actually implemented by libr4d/r4d_ple_conv_bf16.hip:
+the value at logical position p is stored at p % state_len. DLoop sets
+history_ring=1 and uses ple_conv_tree(mode=prefill) for all prefill chunks,
+which computes the same linear dilated convolution and materializes that ring
+after its reads. The new reference also supports history_ring=0 for independent
+canonical-window comparisons. No interpretation of a legacy deferred decode
+window is needed, and no bridge operation is introduced.
+
+Chunked prefill, checkpoint snapshots and prefix-cache restore carry complete
+token and convolution groups at the chunk's committed ctx_lens. Decode reads
+the restored token tail at zero and convolution at its absolute context modulo
+capacity. Mixed batches use the decode prefix [0,D) and prefill suffix [D,S)
+with absolute cu offsets; prefill updates only its own slots. The -2 callback
+commits only decode sequences. The existing PLE lane join orders next-pass
+hash/gather after preceding main-lane commit, and main-lane gate/conv after
+this pass's hash/gather.
+
+embed_lookup_q needs no tree specialization: libavx/avx_ngram.cpp:649 derives
+each row independently from q.ids[m], and its gather loops (660-674,705-718)
+write that row to q.out+m*x_ld. Extra branching rows are independent lookups,
+not a sequential history recurrence; the mmap table and decoder are unchanged.
+
+Numerics remain verlustfrei-nicht-bitgenau: ngram hashing preserves signed
+64-bit wrapping multiplication, XOR and floor remainder; IDs and state copies
+are integer/bit exact. Conv inputs, weights, retained raw inputs, state and
+outputs remain BF16; ascending-tap accumulation and the silu/residual
+intermediates remain F32, with BF16 RN-even output conversion matching the
+existing PLE converter. No intermediate is narrowed or quantizer added.
+mine compiles with -ffp-contract=off; FMA association and host/GPU expf may
+differ from legacy GPU arithmetic. Without DLoop the original PLE declaration
+and launch operands remain selected unchanged, with no candidate buffer or
+new PLE op. Its linear path is therefore bit-identical by code reasoning;
+GPU parity and real prefix/cache/TP ordering still require a GPU run.
+
+Acceptance and drafter flow (Slice E contract)
+---------------------------------------------
+Deterministic drafts use sample-and-match at temperature 0 AND 1: each target
+row draws once conditioned on its ancestor path; walk the child whose token
+matches that row's draw; otherwise emit that draw as the bonus. No sibling
+gets a redraw. This is lossless target sampling (not optimal rejection-sampling
+acceptance). Existing sampler tree conditioning also keys RNG by output depth.
+Shape-dependent target GEMM rounding can still change a pick near a CDF
+boundary; byte-identical speculative/non-speculative stochastic output is not
+claimed. Existing accept_tree_greedy implements the correct walk, including
+parent-before-child prefixes truncated by scheduler clamps.
+
+Tree-state steps do not run device linear ADV_ACCEPT, preissued serial/block
+drafting, or issue_ahead. Engine collects target samples and decides the path
+on the host, compacts attention KV, then releases a commit-only architecture
+pass BEFORE Scheduler::commit and BEFORE the next drafter/forward. The pass
+uses existing RadBatch with draft_pass=-2 and original trunk token/cu/KV data.
+Mapped draft_out_ids is I32[S,16] LOCAL winner nodes, root-first, -1 after path,
+followed by the common cu={0,1}. Mapped num_accepted holds root-inclusive path
+lengths [S], followed by absolute trunk row starts [S]. Prefill path length is
+zero. Architecture intercepts -2 and calls only PleLayer::commit,
+GdnFP8::commit and QsaIndexer::commit. Ctx never records/replays -2 because its host-side dispatch
+list depends on winner values rather than only the batch shape.
+
+Mapped metadata is allocated at BatchBuilder::init, not per step, and reused
+after trunk collection retires the preceding commit. Engine also uploads the
+named PERSIST tree_path_rows I32[S,16] (ABSOLUTE OUT_IDS/LOGITS rows) and
+tree_path_reset I32[S] for dloop_ctx_append. The model retains taps AFTER its
+out_ids gather, so decode indices are so.first_row[i]+best_node[j], NOT full
+token offsets. Decode rows include root plus accepted nodes, never the bonus.
+A producing prefill contributes so.first_row[i], the sole tap that predicts
+the first answer token; nonproducing prefill contributes no row.
+Prefill sets reset=1, decode reset=0. Scheduler::block_begin anchors at the
+winning leaf's logits row, not at path length in flattened-node space.
+The drafter must publish parents before children, no duplicate sibling token,
+with at most 15 draft nodes plus the root, then use host publication after
+commit. The old FullDrafter remains selectable and uses its unchanged flow.
+
+GPU-free checks
+---------------
+Ported host tests cover branch-vs-isolated-path outputs/factors/commit, sibling
+poisoning, absolute mixed subranges, ring wrap, cold contexts, 16 nodes,
+width 17, raw-history positions, transactional invalid metadata, shape hooks,
+and the independent libref/ref_tree_state.h full-state scalar oracle. Added
+checks cover committing a non-last branch, scheduler complete-bound-op refusal
+and admission, QSA sequence/batch exactness, and target-draw branch walking.
+The host sampler-refusal case exposed a teardown race: free_set destroyed upload
+events and freed their slab/ring without retiring queued copies. Event destroy
+is asynchronous and host free immediately releases storage. Batch teardown now
+drains rank streams before freeing metadata; this adds no step-path fence.
+free_set returns the drain failure status; fini then retains mapped winner
+metadata as well as the staging slab rather than freeing possible kernel inputs.
+A pending-write/event regression failed before the fix and passed afterward.
+The final seven-test host filter passed with default OpenMP settings, and the
+sampling-path test passed ten consecutive default-OpenMP runs. Its host ASan
+run also passed (address checking enabled, leak detection disabled). Baseline
+fe6c318 passed three runs in a detached check worktree, subsequently removed.
+The independent scalar-state comparison retains the existing 1e-6 relative-L2
+threshold; exact branch/replay/raw-history comparisons use no tolerance.
+Host build/filtered CTest use build_host_C. HIP compile-only uses build_hip_C,
+explicit clang++ and gfx1201 architecture flags, and never executes its binaries.
+No GPU, engine process, ROCm discovery tool or hardware benchmark is run.
+Only GPU execution can prove device-vs-oracle parity, TP2 ordering, real cache
+restore/mixed-step behavior, long-context sparse transitions, performance and
+acceptance-rate parity. These remain an integration gate, not claimed results.

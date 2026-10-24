@@ -1,0 +1,23 @@
+{
+  "description": "Opt-in measured draft-depth controller for the linear serial MTP path (RADIANCE_ADAPTIVE_BANDIT=1). Arms are depths 1..min(configured window, the drafter's declared depth, 8); a bounded cold sweep visits each arm, then the arm whose credited intervals emitted the most decode tokens per decode row over their real step interval holds, with one bounded probe of the second-best arm every 32 intervals. An interval is credited only when its verify and the draft passes it paid for both ran the chosen arm, every row verified exactly that depth, and no prompt tokens shared the step; a step straddling an arm change is a transition and is neither attempted nor credited. No sampler, acceptance law, RNG, KV/context/concurrency contract, weight, container or scorer change. The controller only chooses how many draft positions a verify step carries, so this is distribution-exact by the existing rejection/maximal-coupling law, but it is NOT bit-exact: which positions a step verifies, and therefore the per-step token burst, the executed verify shape and the realised seeded trajectory, depend on the arm the policy holds. Refused at startup for any tree proposal, tree verifier, pruned rounds, SpecHub, DLoop full-context drafter, block drafter, KL mode, RADIANCE_ADAPTIVE_SPEC, speculation off, or a window of 6+ (whose unarmed two-stage branch picks its depth from device state after the drafter has run, so no step could be attributed to an arm). Default off: unset or 0 is the existing constant-depth path. Not a gate PASS and not a performance claim. The draft-acceptance comparison is NOT waived by this declaration: a DROPPED verdict blocks this candidate like any other.",
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "NUM_SPECULATIVE_TOKENS": "3",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_DARTREE": "0",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_ADAPTIVE_BANDIT": "1",
+    "RADIANCE_SPECHUB": "0",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_MTP_COUPLED": "1",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1",
+    "RADIANCE_GDN_ANCHOR": "1",
+    "RADIANCE_GDN_BOLE_EXACT": "1",
+    "RADIANCE_HEAT_RESIDENCY": "0",
+    "GPU_KEEP_ALIVE": "0",
+    "R4D_MOE_DOWN2": "0"
+  },
+  "engine_args": ["--num-speculative-tokens", "3"]
+}

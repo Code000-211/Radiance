@@ -1,0 +1,30 @@
+{
+  "format": "safetensors",
+  "version": "1.0",
+  "sidecar_size_bytes": 106835904,
+  "parameter_count": 53417952,
+  "dtype": "bfloat16",
+  "target_model_id": "Qwen/Qwen3.5-35B-A3B-FP8",
+  "target_embedding_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "target_head_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+  "target_final_norm_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+  "components": {
+    "context_proj": {"shape": [6144, 768], "params": 4718592},
+    "context_norm": {"shape": [768], "params": 768},
+    "anchor_proj": {"shape": [2048, 768], "params": 1572864},
+    "mask_vector": {"shape": [768], "params": 768},
+    "blocks": {
+      "count": 2,
+      "hidden_size": 768,
+      "intermediate_size": 2304,
+      "q_heads": 12,
+      "kv_heads": 4,
+      "params_per_block": 6881280
+    },
+    "output_proj": {"shape": [768, 2048], "params": 1572864},
+    "markov_head": {
+      "matrix_a": {"shape": [248320, 64], "params": 15892480},
+      "matrix_b": {"shape": [64, 248320], "params": 15892480}
+    }
+  }
+}

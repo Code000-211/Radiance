@@ -1,0 +1,314 @@
+{
+  "format": "radiance-dloop-sidecar",
+  "version": 1,
+  "architecture": "dloop_diffusion",
+  "config": {
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_layers": 2,
+    "num_q_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 16,
+    "context_features_dim": 48,
+    "target_width": 32,
+    "proposal_length": 8,
+    "context_window": 32,
+    "active_vocab": 509,
+    "vocab_size": 512,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "selector_rank": 8,
+    "selector_top_k": 16,
+    "eps": 1e-06,
+    "rope_theta": 10000000.0
+  },
+  "source_checkpoint": "/home/orca/FullDrafter/worktrees/dloop_dartree/reports/dloop_engine/dloop_tiny_source.pt",
+  "source_sha256": "4a629fa3bdec5acabcfebff68b3c22f383b82f5c5bd7bab5652d2e3f4c964144",
+  "completed_steps": 0,
+  "tensors": [
+    {
+      "name": "dloop.context_proj.weight",
+      "shape": [
+        64,
+        48
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.context_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.token_proj.weight",
+      "shape": [
+        64,
+        32
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.mask_token",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.input_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention_conv.base_kernel",
+      "shape": [
+        2,
+        2,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention_conv.kernel_projection.weight",
+      "shape": [
+        16,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention.q_proj.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention.k_proj.weight",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention.v_proj.weight",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.attention.o_proj.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.post_attention_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.mlp_conv.base_kernel",
+      "shape": [
+        2,
+        2,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.mlp_conv.kernel_projection.weight",
+      "shape": [
+        16,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.mlp.gate_proj.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.mlp.up_proj.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.0.mlp.down_proj.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.input_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention_conv.base_kernel",
+      "shape": [
+        2,
+        2,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention_conv.kernel_projection.weight",
+      "shape": [
+        16,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention.q_proj.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention.k_proj.weight",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention.v_proj.weight",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.attention.o_proj.weight",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.post_attention_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.mlp_conv.base_kernel",
+      "shape": [
+        2,
+        2,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.mlp_conv.kernel_projection.weight",
+      "shape": [
+        16,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.mlp.gate_proj.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.mlp.up_proj.weight",
+      "shape": [
+        128,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.layers.1.mlp.down_proj.weight",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.final_norm.weight",
+      "shape": [
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.output_proj.weight",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.selector.hidden_proj.weight",
+      "shape": [
+        8,
+        32
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.selector.pred_codebook.weight",
+      "shape": [
+        512,
+        8
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "name": "dloop.selector.succ_codebook.weight",
+      "shape": [
+        512,
+        8
+      ],
+      "dtype": "BF16"
+    }
+  ],
+  "tree_defaults": {
+    "variant": "fixed",
+    "budget": 15,
+    "width": 12,
+    "candidates": 64,
+    "depth_bonus": -0.2
+  }
+}

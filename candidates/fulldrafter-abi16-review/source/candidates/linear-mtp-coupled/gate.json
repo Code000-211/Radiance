@@ -1,0 +1,15 @@
+{
+  "description": "Experimental linear MTP2 with GPU top-eight proposal sampling and maximal coupling against the final filtered target candidates. Model arithmetic and weight formats are unchanged. Coupled rows normalize in FP64 and use 53-bit independent proposal/acceptance/residual streams, rather than the ordinary FP32/24-bit picker; fixed-seed tokens are not preserved. Numerical cancellation samples the FP64 target directly. RADIANCE_NO_DRAFT must be unset. This configuration is not a gate PASS or a performance claim.",
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_MTP_COUPLED": "1",
+    "RADIANCE_DARTREE": "0",
+    "RADIANCE_SPECHUB": "0",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1"
+  },
+  "engine_args": ["--num-speculative-tokens", "2"]
+}

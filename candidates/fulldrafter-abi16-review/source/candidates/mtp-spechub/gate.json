@@ -1,0 +1,16 @@
+{
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_SPECHUB": "1",
+    "RADIANCE_SPECHUB_VERIFY": "transport",
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_MTP_TREE_ROUNDS": "3",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1"
+  },
+  "engine_args": ["--num-speculative-tokens", "2"]
+}

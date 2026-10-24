@@ -1,0 +1,17 @@
+{
+  "description": "Experimental TP2 fixed DarTree with eight GPU MTP rounds and up to 64 proposals plus root. Exact Bole GDN replay preserves FP32/BF16/INT8 intermediates. Private ancestor-aware target attention uses FP32 QK, softmax, PV and split partials with BF16 output; attention order changes without reducing intermediate precision. This configuration is not a gate PASS or a performance claim.",
+  "numerics": "reordered",
+  "engine_env": {
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "RADIANCE_KERNELS": "mine",
+    "RADIANCE_GDN_BOLE_EXACT": "1",
+    "RADIANCE_DARTREE": "1",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_MTP_TREE_ROUNDS": "8",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1",
+    "RADIANCE_SPECHUB": "0"
+  },
+  "engine_args": ["--num-speculative-tokens", "64"]
+}
