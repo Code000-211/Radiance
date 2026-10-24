@@ -206,21 +206,26 @@ std::string decode_prompt(int stream);
 /* ------------------------------------------------------------------ report */
 
 /* The environment the workload ran under: the NAMES of the variables in `env` (environ-shaped,
- * null-terminated) that an allowlist of prefixes names, sorted. Names only, never values: a value
- * may be a path, a host name or a token, and the report is pasted into issues and committed beside
- * a baseline (diag/diag.h's env_names states the same rule for the startup report). */
+ * null-terminated) that are on a fixed list of the engine's configuration knobs, sorted. Names
+ * only, never values: a value may be a path, a host name or a token, and the report is pasted into
+ * issues and committed beside a baseline (diag/diag.h's env_names states the same rule for the
+ * startup report).
+ *
+ * A fixed list, not a prefix: a prefix admits every suffix, so `RADIANCE_API_KEY_<anything>` is a
+ * name the report would print. A name the engine does not read as configuration is not reported. */
 std::vector<std::string> env_allowlist(char* const* env);
 
-/* The environment the workload ran under: the NAMES of the variables in `env` (environ-shaped,
- * null-terminated) that an allowlist of prefixes names, sorted. Names only, never values: a value
- * may be a path, a host name or a token, and the report is pasted into issues and committed beside
- * a baseline (diag/diag.h's env_names states the same rule for the startup report). */
-std::vector<std::string> env_allowlist(char* const* env);
+/* The engine section of a report, built from the engine's /server_info object: the model's
+ * architecture, quantisation and shapes, and the cards it ran on. The object itself is not copied,
+ * because its `container` is the model's path and its control vector carries a file, and the report
+ * is pasted into issues: a path names a person's home directory and nothing a reader needs. */
+json engine_report(const json& server_info);
 
 /* The Markdown view of a report: one table each for the categories, the concurrency sweep, the
  * prefill sweep and the interference point, from their `summary` sections plus the driver's
  * header. It reads only the JSON, so it can be regenerated from a saved diagnose.json; the
- * per-run detail stays in the JSON. */
+ * per-run detail stays in the JSON. It carries no path either: the header names the model by its
+ * architecture and quantisation (engine_report), never by where it is stored. */
 std::string render_markdown(const json& report);
 
 }  /* namespace diag */

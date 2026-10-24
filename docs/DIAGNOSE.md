@@ -36,7 +36,7 @@ statistic over an empty set is `null` in the JSON and `–` in the Markdown, wit
 | the first time a shape runs (tape recording, code objects, pool growth) | each point runs once unmeasured first, in the same shape |
 | `ignore_eos` generating past EOS, where a drafter hits differently | categories stop at the model's EOS; only the concurrency and prefill sweeps use `ignore_eos`, so every stream decodes for the whole run |
 | a client-side temperature that a deployment never serves | decode runs at temperature 1 — draft acceptance is tuned on it — with the server's top_k/top_p/min_p and a fixed seed per request. Parity does not need greedy: identical logits sample identical tokens at any temperature |
-| the environment | the report lists the `RADIANCE_*`, `R4D_*`, `RAD_*`, `AVX_*`, `OMP_*`, `HIP_*`, `HSA_*` and `ROCR_*` variables **by name only** — a value may be a path or a token, and the report is pasted into issues |
+| the environment | the report lists the engine's configuration knobs **by name only**, from a fixed list (`RADIANCE_HOME`, `RADIANCE_KERNELS`, `OMP_NUM_THREADS`, …) — a value may be a path or a token, and a name that is only a prefix plus a secret suffix is not on the list. The report is pasted into issues, so it carries no path either: the model is named by its architecture and quantisation, and the corpus and baseline are named as such |
 
 The mode warns, in the report, about the settings that make its numbers those of a different
 engine: `--profile-ops` (recorded passes off, barriers added), `--no-prefix-cache` (no lookups or

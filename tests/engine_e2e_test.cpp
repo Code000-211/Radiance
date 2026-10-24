@@ -669,12 +669,20 @@ TEST(qwen35_preemption_by_recompute_changes_no_logit) {
  * declares. Its arithmetic is tests/diagnose_test.cpp's; this is that the driver runs at all, that
  * every prompt was salted and the cache emptied (no request reports a cached token), and that a
  * second run on the same build reproduces every request's tokens, which is what --diagnose-baseline
- * compares. The numbers themselves are a card's measurement, not this test's. */
+ * compares. The numbers themselves are a card's measurement, not this test's.
+ *
+ * The model, the corpus and the baseline all live under a directory named after a marker: the
+ * report is pasted into issues, so no path of the machine may reach it, and a variable whose name
+ * is an allowed prefix plus a secret suffix must not be reported at all. */
 TEST(the_diagnose_mode_measures_itself_and_reproduces_its_tokens) {
     World& w = world();
     tiny::TempDir d("diagnose");
     REQUIRE(d.ok());
-    const std::string corpus = d / "corpus.jsonl";
+    const std::string private_dir = d / "MARKER-private-home";
+    REQUIRE_EQ(mkdir(private_dir.c_str(), 0755), 0);
+    const std::string model = private_dir + "/model.rad";
+    REQUIRE_EQ(symlink(w.llama_rad.c_str(), model.c_str()), 0);
+    const std::string corpus = private_dir + "/corpus.jsonl";
     std::string body;
     for (int i = 0; i < 3; ++i) {
         tiny::Rng r(40 + i);
@@ -689,7 +697,7 @@ TEST(the_diagnose_mode_measures_itself_and_reproduces_its_tokens) {
         "--max-model-len", "1024", "--max-num-seqs", "2", "--max-num-batched-tokens", "256" };
     std::vector<std::string> a = { "--diagnose", d / "first" };
     a.insert(a.end(), shared.begin(), shared.end());
-    const Ran r = radiance(w.llama_rad, a, {}, 600);
+    const Ran r = radiance(model, a, { "RADIANCE_API_KEY_SYNTHETIC_SECRET_IN_NAME=x" }, 600);
     REQUIRE_RAN(r);
 
     std::string text;
@@ -737,16 +745,28 @@ TEST(the_diagnose_mode_measures_itself_and_reproduces_its_tokens) {
     /* Names, not values: the report is pasted into issues. */
     for (const json& n : rep["environment"]["variables"])
         CHECK(n.get<std::string>().find('=') == std::string::npos);
+    /* No path and no secret-suffixed name in either artifact of either run. */
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(text.find(marker) == std::string::npos);
+        CHECK(tiny::read_text(d.path + "/first/diagnose.md").find(marker) == std::string::npos);
+    }
 
     /* The same build, the same workload: identical tokens, which is what the baseline compares. */
-    std::vector<std::string> b = { "--diagnose", d / "second",
-                                   "--diagnose-baseline", d.path + "/first/diagnose.json" };
+    const std::string baseline = private_dir + "/baseline.json";
+    REQUIRE(tiny::write_text(baseline, text));
+    std::vector<std::string> b = { "--diagnose", d / "second", "--diagnose-baseline", baseline };
     b.insert(b.end(), shared.begin(), shared.end());
-    const Ran r2 = radiance(w.llama_rad, b, {}, 600);
+    const Ran r2 = radiance(model, b, {}, 600);
     REQUIRE_RAN(r2);
+    const std::string json2 = tiny::read_text(d.path + "/second/diagnose.json");
     const std::string md = tiny::read_text(d.path + "/second/diagnose.md");
     CHECK(md.find("# Diagnosis") == 0);
     CHECK(md.find("**Verdict: valid**") != std::string::npos);
+    CHECK(md.find("## Parity") != std::string::npos);
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(json2.find(marker) == std::string::npos);
+        CHECK(md.find(marker) == std::string::npos);
+    }
 }
 
 TEST(a_kl_document_longer_than_the_kv_pool_is_refused_up_front) {

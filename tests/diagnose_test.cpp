@@ -105,6 +105,41 @@ TEST(no_samples_is_null_not_zero) {
     CHECK(j["mean"].is_null());
 }
 
+/* THE 1% LOW USES THE QUANTILES' RANK. floor(0.01*n) lands on the second slowest sample at exactly
+ * 100 intervals and on the third at 200 -- every exact hundred flatters the slow edge. Nearest
+ * rank (ceil(p*n)-1) takes the slowest measured interval for 100 and the second for 200.
+ *
+ * phase_report drops the first step (there is no interval before it), so k intervals take k+1
+ * steps. `rate(i)` carries one token over 1e9/rate ns, so the rates are 2, 3, 4, ... in the order
+ * the steps ran and 2 is the slowest. */
+TEST(the_one_percent_low_uses_the_quantiles_rank) {
+    struct Case { int intervals; double low; };
+    const Case cases[] = { { 100, 2.0 }, { 200, 3.0 } };
+    for (const Case& c : cases) {
+        PhaseInput in;
+        in.name = "rates";
+        in.kind = PhaseKind::Decode;
+        int64_t prev = 0;
+        for (int i = 1; i <= c.intervals + 1; ++i) {
+            prev += 1'000'000'000 / i;
+            in.steps.push_back(step(i, RAD_PHASE_DECODE, 1, 0, 1, 1.0, prev));
+        }
+        const json run = phase_report(in);
+        CHECK_EQ(run["steps"]["emission_interval_ms"]["n"].get<int64_t>(), (int64_t)c.intervals);
+        CHECK(near(run["steps"]["tok_s_1pct_low"].get<double>(), c.low));
+
+        /* And out of the report's own table: one point, one run, so the cell is that value. */
+        json rep;
+        rep["categories"] = json::array({ { { "category", "rates" },
+                                            { "requests", c.intervals },
+                                            { "stopped_on_eos", 0 },
+                                            { "summary", summarize_runs({ run }) } } });
+        const std::string celltext = "| " + std::to_string((int)c.low) + " | 0 of " +
+                                     std::to_string(c.intervals) + " |";
+        CHECK(render_markdown(rep).find(celltext) != std::string::npos);
+    }
+}
+
 /* ------------------------------------------------------------------ slow steps */
 
 TEST(slow_steps_names_the_slowest_beside_the_median) {
@@ -733,7 +768,7 @@ TEST(markdown_renders_the_sweeps_from_json_alone) {
     const json run2 = phase_report(in2);
 
     json rep;
-    rep["engine"] = { { "container", "m.rad" }, { "arch", "test" }, { "tp", 2 }, { "backend", "host" },
+    rep["engine"] = { { "arch", "test" }, { "quant", "fp8" }, { "tp", 2 }, { "backend", "host" },
                       { "plan", "dynamic placement" } };
     rep["workload"] = { { "description", "fixed" } };
     rep["verdict"] = "valid";
@@ -749,7 +784,7 @@ TEST(markdown_renders_the_sweeps_from_json_alone) {
 
     const std::string md = render_markdown(rep);
     CHECK(md.find("# Diagnosis") == 0);
-    CHECK(md.find("`m.rad`") != std::string::npos);
+    CHECK(md.find("Model `test` (fp8)") != std::string::npos);
     CHECK(md.find("TP 2") != std::string::npos);
     CHECK(md.find("**Verdict: valid**") != std::string::npos);
     CHECK(md.find("- a warning") != std::string::npos);
@@ -767,35 +802,61 @@ TEST(markdown_renders_the_sweeps_from_json_alone) {
     CHECK(render_markdown(json::parse(rep.dump())) == md);
 }
 
-/* The report's environment section: the knobs by name, from an allowlist, and never a value --
+/* The report's environment section: the knobs by name, from a fixed list, and never a value --
  * the report is pasted into issues and committed beside a baseline. */
-TEST(environment_is_a_name_allowlist) {
-    char tp[]      = "RADIANCE_TP=2";
-    char strict[]  = "RAD_TEST_STRICT=1";
-    char omp[]     = "OMP_NUM_THREADS=4";
-    char other[]   = "OMP_WAIT_POLICY=passive";
-    char key[]     = "MY_API_KEY=sk-very-secret-value";
-    char home[]    = "HOME=/root";
-    char radfake[] = "RADIATOR=not a prefix of RAD_ with a name";
-    char* env[] = { tp, strict, omp, other, key, home, radfake, nullptr };
+TEST(environment_is_a_fixed_name_list) {
+    char tp[]         = "RADIANCE_TP=2";
+    char omp[]        = "OMP_NUM_THREADS=4";
+    char wait[]       = "OMP_WAIT_POLICY=passive";
+    char suffix[]     = "RADIANCE_API_KEY_SYNTHETIC_SECRET_IN_NAME=x";
+    char key[]        = "MY_API_KEY=sk-very-secret-value";
+    char home[]       = "HOME=/root";
+    char radfake[]    = "RADIATOR=not a prefix of RAD_ with a name";
+    char vram[]       = "RADIANCE_HOST_VRAM_MIB=512";
+    char* env[] = { tp, omp, wait, suffix, key, home, radfake, vram, nullptr };
 
     const std::vector<std::string> v = diag::env_allowlist(env);
     CHECK_EQ(v.size(), (size_t)4);
     CHECK(std::find(v.begin(), v.end(), "RADIANCE_TP") != v.end());
-    CHECK(std::find(v.begin(), v.end(), "RAD_TEST_STRICT") != v.end());
     CHECK(std::find(v.begin(), v.end(), "OMP_NUM_THREADS") != v.end());
     CHECK(std::find(v.begin(), v.end(), "OMP_WAIT_POLICY") != v.end());
+    CHECK(std::find(v.begin(), v.end(), "RADIANCE_HOST_VRAM_MIB") != v.end());
+    /* A suffix on an allowed name is not an allowed name: a prefix list would print this one. */
     for (const std::string& n : v) {
         CHECK(n.find('=') == std::string::npos);            /* names, never values */
-        CHECK(n.find("sk-") == std::string::npos);
+        CHECK(n.find("SECRET") == std::string::npos);
         CHECK(n.find("API_KEY") == std::string::npos);
-        CHECK(n.rfind("RADIANCE_", 0) == 0 || n.rfind("RAD_", 0) == 0 ||
-              n.rfind("OMP_", 0) == 0);                      /* nothing outside the allowlist */
+        CHECK(n.find("RADIATOR") == std::string::npos);
     }
     CHECK(std::is_sorted(v.begin(), v.end()));
     /* An empty environment is an empty section, not a fabricated one. */
     char* none[] = { nullptr };
     CHECK(diag::env_allowlist(none).empty());
+}
+
+/* The engine section names the model and the cards, never where they live: /server_info carries the
+ * model's path in `container` and the control vector's file. Neither reaches the report. */
+TEST(the_engine_section_carries_no_path) {
+    const json info = { { "arch", "llama" },
+                        { "quant", "fp8" },
+                        { "n_layers", 32 },
+                        { "n_embd", 4096 },
+                        { "n_vocab", 128256 },
+                        { "n_ctx_train", 8192 },
+                        { "container", "/home/alice/MARKER-private/llama.rad" },
+                        { "control_vector", { { "file", "/home/alice/MARKER-private/cvec.bin" } } },
+                        { "devices", json::array({ json{ { "rank", 0 }, { "name", "card" } } }) } };
+    const json e = engine_report(info);
+    CHECK_EQ(e["arch"].get<std::string>(), std::string("llama"));
+    CHECK_EQ(e["quant"].get<std::string>(), std::string("fp8"));
+    CHECK_EQ(e["n_layers"].get<int64_t>(), (int64_t)32);
+    CHECK_EQ(e["devices"].size(), (size_t)1);
+    CHECK(!e.contains("container"));
+    CHECK(!e.contains("control_vector"));
+    CHECK(e.dump().find("MARKER") == std::string::npos);
+    /* Not an object (a failed engine_info parse) is an empty section, not a crash. */
+    CHECK(engine_report(json::object()).empty());
+    CHECK(engine_report(json()).empty());
 }
 
 RAD_TEST_MAIN()

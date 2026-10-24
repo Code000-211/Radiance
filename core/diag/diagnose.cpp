@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 
 namespace rad {
@@ -36,17 +37,19 @@ uint64_t StepRing::copy_since(uint64_t from, std::vector<StepRecord>* out) const
 
 /* ================================================================== statistics */
 
+/* Nearest rank: the smallest sample with at least p of the samples at or below it. No
+ * interpolation, so every reported value is one that was measured. */
+static size_t nearest_rank(size_t n, double p) {
+    const size_t k = (size_t)std::ceil(p * (double)n);
+    return k == 0 ? 0 : std::min(k - 1, n - 1);
+}
+
 Quantiles quantiles(std::vector<double> v) {
     Quantiles q;
     q.n = (int64_t)v.size();
     if (v.empty()) return q;
     std::sort(v.begin(), v.end());
-    /* Nearest rank: the smallest sample with at least p of the samples at or below it. No
-     * interpolation, so every reported value is one that was measured. */
-    auto at = [&](double p) {
-        size_t k = (size_t)std::ceil(p * (double)v.size());
-        return v[k == 0 ? 0 : std::min(k - 1, v.size() - 1)];
-    };
+    auto at = [&](double p) { return v[nearest_rank(v.size(), p)]; };
     q.min = v.front();
     q.max = v.back();
     q.p50 = at(0.50);
@@ -356,14 +359,13 @@ json phase_report(const PhaseInput& in) {
     }
     /* THE 1% LOW TOKEN RATE: committed tokens over the emission interval, the slowest 1% of
      * emissions. With speculation a burst carries several tokens, so this is a rate per burst,
-     * not one token's latency. */
+     * not one token's latency. Nearest rank, as quantiles(): floor(p*n) would take the second
+     * slowest sample at exactly 100 intervals and flatter the slow edge. */
     {
-        Quantiles r = quantiles(rate);
         json low;
-        if (r.n) {
+        if (!rate.empty()) {
             std::sort(rate.begin(), rate.end());
-            const size_t k = (size_t)std::floor(0.01 * (double)rate.size());
-            low = round3(rate[std::min(k, rate.size() - 1)]);
+            low = round3(rate[nearest_rank(rate.size(), 0.01)]);
         }
         st["tok_s_1pct_low"] = low;
     }
@@ -809,14 +811,49 @@ std::string cell(const json& summary, const char* key) {
 }  /* namespace */
 
 std::vector<std::string> env_allowlist(char* const* env) {
-    /* Prefixes, so a knob added to any of these families is reported without this file changing;
-     * nothing outside them is, and no value is ever read. */
-    static const char* const kPrefixes[] = { "RADIANCE_", "R4D_", "RAD_", "AVX_",
-                                             "OMP_", "HIP_", "HSA_", "ROCR_" };
+    /* A fixed list of the engine's configuration knobs, not a prefix: a prefix takes every suffix
+     * with it, so `RADIANCE_API_KEY_<anything>` would be reported by name. Nothing outside the
+     * list is, and no value is ever read. */
+    static const char* const kNames[] = {
+        "HIP_VISIBLE_DEVICES",    "OMP_NUM_THREADS",       "OMP_WAIT_POLICY",
+        "RADIANCE_CALIB_DIR",     "RADIANCE_CALIB_TOKENS", "RADIANCE_DRAFT_BLOCK_HOST",
+        "RADIANCE_HEAT_RESIDENCY", "RADIANCE_HOME",        "RADIANCE_HOST_DEVICES",
+        "RADIANCE_HOST_VRAM_MIB", "RADIANCE_KERNELS",      "RADIANCE_LOG",
+        "RADIANCE_LOG_STEPS",     "RADIANCE_MTP_COUPLED",  "RADIANCE_PROFILE_EVERY",
+        "RADIANCE_TP",            "RADIANCE_TUNE",         "ROCR_VISIBLE_DEVICES",
+    };
     std::vector<std::string> out;
-    for (const char* p : kPrefixes)
-        for (std::string& n : env_names(env, p)) out.push_back(std::move(n));
+    for (char* const* e = env; e && *e; ++e) {
+        const char* eq = std::strchr(*e, '=');
+        const size_t n = eq ? (size_t)(eq - *e) : std::strlen(*e);
+        for (const char* name : kNames)
+            if (std::strlen(name) == n && std::strncmp(*e, name, n) == 0) {
+                out.emplace_back(*e, n);
+                break;
+            }
+    }
     std::sort(out.begin(), out.end());
+    return out;
+}
+
+json engine_report(const json& server_info) {
+    /* Only the model's identity and the cards: /server_info's `container` is the model's path and
+     * its control vector carries a file, and neither belongs in a report pasted into an issue. The
+     * card's own handle is left out too: it names a resource in this process, not a card. */
+    json out = json::object();
+    if (!server_info.is_object()) return out;
+    for (const char* k : { "arch", "quant", "n_layers", "n_embd", "n_vocab", "n_ctx_train" })
+        if (server_info.contains(k)) out[k] = server_info[k];
+    if (server_info.contains("devices") && server_info["devices"].is_array()) {
+        json kept = json::array();
+        for (const json& d : server_info["devices"]) {
+            json k = json::object();
+            for (const char* f : { "rank", "name", "arch", "vram_bytes" })
+                if (d.is_object() && d.contains(f)) k[f] = d[f];
+            kept.push_back(std::move(k));
+        }
+        out["devices"] = std::move(kept);
+    }
     return out;
 }
 
@@ -824,8 +861,9 @@ std::string render_markdown(const json& rep) {
     std::string m = "# Diagnosis\n\n";
     if (rep.contains("engine")) {
         const json& e = rep["engine"];
-        m += "Model `" + e.value("container", std::string()) + "`, architecture `" + e.value("arch", std::string()) +
-             "`, TP " + num(e.value("tp", json())) + ", backend `" + e.value("backend", std::string()) +
+        m += "Model `" + e.value("arch", std::string("?")) + "` (" +
+             e.value("quant", std::string("quantisation not stated")) + "), TP " +
+             num(e.value("tp", json())) + ", backend `" + e.value("backend", std::string()) +
              "`, " + e.value("plan", std::string("plan not stated")) + ".\n\n";
     }
     if (rep.contains("workload")) m += "Workload: " + rep["workload"].value("description", std::string()) + "\n\n";

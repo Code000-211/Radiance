@@ -520,18 +520,24 @@ int Engine::run_diagnose() {
 
     /* ---- the report ---- */
     json rep;
-    json eng = json::parse(engine_info(), nullptr, /*allow_exceptions=*/false);
-    if (eng.is_discarded()) eng = json::object();
-    eng["tp"] = cfg_.tp;
-    eng["backend"] = device_is_host() ? "host" : "device";
-    eng["plan"] = cfg_.deterministic ? "deterministic (static placement)" : "dynamic placement";
-    eng["max_num_seqs"] = cfg_.max_seqs;
-    eng["context"] = ctx_limit;
-    rep["engine"] = eng;
+    {
+        /* The engine's /server_info is not spliced in: its container is the model's path and its
+         * control vector carries a file (diag::engine_report says what is kept). */
+        const json info = json::parse(engine_info(), nullptr, /*allow_exceptions=*/false);
+        json eng = info.is_object() ? diag::engine_report(info) : json::object();
+        eng["tp"] = cfg_.tp;
+        eng["backend"] = device_is_host() ? "host" : "device";
+        eng["plan"] = cfg_.deterministic ? "deterministic (static placement)" : "dynamic placement";
+        eng["max_num_seqs"] = cfg_.max_seqs;
+        eng["context"] = ctx_limit;
+        rep["engine"] = eng;
+    }
     json w;
     w["description"] = std::string(use_chat ? "chat-templated" : "raw-text") + " prompts, each salted at its head; " +
                        std::to_string(runs) + " measured run(s) a point after one unmeasured; categories from " +
-                       (cfg_.diagnose_corpus.empty() ? std::string("the built-in corpus") : cfg_.diagnose_corpus) +
+                       (cfg_.diagnose_corpus.empty() ? std::string("the built-in corpus")
+                                                     : std::string("the external corpus (its contents are in "
+                                                                   "workload.fingerprint)")) +
                        " up to " + std::to_string(dec_tokens) + " tokens, ending on EOS; concurrency streams " +
                        std::to_string(dec_tokens) + " tokens with ignore_eos; prefill then " +
                        std::to_string(depth_tokens) + " tokens of decode; temperature 1 with the server's "
@@ -582,9 +588,9 @@ int Engine::run_diagnose() {
         std::string why;
         json cmp;
         if (!f.is_open() || base.is_discarded()) {
-            why = "cannot read " + cfg_.diagnose_baseline + " as JSON";
+            why = "the baseline file is not readable JSON";
         } else if (diag::compare_outputs(rep, base, &cmp, &why) == RAD_OK) {
-            cmp["baseline"] = cfg_.diagnose_baseline;
+            cmp["baseline"] = "an earlier report";
             rep["parity"] = cmp;
             parity_ok = cmp["verdict"] == "identical" && cmp["acceptance_verdict"] == "no drop";
             RAD_INFO("diagnose: parity %s, %lld of %lld requests identical; draft acceptance: %s",
@@ -592,7 +598,8 @@ int Engine::run_diagnose() {
                      (long long)cmp["compared"].get<int64_t>(), cmp["acceptance_verdict"].get<std::string>().c_str());
         }
         if (!why.empty()) {
-            rep["parity"] = { { "baseline", cfg_.diagnose_baseline }, { "verdict", "not compared: " + why } };
+            rep["parity"] = { { "baseline", "an earlier report" },
+                              { "verdict", "not compared: " + why } };
             parity_ok = false;
             RAD_ERR("diagnose: %s", why.c_str());
         }
