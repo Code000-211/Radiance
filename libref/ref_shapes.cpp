@@ -1570,6 +1570,7 @@ int ref_qsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t((uint32_t)RAD_I32, { M, topk + 1 });                      /* sel */
     o.t((uint32_t)RAD_I32, { M });                                /* nsel */
     o.t((uint32_t)RAD_I32, { M });                                /* seqused */
+    o.t((uint32_t)RAD_I32, { M, topk + 1 });                      /* selb -- block indices */
     return o.finish("qsa_select", operand, out);
 }
 

@@ -1287,6 +1287,11 @@ static const RadOperandSpec oQsaSelect[] = {
      * per-sequence length as ordinary operands, so the sparse attention is the same op issued with
      * `sel` and this. Emitted here because it is one store of a value this kernel has. */
     { "seqused", RAD_OPD_OUT, 0 },
+    /* The same entries as block indices, in the same order. A page id does not sort by block -- a
+     * dead block drops out of the table and the prefix cache re-orders the rest -- so a table
+     * shared by a tile of query rows, the rows' union in block order, is built from this. Additive:
+     * `sel` is unchanged and a caller may leave it out. */
+    { "selb",    RAD_OPD_OUT, 0 },
 };
 
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
@@ -3241,7 +3246,10 @@ static const RadOpSchema kSchemas[] = {
            "candidate: last is what makes the attention's own causal bound mask inside it and "
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
            "break to the LOWER block index through a prefix count, never through atomic order. "
-           "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0)."),
+           "The table is in BLOCK ORDER (the partial page last), which is the order the attention "
+           "sums in. `selb` repeats the entries as block indices: `sel` holds page ids and a page "
+           "id does not sort by block, so a table shared by a query tile needs both. `signed` 1 "
+           "ranks signed finite scores; absent or 0 ranks max(score, 0)."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "
@@ -7589,7 +7597,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "the topk highest-scoring blocks as a page-id table, with the partial page appended last",
   "any M, any block count, any topk; a decode-shaped launch splits the block list across the "
   "device and merges, and falls back to one workgroup a query when the scratch is absent",
-  "f32 scores and an i32 page table in; an i32 [M, topk+1] table and a live count out",
+  "f32 scores and an i32 page table in; an i32 [M, topk+1] table, the same entries' block "
+  "indices and a live count out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,

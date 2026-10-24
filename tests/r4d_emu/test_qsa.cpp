@@ -14,11 +14,18 @@
  * inside the kernels is predicted from their constants, restated in `Path`; the run fails when the
  * fixtures stop reaching one of them. `sweep N` runs N seeded fixtures at serving sizes instead.
  *
+ * One case is not a kernel against the port: `shared_table_case` feeds the kernel's own `selb` and
+ * `nsel` for a tile of query rows to plugin/qsatable's `qsa_table` and checks that the union in block
+ * order, filtered by a row's mask and followed by that row's partial page, is that row's own table
+ * byte for byte (docs/QSA.md, "Table order"). The op's host reference is run on the same operands and
+ * compared, so the case holds the kernel to the definition of the op too.
+ *
  * Fixtures marked signed run with the op's `signed` parameter: the kernels' signed key order,
  * against the port's signed ranking, over negative, mixed and the sweep's odd scores. The unsigned
  * fixtures are the same as without the parameter. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "qsatable.h"
 #include "r4d_plugin.h"
 
 #include <algorithm>
@@ -72,9 +79,11 @@ struct Fix {
 
 /* ---- libref's ref_qsa_select (libref/ref_qsa.cpp), restated over the fixture's arrays: the same
  * steps in the same order, both rankings. */
-void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns, std::vector<int32_t>& su) {
+void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns,
+                std::vector<int32_t>& su, std::vector<int32_t>& sb) {
     const int64_t topk = f.topk, ratio = f.ratio;
     se.assign((size_t)f.M * (topk + 1), 0); ns.assign((size_t)f.M, 0); su.assign((size_t)f.M, 0);
+    sb.assign((size_t)f.M * (topk + 1), 0);
     for (int64_t m = 0; m < f.M; ++m) {
         const int64_t s = f.seq_of((int)m), p = f.pos[m];
         const int64_t n = std::min(std::min<int64_t>(f.nc[s], f.nb()), (p + 1) / ratio);
@@ -95,19 +104,24 @@ void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns
             for (int64_t b : live) ord.push_back(val[(size_t)b]);
             std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
             const float thr = ord[(size_t)(topk - 1)];
-            for (int64_t b : live)
+            /* The selection in block order, above the threshold and the ties alike: the ties are
+             * the ones the top-k leaves slots for. */
+            int64_t above = 0;
+            for (int64_t b : live) above += val[(size_t)b] > thr;
+            for (int64_t need = topk - above; int64_t b : live) {
                 if (val[(size_t)b] > thr) take.push_back(b);
-            for (int64_t b : live)
-                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+                else if (need > 0 && val[(size_t)b] == thr) { take.push_back(b); --need; }
+            }
         }
         int32_t* row = &se[(size_t)(m * (topk + 1))];
+        int32_t* brow = &sb[(size_t)(m * (topk + 1))];
         int64_t out = 0;
-        for (int64_t b : take) row[out++] = f.bt[(size_t)(s * f.t_ld + b)];
+        for (int64_t b : take) { row[out] = f.bt[(size_t)(s * f.t_ld + b)]; brow[out++] = (int32_t)b; }
         if (n < f.nb() && (p + 1) % ratio != 0) {
             const int32_t part = f.bt[(size_t)(s * f.t_ld + n)];
-            if (part >= 0) row[out++] = part;
+            if (part >= 0) { row[out] = part; brow[out++] = (int32_t)n; }
         }
-        for (int64_t i = out; i <= topk; ++i) row[i] = -1;
+        for (int64_t i = out; i <= topk; ++i) { row[i] = -1; brow[i] = -1; }
         ns[(size_t)m] = (int32_t)out;
         su[(size_t)m] = (int32_t)(out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
     }
@@ -237,22 +251,30 @@ RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape, int64_t ld = 0)
     return t;
 }
 
+/* What a launch wrote, when the caller wants it (the shared-table case keeps the kernel's own
+ * table, not the port's). */
+struct SelOut {
+    std::vector<int32_t> se, ns, su, sb;   /* sb: the same entries as block indices */
+};
+
 /* One launch of `form` against the port. Returns the failures (0 or 1). */
-int run(Fix& f, Form form) {
-    std::vector<int32_t> want, want_n, want_su;
-    ref_select(f, want, want_n, want_su);
+int run(Fix& f, Form form, SelOut* out = nullptr) {
+    std::vector<int32_t> want, want_n, want_su, want_sb;
+    ref_select(f, want, want_n, want_su, want_sb);
     const int M = f.M, W = f.topk + 1;
     std::vector<int32_t> se((size_t)(M + 1) * f.o_ld, kSentinel), ns((size_t)M + 1, kSentinel), su((size_t)M + 1, kSentinel);
-    RadTensor t[8] = {
+    std::vector<int32_t> sb((size_t)(M + 1) * f.o_ld, kSentinel);
+    RadTensor t[9] = {
         tens(f.sc.data(), RAD_F32, {M, f.nb_s}, f.s_ld), tens(f.bt.data(), RAD_I32, {f.S, f.nb_t}, f.t_ld),
         tens(f.nc.data(), RAD_I32, {f.S}),             tens(f.pos.data(), RAD_I32, {M}),
         tens(f.cu.data(), RAD_I32, {f.S + 1}),         tens(se.data(), RAD_I32, {M, W}, f.o_ld),
         tens(ns.data(), RAD_I32, {M}),                 tens(su.data(), RAD_I32, {M}),
+        tens(sb.data(), RAD_I32, {M, W}, f.o_ld),
     };
     RadParam p[6]{};
     p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()}; p[2] = {"topk", RAD_P_INT, f.topk};
     p[3] = {"ratio", RAD_P_INT, f.ratio}; p[4] = {"seqs", RAD_P_INT, f.S}; p[5] = {"signed", RAD_P_INT, 1};
-    RadArgs a{}; a.t = t; a.n_t = 8; a.p = p; a.n_p = f.sgn ? 6 : 5;
+    RadArgs a{}; a.t = t; a.n_t = 9; a.p = p; a.n_p = f.sgn ? 6 : 5;
     const int64_t need = r4d_rad_qsa_select_scratch(&a);
     std::vector<uint32_t> scratch((size_t)(need / 4 + 1), 0xA5A5A5A5u);
     if (form == kAuto) { a.scratch = scratch.data(); a.scratch_bytes = need; }
@@ -282,8 +304,13 @@ int run(Fix& f, Form form) {
             const int32_t w = m < M && i < W ? want[(size_t)m * W + i] : kSentinel;
             if (se[(size_t)m * f.o_ld + i] != w) { ++diff; if (first < 0) first = i; }
         }
+        int bdiff = 0, bfirst = -1;
+        for (int i = 0; i < f.o_ld; ++i) {
+            const int32_t w = m < M && i < W ? want_sb[(size_t)m * W + i] : kSentinel;
+            if (sb[(size_t)m * f.o_ld + i] != w) { ++bdiff; if (bfirst < 0) bfirst = i; }
+        }
         const int32_t wn = m < M ? want_n[(size_t)m] : kSentinel, wsu = m < M ? want_su[(size_t)m] : kSentinel;
-        if (!diff && ns[(size_t)m] == wn && su[(size_t)m] == wsu) continue;
+        if (!diff && !bdiff && ns[(size_t)m] == wn && su[(size_t)m] == wsu) continue;
         if (++bad_rows > 4) continue;
         std::printf("FAIL %-48s %-6s row %d (n %d): nsel %d want %d, seqused %d want %d", f.name.c_str(), fn, m,
                     m < M ? f.n_of(m) : -1, ns[(size_t)m], wn, su[(size_t)m], wsu);
@@ -291,7 +318,18 @@ int run(Fix& f, Form form) {
             const int32_t w = m < M && first < W ? want[(size_t)m * W + first] : kSentinel;
             std::printf(", %d slot(s) differ, first slot %d: %d want %d", diff, first, se[(size_t)m * f.o_ld + first], w);
         }
+        if (bdiff) {
+            const int32_t w = m < M && bfirst < W ? want_sb[(size_t)m * W + bfirst] : kSentinel;
+            std::printf(", %d block index(es) differ, first slot %d: %d want %d", bdiff, bfirst,
+                        sb[(size_t)m * f.o_ld + bfirst], w);
+        }
         std::printf("\n");
+    }
+    if (out) {
+        out->se.assign(se.begin(), se.begin() + (size_t)M * f.o_ld);
+        out->ns.assign(ns.begin(), ns.begin() + M);
+        out->su.assign(su.begin(), su.begin() + M);
+        out->sb.assign(sb.begin(), sb.begin() + (size_t)M * f.o_ld);
     }
     return bad_rows ? 1 : 0;
 }
@@ -451,6 +489,184 @@ Fix fix_few_live() {
     }
     f.cu[S] = S;
     return f;
+}
+
+/* ---- one block table per tile -------------------------------------------------------------------
+ *
+ * The lever this case guards: the sparse attention reads one block table per tile of query rows,
+ * a stable mixture of the rows' own selections, with membership as a per-row mask, instead of one
+ * table per row. The mixture is that tile's pages in block order, so every row's selection is a
+ * subsequence of it and is read back unchanged -- the case checks that on the kernel's own output
+ * rather than on the port, and reports how much the rows share.
+ *
+ * Two properties carry it. A row's list is in block order except for one run at the tail, the
+ * threshold bin's ties (the tie rule picks them, so they cannot sit in place): a row whose list is
+ * already in block order comes back byte for byte, and one that is not keeps its selection but is
+ * read in the table's order, which is a different sum (docs/QSA.md, "The emit is one run in block
+ * order"). And the partial page -- decided by the row's position -- stays out of the shared table
+ * and is appended per row, so a page the chunk itself is filling cannot leak into a row that may
+ * not see it. Both counts are reported; the tail run and the descents are also checked, since a
+ * layout change in the emit would silently make the merge inexact. */
+
+/* The score field a tile sees: one shared block field plus per-row noise, as the rows of a decode
+ * step or of one prefill chunk do. `sigma` is the noise's width in thousandths of the field's, so
+ * 0 is every row the same selection and larger values are rows that agree less; `grid` quantises
+ * the sum, so scores tie exactly and the tie rule decides. */
+Fix fix_shared_scores(const char* name, int M, int nb, int topk, int sigma, int grid, int seed) {
+    Fix f; f.name = name;
+    const int ratio = 4;
+    f.shape(1, M, nb, nb, topk, ratio);
+    f.cu = { 0, M }; f.nc = { nb };
+    for (int b = 0; b < nb; ++b) f.page(0, b) = b;             /* page id = block index */
+    f.page(0, nb) = -1;                                      /* nothing past the history */
+    g_x = 0x853C49E6748FEA9Bull + (uint64_t)seed * 0x9E3779B97F4A7C15ull;
+    std::vector<float> base((size_t)nb);
+    for (auto& v : base) v = (float)(rnd() % 1000003) / 1000003.0f;
+    for (int m = 0; m < M; ++m) {
+        /* One block short of the history's end, a row on and a row off the block boundary: every
+         * block live, the last one partly filled, so half the rows carry a partial page. */
+        f.pos[m] = 4 * (nb - 1) + 2 + m % 2;
+        for (int b = 0; b < nb; ++b) {
+            const float noise = (float)(rnd() % 1000003) / 1000003.0f - 0.5f;
+            float v = base[(size_t)b] + noise * (float)sigma / 1000.0f;
+            if (grid > 0) v = std::floor(v * (float)grid) / (float)grid;
+            f.score(m, b) = v;
+        }
+    }
+    return f;
+}
+
+/* A prefill tile: `rows` query rows of one chunk ending at the history's end, so the rows' visible
+ * counts differ by a block and three rows in four carry a partial page -- the page the chunk is
+ * filling, live in the table and belonging to one row only. */
+Fix fix_shared_prefill(int nb, int rows, int sigma, int seed) {
+    char name[96];
+    std::snprintf(name, sizeof name, "shared: prefill, %d rows, %dK", rows, (nb * 4) / 1024);
+    Fix f = fix_shared_scores(name, rows, nb, 512, sigma, 0, seed);
+    const int base = 4 * nb - rows;
+    for (int m = 0; m < rows; ++m) f.pos[m] = base + m;
+    return f;
+}
+
+/* The row's last table entry is its partial page, exactly when the port appends one: the query's
+ * count is short of the history and its position is off a block boundary, and the sequence's next
+ * block is live (mid-chunk it is; at the end of the history it is not). */
+bool row_has_partial(const Fix& f, int m) {
+    const int n = f.n_of(m);
+    return n < f.nb() && (f.pos[m] + 1) % f.ratio != 0 && f.bt[(size_t)(f.seq_of(m) * f.t_ld + n)] >= 0;
+}
+
+/* One table per tile, built by plugin/qsatable from the kernel's OWN `selb`/`nsel`, then read back
+ * row by row. This is the measurement's premise checked in the same build as the selection: the
+ * union of a tile's selections in block order, filtered by a row's membership mask and followed by
+ * that row's partial page, has to be that row's own table -- byte for byte, `seqused` included, and
+ * the row's selection is a subsequence of the union rather than a set the read path has to re-order.
+ *
+ * The rows are taken from `selb` (block indices), not from `sel`: a page id does not sort by block, a
+ * dead block drops out of the block table and the prefix cache re-orders the rest, so a union built
+ * from page ids would be the wrong order. The kernel fills the table; the op's host reference fills
+ * a second set of buffers from the same inputs and the two are compared, so this case holds the
+ * kernel to the definition of the op as well. */
+int shared_table_case() {
+    std::vector<Fix> fx = {
+        fix_shared_scores("shared: decode depth 3, 8K", 4, 2048, 512, 300, 0, 1),
+        fix_shared_scores("shared: decode depth 6, 8K", 8, 2048, 512, 300, 0, 2),
+        fix_shared_scores("shared: decode depth 3, 32K", 4, 8192, 512, 300, 0, 3),
+        fix_shared_scores("shared: decode depth 6, 32K", 8, 8192, 512, 300, 0, 4),
+        fix_shared_scores("shared: depth 6, 32K, rows that agree less", 8, 8192, 512, 900, 0, 5),
+        fix_shared_scores("shared: depth 6, 32K, a coarse grid of ties", 8, 8192, 512, 40, 64, 6),
+        fix_shared_prefill(2048, 16, 300, 7),
+        fix_shared_prefill(8192, 32, 300, 8),
+    };
+    int fails = 0;
+    for (Fix& f : fx) {
+        SelOut got;
+        if (run(f, kAuto, &got)) { std::printf("FAIL %-46s launch\n", f.name.c_str()); ++fails; continue; }
+        const int M = f.M, W = f.topk + 1;
+        const int64_t tile = std::min(M, 16);
+        const int64_t tiles = (M + tile - 1) / tile;
+        const int64_t u_max = rad_qsa_table_u_max(tile, f.topk, f.nb());
+        std::vector<int32_t> tab((size_t)(tiles * u_max), kSentinel), tlen((size_t)tiles, kSentinel);
+        std::vector<int32_t> mask((size_t)M * u_max, kSentinel), roff((size_t)M, kSentinel);
+        RadTensor t[7] = {
+            tens(got.sb.data(), RAD_I32, {M, W}, f.o_ld), tens(got.ns.data(), RAD_I32, {M}),
+            tens(f.pos.data(), RAD_I32, {M}),            tens(tab.data(), RAD_I32, {tiles, u_max}),
+            tens(tlen.data(), RAD_I32, {tiles}),         tens(mask.data(), RAD_I32, {M, u_max}),
+            tens(roff.data(), RAD_I32, {M}),
+        };
+        RadParam p[5]{};
+        p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()};
+        p[2] = {"topk", RAD_P_INT, f.topk}; p[3] = {"tile", RAD_P_INT, (int)tile};
+        p[4] = {"ratio", RAD_P_INT, f.ratio};
+        RadArgs a{}; a.t = t; a.n_t = 7; a.p = p; a.n_p = 5;
+        const int rc = rad_qsa_table_launch(&a, nullptr);
+        if (rc != RAD_OK) {
+            std::printf("FAIL %-46s qsa_table returned %d\n", f.name.c_str(), rc);
+            ++fails;
+            continue;
+        }
+        /* The same inputs through the op's host reference: the kernel above must agree byte for
+         * byte, which is what makes the union a definition and not one implementation's choice. */
+        std::vector<int32_t> rtab((size_t)(tiles * u_max), kSentinel), rtlen((size_t)tiles, kSentinel);
+        std::vector<int32_t> rmask((size_t)M * u_max, kSentinel), rroff((size_t)M, kSentinel);
+        RadTensor r[7] = {
+            tens(got.sb.data(), RAD_I32, {M, W}, f.o_ld), tens(got.ns.data(), RAD_I32, {M}),
+            tens(f.pos.data(), RAD_I32, {M}),            tens(rtab.data(), RAD_I32, {tiles, u_max}),
+            tens(rtlen.data(), RAD_I32, {tiles}),        tens(rmask.data(), RAD_I32, {M, u_max}),
+            tens(rroff.data(), RAD_I32, {M}),
+        };
+        RadArgs ra = a; ra.t = r;
+        const int rrc = rad_ref_qsa_table(&ra);
+        if (rrc != RAD_OK) {
+            std::printf("FAIL %-46s ref_qsa_table returned %d\n", f.name.c_str(), rrc);
+            ++fails;
+            continue;
+        }
+        if (rtab != tab || rtlen != tlen || rmask != mask || rroff != roff) {
+            std::printf("FAIL %-46s the kernel's table differs from the reference's\n", f.name.c_str());
+            ++fails;
+            continue;
+        }
+        int64_t total = 0, union_ = 0, off_rows = 0;
+        bool unordered = false;
+        int bad_rows = 0;
+        for (int64_t r = 0; r < tiles; ++r) {
+            total += 0;
+            if (tlen[(size_t)r] < 0 || tlen[(size_t)r] > u_max) { ++bad_rows; continue; }
+            union_ += tlen[(size_t)r];
+            for (int64_t j = 1; j < tlen[(size_t)r]; ++j)
+                if (tab[(size_t)(r * u_max + j)] <= tab[(size_t)(r * u_max + j - 1)]) unordered = true;
+        }
+        for (int m = 0; m < M; ++m) {
+            const int64_t t0 = m / tile;
+            if (roff[(size_t)m] != (int32_t)(t0 * u_max)) ++off_rows;
+            total += got.ns[(size_t)m];
+            std::vector<int32_t> rec;
+            for (int64_t j = 0; j < tlen[(size_t)t0]; ++j)
+                if (mask[(size_t)(m * u_max + j)])
+                    rec.push_back(f.bt[(size_t)(f.seq_of(m) * f.t_ld + tab[(size_t)(t0 * u_max + j)])]);
+            /* The partial page is position-decided, stays out of the table and is appended per row. */
+            if (row_has_partial(f, m)) rec.push_back(got.se[(size_t)(m * f.o_ld + got.ns[(size_t)m] - 1)]);
+            bool same = (int)rec.size() == got.ns[(size_t)m];
+            for (int k = 0; same && k < (int)rec.size(); ++k)
+                same = got.se[(size_t)(m * f.o_ld + k)] == rec[(size_t)k];
+            for (int k = (int)rec.size(); same && k <= f.topk; ++k)
+                same = got.se[(size_t)(m * f.o_ld + k)] == -1;
+            if (!same && ++bad_rows <= 3)
+                std::printf("FAIL %-46s row %d: the shared table does not recover this row\n",
+                            f.name.c_str(), m);
+        }
+        if (unordered) { std::printf("FAIL %-46s a table is not in block order\n", f.name.c_str()); ++fails; }
+        if (off_rows) { std::printf("FAIL %-46s %d row(s) with a wrong row_off\n", f.name.c_str(), off_rows); ++fails; }
+        const double factor = union_ ? (double)total / (double)union_ : 0.0;
+        std::printf("  %-46s %d rows x %lld pages -> %lld blocks in %lld tile(s) (%.1fx fewer), "
+                    "mask %lld B/row (a bitmask would be %lld), %d/%d rows recovered\n",
+                    f.name.c_str(), M, (long long)(total / M), (long long)union_, (long long)tiles,
+                    factor, (long long)(u_max * 4), (long long)((u_max + 7) / 8), M - bad_rows, M);
+        fails += bad_rows ? 1 : 0;
+    }
+    std::printf("shared table: %zu tiles, %d failure(s)\n", fx.size(), fails);
+    return fails;
 }
 
 /* A 70-row prefill chunk: wider than the key cache's gate, so the automatic choice is the wide
@@ -628,6 +844,7 @@ int main(int argc, char** argv) {
         Fix f = make();
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
     }
+    if (!sweep) fails += shared_table_case();
     if (sweep) {
         for (const auto& [p, c] : g_paths) std::printf("  %5d row(s): %s\n", c, p.c_str());
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

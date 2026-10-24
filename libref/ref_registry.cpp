@@ -433,7 +433,7 @@ static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD(
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
                                            P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
-                                             OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
+                                             OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused"), OUT("selb") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                               P_INT("seqs"), P_STR("dtype") };
 static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
@@ -1335,8 +1335,8 @@ static const RadOpSchema kSchemas[] = {
   "first min(nc, width) blocks; the relu is per (block, head) and the sum over heads, and a negative "
   "page id scores -inf. Columns past the bound are not written." },
 { "qsa_select", ARR(pQsaSelect), ARR(oQsaSelect),
-  "The topk highest-scoring complete blocks a query has passed, as page ids: ties to the lower block "
-  "index, the blocks above the threshold first and the tied ones after, then the partial page when "
+  "The topk highest-scoring complete blocks a query has passed, as page ids in block order: ties to "
+  "the lower block index, then the partial page when "
   "(pos + 1) % ratio != 0, then -1 to topk + 1. nsel counts the entries and seqused is the "
   "attention's length over them." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),

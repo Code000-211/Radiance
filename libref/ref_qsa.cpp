@@ -103,16 +103,22 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
  * by max(score, 0); with `signed` 1 the live ones are those with a finite score, ranked by it (so
- * -0 ties +0). At most `topk` are taken: all of them when that many or fewer are live, else
- * every block above the topk-th largest value in block order, then the blocks equal to it in block
- * order until topk are taken. The partial page bt[n] follows when (pos + 1) % ratio != 0 and
- * n < width, and -1 pads the row to topk + 1. nsel counts the entries, seqused is
+ * -0 ties +0). At most `topk` are taken, in block order: all of them when that many or fewer are
+ * live, else every block above the topk-th largest value and the blocks equal to it (lowest block
+ * index first) until topk are taken. The order is the contract: the attention sums the pages in
+ * table order, and a table shared by a query tile is their union in the same order (docs/QSA.md).
+ * The partial page bt[n] follows when (pos + 1) % ratio != 0 and
+ * n < width, and -1 pads the row to topk + 1. `selb`, when the caller passes it, repeats the same
+ * entries as block indices (the partial page's is n) -- `sel` holds page ids and a page id does not
+ * sort by block, so a table shared by a query tile is built from `selb`. nsel counts the entries, seqused is
  * (nsel - 1) * ratio + pos % ratio + 1 (0 for an empty table). A row no sequence holds reads
  * sequence 0, as libr4d's does. */
 int ref_qsa_select(const RadArgs* a, RadStream) {
     if (!have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    /* Optional, last: the same entries as block indices. */
+    const RadTensor* sb = a->n_t > 8 ? &a->t[8] : nullptr;
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
     const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
@@ -124,6 +130,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
     if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
     if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    if (sb && (sb->rank != 2 || sb->shape[0] < M || sb->shape[1] < topk + 1)) return RAD_E_SHAPE;
     for (int64_t s = 0; s < n_seq; ++s)
         if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
     for (int64_t m = 0; m < M; ++m)
@@ -131,6 +138,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     const int64_t s_rs = sc->stride[0], s_cs = sc->stride[1];
     const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
     const int64_t o_rs = se->stride[0], o_cs = se->stride[1];
+    const int64_t b_rs = sb ? sb->stride[0] : 0, b_cs = sb ? sb->stride[1] : 0;
     REF_PAR_FOR(M * nb * 4)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t s = seq_holding(cu, n_seq, m, 0);
@@ -153,19 +161,35 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
             for (int64_t b : live) ord.push_back(val[(size_t)b]);
             std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
             const float thr = ord[(size_t)(topk - 1)];
-            for (int64_t b : live)
+            /* The selection in block order, above the threshold and the ties alike: the order is
+             * part of the contract, since the attention sums a query's pages in table order and a
+             * table shared by a query tile is the union in block order (docs/QSA.md). */
+            int64_t above = 0;
+            for (int64_t b : live) above += val[(size_t)b] > thr;
+            int64_t need = topk - above, ties = 0;
+            for (int64_t b : live) {
                 if (val[(size_t)b] > thr) take.push_back(b);
-            for (int64_t b : live)
-                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+                else if (ties < need && val[(size_t)b] == thr) { take.push_back(b); ++ties; }
+            }
         }
         int64_t out = 0;
-        for (int64_t b : take) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs,
-                                      ldi(bt, s * bt_rs + b * bt_cs));
+        for (int64_t b : take) {
+            st_int(se->dtype, se->data, m * o_rs + (out) * o_cs, ldi(bt, s * bt_rs + b * bt_cs));
+            if (sb) st_int(sb->dtype, sb->data, m * b_rs + (out) * b_cs, b);
+            ++out;
+        }
         if (n < nb && (p + 1) % ratio != 0) {
             const int64_t part = ldi(bt, s * bt_rs + n * bt_cs);
-            if (part >= 0) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs, part);
+            if (part >= 0) {
+                st_int(se->dtype, se->data, m * o_rs + (out) * o_cs, part);
+                if (sb) st_int(sb->dtype, sb->data, m * b_rs + (out) * b_cs, n);
+                ++out;
+            }
         }
-        for (int64_t i = out; i <= topk; ++i) st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
+        for (int64_t i = out; i <= topk; ++i) {
+            st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
+            if (sb) st_int(sb->dtype, sb->data, m * b_rs + i * b_cs, -1);
+        }
         st_int(ns->dtype, ns->data, offlin(ns, m), out);
         st_int(su->dtype, su->data, offlin(su, m), out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
     }

@@ -154,6 +154,26 @@ nothing is allocated past the sequence, so `bt[n] >= 0` would work there. Mid-ch
 query finds a later token's live page in `bt[n]`, which `seqused` would then cover. The partial
 page is appended only when `(pos + 1) % ratio != 0`.
 
+## Table order
+
+**The table is the selection in block order**, ties taken by the lowest block index first; the
+partial page follows, decided by position, then `-1` to `topk + 1`. Order is not cosmetic: the
+attention sums its softmax over pages in table order and float addition is not associative, so two
+forms of the selection agree only if they write the same sequence.
+
+Block order is what a table **shared by a query tile** can reproduce. A tile's queries select from
+one history, so their sets overlap heavily; their union, taken in block order, holds every row's
+table as a subsequence, and a row read off the union with its own membership mask is that row's
+table, byte for byte, rather than merely the same set of pages. Any other emit order (score
+descending, as a sort would give) makes the union's order right for at most one row, and forces a
+per-row compaction whose sums can drift from the row path's.
+
+`selb` carries the same entries as `sel`, as block indices, because a page id does not follow its
+block and so cannot be sorted into block order after the fact. A tile's union is what
+`plugin/qsatable`'s `qsa_table` builds from `selb` (prototype: `RADIANCE_QSA_TABLE=1`,
+`docs/OPS.md`). Reading a shared table needs a masked read of it, which the attention does not have
+yet; the table alone is what this measures.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and
@@ -172,6 +192,17 @@ the live context separately (launch geometry comes from the declaration, work fr
 
 **Any two forms of the selection kernel must produce the same bytes**, not only the same set: the
 attention sums its softmax over pages in table order, and float addition is not associative.
+
+**The emit is one run in block order, then the threshold bin.** A row's table holds every block
+above the threshold in block order, then the bin's ties that were taken, also in block order — the
+single descent between them is the only place a list leaves block order, and the run it starts is
+the tie count (one entry at continuous scores, more under heavy ties). That matters for reading one
+table per tile of query rows: the rows' union in block order with a per-row membership mask keeps
+every row's selection exactly, and reproduces a row's table byte for byte when that row's list was
+already in block order — otherwise the row is read in the table's order, which is a different sum.
+The partial page stays out of the shared table either way: it is decided by position, so it cannot
+be an entry another row walks past. `tests/r4d_emu/test_qsa.cpp` (`shared table:`) measures the
+sharing and the recovery on the kernel's own output.
 
 **The score plane is the one buffer whose size is a product of the deployment's bounds** — a row
 of `max_ctx / ratio` floats a query, 512 MiB at a 2048-row step and 256K of context. Under

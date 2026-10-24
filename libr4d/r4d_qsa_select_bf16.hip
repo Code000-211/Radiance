@@ -3,7 +3,10 @@
 // at any context length (docs/QSA.md).
 //
 // The output is page ids: the KV group is paged at the compress ratio, so a selected block is a
-// page and the table is the attention's block table as is.
+// page and the table is the attention's block table as is. `selb` repeats the same entries as BLOCK
+// indices, because a page id does not sort by block (a dead block drops out of the block table and
+// the prefix cache re-orders the rest), and a table shared by a tile of query rows is their union
+// in block order.
 //
 // The partial page is appended last and is not a candidate: the reference always attends the
 // `(pos+1) % ratio` tokens after the last complete block (the query is among them). Every complete
@@ -11,9 +14,11 @@
 // own `kk <= q` bound do the remaining causal masking. The caller passes the effective query
 // position `(nsel - 1) * ratio + pos % ratio`.
 //
-// Selection is a four-digit radix select, not a sort: attention is a softmax over a set, so table
-// order within the set is irrelevant. The set is exact and deterministic: ties break to the lower
-// block index by prefix count, never by atomic completion order.
+// Selection is a four-digit radix select, not a sort: attention is a softmax over a set, so the
+// relative order of the selected blocks does not change which blocks are selected. The set is exact
+// and deterministic: ties break to the lower block index by prefix count, never by atomic
+// completion order. The table itself is the selection in block order, which is what lets a table
+// shared by a query tile stand in for the per-query tables (docs/QSA.md).
 //
 // Returns a RAD status rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
@@ -133,7 +138,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
 
     __shared__ uint32_t hist[kBins];
@@ -161,6 +167,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
     int32_t*       ou = sel   + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;   /* the same entries' blocks */
 
     /* ---- the key cache: one global pass instead of four. */
     const bool cached = n <= cap;
@@ -222,8 +229,10 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     __syncthreads();
 
     /* ---- the emit. Entries strictly above the threshold are always in; entries equal to it are
-     * in while slots remain, lowest block index first. Slots come from a workgroup prefix count,
-     * so a block's slot depends only on how many qualifying blocks precede it. */
+     * in while slots remain, lowest block index first. The table is the selection in block order:
+     * slots come from a workgroup prefix count over the taken blocks, so a block's slot depends
+     * only on how many taken blocks precede it, and a block-ordered walk of the table visits a
+     * query's pages in the order its per-query table does (docs/QSA.md, "The block table"). */
     uint32_t taken_eq = 0;
     for (int b0 = 0; b0 < n; b0 += kThreads) {
         const int b = b0 + t;
@@ -232,37 +241,30 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
         const bool hi = k != 0u && (n <= topk || k > T);
         const bool eq = k != 0u && n > topk && k == T;
 
-        /* High entries take slots from the running output count, ties from the count of ties
-         * already taken. */
-        const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-        const uint32_t rh = (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
+        /* Ties are taken by rank among the ties in block order; then every taken block takes its
+         * slot from the running output count. */
+        const unsigned long long me = __ballot(eq);
         const uint32_t re = (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh);
-        __syncthreads();
-        uint32_t before_h, tot_h;
-        counts_before<kWaves>(wsum, lane, wave, &before_h, &tot_h);
-        const uint32_t base_h = sh_out + before_h;
-        __syncthreads();
         if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
         __syncthreads();
         uint32_t before_e, tot_e;
         counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
-        const uint32_t base_e = taken_eq + before_e;
-
-        if (hi) {
-            const uint32_t slot = base_h + rh;
-            if (slot < (uint32_t)topk) ou[slot] = tb[b];
-        }
-        if (eq) {
-            const uint32_t rank = base_e + re;
-            if (rank < need) {
-                const uint32_t slot = (uint32_t)topk - need + rank;
-                ou[slot] = tb[b];
-            }
-        }
+        const bool take = hi || (eq && taken_eq + before_e + re < need);
         __syncthreads();
-        if (t == 0) sh_out += tot_h;
+
+        const unsigned long long mt = __ballot(take);
+        const uint32_t rt = (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mt);
+        __syncthreads();
+        uint32_t before_t, tot_t;
+        counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
+        if (take) {
+            ou[sh_out + before_t + rt] = tb[b];
+            if (ob) ob[sh_out + before_t + rt] = b;
+        }
         taken_eq += tot_e;
+        __syncthreads();
+        if (t == 0) sh_out += tot_t;
         __syncthreads();
     }
 
@@ -276,10 +278,19 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     if (t == 0) {
         /* Above topk blocks the table is full (ties fill it), unless topk or fewer are live:
          * then T is 0, every live key was emitted, and the slots past them hold nothing. */
-        uint32_t out = (n <= topk || T == 0u) ? sh_out : (uint32_t)topk;
+        uint32_t out = sh_out < (uint32_t)topk ? sh_out : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        /* The partial page is block n; the slot carries that index, and the attention skips it by
+         * position exactly as before (`selb` is additive, `sel` is unchanged). */
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         /* The attention's causal bound. attn_paged takes the block table and seqused_k as
          * ordinary operands, so QSA issues the same op with `sel` as the table and this as the
@@ -403,7 +414,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) {
 
     /* The first digit's 4096 bins; afterwards [0, kBins) is the later digits' histogram and the
@@ -440,6 +452,10 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
     int32_t*       ou = sel   + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;   /* the same entries' blocks */
+
+    if (t == 0) sh_out = 0;
+    __syncthreads();
 
     uint32_t T = 0, need = 0;
     bool sampled = false;
@@ -503,29 +519,36 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         /* More than topk: exactly topk could be every live key, which takes no threshold. */
         if (cnt > (uint32_t)topk && cnt <= (uint32_t)kSampCap) {
             lds_kth(lkey, (int)cnt, (uint32_t)topk, hist, suf, wsum, &sh_T, &sh_need, &T, &need);
-            uint32_t hbase = 0, ebase = 0;
+            /* The list is in block order, so ties are ranked and taken by walking it, and the
+             * table comes out in block order as in the kernel above. */
+            uint32_t ebase = 0;
             for (uint32_t i0 = 0; i0 < cnt; i0 += kThreads) {
                 const uint32_t i = i0 + (uint32_t)t;
                 const uint32_t k = i < cnt ? lkey[i] : 0u;
                 const bool hi = i < cnt && k > T;
                 const bool eq = i < cnt && k == T;
-                const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-                if (lane == 0) {
-                    wsum[wave]  = (uint32_t)__popcll(mh);
-                    wsum2[wave] = (uint32_t)__popcll(me);
-                }
+                const unsigned long long me = __ballot(eq);
+                if (lane == 0) wsum2[wave] = (uint32_t)__popcll(me);
                 __syncthreads();
-                uint32_t before_h, tot_h, before_e, tot_e;
-                counts_before<kWaves>(wsum,  lane, wave, &before_h, &tot_h);
+                uint32_t before_e, tot_e;
                 counts_before<kWaves>(wsum2, lane, wave, &before_e, &tot_e);
-                const uint32_t hp = hbase + before_h +
-                                    (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
-                const uint32_t ep = ebase + before_e +
-                                    (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
-                if (hi) ou[hp] = tb[lblk[i]];
-                if (eq && ep < need) ou[(uint32_t)topk - need + ep] = tb[lblk[i]];
-                hbase += tot_h;
+                const bool take = hi || (eq && ebase + before_e +
+                                              (uint32_t)__popcll(me & ((1ull << lane) - 1ull)) < need);
+                __syncthreads();
+                const unsigned long long mt = __ballot(take);
+                if (lane == 0) wsum[wave] = (uint32_t)__popcll(mt);
+                __syncthreads();
+                uint32_t before_t, tot_t;
+                counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
+                if (take) {
+                    const uint32_t slot =
+                        sh_out + before_t + (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
+                    ou[slot] = tb[lblk[i]];
+                    if (ob) ob[slot] = (int32_t)lblk[i];
+                }
                 ebase += tot_e;
+                __syncthreads();
+                if (t == 0) sh_out += tot_t;
                 __syncthreads();
             }
             sampled = true;
@@ -657,55 +680,61 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
             T = fixed; need = want;
 
             if (merged) {
-                /* ---- emit from the lists. An in-bin key above the threshold takes the slot after
-                 * every taken key before its block: in-bin ones by prefix count, above-bin ones by
-                 * binary search. Its running count then replaces its key so above-bin keys can find
-                 * their slots the same way. Ties fill from topk - need, in block order. */
+                /* ---- emit from the lists, in block order. A taken in-bin key's slot is the count
+                 * of taken keys below it: the above-bin ones by binary search on their own
+                 * block-ordered list, the in-bin ones by prefix count. The running prefix
+                 * replaces the in-bin key so above-bin keys can find that count too. */
                 const uint32_t nin = (uint32_t)ncand;
-                uint32_t hbase = 0, ebase = 0;
+                uint32_t ord = 0, ebase = 0;
                 for (uint32_t i0 = 0; i0 < nin; i0 += kThreads) {
                     const uint32_t i = i0 + (uint32_t)t;
                     const uint32_t k = i < nin ? mkey[i] : 0u;
                     const bool hi = i < nin && k > T;
                     const bool eq = i < nin && k == T;
-                    const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-                    if (lane == 0) {
-                        wsum[wave]  = (uint32_t)__popcll(mh);
-                        wsum2[wave] = (uint32_t)__popcll(me);
-                    }
+                    const unsigned long long me = __ballot(eq);
+                    if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
                     __syncthreads();
-                    uint32_t before_h, tot_h, before_e, tot_e;
-                    counts_before<kWaves>(wsum,  lane, wave, &before_h, &tot_h);
-                    counts_before<kWaves>(wsum2, lane, wave, &before_e, &tot_e);
-                    const uint32_t hp = hbase + before_h +
-                                        (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
-                    const uint32_t ep = ebase + before_e +
-                                        (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
+                    uint32_t before_e, tot_e;
+                    counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
+                    const bool take = hi || (eq && ebase + before_e +
+                                                  (uint32_t)__popcll(me & ((1ull << lane) - 1ull)) < need);
+                    __syncthreads();
+                    const unsigned long long mt = __ballot(take);
+                    if (lane == 0) wsum[wave] = (uint32_t)__popcll(mt);
+                    __syncthreads();
+                    uint32_t before_t, tot_t;
+                    counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
+                    const uint32_t ord_i = ord + before_t +
+                                           (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
                     if (i < nin) {
                         const uint32_t b = mblk[i];
-                        if (hi) ou[hp + lower_bound_u32(mabv, n_abv, b)] = tb[b];
-                        if (eq && ep < need) ou[(uint32_t)topk - need + ep] = tb[b];
-                        mkey[i] = hp;
+                        if (take) {
+                            const uint32_t slot = ord_i + lower_bound_u32(mabv, n_abv, b);
+                            ou[slot] = tb[b];
+                            if (ob) ob[slot] = (int32_t)b;
+                        }
+                        mkey[i] = ord_i;
                     }
-                    hbase += tot_h;
                     ebase += tot_e;
+                    ord   += tot_t;
                     __syncthreads();
                 }
                 for (uint32_t j = (uint32_t)t; j < n_abv; j += kThreads) {
                     const uint32_t b = mabv[j];
                     const uint32_t p = lower_bound_u32(mblk, nin, b);
-                    ou[j + (p < nin ? mkey[p] : hbase)] = tb[b];
+                    const uint32_t slot = j + (p < nin ? mkey[p] : ord);
+                    ou[slot] = tb[b];
+                    if (ob) ob[slot] = (int32_t)b;
                 }
+                if (t == 0) sh_out = n_abv + ord;
             }
         } else {
             T = sh_T; need = sh_need;
         }
     }
     __syncthreads();
-    if (t == 0) sh_out = 0;
-    __syncthreads();
 
-    /* ---- the emit, identical to the kernel above. */
+    /* ---- the emit, identical to the kernel above: the selection in block order. */
     uint32_t taken_eq = 0;
     for (int b0 = 0; b0 < ((merged || sampled) ? 0 : n); b0 += kThreads) {
         const int b = b0 + t;
@@ -714,44 +743,46 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         const bool hi = k != 0u && (n <= topk || k > T);
         const bool eq = k != 0u && n > topk && k == T;
 
-        const unsigned long long mh = __ballot(hi), me = __ballot(eq);
-        const uint32_t rh = (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
+        const unsigned long long me = __ballot(eq);
         const uint32_t re = (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
-        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh);
-        __syncthreads();
-        uint32_t before_h, tot_h;
-        counts_before<kWaves>(wsum, lane, wave, &before_h, &tot_h);
-        const uint32_t base_h = sh_out + before_h;
-        __syncthreads();
         if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
         __syncthreads();
         uint32_t before_e, tot_e;
         counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
-        const uint32_t base_e = taken_eq + before_e;
-
-        if (hi) {
-            const uint32_t slot = base_h + rh;
-            if (slot < (uint32_t)topk) ou[slot] = tb[b];
-        }
-        if (eq) {
-            const uint32_t rank = base_e + re;
-            if (rank < need) {
-                const uint32_t slot = (uint32_t)topk - need + rank;
-                ou[slot] = tb[b];
-            }
-        }
+        const bool take = hi || (eq && taken_eq + before_e + re < need);
         __syncthreads();
-        if (t == 0) sh_out += tot_h;
+
+        const unsigned long long mt = __ballot(take);
+        const uint32_t rt = (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mt);
+        __syncthreads();
+        uint32_t before_t, tot_t;
+        counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
+        if (take) {
+            ou[sh_out + before_t + rt] = tb[b];
+            if (ob) ob[sh_out + before_t + rt] = b;
+        }
         taken_eq += tot_e;
+        __syncthreads();
+        if (t == 0) sh_out += tot_t;
         __syncthreads();
     }
 
     /* ---- the partial page, appended last, as above. */
     if (t == 0) {
-        uint32_t out = (n <= topk || T == 0u) ? sh_out : (uint32_t)topk;
+        uint32_t out = sh_out < (uint32_t)topk ? sh_out : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        /* The partial page is block n; the slot carries that index, and the attention skips it by
+         * position exactly as before (`selb` is additive, `sel` is unchanged). */
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         const int32_t su = (int32_t)((out == 0) ? 0 : (out - 1) * (uint32_t)ratio +
                                                       (uint32_t)(p % ratio) + 1u);
@@ -771,7 +802,8 @@ static int g_qsa_select_form = 0;
  * A chunk's local top-k contains every global top-k member of that chunk, so the block list can
  * be split exactly: if a block were in the global top-k but not its chunk's, k blocks of the chunk
  * would outrank it, hence k blocks globally. This needs the same total order on both sides: key
- * descending, then block index ascending, as the emit builds by prefix count.
+ * descending, then block index ascending, as the emit ranks by prefix count. (The table is written
+ * in block order; the total order decides which blocks are in it.)
  *
  * So up to kParWMax chunks per query find their local top-k in LDS, and one workgroup per query
  * merges the candidates and emits. Chunk lists are block-ordered and concatenated in chunk order,
@@ -808,7 +840,7 @@ static inline int par_chunks(long long nb) {
  *
  * `every_at_want`: `want` or fewer live keys are all taken (T = 0), as the single-workgroup
  * kernel takes topk or fewer. The local pass sets it. The merge does not: its candidates can be
- * exactly the top-k of a longer list, whose ties still go last, and it never has fewer.
+ * exactly the top-k of a longer list, whose ties are still ranked block first.
  *
  * Templated on the workgroup width (the merge is wider than the bin count). Above 256 threads the
  * surplus skips the bin scan; guards wrap the work, never a __syncthreads(). */
@@ -851,23 +883,23 @@ __device__ __forceinline__ void radix_thresh(const uint32_t* __restrict__ key, i
     }
 }
 
-/* The qualifying set by prefix count, in two layouts.
+/* The qualifying set by prefix count, in block order.
  *
- * The merge must reproduce the single-workgroup kernel's table exactly (entries above the
- * threshold first, ties last): the attention sums pages in table order and float addition is not
- * associative. The local pass instead writes in block order, since the merge's tie rule reads it
- * that way. Slots come from workgroup prefix counts, never from scheduling. */
+ * Both passes write the selection in block order, so the merge's candidates (chunk lists, each
+ * block-ordered, concatenated in chunk order) come out in block order by a plain prefix count. The
+ * attention then sums a query's pages in the order its per-query table holds them, which is what
+ * lets a shared per-tile table stand in for the per-query one (docs/QSA.md). Slots come from
+ * workgroup prefix counts, never from scheduling. */
 struct ParEmit {
     uint32_t* wsum;                    /* [kWaves] scratch for the wave prefix */
-    uint32_t* sh_hi;                   /* running count of entries above the threshold */
     uint32_t* sh_ord;                  /* running count of entries taken, in block order */
     uint32_t  taken_eq;                /* ties taken so far; per thread, and uniform by induction */
     uint32_t  T, need;
     bool      all;                     /* below the top-k: everything live is in */
 };
 struct ParTake {
-    bool     hi, take;
-    uint32_t slot_hi, slot_ord, rank_eq;
+    bool     take;
+    uint32_t slot_ord, rank_eq;
 };
 
 /* One ballot, one wave prefix, one workgroup prefix. `*run` is the running total, advanced by
@@ -889,21 +921,19 @@ __device__ __forceinline__ uint32_t par_scan(ParEmit& e, bool p, int lane, int w
     return base + rk;
 }
 
-/* WantHi / WantOrd select which slots are computed: each par_scan costs a ballot and two
- * barriers, the merge reads only slot_hi and rank_eq, and the local pass only slot_ord. The
- * branches are compile-time, so every thread takes the same path and the barriers inside are
- * legal. `take` depends on rank_eq, which is always computed first. */
-template <bool WantHi, bool WantOrd, int NT>
+/* Two scans: the tie's rank among the ties (needed to decide whether it is taken at all), then the
+ * taken entry's slot in block order. `take` depends on rank_eq, which is why it is computed
+ * first. */
+template <int NT>
 __device__ __forceinline__ ParTake par_take(ParEmit& e, uint32_t k, int lane, int wave) {
     ParTake r{};
-    r.hi        = k != 0u && (e.all || k > e.T);
+    const bool hi = k != 0u && (e.all || k > e.T);
     const bool eq = k != 0u && !e.all && k == e.T;
 
     uint32_t tot_e = 0;
     r.rank_eq = par_scan<NT>(e, eq, lane, wave, nullptr, e.taken_eq, &tot_e);
-    r.take    = r.hi || (eq && r.rank_eq < e.need);
-    if (WantHi)  r.slot_hi  = par_scan<NT>(e, r.hi,   lane, wave, e.sh_hi,  *e.sh_hi,  nullptr);
-    if (WantOrd) r.slot_ord = par_scan<NT>(e, r.take, lane, wave, e.sh_ord, *e.sh_ord, nullptr);
+    r.take    = hi || (eq && r.rank_eq < e.need);
+    r.slot_ord = par_scan<NT>(e, r.take, lane, wave, e.sh_ord, *e.sh_ord, nullptr);
     e.taken_eq += tot_e;
     __syncthreads();
     return r;
@@ -920,7 +950,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 
     constexpr int LT = kLocalThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
-    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord;
+    __shared__ uint32_t sh_T, sh_need, sh_ord;
     __shared__ int      sh_seq;
     R4D_DYN_LDS(uint32_t, sh_key);
 
@@ -948,14 +978,14 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     for (int i = t; i < cn; i += LT) sh_key[i] = keyof<Signed>(sc[lo + i], tb[lo + i]);
     __syncthreads();
 
-    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, cn <= topk };
+    ParEmit e{ wsum, &sh_ord, 0u, 0u, 0u, cn <= topk };
     if (!e.all) {
         radix_thresh<LT>(sh_key, cn, (uint32_t)topk, true, hist, suf, wsum, &sh_T, &sh_need);
         e.T = sh_T; e.need = sh_need;
     }
     /* A threshold means more than topk live keys here, so more than topk in the whole list. */
     const bool over = !e.all && e.T != 0u;
-    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    if (t == 0) sh_ord = 0;
     __syncthreads();
 
     /* In block order: the merge breaks ties by block index. */
@@ -964,14 +994,14 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     for (int i0 = 0; i0 < cn; i0 += LT) {
         const int i = i0 + t;
         const uint32_t k = i < cn ? sh_key[i] : 0u;
-        const ParTake r = par_take<false, true, LT>(e, k, lane, wave);
+        const ParTake r = par_take<LT>(e, k, lane, wave);
         if (r.take && r.slot_ord < (uint32_t)topk) {
             dk[r.slot_ord] = k;
-            /* Store the page, not the block index: resolving it here spreads the dependent load
-             * over many workgroups instead of the merge's few. The merge breaks ties by list
-             * position (block-ordered), never by index. A taken candidate has k != 0, so its
-             * page is live. */
-            di[r.slot_ord] = tb[lo + i];
+            /* The block index, not the page: the merge resolves `tb[b]` once per entry and needs
+             * the index itself for `selb`, so this is the same number of dependent loads. The
+             * merge breaks ties by list position (block-ordered), never by index. A taken
+             * candidate has k != 0, so its page is live. */
+            di[r.slot_ord] = lo + i;
         }
     }
     if (t == 0) cc[(size_t)m * kParWMax + c] =
@@ -985,12 +1015,13 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ cc, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
 
     constexpr int NT = kMergeThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
-    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord, sh_tot, sh_over;
+    __shared__ uint32_t sh_T, sh_need, sh_ord, sh_tot, sh_over;
     __shared__ int      sh_seq, sh_off[kParWMax + 1];
     R4D_DYN_LDS(uint32_t, sh_key);
 
@@ -1035,31 +1066,31 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     /* Everything, in block order, exactly when the single-workgroup kernel takes everything: at
      * most topk blocks, or topk or fewer live. With no chunk over topk the candidates are every
      * live key, so their count is the live count; a chunk over topk means more than topk live,
-     * and then exactly topk candidates are the top-k, whose ties go last. */
-    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, n <= topk || (!sh_over && tot <= topk) };
+     * and then exactly topk candidates are the top-k, ties ranked block first. */
+    ParEmit e{ wsum, &sh_ord, 0u, 0u, 0u, n <= topk || (!sh_over && tot <= topk) };
     if (!e.all) {
         radix_thresh<NT>(sh_key, tot, (uint32_t)topk, false, hist, suf, wsum, &sh_T, &sh_need);
         e.T = sh_T; e.need = sh_need;
     }
-    if (t == 0) { sh_hi = 0; sh_ord = 0; }
+    if (t == 0) sh_ord = 0;
     __syncthreads();
 
     const int32_t* tb = bt  + (size_t)seq * t_ld;
     int32_t*       ou = sel + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;
     for (int i0 = 0; i0 < tot; i0 += NT) {
         const int i = i0 + t;
         const uint32_t k = i < tot ? sh_key[i] : 0u;
-        const ParTake r = par_take<true, false, NT>(e, k, lane, wave);
+        const ParTake r = par_take<NT>(e, k, lane, wave);
         if (r.take) {
             /* The candidate's chunk, from the offsets. */
             int c = nchunk - 1;
             while (c > 0 && sh_off[c] > i) --c;
-            /* Already a page (resolved by the local pass); tb is still needed for the partial
-             * page. */
-            const int32_t page = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
-            /* The single-workgroup kernel's layout: above the threshold first, ties last. */
-            if (r.hi) { if (r.slot_hi < (uint32_t)topk) ou[r.slot_hi] = page; }
-            else       { ou[(uint32_t)topk - e.need + r.rank_eq] = page; }
+            /* A block index, resolved here: one dependent load per emitted entry either way, and
+             * `selb` needs the index itself. */
+            const int32_t b = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
+            ou[r.slot_ord] = tb[b];
+            if (ob) ob[r.slot_ord] = b;
         }
     }
 
@@ -1069,10 +1100,17 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
          * table is full (ties fill it), and the merged count can fall short, which would let the
          * padding loop overwrite ties with -1. The exception is the same as there: topk or
          * fewer live blocks, all of them emitted. */
-        uint32_t out = e.all ? sh_hi : (uint32_t)topk;
+        uint32_t out = sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         const int32_t su = (int32_t)((out == 0) ? 0
                                    : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
@@ -1095,11 +1133,15 @@ static inline int64_t par_scratch_bytes(long long topk) {
 //   pos   [M]            i32, each query's absolute position
 //   cu    [nseq+1]       i32, cumulative query counts: which sequence a query row belongs to
 //   sel   [M][topk+1]    i32, `o_ld` elements a row (0 = topk+1); -1 padded
+//   selb  [M][topk+1]    i32, the same entries' BLOCK indices (the partial page's is `n`), -1
+//                        padded; absent = not written. `sel` carries page ids, which do not sort
+//                        by block, so a table shared by a query tile needs this
 //   nsel  [M]            i32
 // Signed selects the key order (keyof), from the op's `signed` parameter.
 template <bool Signed>
 static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long cu, long sel,
-                                   long nsel, long seqused, int M, int nb, int topk, int ratio,
+                                   long selb, long nsel, long seqused, int M, int nb, int topk,
+                                   int ratio,
                                    int nseq, int s_ld, int t_ld, int o_ld,
                                    void* scratch, long long scratch_bytes, RadStream stream) {
     if (!score || !bt || !nc || !cu || !sel || !nsel || !seqused) return R4D_NO(RAD_E_INVAL);
@@ -1131,7 +1173,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                         (size_t)nchunk * topk * sizeof(uint32_t), (const uint32_t*)ck,
                         (const int32_t*)ci, (const int32_t*)cc, (const int32_t*)bt,
                         (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                        (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,
+                        (int32_t*)sel, (int32_t*)selb, (int32_t*)nsel, (int32_t*)seqused,
                         nb, topk, ratio, nseq, t_ld, o_ld, nchunk);
     }
 
@@ -1141,8 +1183,8 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                         dim3(kThreads), 0,
                         (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                         (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,
-                        (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld,
-                        o_ld);
+                        (int32_t*)selb, (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq,
+                        s_ld, t_ld, o_ld);
     }
 
     /* Never more than the table width. */
@@ -1151,7 +1193,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                    (int32_t*)sel, (int32_t*)nsel,
+                    (int32_t*)sel, (int32_t*)selb, (int32_t*)nsel,
                     (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
 }
 
@@ -1165,7 +1207,7 @@ extern "C" int64_t r4d_rad_qsa_select_scratch(const RadArgs* a) {
 // ============================================================== the plugin ABI entry point
 
 enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL_NSEL = 6,
-       QL_SEQ = 7 };
+       QL_SEQ = 7, QL_SELB = 8 };
 
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* sc = r4d_opt(a, QL_SCORE);
@@ -1176,6 +1218,7 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* se = r4d_opt(a, QL_SEL);
     const RadTensor* ns = r4d_opt(a, QL_NSEL);
     const RadTensor* su = r4d_opt(a, QL_SEQ);
+    const RadTensor* sb = r4d_opt(a, QL_SELB);   /* optional: additive, `sel` alone is the table */
     if (!sc || !bt || !nc || !po || !cu || !se || !ns || !su) return R4D_NO(RAD_E_INVAL);
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long topk  = r4d_geti_or(a, "topk", 0);
@@ -1195,12 +1238,17 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     if (se->shape[0] != M || se->shape[1] != topk + 1) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(ns) < M) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(po) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
+    if (sb && (sb->rank != 2 || sb->shape[0] != M || sb->shape[1] != topk + 1))
+        return R4D_NO(RAD_E_SHAPE);
     const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
     if (sp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    /* `selb` is written at `sel`'s row pitch (the kernels carry one pitch for both), so a caller
+     * that pads one and not the other is refused rather than silently misaligned. */
+    if (sb && r4d_row_pitch(sb) != op) return R4D_NO(RAD_E_STRIDE);
     /* Scratch is optional: without enough, the non-split kernels run. */
     auto* const emit = sgn ? r4d_qsa_select_bf16_emit<true> : r4d_qsa_select_bf16_emit<false>;
     return emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
-                r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
+                r4d_addr(cu), r4d_addr(se), r4d_addr(sb), r4d_addr(ns), r4d_addr(su),
                 (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
                 (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
                 stream);

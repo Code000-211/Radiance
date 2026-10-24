@@ -19441,7 +19441,9 @@ static void sample_argmax_case(const Plugin& pl) {
  *
  * Focused on ties and the tail. Block scores (sums of relus over a shared grid) tie often, so the
  * fixture gives the threshold value to more blocks than there are slots left, and the oracle is a
- * full sort by (score descending, index ascending), the rule the kernel's prefix counts implement.
+ * full sort by (score descending, index ascending), which decides membership: the ties that get
+ * slots are the lowest block indices, as the kernel's prefix counts take them. The table itself is
+ * in block order (docs/QSA.md, "Table order"), so the set is what is compared here.
  *
  * Checked:
  *   the set matches a host sort;
@@ -19965,7 +19967,7 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
  *   0  few live pages, continuous scores           1  few live, most of them scoring zero or less
  *   2  live pages, most scores -inf                3  exactly topk live, a third tied at zero
  *   4  all live keys in the first chunk, more than topk, ties at the threshold (the split merge
- *      sees exactly topk candidates and must still put the ties last)
+ *      sees exactly topk candidates and must still rank the ties block first)
  *   5  nothing live                                6  at most topk blocks (control)
  *   7  everything live (control)
  * -0.0 scores are planted in rows 1 and 4: libref ranks them as zero. */
@@ -20015,7 +20017,7 @@ static void qsa_select_few_live_case(const Plugin& pl) {
     cuh[(size_t)S] = (int32_t)M;
 
     /* libref's rule (ref_qsa_select): every live block when topk or fewer are live, else the
-     * blocks above the topk-th largest value in block order, then its ties in block order. */
+     * blocks above the topk-th largest value and its ties, together in block order. */
     std::vector<int32_t> want((size_t)(M * (topk + 1)), -1), want_n((size_t)M), want_su((size_t)M);
     for (int64_t m = 0; m < M; ++m) {
         const int64_t n = nrow[m];
@@ -20036,9 +20038,13 @@ static void qsa_select_few_live_case(const Plugin& pl) {
             std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(),
                              [](float l, float r) { return l > r; });
             const float thr = ord[(size_t)(topk - 1)];
-            for (int64_t b : live) if (val[(size_t)b] > thr) take.push_back(b);
-            for (int64_t b : live)
-                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+            /* In block order, ties included, so the table is what a shared per-tile table holds. */
+            int64_t above = 0;
+            for (int64_t b : live) above += val[(size_t)b] > thr;
+            for (int64_t need = topk - above; int64_t b : live) {
+                if (val[(size_t)b] > thr) take.push_back(b);
+                else if (need > 0 && val[(size_t)b] == thr) { take.push_back(b); --need; }
+            }
         }
         int32_t* row = &want[(size_t)(m * (topk + 1))];
         int64_t out = 0;
