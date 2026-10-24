@@ -267,7 +267,7 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 lfm2_bf16 gemm
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test)
+foreach(t engine_e2e_test convert_test diagnose_e2e_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -279,6 +279,12 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+# diagnose_e2e_test runs the engine's self-measurement over its whole fixed workload, once per case:
+# five runs of the workload, most of them seconds apart in wall time because the workload is the
+# cost. Labelled `e2e` with engine_e2e_test and kept out of the fast tier.
+if(TARGET diagnose_e2e_test)
+  set_tests_properties(diagnose_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

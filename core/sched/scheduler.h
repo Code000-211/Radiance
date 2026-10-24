@@ -13,6 +13,7 @@
  */
 #pragma once
 #include "batch.h"
+#include "steplog.h"
 #include "draft.h"
 #include "metrics.h"
 
@@ -269,6 +270,31 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+
+    /* ---------------------------------------------------------- the step record (steplog.h)
+     *
+     * Keep one record per step for the engine's own measurement (--diagnose). Off unless asked,
+     * in which case the step path writes nothing and nothing is kept; on, `steps` records are held
+     * in a ring allocated here, so the step path allocates nothing and takes no lock beyond the
+     * one it already holds.
+     *
+     * Only the engine's self-measurement enables it: a serving process never does, because the
+     * ring is memory off the card and a store per step no reader wants. */
+    void     enable_step_log(size_t steps);
+    void     disable_step_log();
+    bool     step_log_enabled() const;
+    /* Copies out what the ring holds, oldest first, and clears it; returns how many records were
+     * overwritten before anyone read them. Takes the step lock, so call it between phases rather
+     * than while a step is open. */
+    uint64_t drain_step_log(std::vector<StepRecord>* out);
+
+    /* True when no step is open, none is issued ahead, and no committed step is waiting for its
+     * record -- so everything that has run is in the step log. Engine::run_diagnose waits for this
+     * before draining a point's records: a result is committed before its step is recorded, so a
+     * reader that stops at the last token would attribute the point's final step to the next point.
+     * A scheduler driven through commit() alone (the scheduler tests) never calls step_finished() and
+     * so is never quiet; nothing there waits. */
+    bool     step_quiet();
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
@@ -550,6 +576,8 @@ private:
     StepPlan plan_;
     StepPlan plan_next_;
     bool     next_open_ = false;
+    /* A step has been committed and its step_finished(), which writes its record, has not run. */
+    bool     commit_reported_ = false;
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
         return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);
@@ -622,6 +650,18 @@ private:
      * throughput window; metrics() decays what it reports by this. */
     std::chrono::steady_clock::time_point last_step_at_ = std::chrono::steady_clock::now();
     int64_t step_prefill_tok_ = 0, step_decode_tok_ = 0;
+    /* Tokens this step pushed to a sink: 1 for a prefill that completes, 1 + accepted drafts for a
+     * verify. The step record's `tok_out`, and the only definition of a burst (steplog.h). */
+    int64_t step_emit_tok_ = 0;
+    /* Draft tokens the step being committed accepted, for its record; reset with the token
+     * counters, at the step's start. */
+    int64_t step_accepted_tok_ = 0;
+    /* Whether the step being built was issued ahead of the previous one's commit (step_next), for
+     * its record: its bracket is only the host's part of it. */
+    bool     step_ahead_ = false;
+    /* The step the engine enabled for --diagnose, and when it ended, for the record's gap. */
+    StepLog  step_log_;
+    std::chrono::steady_clock::time_point step_log_last_{};
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
      * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
@@ -638,6 +678,10 @@ private:
 
     /* arrival; mu_ held */
     int  add_locked(std::unique_ptr<Request> r);
+
+    /* The step record for the bracket that just closed (steplog.h); mu_ held, and cheap: one
+     * store when the log is off, which is every process but --diagnose. */
+    void record_step(const std::chrono::steady_clock::time_point& end);
 
     /* ordering */
     bool ahead_of(int32_t a, int32_t b) const;

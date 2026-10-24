@@ -1699,6 +1699,15 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `--kld-lora NAME` | run the documents through the `--lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
 | `--kld-lora-sources PREFIX` | with `--kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
 
+**Self-measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-self-measurement-mode)
+
+| flag | |
+|---|---|
+| `--diagnose DIR` | run the engine's fixed serving workload through its own scheduler instead of listening, and write `DIR/diagnose.json` and `DIR/diagnose.md`: step time by step shape, the interval between the steps that emitted tokens and how much of it was waiting, tokens and rows per step, cache hits, draft acceptance by category and by draft position, and every generated token |
+| `--diagnose-baseline FILE` | an earlier `diagnose.json`: any token difference fails the run, and a fall in pooled acceptance is reported; refuses a report of another workload or another salt |
+| `--diagnose-salt N` | the number every prompt is salted with, so nothing in the workload is served from the prefix cache (default 1); two runs compare only with the same `N` |
+| `--diagnose-acceptance-drop FRAC` | how far pooled acceptance has to fall, as a fraction of what it was, before a baseline run says it fell (default 0.10) |
+
 **Diagnostics**
 
 | flag | |

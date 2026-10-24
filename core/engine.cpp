@@ -7,6 +7,7 @@
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
 #include "kld.h"
+#include "diagnose.h"
 #include "mm/processor.h"
 #include "mm/media.h"
 
@@ -1601,11 +1602,13 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
-    if (cfg_.kld()) {
+    if (cfg_.kld() || cfg_.diagnose()) {
+        /* Both modes replace serving with a driver of their own, and both want the deployment read
+         * exactly as a serving run would read it, above the mode's own lines. */
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.kld() ? run_kld() : cfg_.diagnose() ? run_diagnose() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
