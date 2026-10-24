@@ -479,7 +479,11 @@ int h_event_record(RadEvent ev, RadStream st) {
     t.ev   = e;
     t.seq  = seq;
     event_retain(e);
-    return stream_push((HostStream*)st, t);
+    /* A push the stream refuses queues nothing, so the task's reference is ours to drop again --
+     * as rad_stream_gate does. Kept before the push so the worker cannot free the event first. */
+    const int rc = stream_push((HostStream*)st, t);
+    if (rc < 0) event_release(e);
+    return rc;
 }
 
 int h_event_wait(RadStream st, RadEvent ev) {
@@ -501,7 +505,9 @@ int h_event_wait(RadStream st, RadEvent ev) {
     t.ev   = e;
     t.seq  = target;
     event_retain(e);
-    return stream_push((HostStream*)st, t);
+    const int rc = stream_push((HostStream*)st, t);   /* the same drop as h_event_record */
+    if (rc < 0) event_release(e);
+    return rc;
 }
 
 int h_event_query(RadEvent ev) {
