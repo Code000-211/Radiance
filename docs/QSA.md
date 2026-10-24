@@ -187,6 +187,17 @@ the live context separately (launch geometry comes from the declaration, work fr
 **Any two forms of the selection kernel must produce the same bytes**, not only the same set: the
 attention sums its softmax over pages in table order, and float addition is not associative.
 
+**The emit is one run in block order, then the threshold bin.** A row's table holds every block
+above the threshold in block order, then the bin's ties that were taken, also in block order — the
+single descent between them is the only place a list leaves block order, and the run it starts is
+the tie count (one entry at continuous scores, more under heavy ties). That matters for reading one
+table per tile of query rows: the rows' union in block order with a per-row membership mask keeps
+every row's selection exactly, and reproduces a row's table byte for byte when that row's list was
+already in block order — otherwise the row is read in the table's order, which is a different sum.
+The partial page stays out of the shared table either way: it is decided by position, so it cannot
+be an entry another row walks past. `tests/r4d_emu/test_qsa.cpp` (`shared table:`) measures the
+sharing and the recovery on the kernel's own output.
+
 **The score plane is the one buffer whose size is a product of the deployment's bounds** — a row
 of `max_ctx / ratio` floats a query, 512 MiB at a 2048-row step and 256K of context. Under
 `--prefill-span`, where every step that mixes sequences fits in a MoE pass
