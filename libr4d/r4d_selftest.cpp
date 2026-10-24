@@ -23317,12 +23317,19 @@ static void embed_lookup_q_case(const Plugin& pl) {
  *      and the LOADING/READY handshake runs under continuous replacement;
  *   4. a second table through the same instance, which must bypass the cache -- a hit there would
  *      return the first table's bytes;
- *   5. four streams at once, the same ids, so one launch's misses race the next one's hits.
+ *   5. four streams at once, the same ids, so one launch's misses race the next one's hits, and
+ *      then the same on one set of four ways, where every launch reclaims a way another stream
+ *      may be between its payload load and its recheck on -- the X, Y, X the generation exists
+ *      for. The window is entered by contention, not forced: this stage proves that concurrent
+ *      reclaim-and-rewrite never produces a wrong byte, not that a given interleaving occurred.
  *
  * Then the instance is freed and re-initialised, which must start cold, and a launch with no
- * instance (the default, no cache) must write the same bytes as the cached one. */
+ * instance (the default, no cache) must write the same bytes as the cached one.
+ *
+ * Its own case name: the row it exercises has one already, and `--case ple_cache` has to select
+ * this stage rather than report a case no block claims. */
 static void ple_cache_case(const Plugin& pl) {
-    if (!sel("embed_lookup_q_bf16")) return;
+    if (!sel("ple_cache")) return;
     const char* what = "PLE row cache vs a host gather, to the bit";
     const RadKernelInfo* r = find(pl, "embed_lookup_q_bf16");
     if (!r) { ok(what, false, "row absent"); return; }
@@ -23372,9 +23379,8 @@ static void ple_cache_case(const Plugin& pl) {
     std::vector<RadParam> ps = { PI("M", M), PI("n_embd", NE), PI("n_vocab", NV),
                                 PS("dtype", "bf16") };
 
-    auto launch = [&](const std::vector<int32_t>& ids, void* tab, void* x, hipStream_t st,
-                      void* inst) {
-        st_memcpy(d_tok, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+    auto launch_on = [&](void* tok, void* tab, void* x, hipStream_t st, void* inst) {
+        ts[0].data = tok;
         ts[1].data = tab;
         ts[3].data = x;
         RadArgs a;
@@ -23384,6 +23390,11 @@ static void ple_cache_case(const Plugin& pl) {
         a.world_size = 1;
         a.instance = inst;
         return r->launch(&a, (RadStream)st);
+    };
+    auto launch = [&](const std::vector<int32_t>& ids, void* tab, void* x, hipStream_t st,
+                      void* inst) {
+        st_memcpy(d_tok, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+        return launch_on(d_tok, tab, x, st, inst);
     };
     auto check = [&](const char* stage, const std::vector<int32_t>& ids,
                      const std::vector<uint8_t>& t, void* x, int rc) {
@@ -23450,6 +23461,34 @@ static void ple_cache_case(const Plugin& pl) {
     check("back to the first table", ids_fit, table, d_x,
           launch(ids_fit, d_tab, d_x, nullptr, inst));
 
+    /* A round on four streams: a token buffer and an output buffer a stream, the ids copied on
+     * the stream itself out of pinned memory, all four launches enqueued, and only then a sync
+     * and the read-backs. A check() after each launch would put a device-wide copy between them
+     * and the launches would take turns -- the concurrency this stage exists for would never run. */
+    const size_t tok_b = (size_t)M * 4;
+    int32_t* h_tok = nullptr;
+    if (hip_ck(hipHostMalloc((void**)&h_tok, 4 * tok_b), "hipHostMalloc", __LINE__) !=
+        (int)hipSuccess)
+        h_tok = nullptr;
+    void* d_tok_s[4] = { dalloc(tok_b), dalloc(tok_b), dalloc(tok_b), dalloc(tok_b) };
+    auto streams_round = [&](const char* stage, int round, const std::vector<int32_t>& ids,
+                             void* const* out, hipStream_t* ss, void* inst_) {
+        if (!h_tok || !d_tok_s[0]) {
+            bad += fmt("%s %d: no pinned token buffer; ", stage, round);
+            return;
+        }
+        int rc[4];
+        for (int s = 0; s < 4; ++s) {
+            std::memcpy((char*)h_tok + s * tok_b, ids.data(), tok_b);
+            hip_ck(hipMemcpyAsync(d_tok_s[s], (const char*)h_tok + s * tok_b, tok_b,
+                                  hipMemcpyHostToDevice, ss[s]), "hipMemcpyAsync", __LINE__);
+            rc[s] = launch_on(d_tok_s[s], d_tab, out[s], ss[s], inst_);
+        }
+        for (int s = 0; s < 4; ++s) st_stream_sync(ss[s]);
+        for (int s = 0; s < 4; ++s)
+            check(fmt("%s %d/%d", stage, round, s).c_str(), ids, table, out[s], rc[s]);
+    };
+
     /* Four streams, eight rounds: the same ids, so each stream's rows are the others' hits. */
     hipStream_t st[4] = { nullptr, nullptr, nullptr, nullptr };
     void* sx[4] = { dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)),
@@ -23460,12 +23499,8 @@ static void ple_cache_case(const Plugin& pl) {
     if (!streams_ok) {
         bad += "hipStreamCreate failed; ";
     } else {
-        for (int round = 0; round < 8; ++round) {
-            for (int s = 0; s < 4; ++s)
-                check(fmt("streams %d/%d", round, s).c_str(), ids_fit, table, sx[s],
-                      launch(ids_fit, d_tab, sx[s], st[s], inst));
-        }
-        for (int s = 0; s < 4; ++s) st_stream_sync(st[s]);
+        for (int round = 0; round < 8; ++round)
+            streams_round("streams", round, ids_fit, sx, st, inst);
         for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(st[s]), "hipStreamDestroy", __LINE__);
     }
 
@@ -23485,7 +23520,10 @@ static void ple_cache_case(const Plugin& pl) {
     /* One set, four places, eight ids, four streams, sixteen shuffles: every launch reclaims ways
      * the other streams are reading. That is the reclaim-and-rewrite (X, Y, X while a reader is
      * between its payload load and its recheck) a bare status word cannot see and the generation
-     * can, so this is the stage the seqlock earns its keep on. */
+     * can, so this is the stage the seqlock earns its keep on. The four launches of a round are
+     * enqueued back to back (streams_round), so they overlap instead of taking turns; which
+     * interleaving a given round hits is the card's, so a round that never lands in the window
+     * costs coverage, never a false pass. */
     setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "1", 1);
     void* inst3 = nullptr;
     if (r->init(nullptr, 0, 0, 1, &inst3) != RAD_OK || !inst3) {
@@ -23505,16 +23543,14 @@ static void ple_cache_case(const Plugin& pl) {
                     rs = rs * 1664525u + 1013904223u;
                     ids[(size_t)m] = (int32_t)((rs >> 9) % 8u);
                 }
-                for (int s = 0; s < 4; ++s)
-                    check(fmt("hot set %d/%d", round, s).c_str(), ids, table, hx[s],
-                          launch(ids, d_tab, hx[s], hs[s], inst3));
+                streams_round("hot set", round, ids, hx, hs, inst3);
             }
-            for (int s = 0; s < 4; ++s) st_stream_sync(hs[s]);
             for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(hs[s]), "hipStreamDestroy", __LINE__);
         }
         r->fini(inst3);
     }
 
+    if (h_tok) hip_ck(hipHostFree(h_tok), "hipHostFree", __LINE__);
     if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
     else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
     ok(what, bad.empty(), bad);

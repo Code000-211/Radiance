@@ -153,6 +153,9 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
 // plain EMPTY/LOADING/READY word cannot tell a row that stayed put from one reclaimed and then
 // rewritten for the same id while the reader was between its payload load and its recheck, and
 // the payload comes out of L1, so that torn read would be served again on later launches.
+// Two a publication, so a way's generation wraps to 0 after 2^31 writes: the row reads as empty
+// and is refilled, and only a reader kept across all 2^31 rewrites of that one way could take a
+// stale row for a hit. Sized for the row, not made wraparound-free.
 constexpr uint32_t kPleRow = 160, kPleLanes = kPleRow / 8, kPleWays = 4;
 constexpr uint32_t kPleCacheThreads = 32;
 
