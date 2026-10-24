@@ -1,0 +1,471 @@
+From 2a1fa3de9dd6ee839a1fd012a639b9e792575cd1 Mon Sep 17 00:00:00 2001
+From: orca <orca@ct105.local>
+Date: Thu, 8 Oct 2026 03:59:15 +0200
+Subject: [PATCH] feat(arch): fuse GDN in-projection weight concat and QSA
+ op_qprep
+
+---
+ arch/common/rad_block_gdn_fp8.h    | 81 ++++++++----------------------
+ arch/common/rad_fp8.h              | 44 ++++++++--------
+ arch/common/rad_qsa.h              |  2 +-
+ arch/qwen35_fp8/qwen35_fp8.cpp     |  6 +--
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp | 12 +++--
+ libr4d/r4d_gemm_fp8a8.hip          |  4 +-
+ libr4d/r4d_rows.cpp                |  4 +-
+ tests/arch_test.cpp                | 74 +++++++++++++++++++++++++++
+ 8 files changed, 130 insertions(+), 97 deletions(-)
+
+diff --git a/arch/common/rad_block_gdn_fp8.h b/arch/common/rad_block_gdn_fp8.h
+index 833e2af..e689f58 100644
+--- a/arch/common/rad_block_gdn_fp8.h
++++ b/arch/common/rad_block_gdn_fp8.h
+@@ -116,7 +116,7 @@ struct GdnFP8 {
+     int         layer = 0;
+     rad_kvgroup kv_state = 0, kv_conv = 0;
+ 
+-    rad_weight w_norm = 0, w_ab = 0, w_conv = 0;
++    rad_weight w_norm = 0, w_conv = 0;
+     /* The input was normed and quantised by the caller; this block declares no norm. */
+     bool       ext_in = false;
+     rad_weight w_a_log = 0, w_dt_bias = 0, w_out_norm = 0;
+@@ -124,7 +124,6 @@ struct GdnFP8 {
+     NormQuantFP8 nq_h{};
+     QuantFP8   q_o{};
+ 
+-    rad_op op_ab = 0;
+     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
+     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
+     /* `gdn_conv_recurrent_update`, if it resolves: the pair above as one launch, the convolution
+@@ -220,18 +219,10 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+     }
+     /* The name maps ahead of the weights they name: a checkpoint is asked what a weight is
+      * through its map, at the declaration. */
+-    RAD_ARCH_TRY(map_concat(b, nm.f("blk.%d.ssm_ab.weight", l),     { s.in_a, s.in_b }, 0));
+     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_conv1d.weight", l), s.conv1d));
+     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_a_log", l),         s.a_log));
+     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_dt.bias", l),       s.dt_bias));
+     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_norm.weight", l),   s.out_norm));
+-    /* The decay and beta projections, kept bf16 because the checkpoint kept them bf16 -- see the
+-     * header. Row-sharded with the value heads they belong to: a and b are concatenated along dim 0
+-     * so rank r owns rows [r*n_head_v, (r+1)*n_head_v) of EACH half, which is what the two-part
+-     * row split says and what a contiguous slice of the concatenation would not give. */
+-    w_ab       = decl_w(b, nm.f("blk.%d.ssm_ab.weight", l),     RAD_BF16, {ab_dim, g.n_embd},
+-                        RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(l), 0,
+-                        {cfg.n_head_v, cfg.n_head_v});
+     /* The depthwise convolution is per channel, so it shards with the channels it convolves --
+      * and those channels are [q|k|v], three groups in one stored tensor, so the split is theirs. */
+     w_conv     = decl_w(b, nm.f("blk.%d.ssm_conv1d.weight", l), RAD_BF16,
+@@ -246,59 +237,30 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+ 
+ 
+-    /* One norm and one quantise of the normed hidden state, in one op; the qkv and z
+-     * projections both read it. rad_fp8.h's NormQuantFP8 says why they are not two. */
++    /* One norm and one quantise of the normed hidden state, in one op; the qkv, z and ab
++     * projections all read it. rad_fp8.h's NormQuantFP8 says why they are not two. */
+     if (!ext_in)
+         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
+                                   fold ? w.x : 0, 0, ar_in));
+-    /* TWO CHECKPOINT TENSORS, FOUR PROJECTIONS, ONE GEMM. in_proj_qkv is [q|k|v] stacked along
+-     * dim 0 and in_proj_z is the output gate; both read the SAME normed, quantised hidden state
+-     * and differ only in their rows, so they are one weight here and one launch at step time.
+-     *
+-     * WHY ONE CALL AND NOT TWO. The decode GEMM is bandwidth-bound but not at small N: two calls
+-     * at 5120 and 3072 rows cost more between them than one call at 8192, because each pays its
+-     * own ramp and tail on top of its launch. Over this model's delta-net layers that adds up to a
+-     * measurable share of a decode step. It is bit-identical: nothing about a row's arithmetic
+-     * changes, and both extents are already past the split-K threshold so the summation order does
+-     * not move either.
+-     *
+-     * THE ROW PARTS ARE THE WHOLE POINT. Rank r must own its slice of EACH of q, k, v and z, so
+-     * the shard is declared as four parts and not as one contiguous cut -- which would give rank 0
+-     * all of q, all of k and a third of v, a well-formed wrong model. */
+-    RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_inz", l), conv_dim + v_dim, g.n_embd,
+-                            RAD_SHARD_ROW, grp_layer(l), { s.in_qkv, s.in_z }, w.h, w.in.x, 0,
+-                            { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }));
+-    /* NOT SLICED, and why it could need to be is worth keeping. This is a 96-column bf16 GEMM --
+-     * half a percent of the layer's projection bytes -- and a bf16 kernel for this shape that
+-     * stopped at M = 64 would leave a hole in its bucket table above 64. Since every op in a step
+-     * is issued at the same token count, that one hole would cap the prefill chunk of the entire
+-     * 27B model at 64 tokens, and the workaround is a launch per 64 rows in every GDN layer. The
+-     * cap was a launcher guard the kernel does not need: MT row tiles live in a block and grid.y
+-     * covers the rest, so M is general, and with the guard raised this is one launch.
+-     *
+-     * AT DECODE THE COST IS THE LAUNCH COUNT, not the arithmetic. `gemm_nt` is the most-dispatched
+-     * kernel in a decode step and it is almost entirely fixed cost, spread over three separate
+-     * small per-layer projections that all read the same activation: the MoE router (one a layer),
+-     * the shared expert's gate (one a layer, RANK 0 ONLY, so on the rank the all-reduce is already
+-     * waiting for) and this a|b (one a GDN layer).
+-     *
+-     * Fusing them is the lever and it is not a small one: they read the same activation but hold
+-     * different weights, so a merge wants either contiguous weights -- a re-convert, which is
+-     * ruled out -- or a GROUPED gemm_nt taking a table of weight pointers the way moe_gemm_q
+-     * does. */
+-    op_ab = rw(b, RAD_OP(b, "gemm_nt",
+-                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", ab_dim),
+-                              RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+-                   RAD_WEIGHTS(w_ab)), {w.h.x}, {w.ab});
++    /* FOUR CHECKPOINT TENSORS, SIX PROJECTIONS, ONE GEMM: [q|k|v], output gate z, and decay/beta
++     * gates a and b. All read the SAME normed, quantised hidden state and differ only in their rows,
++     * so they are concatenated into one weight and issued in one launch at step time. */
++    const int64_t total_in = conv_dim + v_dim + ab_dim;
++    RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_in", l), total_in, g.n_embd,
++                            RAD_SHARD_ROW, grp_layer(l),
++                            { s.in_qkv, s.in_z, s.in_a, s.in_b },
++                            w.h, w.in.x, 0,
++                            { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim(),
++                              cfg.n_head_v, cfg.n_head_v }));
+ 
+     /* ---- the chunked path. Unchanged from the bf16 block except that `a` and `b_gate` are views
+-     * of `ab` rather than of the projection row's tail. */
++     * of `w.in.x` rather than of a separate buffer. */
+     op_conv_prep = rw(b, RAD_OP(b, "gdn_conv_prep",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_k", cfg.head_k),
+                                      RAD_INT("head_v", cfg.head_v), RAD_INT("chunk", cfg.chunk),
+                                      RAD_INT("conv_width", cfg.conv_width)),
+                           RAD_WEIGHTS(w_conv, w_a_log, w_dt_bias)),
+-                      {w.in.x, w.ab}, {w.q, w.k, w.v, w.gdec, w.beta});
++                      {w.in.x}, {w.q, w.k, w.v, w.gdec, w.beta});
+     op_kkt  = rw(b, RAD_OP(b, "gdn_kkt_solve",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_k", cfg.head_k)),
+                      RAD_NOWEIGHTS),
+@@ -342,7 +304,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+                                  RAD_STR("state_form",
+                                          g.max_spec > 0 ? "anchor" : "per_candidate")),
+                       RAD_WEIGHTS(w_a_log, w_dt_bias, w_out_norm)),
+-                  {w.q, w.k, w.v, w.ab, w.in.x}, {w.o.x});
++                  {w.q, w.k, w.v, w.in.x}, {w.o.x});
+     /* The epilogue's codes, for an fp8 or int8 out-projection -- the int8 pair when the model feeds
+      * it (ActFP8::q8_fed), whose dtype picks the kernel's quantiser; a bf16 one reads `o.x` and
+      * nothing else, and the operands are left absent. */
+@@ -364,7 +326,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
+                                   RAD_STR("state_form",
+                                           g.max_spec > 0 ? "anchor" : "per_candidate")),
+                        RAD_WEIGHTS(w_conv, w_a_log, w_dt_bias, w_out_norm)),
+-                   {w.in.x, w.ab}, {w.o.x});
++                   {w.in.x}, {w.o.x});
+         if (op_cr && w.o.cq()) {
+             const rad_buf oq[2] = { w.o.cq(), w.o.cs() };
+             RAD_ARCH_TRY(rad_op_writes(b, op_cr, oq, 2));
+@@ -413,7 +375,6 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
+ 
+     if (!ext_in) nq_h.step(c, T);
+     in.step(c, w.h, w.in.x, T);
+-    RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+ 
+     /* THE TWO PATHS, EACH OVER ITS OWN RUN OF SEQUENCES.
+      *
+@@ -444,13 +405,13 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
+     const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
+     const int64_t P  = S - D;
+     const int64_t PT = T - DT;
+-    const int64_t in_w = conv_dim + v_dim;      /* w.in.x's declared row width */
++    const int64_t in_w = conv_dim + v_dim + cfg.ab_dim();      /* w.in.x's declared row width */
+ 
+     if (D > 0 && op_cr && qd <= cr_rows) {
+         RAD_ISSUE_N(c, op_cr, qd,
+                     bcol(w.in.x, 0, conv_dim, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),
+                     praw(cv_idx, RAD_I32, D),
+-                    bcol(w.ab, 0, H, DT), bcol(w.ab, H, H, DT),
++                    bcol(w.in.x, conv_dim + v_dim, H, DT), bcol(w.in.x, conv_dim + v_dim + H, H, DT),
+                     RAD_W(w_a_log), RAD_W(w_dt_bias), kv_cache(kv_state, layer),
+                     praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
+                     praw(batch->cu_seqlens, RAD_I32, D + 1),
+@@ -465,7 +426,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
+                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT));
+         RAD_ISSUE_N(c, op_recur, qd,
+                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT),
+-                    bcol(w.ab, 0, H, DT), bcol(w.ab, H, H, DT),
++                    bcol(w.in.x, conv_dim + v_dim, H, DT), bcol(w.in.x, conv_dim + v_dim + H, H, DT),
+                     RAD_W(w_a_log), RAD_W(w_dt_bias), kv_cache(kv_state, layer),
+                     praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
+                     praw(batch->cu_seqlens, RAD_I32, D + 1),
+@@ -478,7 +439,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
+         RAD_ISSUE(c, op_conv_prep,
+                   bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),
+                   kv_cache(kv_conv, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
+-                  bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
++                  bcol(w.in.x, conv_dim + v_dim, H, T), bcol(w.in.x, conv_dim + v_dim + H, H, T),
+                   praw(cv_idx ? cv_idx + D : nullptr, RAD_I32, P),
+                   praw(batch->ctx_lens + D, RAD_I32, P),
+                   brows(w.q, T), brows(w.k, T), brows(w.v, T),
+diff --git a/arch/common/rad_fp8.h b/arch/common/rad_fp8.h
+index d7429c9..7970225 100644
+--- a/arch/common/rad_fp8.h
++++ b/arch/common/rad_fp8.h
+@@ -894,11 +894,10 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
+     /* The one geometric precondition, checked here so it is reported once per weight with the
+      * weight named rather than as a kernel miss with a band in it. These are PER-RANK extents, so
+      * this is also the check that a tensor-parallel width does not cut a scale block in half. */
+-    if (N % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK) {
+-        fprintf(stderr, "radiance: '%s' is %lldx%lld per rank, which is not a whole number of "
+-                        "%dx%d scale blocks. A block-scaled fp8 weight cannot be split inside a "
+-                        "block; use a bf16 linear here or a world_size that divides cleanly.\n",
+-                base, (long long)N, (long long)K, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
++    if (N <= 0 || K % RAD_FP8_BLOCK) {
++        fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an fp8 weight requires "
++                        "K in whole %d-column scale groups.\n",
++                base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+         return RAD_E_INVAL;
+     }
+ 
+@@ -909,16 +908,15 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
+      * not a whole number of blocks cannot be expressed either way, so it is refused by name. */
+     int64_t wparts[RAD_MAX_ROW_PARTS] = {0}, sparts[RAD_MAX_ROW_PARTS] = {0};
+     int     np = 0;
++    int64_t accum = 0;
+     for (int64_t p : row_parts) {
+         if (np >= RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
+-        if (p % RAD_FP8_BLOCK) {
+-            fprintf(stderr, "radiance: '%s' stacks a %lld-row part, which is not a whole number "
+-                            "of %d-row scale blocks; it cannot be row-sharded.\n",
+-                    base, (long long)p, RAD_FP8_BLOCK);
+-            return RAD_E_INVAL;
+-        }
++        if (p <= 0) return RAD_E_INVAL;
+         wparts[np] = p;
+-        sparts[np] = p / RAD_FP8_BLOCK;
++        int64_t b0 = fp8_blocks(accum);
++        accum += p;
++        int64_t b1 = fp8_blocks(accum);
++        sparts[np] = b1 - b0;
+         ++np;
+     }
+ 
+@@ -1025,26 +1023,24 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
+                              std::initializer_list<const char*> src,
+                              std::initializer_list<int64_t> row_parts) {
+     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
+-    if (N % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK) {
+-        fprintf(stderr, "radiance: '%s' is %lldx%lld per rank, which is not a whole number of "
+-                        "%dx%d scale blocks. A block-scaled fp8 weight cannot be split inside a "
+-                        "block; use a bf16 linear here or a world_size that divides cleanly.\n",
+-                base, (long long)N, (long long)K, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
++    if (K % RAD_FP8_BLOCK) {
++        fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an fp8 weight requires "
++                        "K in whole %d-column scale groups.\n",
++                base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+         return RAD_E_INVAL;
+     }
+ 
+     int64_t wp[RAD_MAX_ROW_PARTS] = {0}, sp[RAD_MAX_ROW_PARTS] = {0};
+     int     np = 0;
++    int64_t accum = 0;
+     for (int64_t p : row_parts) {
+         if (np >= RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
+-        if (p % RAD_FP8_BLOCK) {
+-            fprintf(stderr, "radiance: '%s' stacks a %lld-row part, which is not a whole number "
+-                            "of %d-row scale blocks; it cannot be row-sharded.\n",
+-                    base, (long long)p, RAD_FP8_BLOCK);
+-            return RAD_E_INVAL;
+-        }
++        if (p <= 0) return RAD_E_INVAL;
+         wp[np] = p;
+-        sp[np] = p / RAD_FP8_BLOCK;
++        int64_t b0 = fp8_blocks(accum);
++        accum += p;
++        int64_t b1 = fp8_blocks(accum);
++        sp[np] = b1 - b0;
+         ++np;
+     }
+ 
+diff --git a/arch/common/rad_qsa.h b/arch/common/rad_qsa.h
+index 76044b6..79216d4 100644
+--- a/arch/common/rad_qsa.h
++++ b/arch/common/rad_qsa.h
+@@ -147,7 +147,7 @@ struct QsaIndexer {
+     rad_op      op_score_shard = 0, op_select_shard = 0;
+     rad_op      op_gather_sel = 0, op_gather_sequ = 0;
+ 
+-    bool on() const { return op_rope != 0; }
++    bool on() const { return op_rope != 0 || op_qprep != 0; }
+ 
+     /* `bk` is the block-key KV group, created on FIRST USE and shared by every QSA layer after
+      * that -- which is why it is an in/out parameter rather than a member. It cannot be declared
+diff --git a/arch/qwen35_fp8/qwen35_fp8.cpp b/arch/qwen35_fp8/qwen35_fp8.cpp
+index a29a80a..3c0ade1 100644
+--- a/arch/qwen35_fp8/qwen35_fp8.cpp
++++ b/arch/qwen35_fp8/qwen35_fp8.cpp
+@@ -770,9 +770,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+     /* `gdn_in` is conv_dim + v_dim and not in_dim: a and b are their own buffer here because the
+      * checkpoint keeps them bf16, and the output gate is the tail of THIS one because it does not
+      * (rad_block_gdn_fp8.h). The convolution and the gate are column views of it. */
+-    m.a_in.x    = decl_b(b, nm.f("gdn_in"),   g.act_dtype, {g.max_tok, conv_dim + v_dim});
+-    RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", conv_dim + v_dim));
+-    m.b_ab      = decl_b(b, nm.f("gdn_ab"),   g.act_dtype, {g.max_tok, gc.ab_dim()});
++    const int64_t in_dim = conv_dim + v_dim + gc.ab_dim();
++    m.a_in.x    = decl_b(b, nm.f("gdn_in"),   g.act_dtype, {g.max_tok, in_dim});
++    RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", in_dim));
+     m.b_gq      = decl_b(b, nm.f("gdn_q"),    g.act_dtype, {g.max_tok, gc.n_head_k, gc.head_k});
+     m.b_gk      = decl_b(b, nm.f("gdn_k"),    g.act_dtype, {g.max_tok, gc.n_head_k, gc.head_k});
+     m.b_gv      = decl_b(b, nm.f("gdn_v"),    g.act_dtype, {g.max_tok, gc.n_head_v, gc.head_v});
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 147b8ba..f5cc507 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -757,9 +757,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+         for (int64_t l = 0; l < g.n_layer; ++l) {
+             if (is_full_attention(l, interval)) continue;
+             RAD_ARCH_TRY(m.layers[(size_t)l].gdn.in.probe(
+-                b, nm, g, nm.f("blk.%lld.ssm_inz", (long long)l),
++                b, nm, g, nm.f("blk.%lld.ssm_in", (long long)l),
+                 { nm.ckpt("%s.%lld.linear_attn.in_proj_qkv.weight", pre0, (long long)l),
+-                  nm.ckpt("%s.%lld.linear_attn.in_proj_z.weight", pre0, (long long)l) }));
++                  nm.ckpt("%s.%lld.linear_attn.in_proj_z.weight", pre0, (long long)l),
++                  nm.ckpt("%s.%lld.linear_attn.in_proj_a.weight", pre0, (long long)l),
++                  nm.ckpt("%s.%lld.linear_attn.in_proj_b.weight", pre0, (long long)l) }));
+             m.trunk_i8 = m.layers[(size_t)l].gdn.in.probed_i8;
+             break;
+         }
+@@ -844,9 +846,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             return RAD_E_INVAL;
+     }
+ 
+-    m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
+-    RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", conv_dim + v_dim));
+-    m.b_ab   = decl_b(b, nm.f("gdn_ab"),   g.act_dtype, {T, m.gcfg.ab_dim()});
++    const int64_t in_dim = conv_dim + v_dim + m.gcfg.ab_dim();
++    m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, in_dim});
++    RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", in_dim));
+     m.b_gq   = decl_b(b, nm.f("gdn_q"),    g.act_dtype, {T, m.gcfg.n_head_k, m.gcfg.head_k});
+     m.b_gk   = decl_b(b, nm.f("gdn_k"),    g.act_dtype, {T, m.gcfg.n_head_k, m.gcfg.head_k});
+     m.b_gv   = decl_b(b, nm.f("gdn_v"),    g.act_dtype, {T, m.gcfg.n_head_v, m.gcfg.head_v});
+diff --git a/libr4d/r4d_gemm_fp8a8.hip b/libr4d/r4d_gemm_fp8a8.hip
+index ea8ff31..0083f93 100644
+--- a/libr4d/r4d_gemm_fp8a8.hip
++++ b/libr4d/r4d_gemm_fp8a8.hip
+@@ -1673,7 +1673,7 @@ static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M,
+     // Required, not preferred: the fold at the end of the K loop assumes a whole 128-column scale
+     // block, and the AW=false branch reads the weight's scale as one scalar for 128 B rows.
+     if (K % (int)kBlock) return -4;
+-    if (N % (int)kBlock) return -5;
++    if (N <= 0) return -5;
+     if (!a_ld)  a_ld  = K;
+     if (!w_ld)  w_ld  = K;
+     const int nkb = (K + (int)kBlock - 1) / (int)kBlock;
+@@ -1682,7 +1682,7 @@ static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M,
+ 
+     constexpr uint32_t FM = kFWaves * kFMTiles * 16;
+     const dim3 grid(((uint32_t)M + FM - 1) / FM, ((uint32_t)N + kFN - 1) / kFN, 1);
+-    const bool full = ((uint32_t)M % FM == 0);         // N % 128 and K % 128 are already required
++    const bool full = ((uint32_t)M % FM == 0) && ((uint32_t)N % kFN == 0);
+     if (full)
+         hipLaunchKernelGGL((gemm_fp8a8_kernel<true, false, kFNTiles, kFMTiles, kFWaves, kFK, false, I8>), grid,
+                            dim3(kFWaves * kWave), 0, (hipStream_t)stream, (const uint8_t*)a,
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index aedb17c..47fb019 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2662,7 +2662,7 @@ static const RadConstraint cGemmNtFp8A8M16[] = {
+     C_IN("dtype", "fp8a8"),
+ };
+ static const RadConstraint cGemmNtFp8A8Tiled[] = {
+-    C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
++    C_DIV("K", R4D_FP8_BLOCK), C_GE("N", 1), C_EQ("group", R4D_FP8_BLOCK),
+     C_IN("dtype", "fp8a8"),
+ };
+ /* The int8 twins: the same bands at dtype i8a8. */
+@@ -2671,7 +2671,7 @@ static const RadConstraint cGemmNtI8A8M16[] = {
+     C_IN("dtype", "i8a8"),
+ };
+ static const RadConstraint cGemmNtI8A8Tiled[] = {
+-    C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
++    C_DIV("K", R4D_FP8_BLOCK), C_GE("N", 1), C_EQ("group", R4D_FP8_BLOCK),
+     C_IN("dtype", "i8a8"),
+ };
+ /* libr4d's row says `K DIV 4`; the key rename to docs/OPS.md's `n` is the same one every quantiser
+diff --git a/tests/arch_test.cpp b/tests/arch_test.cpp
+index 0e49012..9404827 100644
+--- a/tests/arch_test.cpp
++++ b/tests/arch_test.cpp
+@@ -276,6 +276,13 @@ extern "C" int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
+ /* Non-null and distinct per handle: a plugin only passes these through to rad_route_report. */
+ extern "C" void* rad_weight_ptr(RadCtx* c, rad_weight w) { (void)c; return (void*)(uintptr_t)(w * 64 + 8); }
+ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void*)(uintptr_t)(b * 64 + 16); }
++extern "C" int   rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) { (void)dst; (void)src; (void)bytes; (void)s; return 0; }
++extern "C" int   rad_stream_sync(RadStream s) { (void)s; return 0; }
++extern "C" int   rad_lane(RadCtx* c, int lane) { (void)c; (void)lane; return 0; }
++extern "C" int   rad_lane_join(RadCtx* c, int from, int to) { (void)c; (void)from; (void)to; return 0; }
++extern "C" void* rad_dev_alloc(int64_t bytes, int kind) { (void)bytes; (void)kind; return nullptr; }
++extern "C" void  rad_dev_free(void* p, int kind) { (void)p; (void)kind; }
++extern "C" int   rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) { (void)dst; (void)value; (void)bytes; (void)s; return 0; }
+ 
+ /* ==================================================================== the plugin under test */
+ #include "../arch/qwen35_bf16/qwen35_bf16.cpp"
+@@ -1836,6 +1843,73 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
+ }
+ 
+ 
++TEST(qwen4exp_gdn_in_proj_concat_and_qsa_qprep_fusion) {
++    RadModelMeta meta = qwen4exp_meta();
++    RadBuildCtx c2 = build_ctx(0, 2);
++    c2.max_tok  = 2048;
++    c2.max_seqs = 8;
++    c2.max_spec = 3;
++    c2.max_ctx  = 200000;
++    RadBuilder b;
++    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c2), RAD_OK);
++    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
++
++    /* 1. GDN blk.0.ssm_in weight concatenation at TP2:
++     * Total rows N = 8240 (5120 conv [q|k|v] + 3072 gate z + 48 decay gates a & b) */
++    const RecWeight* w_in = nullptr;
++    const RecWeight* w_ab = nullptr;
++    for (const RecWeight& w : b.weights) {
++        if (w.name == "blk.0.ssm_in.weight") w_in = &w;
++        if (w.name == "blk.0.ssm_ab.weight") w_ab = &w;
++    }
++    REQUIRE(w_in != nullptr);
++    CHECK(w_ab == nullptr);
++    CHECK_EQ(w_in->d.shape[0], 8240);
++    CHECK_EQ(w_in->d.shape[1], 2560);
++    CHECK_EQ(w_in->d.shard, RAD_SHARD_ROW);
++    CHECK_EQ(w_in->d.n_row_parts, 6);
++    CHECK_EQ(w_in->d.row_parts[0], 1024);
++    CHECK_EQ(w_in->d.row_parts[1], 1024);
++    CHECK_EQ(w_in->d.row_parts[2], 3072);
++    CHECK_EQ(w_in->d.row_parts[3], 3072);
++    CHECK_EQ(w_in->d.row_parts[4], 24);
++    CHECK_EQ(w_in->d.row_parts[5], 24);
++
++    /* 2. QSA op_qprep declaration on full-attention layers (layer 3 and 7): */
++    CHECK(m.layers[3].full);
++    CHECK(m.layers[3].qsa.on());
++    CHECK(m.layers[3].qsa.op_qprep != 0);
++
++    /* 3. Issue decode step and verify execution: */
++    RadCtx c; c.b = &b; c.rank = 0; c.world = 2;
++    RadBatch batch = decode_batch();
++    c.batch = &batch;
++    qwen4exp_fp8::step(&c, &batch);
++
++    /* In GDN Layer 0: only 1 in-projection GEMM is issued (m.layers[0].gdn.in.op or op_m1).
++     * In QSA Layer 3: op_qprep (qk_norm_rope_gate) is issued as 1 fused launch instead of 4 rmsnorm + 1 rope. */
++    int layer0_in_gemm_count = 0;
++    int qsa_qprep_count = 0;
++    int qsa_unfused_norm_count = 0;
++    int qsa_unfused_rope_count = 0;
++
++    for (const auto& issue : c.issues) {
++        if (issue.op == m.layers[0].gdn.in.op || issue.op == m.layers[0].gdn.in.op_m1)
++            ++layer0_in_gemm_count;
++        if (issue.op == m.layers[3].qsa.op_qprep)
++            ++qsa_qprep_count;
++        if (issue.op == m.layers[3].qsa.op_norm)
++            ++qsa_unfused_norm_count;
++        if (issue.op == m.layers[3].qsa.op_rope)
++            ++qsa_unfused_rope_count;
++    }
++    CHECK_EQ(layer0_in_gemm_count, 1);
++    CHECK_EQ(qsa_qprep_count, 1);
++    CHECK_EQ(qsa_unfused_norm_count, 0);
++    CHECK_EQ(qsa_unfused_rope_count, 0);
++}
++
++
+ /* FOUR RANKS: THE KV HEADS REPLICATE, THE EXPERT WIDTHS SPLIT, THE FUSED COLLECTIVES STOP.
+  *
+  * This is the tensor-parallel test above's sibling for the other model in the tree, and it exists
+-- 
+2.39.5
+

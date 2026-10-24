@@ -1,0 +1,896 @@
+From abf30d8d7483ca47d7da9dc37dd2307b3e9c18d1 Mon Sep 17 00:00:00 2001
+From: orca <orca@ct105.local>
+Date: Thu, 8 Oct 2026 04:11:39 +0200
+Subject: [PATCH] feat(fr_spec): implement reduced vocabulary draft head from
+ mtp-lm-head-reduced
+
+---
+ arch/common/rad_block_mtp_fp8.h    |   7 ++
+ arch/common/rad_block_mtp_hc.h     |  47 ++++++++-
+ arch/qwen4exp_fp8/qwen4exp_fp8.cpp |  25 +++--
+ core/build/startup.cpp             |  28 ++++--
+ core/engine.h                      |   2 +
+ core/engine_draft.cpp              |  43 ++++++++
+ core/engine_priv.h                 |   2 +
+ core/format/checkpoint.cpp         |  86 ++++++++++++++--
+ core/format/checkpoint.h           |   1 +
+ core/sched/advance.h               |   2 +
+ core/sched/advance_impl.h          |  10 +-
+ libr4d/r4d_layout.cpp              |   3 +-
+ tests/checkpoint_test.cpp          | 116 +++++++++++++++++++--
+ tests/fr_spec_test.cpp             | 156 +++++++++++++++++++++++++++++
+ 14 files changed, 485 insertions(+), 43 deletions(-)
+ create mode 100644 tests/fr_spec_test.cpp
+
+diff --git a/arch/common/rad_block_mtp_fp8.h b/arch/common/rad_block_mtp_fp8.h
+index dac7f12..4813026 100644
+--- a/arch/common/rad_block_mtp_fp8.h
++++ b/arch/common/rad_block_mtp_fp8.h
+@@ -134,6 +134,13 @@ inline bool mtp_draft_head_q2(RadBuilder* b, const char* head, const char* lm) {
+     return weight_enc(b, head, &e) && e.n_planes > 0 && e.plane[0].dtype == RAD_U2;
+ }
+ 
++inline bool mtp_draft_head_reduced(RadBuilder* b, const char* head, const char* lm_reduced) {
++    if (!head || !lm_reduced) return false;
++    if (map_copy(b, head, lm_reduced) < 0) return false;
++    RadEncoding e{};
++    return weight_enc(b, head, &e) && e.n_planes > 0 && e.plane[0].dtype == RAD_U4;
++}
++
+ /* TEMPLATED ON THE FEED-FORWARD, because the head is a TRUNK LAYER and a trunk layer's
+  * feed-forward is dense in one member of this family and routed in the next. Qwen3.6-35B-A3B's
+  * `mtp.layers.0` carries `mlp.experts.*`, `mlp.gate` and a shared expert, exactly as its trunk
+diff --git a/arch/common/rad_block_mtp_hc.h b/arch/common/rad_block_mtp_hc.h
+index ab941d0..7cff730 100644
+--- a/arch/common/rad_block_mtp_hc.h
++++ b/arch/common/rad_block_mtp_hc.h
+@@ -170,10 +170,12 @@ struct MtpHcBlock {
+     int     depth  = 0;    /* rounds this deployment will run -- the carry's last-round test */
+     int64_t ngroup = 0;    /* the pre-fc norm's groups: hc, one rsqrt a sub-stream */
+     bool    q2     = false;
++    bool    is_red = false;
+     /* The 2-bit draft head's logical weight: the checkpoint's lm_head under a name of its own,
+      * which a recipe stores as 2-bit codes. The plugin asks mtp_draft_head_q2 about this name --
+      * which also declares its map -- and declares the head's buffers when the answer is yes. */
+     static const char* head_name(Names& nm) { return nm.f("mtp.draft_head.weight"); }
++    static const char* head_name_reduced(Names& nm) { return nm.f("mtp.draft_head_reduced"); }
+ 
+     rad_weight w_tok = 0, w_lm = 0, w_fc_h = 0, w_fc_e = 0, w_pre_h = 0, w_pre_e = 0;
+     rad_weight w_dh = 0, w_dhs = 0;
+@@ -378,8 +380,38 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
+      * row-interleaved and requires the row to be a whole number of 16-byte words, and a pair is
+      * (int32 id, float value) -- so R = 1 is an 8-byte row and is refused, while R = 2 is 16. The
+      * engine reads column 0 through `proposal_pitch`, which is what that field is for. */
+-    q2 = w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
+-    if (q2) {
++    const bool has_bufs = w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
++    RadEncoding e_red{};
++    const char* dhn_red = head_name_reduced(nm);
++    is_red = has_bufs && weight_enc(b, dhn_red, &e_red) && e_red.n_planes > 0 && e_red.plane[0].dtype == RAD_U4;
++    q2 = !is_red && has_bufs;
++    if (is_red) {
++        const int64_t hrows = 52416;
++        w_dh  = decl_view(b, dhn_red, nullptr, "codes", RAD_U4, {hrows, g.n_embd},
++                          RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
++        w_dhs = decl_view(b, nm.f("mtp.draft_head_reduced.scale"), dhn_red, "scale,zero", RAD_F16,
++                          {hrows, g.n_embd}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
++        if (!w_dh || !w_dhs) return RAD_E_INVAL;
++
++        op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
++                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
++                                     RAD_INT("n", g.n_embd), RAD_INT("group", MTP_W2_GROUP),
++                                     RAD_STR("dtype", g.dtype)),
++                          RAD_NOWEIGHTS),
++                      {w.hout}, {w.dq, w.ds, w.dsum});
++        op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
++                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
++                                      RAD_INT("N", hrows), RAD_INT("K", g.n_embd),
++                                      RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w4a8_asym")),
++                           RAD_WEIGHTS(w_dh, w_dhs)),
++                       {w.dq, w.ds, w.dsum}, {w.dlog});
++        op_dtopk = rw(b, RAD_OP(b, "row_topk",
++                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("N", hrows),
++                                     RAD_INT("R", 1), RAD_STR("dtype", g.dtype)),
++                          RAD_NOWEIGHTS),
++                     {w.dlog}, {w.didx, w.dval});
++        if (!op_dquant || !op_dlogits || !op_dtopk) return RAD_E_INVAL;
++    } else if (q2) {
+         /* AND IT IS VOCAB-PARALLEL, which is 159 MB a round rather than 318. The head does not go
+          * through the sampler, so its argmax is a `row_topk` over one rank's plane -- and a
+          * sharded plane alone would make every rank propose only tokens from its own half. That
+@@ -498,7 +530,7 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
+      * every pass of the step. */
+     {
+         rad_op last = op_logits;
+-        if (q2) last = op_dmerge ? op_dmerge : op_drerank ? op_drerank : op_dtopk;
++        if (q2 || is_red) last = op_dmerge ? op_dmerge : op_drerank ? op_drerank : op_dtopk;
+         if (rad_op_reads(b, last, &w.hin, 1) < 0) return RAD_E_INVAL;
+     }
+     return RAD_OK;
+@@ -568,7 +600,14 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
+     }
+ 
+     mixer.read(c, L, 0, L);
+-    if (q2) {
++    if (is_red) {
++        RAD_ISSUE_N(c, op_dquant, L, brows(w.hout, L), brows(w.dq, L), brows(w.ds, L),
++                    RAD_B(w.dsum));
++        RAD_ISSUE_N(c, op_dlogits, L, brows(w.dq, L), brows(w.ds, L), RAD_W(w_dh), RAD_W(w_dhs),
++                    brows(w.dlog, L), RAD_B(w.dsum), RAD_NONE);
++        RAD_ISSUE_N(c, op_dtopk, L, brows(w.dlog, L), brows(w.didx, L), brows(w.dval, L),
++                    RAD_NONE);
++    } else if (q2) {
+         /* `dsum` is GROUP-major [n_embd/group][ceil(L/16)*16] and not row-major, so it is passed
+          * whole: there is no row slice of it that means anything. */
+         RAD_ISSUE_N(c, op_dquant, L, brows(w.hout, L), brows(w.dq, L), brows(w.ds, L),
+diff --git a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+index 147b8ba..3f8e4b1 100644
+--- a/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
++++ b/arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+@@ -1249,18 +1249,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+         m.b_mtp_hw   = decl_b(b, nm.f("mtp_hw"),   g.act_dtype, {T, HN});
+         m.b_mtp_e    = decl_b(b, nm.f("mtp_e"),    g.act_dtype, {T, g.n_embd});
+         m.b_mtp_hout = decl_b(b, nm.f("mtp_hout"), g.act_dtype, {g.max_logit_rows, g.n_embd});
+-        /* THE 2-BIT DRAFT HEAD, when the model holds one: asked once, here, because the answer
++        /* THE REDUCED or 2-BIT DRAFT HEAD, when the model holds one: asked once, here, because the answer
+          * declares the head's buffers and the block reads it back from them. */
+-        if (mtp_draft_head_q2(b, MtpHcBlock::head_name(nm), nm.ckpt("lm_head.weight"))) {
++        const bool has_reduced = mtp_draft_head_reduced(b, MtpHcBlock::head_name_reduced(nm),
++                                                        nm.ckpt("mtp.lm_head_reduced.weight_q4"));
++        const bool has_q2 = !has_reduced &&
++                            mtp_draft_head_q2(b, MtpHcBlock::head_name(nm), nm.ckpt("lm_head.weight"));
++        if (has_reduced || has_q2) {
+             const int64_t dmpad = ((g.max_logit_rows + 15) / 16) * 16;
+             m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,  {g.max_logit_rows, g.n_embd});
+             m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32, {g.max_logit_rows, 1});
+             m.b_mtp_dsum = decl_b(b, nm.f("mtp_dsum"), RAD_F32, {g.n_embd / 128, dmpad});
+             /* AT THIS RANK'S ROWS, not the model's: the 2-bit head is vocab-parallel and the
+-             * merge below puts the halves back together. rad_arch.h owns the rule. */
++             * merge below puts the halves back together. For reduced head: replicated, 52416 rows. */
+             m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype,
+-                                  {g.max_logit_rows, vocab_head_rows(g)});
+-            if (vocab_head_sharded(g)) {
++                                  {g.max_logit_rows, has_reduced ? 52416 : vocab_head_rows(g)});
++            if (!has_reduced && vocab_head_sharded(g)) {
+                 m.b_mtp_dpair = decl_b(b, nm.f("mtp_dpair"), RAD_F32,
+                                        {g.max_logit_rows, kDraftTopR, 2});
+                 m.b_mtp_dgath = decl_b(b, nm.f("mtp_dgath"), RAD_F32,
+@@ -1268,11 +1272,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+             }
+             /* NAMED and declared, because the engine reads the proposal straight out of it: a
+              * draft round's token comes from row_topk and never through the sampler. */
+-            /* kDraftTopR COLUMNS, and a draft reads one. The rest are the coarse head's other
+-             * candidates, which `logit_rerank` scores before column 0 is taken; SD02 gathers and
+-             * merges only the top kDraftGatherR candidates (16-byte row for ar_gather_2rank). */
+-            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_logit_rows, kDraftTopR});
+-            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_logit_rows, kDraftTopR});
++            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,
++                                  {g.max_logit_rows, has_reduced ? 1 : kDraftTopR});
++            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,
++                                  {g.max_logit_rows, has_reduced ? 1 : kDraftTopR});
+         }
+ 
+         MtpHcBlock::Wire tw{};
+@@ -1370,7 +1373,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
+         dd.kind           = RAD_DRAFT_SERIAL;
+         dd.depth          = ctx->max_spec;
+         dd.proposal       = m.b_mtp_didx;
+-        dd.proposal_pitch = kDraftTopR;   /* the pick is column 0; see kDraftTopR */
++        dd.proposal_pitch = has_reduced ? 1 : kDraftTopR;   /* the pick is column 0; see kDraftTopR */
+         dd.mask_token     = -1;
+         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
+         rad_note(b, "MTP head: one gated-attention layer with 512 routed experts, over the WIDE "
+diff --git a/core/build/startup.cpp b/core/build/startup.cpp
+index 7477c01..41e3a3b 100644
+--- a/core/build/startup.cpp
++++ b/core/build/startup.cpp
+@@ -173,20 +173,30 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
+     const int n_tuned = r.load_tune(tune_home);
+     if (n_tuned > 0) RAD_INFO("tune cache: %d row(s) from %s", n_tuned, tune.c_str());
+ 
+-    /* The selection key is the PAIR (spec §2.4). An exact match on both halves, with no fallback:
+-     * a quantised container handed to a plugin that declares dense weights fails later, at the
+-     * name map, with a worse message than the one below. */
++    /* The selection key is the PAIR (spec §2.4). An exact match on both halves is preferred;
++     * if no quant-specific plugin exists, an unquantised/universal plugin (empty arch_quant)
++     * serves as fallback. */
++    const Plugin* fallback = nullptr;
+     for (const Plugin& p : r.plugins()) {
+         if (p.kind == RAD_PLUGIN_KERNEL) {
+             out->kernels.push_back({ p.name, p.version });
+-        } else if (p.kind == RAD_PLUGIN_ARCH && !arch_id.empty() && p.arch_id == arch_id &&
+-                   p.arch_quant == quant) {
+-            out->arch_plugin  = p.name;
+-            out->arch_version = p.version;
+-            out->arch_id      = p.arch_id;
+-            out->arch_quant   = p.arch_quant;
++        } else if (p.kind == RAD_PLUGIN_ARCH && !arch_id.empty() && p.arch_id == arch_id) {
++            if (p.arch_quant == quant) {
++                out->arch_plugin  = p.name;
++                out->arch_version = p.version;
++                out->arch_id      = p.arch_id;
++                out->arch_quant   = p.arch_quant;
++            } else if (p.arch_quant.empty()) {
++                fallback = &p;
++            }
+         }
+     }
++    if (out->arch_plugin.empty() && fallback) {
++        out->arch_plugin  = fallback->name;
++        out->arch_version = fallback->version;
++        out->arch_id      = fallback->arch_id;
++        out->arch_quant   = fallback->arch_quant;
++    }
+ 
+     if (out->kernels.empty()) {
+         RAD_ERR("no kernel plugin loaded from %s/kernels. Every weight's layout comes from the "
+diff --git a/core/engine.h b/core/engine.h
+index c992dc5..44cdefe 100644
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -280,6 +280,8 @@ private:
+     int  step_state_init();
+     void step_state_fini();
+     StepSlot*            slots_host_ = nullptr;
++    int32_t*             vocab_ids_host_ = nullptr;
++    int32_t              n_vocab_ids_ = 0;
+ 
+     /* STEP-TIME ATTRIBUTION, Debug only (see the barrier in step_loop): which of the scheduler's
+      * own jobs the time went to. A two-way host/ranks split says which side of the barrier a step
+diff --git a/core/engine_draft.cpp b/core/engine_draft.cpp
+index 364395b..a4f4fe4 100644
+--- a/core/engine_draft.cpp
++++ b/core/engine_draft.cpp
+@@ -33,6 +33,25 @@ int Engine::step_state_init() {
+     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
++
++    /* Load reduced vocabulary token ids into pinned host memory if available */
++    if (ckpt_) {
++        if (const SrcTensor* vt = ckpt_->find("mtp.lm_head_reduced.vocab_ids")) {
++            const int64_t n_v = vt->numel();
++            n_vocab_ids_ = (int32_t)n_v;
++            const int64_t v_bytes = n_v * (int64_t)sizeof(int32_t);
++            vocab_ids_host_ = static_cast<int32_t*>(rad_dev_alloc(v_bytes, RAD_MEM_HOST_PINNED));
++            if (vocab_ids_host_) {
++                if (vt->rad_dtype == RAD_I64) {
++                    const int64_t* src64 = static_cast<const int64_t*>(vt->data);
++                    for (int64_t j = 0; j < n_v; ++j) vocab_ids_host_[j] = (int32_t)src64[j];
++                } else if (vt->rad_dtype == RAD_I32) {
++                    std::memcpy(vocab_ids_host_, vt->data, (size_t)v_bytes);
++                }
++            }
++        }
++    }
++
+     for (auto& rk : ranks_) {
+         RAD_TRY(rad_dev_set(rk->device));
+         rk->step_slots = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_DEVICE));
+@@ -48,6 +67,20 @@ int Engine::step_state_init() {
+         if (!eog.empty())
+             RAD_TRY(rad_memcpy_async(rk->eog, eog.data(), (int64_t)eog.size() * 4,
+                                      rk->ctx.stream()));
++
++        if (vocab_ids_host_ && n_vocab_ids_ > 0) {
++            rk->n_vocab_ids = n_vocab_ids_;
++            rk->vocab_ids_dev = static_cast<int32_t*>(
++                rad_dev_alloc((int64_t)n_vocab_ids_ * (int64_t)sizeof(int32_t), RAD_MEM_DEVICE));
++            if (!rk->vocab_ids_dev) {
++                RAD_ERR("step state: no device memory for reduced vocab ids on card %d", rk->device);
++                return RAD_E_NOMEM;
++            }
++            RAD_TRY(rad_memcpy_async(rk->vocab_ids_dev, vocab_ids_host_,
++                                     (int64_t)n_vocab_ids_ * (int64_t)sizeof(int32_t),
++                                     rk->ctx.stream()));
++        }
++
+         RAD_TRY(rad_stream_sync(rk->ctx.stream()));
+     }
+     if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0]->device));
+@@ -63,11 +96,17 @@ void Engine::step_state_fini() {
+         (void)rad_dev_set(rk->device);
+         if (rk->step_slots) rad_dev_free(rk->step_slots, RAD_MEM_DEVICE);
+         if (rk->eog) rad_dev_free(rk->eog, RAD_MEM_DEVICE);
++        if (rk->vocab_ids_dev) rad_dev_free(rk->vocab_ids_dev, RAD_MEM_DEVICE);
+         rk->step_slots = nullptr;
+         rk->eog = nullptr;
++        rk->vocab_ids_dev = nullptr;
++        rk->n_vocab_ids = 0;
+     }
+     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
+     slots_host_ = nullptr;
++    if (vocab_ids_host_) rad_dev_free(vocab_ids_host_, RAD_MEM_HOST_PINNED);
++    vocab_ids_host_ = nullptr;
++    n_vocab_ids_ = 0;
+     if (trunk_end_) rad_event_destroy(trunk_end_);
+     trunk_end_ = nullptr;
+     if (step_end_) rad_event_destroy(step_end_);
+@@ -126,6 +165,10 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
+                                                                   : rk.ctx.buf_ptr(rk.tok_buf));
+             a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
+                               ? drafter_.proposal_pitch : 1;
++            if (rk.vocab_ids_dev) {
++                a.vocab_ids = rk.vocab_ids_dev;
++                a.n_vocab_ids = rk.n_vocab_ids;
++            }
+         } else {
+             a.src = static_cast<const int32_t*>(rk.ctx.buf_ptr(rk.tok_buf));
+         }
+diff --git a/core/engine_priv.h b/core/engine_priv.h
+index 1498650..1180324 100644
+--- a/core/engine_priv.h
++++ b/core/engine_priv.h
+@@ -93,6 +93,8 @@ struct Engine::Rank {
+     StepSlot* step_slots = nullptr;
+     int32_t*  eog = nullptr;
+     int32_t   n_eog = 0;
++    int32_t*  vocab_ids_dev = nullptr;
++    int32_t   n_vocab_ids = 0;
+ };
+ 
+ /* THE TIERS' WORK IN FLIGHT (Engine::tier_tick). One copy batch out on every rank's transfer
+diff --git a/core/format/checkpoint.cpp b/core/format/checkpoint.cpp
+index 081ff1f..4473ef9 100644
+--- a/core/format/checkpoint.cpp
++++ b/core/format/checkpoint.cpp
+@@ -9,6 +9,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <map>
++#include <unistd.h>
+ 
+ namespace rad {
+ 
+@@ -420,6 +421,14 @@ int Checkpoint::open_safetensors(const std::string& path) {
+                            is_index, &shards));
+     }
+     for (const auto& sh : shards) RAD_TRY(add_shard(sh));
++    std::string reduced_head = dir_ + "/mtp-lm-head-reduced.safetensors";
++    if (const char* env_p = std::getenv("RADIANCE_MTP_HEAD_REDUCED")) {
++        if (*env_p) reduced_head = env_p;
++    }
++    if (std::find(shards.begin(), shards.end(), reduced_head) == shards.end() &&
++        ::access(reduced_head.c_str(), F_OK) == 0) {
++        RAD_TRY(add_shard(reduced_head));
++    }
+ 
+     RAD_TRY(meta_from_config_json(dir_, &meta_));
+     RAD_TRY(meta_merge_generation_config(dir_, &meta_));
+@@ -517,8 +526,23 @@ const SrcTensor* Checkpoint::slice(const SrcTensor& st, int index, const char* d
+ 
+ namespace {
+ 
+-/* FP8's scale plane is a companion tensor: `X.weight` is scaled by `X.weight_scale_inv`. */
+-std::string scale_name(const std::string& codes) { return codes + "_scale_inv"; }
++/* FP8's scale plane is a companion tensor: `X.weight` is scaled by `X.weight_scale_inv`.
++ * Q4 affine's companion tensors: `X.weight_q4` has `X.weight_scale` and `X.weight_zero`. */
++std::string scale_name(const std::string& codes) {
++    if (codes.size() >= 10 && codes.compare(codes.size() - 10, 10, ".weight_q4") == 0)
++        return codes.substr(0, codes.size() - 10) + ".weight_scale";
++    if (codes.size() >= 9 && codes.compare(codes.size() - 9, 9, "weight_q4") == 0)
++        return codes.substr(0, codes.size() - 9) + "weight_scale";
++    return codes + "_scale_inv";
++}
++
++std::string zero_name(const std::string& codes) {
++    if (codes.size() >= 10 && codes.compare(codes.size() - 10, 10, ".weight_q4") == 0)
++        return codes.substr(0, codes.size() - 10) + ".weight_zero";
++    if (codes.size() >= 9 && codes.compare(codes.size() - 9, 9, "weight_q4") == 0)
++        return codes.substr(0, codes.size() - 9) + "weight_zero";
++    return "";
++}
+ 
+ }  /* namespace */
+ 
+@@ -530,7 +554,7 @@ std::string ckpt_tensor_of(const SrcTensor& t) {
+ bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
+                     std::unordered_set<std::string>* hit) {
+     bool any = false;
+-    for (const auto* list : { &w.pieces, &w.scales })
++    for (const auto* list : { &w.pieces, &w.scales, &w.zeroes })
+         for (const SrcTensor* t : *list) {
+             if (!t) continue;
+             const std::string n = ckpt_tensor_of(*t);
+@@ -577,6 +601,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
+     for (const Src1& s1 : srcs) {
+         const SrcTensor* st = ck.find(s1.name);
+         const SrcTensor* sc = st ? ck.find(scale_name(s1.name)) : nullptr;
++        const std::string zn = zero_name(s1.name);
++        const SrcTensor* sz = (st && !zn.empty()) ? ck.find(zn) : nullptr;
+         /* A SUB-TENSOR INDEX IS TAKEN, never ignored: ignoring it gives every expert a copy of
+          * the whole stack, in a model that loads and answers. Its scale plane is stacked the same
+          * way and sliced at the same index. */
+@@ -585,6 +611,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
+             if (!st) return refuse(RAD_E_SHAPE, "a sub-tensor it names is not there");
+             if (sc && !(sc = ck.slice(*sc, s1.index, name.c_str())))
+                 return refuse(RAD_E_SHAPE, "its scale plane cannot be sliced at the same index");
++            if (sz && !(sz = ck.slice(*sz, s1.index, name.c_str())))
++                return refuse(RAD_E_SHAPE, "its zero plane cannot be sliced at the same index");
+         }
+         if (!st) {
+             if (alternatives) continue;
+@@ -594,6 +622,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
+         }
+         out->pieces.push_back(st);
+         out->scales.push_back(sc);
++        out->zeroes.push_back(sz);
+         if (alternatives) break;
+     }
+     if (out->pieces.empty()) {
+@@ -624,6 +653,24 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
+     }
+     rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+ 
++    const bool is_q4_affine = !out->zeroes.empty() && out->zeroes[0] != nullptr &&
++                              !out->scales.empty() && out->scales[0] != nullptr &&
++                              (p0.rad_dtype == RAD_U8 || p0.rad_dtype == RAD_U4);
++    if (is_q4_affine) {
++        if (!out->scales[0]->shape.empty() &&
++            p0.shape.back() * 2 == out->scales[0]->shape.back() * 128) {
++            out->shape[out->rank - 1] = p0.shape.back() * 2;
++        }
++        rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
++        out->trivial = true;
++        rad_enc_clear(&out->enc);
++        rad_enc_copy_str(out->enc.scheme, "affine");
++        rad_enc_add_plane(&out->enc, "codes", RAD_U4, 1, 1);
++        rad_enc_add_plane(&out->enc, "scale", out->scales[0]->rad_dtype, 1, 128);
++        rad_enc_add_plane(&out->enc, "zero", out->zeroes[0]->rad_dtype, 1, 128);
++        return RAD_OK;
++    }
++
+     /* THE ENCODING THE PIECES ARE, when it is trivial (spec §4.3). */
+     const uint32_t dt = p0.rad_dtype;
+     bool same = true, scaled = true, unscaled = true;
+@@ -671,7 +718,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
+             rad_enc_clear(&out->enc);
+             rad_enc_copy_str(out->enc.scheme, "affine");
+             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
+-            rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
++            rad_enc_add_plane(&out->enc, "scale", (sdt == RAD_F32) ? (uint32_t)RAD_BF16 : sdt, br, bc);
+         }
+     } else if (!unscaled) {
+         out->why = "some of its pieces carry a scale plane and some do not";
+@@ -871,7 +918,7 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
+     };
+     if (!w.trivial || k < 0 || k >= w.enc.n_planes)
+         return refuse(RAD_E_STATE, "not a plane of a trivial encoding");
+-    const std::vector<const SrcTensor*>& src = k == 0 ? w.pieces : w.scales;
++    const std::vector<const SrcTensor*>& src = k == 0 ? w.pieces : (k == 1 ? w.scales : w.zeroes);
+     int64_t pr = 0, pc = 0;
+     rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+     if (r0 < 0 || nr < 0 || r0 + nr > pr) return refuse(RAD_E_SHAPE, "plane rows out of range");
+@@ -880,6 +927,17 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
+     uint8_t* o = (uint8_t*)dst;
+     if (k == 0) {
+         /* the codes: the pieces joined, bytes as they are */
++        const int bits = rad_dtype_bits(dt);
++        if (bits < 8) {
++            const int64_t row_bytes = rad_dtype_bytes(dt, pc);
++            for (int64_t r = 0; r < nr; ++r) {
++                const int64_t src_row = r0 + r;
++                std::memcpy(o + r * row_bytes,
++                            (const uint8_t*)src[0]->data + src_row * row_bytes,
++                            (size_t)row_bytes);
++            }
++            return RAD_OK;
++        }
+         Joined j;
+         j.init(src, w.concat_dim);
+         return j.walk(r0 * pc, (r0 + nr) * pc, [&](int p, int64_t e, int64_t n) {
+@@ -888,16 +946,26 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
+             return RAD_OK;
+         });
+     }
+-    /* an FP8 scale plane: the pieces' scale rows one after another */
++    /* an FP8 scale or affine scale/zero plane: the pieces' scale rows one after another */
+     int64_t base = 0;
+     for (const SrcTensor* s : src) {
+         int64_t sr = 0, scl = 0;
+         rad_enc_view((uint32_t)s->shape.size(), s->shape.data(), &sr, &scl);
+         const int64_t lo = std::max(r0, base), hi = std::min(r0 + nr, base + sr);
+         if (hi > lo) {
+-            std::memcpy(o, (const uint8_t*)s->data + (lo - base) * scl * eb,
+-                        (size_t)((hi - lo) * scl * eb));
+-            o += (hi - lo) * scl * eb;
++            if (s->rad_dtype == RAD_F32 && dt == RAD_BF16) {
++                const float* in = (const float*)s->data + (lo - base) * scl;
++                uint16_t* out_bf16 = (uint16_t*)o;
++                const int64_t count = (hi - lo) * scl;
++                for (int64_t i = 0; i < count; ++i) {
++                    out_bf16[i] = rad_f32_to_bf16(in[i]);
++                }
++                o += count * sizeof(uint16_t);
++            } else {
++                std::memcpy(o, (const uint8_t*)s->data + (lo - base) * scl * eb,
++                            (size_t)((hi - lo) * scl * eb));
++                o += (hi - lo) * scl * eb;
++            }
+         }
+         base += sr;
+     }
+diff --git a/core/format/checkpoint.h b/core/format/checkpoint.h
+index a6d2e43..9f6441c 100644
+--- a/core/format/checkpoint.h
++++ b/core/format/checkpoint.h
+@@ -132,6 +132,7 @@ struct CkptWeight {
+     std::string name;                         /* the logical (declared) name */
+     std::vector<const SrcTensor*> pieces;     /* the codes, in concatenation order */
+     std::vector<const SrcTensor*> scales;     /* FP8 only: one a piece */
++    std::vector<const SrcTensor*> zeroes;     /* affine Q4 only: one a piece */
+     int      concat_dim = 0;
+     uint32_t rank = 0;
+     int64_t  shape[RAD_MAX_RANK] = {0};       /* the logical shape */
+diff --git a/core/sched/advance.h b/core/sched/advance.h
+index 855c518..e08217b 100644
+--- a/core/sched/advance.h
++++ b/core/sched/advance.h
+@@ -87,6 +87,8 @@ struct AdvanceArgs {
+     int64_t src_pitch = 1;
+     const int32_t* eog = nullptr;   /* end-of-generation ids, sorted */
+     int32_t n_eog = 0;
++    const int32_t* vocab_ids = nullptr; /* reduced vocabulary id mapping table */
++    int32_t n_vocab_ids = 0;
+     /* THE ROTARY PLANES (RadBatch::rope_pos), [3][rope_pitch] at rope_off, or rope_off -1 when the
+      * build carries none. A row whose position the card moves carries its rotary position along
+      * by the offset the host staged for it: the rows the card owns are decode and draft rows, all
+diff --git a/core/sched/advance_impl.h b/core/sched/advance_impl.h
+index 504fbfd..5be0d3c 100644
+--- a/core/sched/advance_impl.h
++++ b/core/sched/advance_impl.h
+@@ -135,7 +135,8 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
+         /* Round 2 onward: round 1 is the history pass's last row (ADV_HIST above), so every
+          * round embeds the proposal of the round before it. */
+         const int32_t base = S.head + a.round - 1;
+-        const int32_t t = a.src[(int64_t)i * a.src_pitch];
++        int32_t t = a.src[(int64_t)i * a.src_pitch];
++        if (a.vocab_ids && t >= 0 && t < a.n_vocab_ids) t = a.vocab_ids[t];
+         S.tok[a.round - 1] = t;
+         tok[k] = t;
+         adv_pos(a, pos, k, base);
+@@ -143,9 +144,12 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
+         adv_groups(a, i, k, base, 1);
+         return;
+     }
+-    case ADV_TAKE:
+-        S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
++    case ADV_TAKE: {
++        int32_t t = a.src[(int64_t)i * a.src_pitch];
++        if (a.vocab_ids && t >= 0 && t < a.n_vocab_ids) t = a.vocab_ids[t];
++        S.tok[a.round] = t;
+         return;
++    }
+     default:
+         return;
+     }
+diff --git a/libr4d/r4d_layout.cpp b/libr4d/r4d_layout.cpp
+index 700a4ce..84864a0 100644
+--- a/libr4d/r4d_layout.cpp
++++ b/libr4d/r4d_layout.cpp
+@@ -352,7 +352,8 @@ int w4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
+     if (g.K % R4D_W4_KPB) return RAD_E_SHAPE;
+     const bool asym = w4_asym(p, n_p);
+     const bool ok = asym ? (r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U8) ||
+-                            r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U4))
++                            r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U4) ||
++                            r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_I16))
+                          : r4d_enc::affine(enc, RAD_I4, RAD_F16, 1, g.group);
+     if (!ok) return RAD_E_DTYPE;
+     if (gout) *gout = g;
+diff --git a/tests/checkpoint_test.cpp b/tests/checkpoint_test.cpp
+index b61d59e..2091cde 100644
+--- a/tests/checkpoint_test.cpp
++++ b/tests/checkpoint_test.cpp
+@@ -35,10 +35,7 @@ std::string dir_path() {
+            std::to_string((long long)getpid());
+ }
+ 
+-/* One model.safetensors and a config.json in a fresh directory. */
+-std::string write_checkpoint(const std::vector<T>& ts, const std::string& config) {
+-    const std::string dir = dir_path();
+-    ::mkdir(dir.c_str(), 0755);
++void write_safetensors_file(const std::string& path, const std::vector<T>& ts) {
+     std::string hdr = "{";
+     uint64_t off = 0;
+     for (size_t i = 0; i < ts.size(); ++i) {
+@@ -52,13 +49,20 @@ std::string write_checkpoint(const std::vector<T>& ts, const std::string& config
+     }
+     hdr += "}";
+     while (hdr.size() % 8) hdr += ' ';
+-    FILE* f = std::fopen((dir + "/model.safetensors").c_str(), "wb");
++    FILE* f = std::fopen(path.c_str(), "wb");
+     const uint64_t n = hdr.size();
+     std::fwrite(&n, 8, 1, f);
+     std::fwrite(hdr.data(), 1, hdr.size(), f);
+     for (const T& t : ts) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
+     std::fclose(f);
+-    f = std::fopen((dir + "/config.json").c_str(), "wb");
++}
++
++/* One model.safetensors and a config.json in a fresh directory. */
++std::string write_checkpoint(const std::vector<T>& ts, const std::string& config) {
++    const std::string dir = dir_path();
++    ::mkdir(dir.c_str(), 0755);
++    write_safetensors_file(dir + "/model.safetensors", ts);
++    FILE* f = std::fopen((dir + "/config.json").c_str(), "wb");
+     std::fwrite(config.data(), 1, config.size(), f);
+     std::fclose(f);
+     return dir;
+@@ -66,6 +70,7 @@ std::string write_checkpoint(const std::vector<T>& ts, const std::string& config
+ 
+ void remove_checkpoint(const std::string& dir) {
+     std::remove((dir + "/model.safetensors").c_str());
++    std::remove((dir + "/mtp-lm-head-reduced.safetensors").c_str());
+     std::remove((dir + "/config.json").c_str());
+     ::rmdir(dir.c_str());
+ }
+@@ -334,4 +339,103 @@ TEST(what_is_not_served_as_it_is_says_why) {
+     remove_checkpoint(dir);
+ }
+ 
++/* REDUCED VOCABULARY DRAFT HEAD (Q4 affine with companion scale and zero, and vocab_ids). */
++TEST(reduced_draft_head_q4_loads_and_resolves) {
++    const std::string dir = write_checkpoint({ bf16("embed", { 2, 2 }, 1.0f) }, kConfig);
++
++    std::vector<uint8_t> v_ids(4 * sizeof(int64_t));
++    int64_t* ids = (int64_t*)v_ids.data();
++    ids[0] = 100; ids[1] = 200; ids[2] = 300; ids[3] = 400;
++
++    std::vector<uint8_t> q4_bytes(2 * 64, 0x55);
++    std::vector<uint8_t> sc_bytes(2 * 1 * sizeof(uint16_t));
++    uint16_t* sc = (uint16_t*)sc_bytes.data();
++    sc[0] = rad_f32_to_f16(1.5f); sc[1] = rad_f32_to_f16(2.5f);
++
++    std::vector<uint8_t> z_bytes(2 * 1 * sizeof(int16_t));
++    int16_t* z = (int16_t*)z_bytes.data();
++    z[0] = 8; z[1] = 8;
++
++    T t_ids{ "mtp.lm_head_reduced.vocab_ids", "I64", { 4 }, std::move(v_ids) };
++    T t_q4{ "mtp.lm_head_reduced.weight_q4", "U8", { 2, 64 }, std::move(q4_bytes) };
++    T t_sc{ "mtp.lm_head_reduced.weight_scale", "F16", { 2, 1 }, std::move(sc_bytes) };
++    T t_z{ "mtp.lm_head_reduced.weight_zero", "I16", { 2, 1 }, std::move(z_bytes) };
++
++    write_safetensors_file(dir + "/mtp-lm-head-reduced.safetensors", { t_ids, t_q4, t_sc, t_z });
++
++    Checkpoint ck;
++    REQUIRE_EQ(ck.open(dir), RAD_OK);
++
++    const SrcTensor* vt = ck.find("mtp.lm_head_reduced.vocab_ids");
++    REQUIRE(vt != nullptr);
++    CHECK_EQ(vt->numel(), (int64_t)4);
++    CHECK_EQ(vt->rad_dtype, (uint32_t)RAD_I64);
++
++    Program prog;
++    prog.name_map.push_back(map("mtp.draft_head_reduced", RAD_MAP_COPY, { "mtp.lm_head_reduced.weight_q4" }));
++
++    CkptWeight w;
++    std::string why;
++    REQUIRE_EQ(ckpt_resolve(ck, prog, "mtp.draft_head_reduced", false, &w, &why), RAD_OK);
++    CHECK(w.trivial);
++    CHECK_EQ(w.rows, (int64_t)2);
++    CHECK_EQ(w.cols, (int64_t)128);
++    CHECK_EQ(w.enc.n_planes, 3);
++    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U4);
++    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F16);
++    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_I16);
++
++    std::vector<uint8_t> p0(2 * 64, 0);
++    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 2, p0.data(), &why), RAD_OK);
++    CHECK_EQ(p0[0], (uint8_t)0x55);
++    CHECK_EQ(p0[127], (uint8_t)0x55);
++
++    std::vector<uint16_t> p1(2, 0);
++    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2, p1.data(), &why), RAD_OK);
++    CHECK_EQ(p1[0], sc[0]);
++    CHECK_EQ(p1[1], sc[1]);
++
++    std::vector<int16_t> p2(2, 0);
++    REQUIRE_EQ(ckpt_plane_rows(w, 2, 0, 2, p2.data(), &why), RAD_OK);
++    CHECK_EQ(p2[0], z[0]);
++    CHECK_EQ(p2[1], z[1]);
++
++    std::unordered_set<std::string> hit;
++    CHECK(ckpt_reads_any(w, { "mtp.lm_head_reduced.weight_zero" }, &hit));
++    CHECK_EQ(hit.size(), (size_t)1);
++
++    remove_checkpoint(dir);
++}
++
++TEST(block_fp8_with_f32_scale_resolves_and_converts_to_bf16) {
++    std::vector<uint8_t> f32_scale_bytes(1 * 1 * sizeof(float));
++    float* f32_sc = (float*)f32_scale_bytes.data();
++    f32_sc[0] = 0.05f;
++
++    T t_codes = fp8("blk.0.attn.weight", { 128, 128 });
++    T t_scale{ "blk.0.attn.weight_scale_inv", "F32", { 1, 1 }, std::move(f32_scale_bytes) };
++
++    const std::string dir = write_checkpoint({ t_codes, t_scale }, kConfig);
++    Checkpoint ck;
++    REQUIRE_EQ(ck.open(dir), RAD_OK);
++
++    Program prog;
++    prog.name_map.push_back(map("blk.0.attn", RAD_MAP_COPY, { "blk.0.attn.weight" }));
++
++    CkptWeight w;
++    std::string why;
++    REQUIRE_EQ(ckpt_resolve(ck, prog, "blk.0.attn", false, &w, &why), RAD_OK);
++    CHECK(w.trivial);
++    CHECK_EQ(w.enc.n_planes, 2);
++    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
++    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_BF16);
++
++    std::vector<uint16_t> sc_out(1, 0);
++    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 1, sc_out.data(), &why), RAD_OK);
++    CHECK_EQ(sc_out[0], rad_f32_to_bf16(0.05f));
++
++    remove_checkpoint(dir);
++}
++
+ RAD_TEST_MAIN()
++
+diff --git a/tests/fr_spec_test.cpp b/tests/fr_spec_test.cpp
+new file mode 100644
+index 0000000..08dfdff
+--- /dev/null
++++ b/tests/fr_spec_test.cpp
+@@ -0,0 +1,156 @@
++/* fr_spec_test.cpp -- test reduced vocabulary draft head (FR-Spec) from mtp-lm-head-reduced.safetensors. */
++#include "rad_test.h"
++#include "format/checkpoint.h"
++#include "sched/advance.h"
++#include "sched/advance_impl.h"
++#include "rad_plugin.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++using namespace rad;
++
++namespace {
++
++RadNameMap map(const char* declared, int mode, std::vector<const char*> src) {
++    RadNameMap m{};
++    m.declared = declared;
++    m.mode = mode;
++    m.n_src = (int)src.size();
++    for (int i = 0; i < 8; ++i) m.src_index[i] = -1;
++    for (size_t i = 0; i < src.size(); ++i) m.src[i] = src[i];
++    return m;
++}
++
++}  // namespace
++
++TEST(fr_spec_model_reduced_head_loads_from_disk) {
++    const std::string model_dir = "/root/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ-v2";
++    if (::access((model_dir + "/mtp-lm-head-reduced.safetensors").c_str(), F_OK) != 0) {
++        // Model not present in environment, skip gracefully
++        return;
++    }
++
++    Checkpoint ck;
++    REQUIRE_EQ(ck.open(model_dir), RAD_OK);
++
++    // 1. Check vocab_ids tensor
++    const SrcTensor* vt = ck.find("mtp.lm_head_reduced.vocab_ids");
++    REQUIRE(vt != nullptr);
++    CHECK_EQ(vt->numel(), (int64_t)52416);
++    CHECK_EQ(vt->rad_dtype, (uint32_t)RAD_I64);
++
++    const int64_t* ids = static_cast<const int64_t*>(vt->data);
++    CHECK(ids[0] >= (int64_t)0);
++    CHECK(ids[0] < (int64_t)250000);
++
++    // 2. Check Q4 weights and companion scale/zero
++    const SrcTensor* wq = ck.find("mtp.lm_head_reduced.weight_q4");
++    REQUIRE(wq != nullptr);
++    CHECK_EQ(wq->shape.size(), (size_t)2);
++    CHECK_EQ(wq->shape[0], (int64_t)52416);
++    CHECK_EQ(wq->shape[1], (int64_t)1280);
++
++    const SrcTensor* ws = ck.find("mtp.lm_head_reduced.weight_scale");
++    REQUIRE(ws != nullptr);
++    CHECK_EQ(ws->shape.size(), (size_t)2);
++    CHECK_EQ(ws->shape[0], (int64_t)52416);
++    CHECK_EQ(ws->shape[1], (int64_t)20);
++
++    const SrcTensor* wz = ck.find("mtp.lm_head_reduced.weight_zero");
++    REQUIRE(wz != nullptr);
++    CHECK_EQ(wz->shape.size(), (size_t)2);
++    CHECK_EQ(wz->shape[0], (int64_t)52416);
++    CHECK_EQ(wz->shape[1], (int64_t)20);
++
++    // 3. Resolve mtp.draft_head_reduced logical weight
++    Program prog;
++    prog.name_map.push_back(map("mtp.draft_head_reduced", RAD_MAP_COPY, { "mtp.lm_head_reduced.weight_q4" }));
++
++    CkptWeight w;
++    std::string why;
++    REQUIRE_EQ(ckpt_resolve(ck, prog, "mtp.draft_head_reduced", false, &w, &why), RAD_OK);
++    CHECK(w.trivial);
++    CHECK_EQ(w.rows, (int64_t)52416);
++    CHECK_EQ(w.cols, (int64_t)2560);
++    CHECK_EQ(w.enc.n_planes, 3);
++    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U4);
++    CHECK_EQ(w.enc.plane[0].block[0], (int64_t)1);
++    CHECK_EQ(w.enc.plane[0].block[1], (int64_t)1);
++    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F16);
++    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
++    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)128);
++    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_I16);
++    CHECK_EQ(w.enc.plane[2].block[0], (int64_t)1);
++    CHECK_EQ(w.enc.plane[2].block[1], (int64_t)128);
++
++    // 4. Test reading plane rows
++    std::vector<uint8_t> r_codes(2 * 1280);
++    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 2, r_codes.data(), &why), RAD_OK);
++    std::vector<uint16_t> r_scales(2 * 20);
++    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2, r_scales.data(), &why), RAD_OK);
++    std::vector<int16_t> r_zeroes(2 * 20);
++    REQUIRE_EQ(ckpt_plane_rows(w, 2, 0, 2, r_zeroes.data(), &why), RAD_OK);
++
++    // Check zeroes are in valid range 1..14 (center 8)
++    for (int i = 0; i < 40; ++i) {
++        CHECK(r_zeroes[i] >= 1);
++        CHECK(r_zeroes[i] <= 15);
++    }
++}
++
++TEST(fr_spec_advance_vocab_translation) {
++    // Test that adv_row correctly maps draft token indices to vocab_ids in ADV_ROUND and ADV_TAKE
++    std::vector<int32_t> mock_vocab_ids = { 1000, 2000, 3000, 4000, 5000 };
++    StepSlot slots[4]{};
++
++    // Create slab buffer for advance args
++    // Layout: row_off, tok_off, pos_off, ctx_off, sid_off, cu_off, q_off, acc_off, out_off
++    int32_t slab_data[256]{};
++    // row_pitch = 4
++    // rows[0..3] = flag (1), rtok, rout, aux
++    slab_data[0] = 1; // row 0 active
++    slab_data[4] = 0; // rtok
++    slab_data[8] = 0; // rout
++    slab_data[12] = 1; // aux
++
++    int32_t proposals[4] = { 2, 0, 1, 3 }; // rank proposals (indices into mock_vocab_ids)
++
++    AdvanceArgs a{};
++    a.mode = ADV_ROUND;
++    a.round = 2;
++    a.n_seq = 1;
++    a.slab = reinterpret_cast<char*>(slab_data);
++    a.row_off = 0;
++    a.row_pitch = 4;
++    a.tok_off = 16 * sizeof(int32_t);
++    a.pos_off = 32 * sizeof(int32_t);
++    a.ctx_off = 48 * sizeof(int32_t);
++    a.sid_off = 64 * sizeof(int32_t);
++    a.cu_off = 80 * sizeof(int32_t);
++    a.q_off = 96 * sizeof(int32_t);
++    a.st = slots;
++    a.src = proposals;
++    a.src_pitch = 1;
++    a.vocab_ids = mock_vocab_ids.data();
++    a.n_vocab_ids = (int32_t)mock_vocab_ids.size();
++
++    // In slot 0: head = 10
++    slots[0].head = 10;
++
++    adv_row(a, 0);
++
++    // Row 0 proposed index 2 -> should map to mock_vocab_ids[2] = 3000
++    CHECK_EQ(slots[0].tok[1], 3000);
++
++    // Now test ADV_TAKE (e.g. final draft token)
++    a.mode = ADV_TAKE;
++    a.round = 3;
++    adv_row(a, 0);
++    CHECK_EQ(slots[0].tok[3], 3000);
++}
++
++RAD_TEST_MAIN()
+-- 
+2.39.5
+

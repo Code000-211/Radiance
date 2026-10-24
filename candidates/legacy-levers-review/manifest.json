@@ -1,0 +1,655 @@
+{
+  "kind": "inactive-historical-proposals",
+  "source_head": "7eab082cf8c128a9546300324be4eb5a80e7f940",
+  "target_base": "cb5a69ac3f993560ed8dcb32fa524b3b9f987c62",
+  "source_abi": 16,
+  "target_abi": 26,
+  "target_execution": "NOT RUN; original proposals not applied",
+  "files": [
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/lever.patch",
+      "sha256": "039c24ea4e6b2017606be9b42f3e154037adf6e68075dcc73045ff0ae6dad7b1",
+      "bytes": 27343
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/README.md",
+      "sha256": "7518337b66706e13c040c2c651610532a798df627b896888021c51969f32acd8",
+      "bytes": 5233
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/libr4d/r4d_gemm_fp8a8.hip",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/libr4d/r4d_gemm_fp8a8.hip",
+      "sha256": "e59032c40813983e56547bba4609cfb304004fd3f907992ed84aa6f0d898c2ac",
+      "bytes": 114336
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/libr4d/r4d_rows.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/libr4d/r4d_rows.cpp",
+      "sha256": "d9bce14d41cfcdc3a5a57803dc5e474b82517f9ef540496a9899f25fae825d9d",
+      "bytes": 294181
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/tests/arch_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/tests/arch_test.cpp",
+      "sha256": "1976883b6f8a32a6084ecb9148b75f2b887950a1a366eb33e59953bed0cfc96d",
+      "bytes": 163293
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/arch/qwen35_fp8/qwen35_fp8.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/arch/qwen35_fp8/qwen35_fp8.cpp",
+      "sha256": "0d1ac4920e1e2982283dea0506472d6d12d0271ebe026ac74c5b4a00acbcb70a",
+      "bytes": 87721
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "sha256": "dee82857cf1d8fc1e0732040bebd0e3129300d2a0033599c0b4fdff148ec20b7",
+      "bytes": 96594
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_fp8.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_fp8.h",
+      "sha256": "4f16fe048822b6f3aec2952edaa58d57aeaea760fa00c2d4783021df98eb07a3",
+      "bytes": 61536
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_block_gdn_fp8.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_block_gdn_fp8.h",
+      "sha256": "81f6c79a2fa30bb6effda5c7e2e2c93c1288ce8f0c8af712a38ddf91db6efa38",
+      "bytes": 28788
+    },
+    {
+      "source": "candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_qsa.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever1_gdn_qsa_fusion/src/arch/common/rad_qsa.h",
+      "sha256": "6c943c30872cf738ccbcd4e33f6340eb9bc5a3057cee8f6b624c5426d124e5f7",
+      "bytes": 32274
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/lever.patch",
+      "sha256": "1770b2627504ff3f9c5a95d3707acfa49d5e28b692f8deabbb5093551b88e5ab",
+      "bytes": 59500
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/README.md",
+      "sha256": "5d9f7389bb5e83ef29ffb63cc284f81015e29357d7565875d7ec8b69f8783695",
+      "bytes": 8736
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/docs/OPS.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/docs/OPS.md",
+      "sha256": "379f2e42e2e015f7ae391459836d00ba0e46f85890414585361391bbb8e0bf1e",
+      "bytes": 104950
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/libr4d/r4d_shapes.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/libr4d/r4d_shapes.cpp",
+      "sha256": "fa16fff7ad75c030414f1d8ba047ceab91cdea859f73406afbec81ada7b58db2",
+      "bytes": 97995
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/libr4d/r4d_moe.hip",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/libr4d/r4d_moe.hip",
+      "sha256": "50af0a6f7d2c753be0b2de138f465361a0f0e9a8c4c1a108f48ffa16f47f0ee0",
+      "bytes": 185734
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/libr4d/r4d_rows.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/libr4d/r4d_rows.cpp",
+      "sha256": "b5f44f7e18ce9296943bbe777843056c056b10bc0f5014458bc74ac2b32860b4",
+      "bytes": 297215
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/libr4d/r4d_selftest.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/libr4d/r4d_selftest.cpp",
+      "sha256": "218a4fcc7849b7caebfce09ffaf6e4231887e8cb8cda824ef0039148348eee89",
+      "bytes": 601911
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/libr4d/r4d_plugin.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/libr4d/r4d_plugin.h",
+      "sha256": "1a6c633cfece18f83f0564577e6cad6983ff35e7fbcc78140de35401a69fee8a",
+      "bytes": 36028
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/tests/arch_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/tests/arch_test.cpp",
+      "sha256": "51496cc427f0dea19e006a373ad8b57fd1b0721a3beb8da8482c42faf7f0cceb",
+      "bytes": 165507
+    },
+    {
+      "source": "candidates/lever2_fused_moe_router/src/arch/common/rad_block_moe_fp8.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever2_fused_moe_router/src/arch/common/rad_block_moe_fp8.h",
+      "sha256": "b816264c10efc575f37ee5bc2f93bda32c9309f04dbf875804bd68df7dad4f9c",
+      "bytes": 110519
+    },
+    {
+      "source": "candidates/lever9_4way_rlfu_vram_cache/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever9_4way_rlfu_vram_cache/lever.patch.invalid.txt",
+      "sha256": "e0c340766643e4ada7d71cb2e995730b22130962506fdcf75922d78e21a65e0e",
+      "bytes": 2922
+    },
+    {
+      "source": "candidates/lever9_4way_rlfu_vram_cache/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever9_4way_rlfu_vram_cache/README.md",
+      "sha256": "40938125969819b55be368b360838c805159a828ae1f4c8f2bf8966e21a509c5",
+      "bytes": 3201
+    },
+    {
+      "source": "candidates/kv_cache_qsa_research/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/kv_cache_qsa_research/README.md",
+      "sha256": "6532263b2fa8d9aaa9775b01d4c797655cabd2a86b993ede205192c67959b93a",
+      "bytes": 22960
+    },
+    {
+      "source": "candidates/lever11_pipelined_63vgpr_hc_write/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever11_pipelined_63vgpr_hc_write/lever.patch",
+      "sha256": "8a32efa71463f81eabf69dc43f355dbcb4d1ede8c73a887470f48cdc6ee1f601",
+      "bytes": 1330
+    },
+    {
+      "source": "candidates/lever11_pipelined_63vgpr_hc_write/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever11_pipelined_63vgpr_hc_write/README.md",
+      "sha256": "b5bdadb40f386e991ce53c1a4102e37e47153d7ddd93aec285840715f176f9f6",
+      "bytes": 3485
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/lever.patch",
+      "sha256": "8d122db5580a4e0515724adf168e5dc979bbf6cff3237478c2f5e1840e8943f0",
+      "bytes": 60339
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/README.md",
+      "sha256": "f1be05633d7df62be9cc37034c76ef3e45eef819193fea243ec1b67e6505cbe4",
+      "bytes": 6241
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/tools/qsa_overlap_sim.py",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/tools/qsa_overlap_sim.py",
+      "sha256": "daf5c854f44c7e579f32dfaac1cefe2fd0bc439dc3e6042173bf2f35515d9f84",
+      "bytes": 9965
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libref/ref_shapes.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libref/ref_shapes.cpp",
+      "sha256": "7cb38ea2274d19f33b1bca71fa1600df52099439b0bcab9b7c6121239127875a",
+      "bytes": 107508
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libref/ref_registry.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libref/ref_registry.cpp",
+      "sha256": "5bfa36f417493bf6236f43437310809ef13c9d76a6b8feb2f7384b196cc1ac68",
+      "bytes": 85844
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libref/ref_ops.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libref/ref_ops.h",
+      "sha256": "51bfcd9dabddb27764b70e17570e3f6030660d9122f9aa192571e5bea29107d6",
+      "bytes": 12744
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libref/ref_attn.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libref/ref_attn.cpp",
+      "sha256": "b0c90769d22c69e1fb5d50a30f2bdbf6f5d259d1411e5f3ddd93df2e15862cfc",
+      "bytes": 31458
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libref/ref_common.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libref/ref_common.h",
+      "sha256": "4585e39d8470828c1717a26f0aa87fe056adadf495a50579992fe1988bcb58fb",
+      "bytes": 25123
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/config.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/config.cpp",
+      "sha256": "47eeda42ddc5ddd9e2c0d0e906122a161bc62c6fffd6504cc3a083d4cb0fe7e5",
+      "bytes": 53730
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/engine_bringup.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/engine_bringup.cpp",
+      "sha256": "9aacc83c091a23c7a3b6cc257c95af4760105d887c17408cd889b06041ed1501",
+      "bytes": 209386
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/rad_core.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/rad_core.h",
+      "sha256": "d7170fc50d51dbca132a5fcc116c3ee29ba2a543eeeb6ef6c95668f3264ee3e0",
+      "bytes": 51542
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/runtime/issue.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/runtime/issue.cpp",
+      "sha256": "c835fab43c8ae0bf3500073746b1b61dfe2bea334b41a0619a15deb449bac9b6",
+      "bytes": 72605
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/runtime/ctx.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/runtime/ctx.h",
+      "sha256": "9d0a8d080d1d6974209c85760a73ec9dee4d42a1e492e11cdfab32db3ee177f7",
+      "bytes": 51811
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/core/mem/kv.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/core/mem/kv.cpp",
+      "sha256": "c575a17e96288242d6f0cd4981933633d214b44c623104dc8598d9ea8bb03b92",
+      "bytes": 79268
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/abi/rad_types.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/abi/rad_types.h",
+      "sha256": "d6aebcf78dc2419006a8204c3eaecf8b1d731436c4536b8e8d096b69b93e8ed4",
+      "bytes": 18472
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/abi/rad_runtime.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/abi/rad_runtime.h",
+      "sha256": "07023afbb85781803162c7c7d6292595e86e73339ff2fa6f7b0f785e0cf3ac0a",
+      "bytes": 25534
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/abi/rad_builder.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/abi/rad_builder.h",
+      "sha256": "25df9d70ad3c4dccbac2b27a5fbe7eb1a54f96902061407fb8ffe0b35bd15ff4",
+      "bytes": 43331
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/tools/qsa_overlap_sim.py",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/tools/qsa_overlap_sim.py",
+      "sha256": "daf5c854f44c7e579f32dfaac1cefe2fd0bc439dc3e6042173bf2f35515d9f84",
+      "bytes": 9965
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_model_bf16.hip",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_model_bf16.hip",
+      "sha256": "390bd880c4a8c022b520033a2ff32db395265685272b2b7c94aaebd2b141d6a6",
+      "bytes": 97102
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_rows.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_rows.cpp",
+      "sha256": "3e077b39aac4d5dd7dbfc90b7d893ef51a5b4944bfbc520b94a14bb4f0585840",
+      "bytes": 295463
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d.h",
+      "sha256": "e24273d266b1597385274661183c7ed2b171c19acf840528b91f06ce52238eda",
+      "bytes": 69599
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_plugin.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/libr4d/r4d_plugin.h",
+      "sha256": "a2d9766e88b18ade3ed593fee74acc764e2d6b3411f9ffb9ec49919d9f67dfb2",
+      "bytes": 35696
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/tests/ref_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/tests/ref_test.cpp",
+      "sha256": "fe1420f74fc45cea6ad2d2fd1811810417d873f936eb5b2ef3417664cef8124a",
+      "bytes": 151019
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/tests/config_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/tests/config_test.cpp",
+      "sha256": "bb64b47303978cb0d513207665142358380605b7c96354459005eac51f75bd42",
+      "bytes": 41556
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "sha256": "4efa7aded624ca9bbc6582390523d663f0165cd966198624442da459f8b01189",
+      "bytes": 97875
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/arch/common/rad_block_attn_gated_fp8.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/arch/common/rad_block_attn_gated_fp8.h",
+      "sha256": "29bb42260cf7a97263f917345497c2548390441908c01d7ebacb870cc5faa4e4",
+      "bytes": 36042
+    },
+    {
+      "source": "candidates/lever3_qsa_offload_kvarn/src/arch/common/rad_qsa.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever3_qsa_offload_kvarn/src/arch/common/rad_qsa.h",
+      "sha256": "7133ed92b90a2cdf028228bbba659324012e01bd0f03e3e762f19a3a9526908c",
+      "bytes": 33115
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/lever.patch",
+      "sha256": "876a1da19a3b072ee37a57a44aadf07e1b59ea6d50d5fd2f2d07374df960206a",
+      "bytes": 42406
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/README.md",
+      "sha256": "3cbc09294aab99604c16da2f9745b08dd125a8d0c3751c5e74780d84d658eefb",
+      "bytes": 5240
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/engine_draft.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/engine_draft.cpp",
+      "sha256": "c996611c44fd6b5c17814b17e96106aa784b7e55aaba08ee30d9cb0dc78f7d2f",
+      "bytes": 27177
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/engine.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/engine.h",
+      "sha256": "f1b7ce2bf32b558b3630d779ee03b0701319c45fda3d0582c9fe355846cf9117",
+      "bytes": 20502
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/engine_priv.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/engine_priv.h",
+      "sha256": "5d9afcc7a27b0e5fa796ac4c3ea095f87fcee262196cfafc8c92777d3011a662",
+      "bytes": 6404
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/build/startup.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/build/startup.cpp",
+      "sha256": "97fdd3b64cb620b09d4b22166967bd78774e95f5ca38fb6d12aa01581a60968a",
+      "bytes": 17697
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/format/checkpoint.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/format/checkpoint.h",
+      "sha256": "b776fb0e338211b77c4d616710827e8350d0992700ebaca90b410c3df3a9cfd7",
+      "bytes": 8435
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/format/checkpoint.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/format/checkpoint.cpp",
+      "sha256": "98d5ffe7b9eee88b20bbd18bc69884c4caeb3acf637adc1d074c4a90120e28a5",
+      "bytes": 46229
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/sched/advance.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/sched/advance.h",
+      "sha256": "64043458a891db468b6ee0e96f70753c5621dbd97b1cecc98700c2698b8f1702",
+      "bytes": 5976
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/core/sched/advance_impl.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/core/sched/advance_impl.h",
+      "sha256": "b77f4782ea0f98d6853eddb3081e1c43715715d093a1fb36b286e3b4bf7eb1f6",
+      "bytes": 6560
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/libr4d/r4d_layout.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/libr4d/r4d_layout.cpp",
+      "sha256": "033ab4ed4ed5fb432d0fdc8799449edc929d87cf9bf4d08cc3a81679ade0628c",
+      "bytes": 47598
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/tests/fr_spec_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/tests/fr_spec_test.cpp",
+      "sha256": "1d024ffc23eb295178161b7bdc0e9d6c9376ca4e0ef024610b6baee180e3fd1e",
+      "bytes": 5241
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/tests/checkpoint_test.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/tests/checkpoint_test.cpp",
+      "sha256": "35339c147bcb7b805e202ed7d25572ebe7e2865d78f929c57923231966fc6761",
+      "bytes": 18814
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp",
+      "sha256": "0a0af1c09b4f51ae0a4fb4fa95b8fc80b973012d13dbbbef61e7c4d54860b1e4",
+      "bytes": 96641
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/arch/common/rad_block_mtp_hc.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/arch/common/rad_block_mtp_hc.h",
+      "sha256": "310ce34b8733256ed2bad0fd0217e53a5ba19bfbd4a05964aac9a34f28fe57aa",
+      "bytes": 38983
+    },
+    {
+      "source": "candidates/lever4_fr_spec_draft_head/src/arch/common/rad_block_mtp_fp8.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever4_fr_spec_draft_head/src/arch/common/rad_block_mtp_fp8.h",
+      "sha256": "a69aa669c4ba4f5ee15ba2bc657ec6153cd80f2a63237ef629b11b90c06e615c",
+      "bytes": 29075
+    },
+    {
+      "source": "candidates/lever8_stager_wrap_prefetch/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever8_stager_wrap_prefetch/lever.patch",
+      "sha256": "becd12a439c11110f8441bab66c8dcb68af624634924b1035b870d7d065bd965",
+      "bytes": 2037
+    },
+    {
+      "source": "candidates/lever8_stager_wrap_prefetch/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever8_stager_wrap_prefetch/README.md",
+      "sha256": "deb5cdcaf42daccf0a9fbda97fd407b61ed3d829031837085d313043416eb624",
+      "bytes": 3379
+    },
+    {
+      "source": "candidates/lever12_zero_cpu_wait_pipelining/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever12_zero_cpu_wait_pipelining/lever.patch.invalid.txt",
+      "sha256": "addb6863fd252587665b152be9e429b943bc190c1a6e415c1ffbe1385925957f",
+      "bytes": 1340
+    },
+    {
+      "source": "candidates/lever12_zero_cpu_wait_pipelining/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever12_zero_cpu_wait_pipelining/README.md",
+      "sha256": "247e2e03c93e4ae8db60b94ca00851fe315e7edc5fdebb084ebc7068ec843404",
+      "bytes": 3947
+    },
+    {
+      "source": "candidates/lever10_moe_decode_grid_clamp_wave0/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever10_moe_decode_grid_clamp_wave0/lever.patch.invalid.txt",
+      "sha256": "78b82cc11d0ef67d88b733c52ecfb1cd1b696d4c0a34363df2dc1c5e18ee3ab9",
+      "bytes": 1859
+    },
+    {
+      "source": "candidates/lever10_moe_decode_grid_clamp_wave0/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever10_moe_decode_grid_clamp_wave0/README.md",
+      "sha256": "112923fa25aa1c55e7a576244ee48032ecce75cad8089801c0338c126cdb6211",
+      "bytes": 3582
+    },
+    {
+      "source": "candidates/lever6_fast_store_drain_p2p_ar/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever6_fast_store_drain_p2p_ar/lever.patch",
+      "sha256": "6b971c68ad751426de6821061422b16dc933f07b6aed9d6d089ba20dd19abc25",
+      "bytes": 890
+    },
+    {
+      "source": "candidates/lever6_fast_store_drain_p2p_ar/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever6_fast_store_drain_p2p_ar/README.md",
+      "sha256": "6f81fc42a9c72aa4605b16670dbd6e7f39bc87c0b954559ce8e30aa07185f9d8",
+      "bytes": 3897
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/lever.patch",
+      "sha256": "b9489fa41e6adb6de8b1c24c1645a6a42e851e9d5c9811ed71e8a461fb3f554a",
+      "bytes": 18555
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/README.md",
+      "sha256": "d0beaac4ef3932e61a34d91f17225bb19acf438be23621f2ab93e0e8555bb5da",
+      "bytes": 5079
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/src/core/sample/accept.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/src/core/sample/accept.cpp",
+      "sha256": "854a693bbd8a55a454d8d8243cacdb8665071e657fe8f892c09b548137a6183a",
+      "bytes": 6772
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/src/core/sched/draft.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/src/core/sched/draft.h",
+      "sha256": "62e774cbfe2fce409521a9ea55ff614e6dc1d10ac9a49babb286d0ff21178179",
+      "bytes": 4573
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/src/core/sched/scheduler.cpp",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/src/core/sched/scheduler.cpp",
+      "sha256": "0452b25a3c449d92dcd40c4a3a7dda4f21358e1622a6839cf74574baccee772d",
+      "bytes": 120725
+    },
+    {
+      "source": "candidates/lever5_adaptive_bandit_controller/src/core/sched/scheduler.h",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever5_adaptive_bandit_controller/src/core/sched/scheduler.h",
+      "sha256": "d0ef8c14b7aefd3ddbe96fd5068bad2659fe0d7c737e8d7c93ddd93fa59c6e7b",
+      "bytes": 49308
+    },
+    {
+      "source": "candidates/lever7_swizzled_prefill_gemm_vopd/lever.patch",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever7_swizzled_prefill_gemm_vopd/lever.patch",
+      "sha256": "c80d5486e629c3cf0e47a6985a59bce3be686580ed7503c2fb9a09177a1f3cdc",
+      "bytes": 2295
+    },
+    {
+      "source": "candidates/lever7_swizzled_prefill_gemm_vopd/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/lever7_swizzled_prefill_gemm_vopd/README.md",
+      "sha256": "a4ac3ad0e1ae874eca3cf11577d1700df54c57c7705b979d3fcd03c0e87e91ac",
+      "bytes": 3344
+    },
+    {
+      "source": "candidates/README.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/README.md",
+      "sha256": "c93e8ef273e155215148b6e366d23f93b7ebba44b5ea292446f77fdfe35f2b0c",
+      "bytes": 6200
+    },
+    {
+      "source": "candidates/POST_OPT146_FORENSIC_AUDIT_AND_EVALUATION.md",
+      "published": "candidates/legacy-levers-review/originals/candidates/POST_OPT146_FORENSIC_AUDIT_AND_EVALUATION.md",
+      "sha256": "64cbd8cb5fd8eec89604d013fb532781782a13968180738360ca0030a2ec5950",
+      "bytes": 49224
+    }
+  ],
+  "patch_classification": [
+    {
+      "path": "candidates/lever1_gdn_qsa_fusion/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever2_fused_moe_router/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever9_4way_rlfu_vram_cache/lever.patch",
+      "parse_exit": 128,
+      "error": "error: corrupt patch at line 77"
+    },
+    {
+      "path": "candidates/lever11_pipelined_63vgpr_hc_write/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever3_qsa_offload_kvarn/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever4_fr_spec_draft_head/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever8_stager_wrap_prefetch/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever12_zero_cpu_wait_pipelining/lever.patch",
+      "parse_exit": 128,
+      "error": "error: corrupt patch at line 11"
+    },
+    {
+      "path": "candidates/lever10_moe_decode_grid_clamp_wave0/lever.patch",
+      "parse_exit": 128,
+      "error": "error: corrupt patch at line 24"
+    },
+    {
+      "path": "candidates/lever6_fast_store_drain_p2p_ar/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever5_adaptive_bandit_controller/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    },
+    {
+      "path": "candidates/lever7_swizzled_prefill_gemm_vopd/lever.patch",
+      "parse_exit": 0,
+      "error": ""
+    }
+  ],
+  "candidate_coverage": [
+    {
+      "candidate": "kv_cache_qsa_research",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever10_moe_decode_grid_clamp_wave0",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever11_pipelined_63vgpr_hc_write",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever12_zero_cpu_wait_pipelining",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever1_gdn_qsa_fusion",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever2_fused_moe_router",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever3_qsa_offload_kvarn",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever4_fr_spec_draft_head",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever5_adaptive_bandit_controller",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever6_fast_store_drain_p2p_ar",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever7_swizzled_prefill_gemm_vopd",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever8_stager_wrap_prefetch",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    },
+    {
+      "candidate": "lever9_4way_rlfu_vram_cache",
+      "review_package": "legacy-levers-review",
+      "status": "historical proposal; inactive; claims unverified"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+diff --git a/libr4d/r4d_gemm_w4a8_prefill.hip b/libr4d/r4d_gemm_w4a8_prefill.hip
+index 2cb9a70..580d6fe 100644
+--- a/libr4d/r4d_gemm_w4a8_prefill.hip
++++ b/libr4d/r4d_gemm_w4a8_prefill.hip
+@@ -410,6 +410,8 @@ void r4d_gemm_w4a8_prefill(long a, long ascale, long wq, long ws, long c, int M,
+     case 31: PF(2, 8, 4, 2, 2 | 128 | 256, 1); break;     // b128 A + both
+     case 32: PF(2, 8, 4, 2, 8 | 128 | 256 | 1, 4); break; // + grid swizzle 4
+     case 33: PF(2, 8, 4, 2, 8 | 128 | 256 | 1, 8); break; // + grid swizzle 8
++    case 34: PF(2, 8, 4, 2, 2 | 128 | 256 | 1, 4); break; // b128 A + VOPD + swizzle 4
++    case 35: PF(2, 8, 4, 2, 2 | 128 | 256 | 1, 8); break; // b128 A + VOPD + swizzle 8
+     default: PF(2, 8, 4, 2, 2, 1); break;                 // b128 A + VOPD fold
+   }
+ #undef PF
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+index b2d7525..aedb17c 100644
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -2994,10 +2994,10 @@ static const RadTunable tGemmTiled[] = {
+ 
+ /* The prefill kernel's arms, on the same terms. Ablations (20-23, 25, 26) are excluded for the
+  * same reason. */
+-static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28, 29, 30 };
++static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28, 29, 30, 31, 32, 33, 34, 35 };
+ static const RadTunable tGemmPrefill[] = {
+-  { "tile", kPrefillArms, NELEM(kPrefillArms), 0,
+-    "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
++  { "tile", kPrefillArms, NELEM(kPrefillArms), 34,
++    "compiled tile arm; 34 is BM 128 x BN 256 with VOPD, ASCVEC, STFAST and Swizzle 4" },
+ };
+ 
+ /* ------------------------------------------------------------------------ split-KV attention
+@@ -5095,6 +5095,7 @@ static void tile_bmbn(int arm, int prefill, R4dTileCfg* out) {
+         { 0, 128, 256 }, { 2, 128, 256 }, { 3, 128, 256 }, { 5, 128, 256 }, { 6, 128, 256 },
+         { 8,  64, 256 }, { 9,  96, 256 }, { 10, 128, 128 }, { 13, 64, 256 }, { 14, 256, 128 },
+         { 27, 128, 256 }, { 28, 128, 256 }, { 29, 128, 256 }, { 30, 128, 256 },
++        { 31, 128, 256 }, { 32, 128, 256 }, { 33, 128, 256 }, { 34, 128, 256 }, { 35, 128, 256 },
+     };
+     const Arm* t = prefill ? pf : tiled;
+     const int  n = prefill ? NELEM(pf) : NELEM(tiled);
