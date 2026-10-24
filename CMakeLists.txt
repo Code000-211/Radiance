@@ -310,6 +310,10 @@ add_subdirectory(arch)
 # the experimental line owns. Built by default so the flag's kernels exist in the same tree that
 # enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
 add_subdirectory(plugin/spechub)
+# qsatable: the shared QSA block table (MAIN-54). A prototype row, built by default so the
+# emulator's qsa test can call it in the same build; the architecture issues `qsa_table` only
+# with RADIANCE_QSA_TABLE=1.
+add_subdirectory(plugin/qsatable)
 # candidates/: ports of out-of-tree candidates, opted in one directory at a time. Each is built as
 # its own project shape (see candidates/gdn-query-reload/CMakeLists.txt) and never installed, so a
 # default build is unchanged.

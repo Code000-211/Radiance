@@ -168,6 +168,12 @@ table, byte for byte, rather than merely the same set of pages. Any other emit o
 descending, as a sort would give) makes the union's order right for at most one row, and forces a
 per-row compaction whose sums can drift from the row path's.
 
+`selb` carries the same entries as `sel`, as block indices, because a page id does not follow its
+block and so cannot be sorted into block order after the fact. A tile's union is what
+`plugin/qsatable`'s `qsa_table` builds from `selb` (prototype: `RADIANCE_QSA_TABLE=1`,
+`docs/OPS.md`). Reading a shared table needs a masked read of it, which the attention does not have
+yet; the table alone is what this measures.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and

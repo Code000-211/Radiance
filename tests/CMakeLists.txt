@@ -401,14 +401,24 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_fp8_f32scale.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip)
+# The shared-table op's row (plugin/qsatable) runs in the same build as the selection it consumes:
+# test_qsa's shared-table case feeds qsa_select's own `selb`/`nsel` to qsa_table and checks that the
+# union filtered by each row's mask is that row's own list, entry for entry. Its host reference comes
+# along so the kernel is held to the definition of the op as well.
+set(R4D_EMU_PLUGIN ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsatable.hip
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsatable.cpp
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/ref_qsatable.cpp)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
-  set_source_files_properties(${R4D_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
-  add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp)
-  target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR})
+  set_source_files_properties(${R4D_EMU_HIP} ${R4D_EMU_PLUGIN}
+                              PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
+  add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU_PLUGIN}
+              ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp)
+  target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR}
+                             ${CMAKE_SOURCE_DIR}/plugin/qsatable)
   target_link_libraries(r4d_emu_kernels PUBLIC rad_abi)
   # As in libr4d: the joins must match the unfused chain bit for bit, so no FMA contraction.
   target_compile_options(r4d_emu_kernels PRIVATE -ffp-contract=off -Wno-psabi)
@@ -433,15 +443,21 @@ else()
     set(dir ${CMAKE_CURRENT_BINARY_DIR}/r4d_emu)
     file(MAKE_DIRECTORY ${dir})
     set(flags -std=c++20 -O2 -ffp-contract=off -Wno-psabi -I${R4D_EMU}/emu -I${R4D_EMU}
-              -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR})
+              -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR} -I${CMAKE_SOURCE_DIR}/plugin/qsatable)
     set(objs "")
-    foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
+    foreach(src ${R4D_EMU_HIP} ${R4D_EMU_PLUGIN} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
                 ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
                 ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp ${R4D_EMU}/test_fp8f32.cpp
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp)
       get_filename_component(stem ${src} NAME_WE)
+      # A plugin directory holds `qsatable.cpp` and `qsatable.hip` with one stem, so its objects take
+      # the source's extension as a suffix: the object name is otherwise the stem alone and collides.
+      if(src IN_LIST R4D_EMU_PLUGIN)
+        get_filename_component(ext ${src} EXT)
+        set(stem "${stem}${ext}")
+      endif()
       set(lang "")
       if(src MATCHES "\\.hip$")
         set(lang -x c++)

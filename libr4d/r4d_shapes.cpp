@@ -1845,7 +1845,9 @@ extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
 }
 
 /* The QSA selection. `sel` is `topk + 1` wide: the extra slot is the partial page, without which
- * the newest tokens would be dropped. */
+ * the newest tokens would be dropped. `selb` is the same shape holding block indices, which a table
+ * shared by a tile of query rows needs to sort the rows' entries (a page id does not sort by
+ * block). */
 extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M  = pi(p, n_p, "M");
@@ -1861,9 +1863,10 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
         opd_idx(s, 1, nb + 1),                /* complete blocks per sequence, at most nb */
         opd_idx(M, 1, nb * r),                /* the query's own position */
         opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
-        opd((uint32_t)RAD_I32, M, k + 1),
+        opd((uint32_t)RAD_I32, M, k + 1),    /* sel: the selected pages */
         opd((uint32_t)RAD_I32, M),
         opd((uint32_t)RAD_I32, M),
+        opd((uint32_t)RAD_I32, M, k + 1),    /* selb: the same entries as block indices */
     };
     R4D_PICK(l);
 }

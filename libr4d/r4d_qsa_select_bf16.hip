@@ -3,7 +3,10 @@
 // at any context length (docs/QSA.md).
 //
 // The output is page ids: the KV group is paged at the compress ratio, so a selected block is a
-// page and the table is the attention's block table as is.
+// page and the table is the attention's block table as is. `selb` repeats the same entries as BLOCK
+// indices, because a page id does not sort by block (a dead block drops out of the block table and
+// the prefix cache re-orders the rest), and a table shared by a tile of query rows is their union
+// in block order.
 //
 // The partial page is appended last and is not a candidate: the reference always attends the
 // `(pos+1) % ratio` tokens after the last complete block (the query is among them). Every complete
@@ -135,7 +138,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
 
     __shared__ uint32_t hist[kBins];
@@ -163,6 +167,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
     int32_t*       ou = sel   + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;   /* the same entries' blocks */
 
     /* ---- the key cache: one global pass instead of four. */
     const bool cached = n <= cap;
@@ -253,7 +258,10 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
         __syncthreads();
         uint32_t before_t, tot_t;
         counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
-        if (take) ou[sh_out + before_t + rt] = tb[b];
+        if (take) {
+            ou[sh_out + before_t + rt] = tb[b];
+            if (ob) ob[sh_out + before_t + rt] = b;
+        }
         taken_eq += tot_e;
         __syncthreads();
         if (t == 0) sh_out += tot_t;
@@ -272,8 +280,17 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
          * then T is 0, every live key was emitted, and the slots past them hold nothing. */
         uint32_t out = sh_out < (uint32_t)topk ? sh_out : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        /* The partial page is block n; the slot carries that index, and the attention skips it by
+         * position exactly as before (`selb` is additive, `sel` is unchanged). */
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         /* The attention's causal bound. attn_paged takes the block table and seqused_k as
          * ordinary operands, so QSA issues the same op with `sel` as the table and this as the
@@ -397,7 +414,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) {
 
     /* The first digit's 4096 bins; afterwards [0, kBins) is the later digits' histogram and the
@@ -434,6 +452,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
     int32_t*       ou = sel   + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;   /* the same entries' blocks */
 
     if (t == 0) sh_out = 0;
     __syncthreads();
@@ -521,9 +540,12 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 __syncthreads();
                 uint32_t before_t, tot_t;
                 counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
-                if (take)
-                    ou[sh_out + before_t + (uint32_t)__popcll(mt & ((1ull << lane) - 1ull))] =
-                        tb[lblk[i]];
+                if (take) {
+                    const uint32_t slot =
+                        sh_out + before_t + (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
+                    ou[slot] = tb[lblk[i]];
+                    if (ob) ob[slot] = (int32_t)lblk[i];
+                }
                 ebase += tot_e;
                 __syncthreads();
                 if (t == 0) sh_out += tot_t;
@@ -686,7 +708,11 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                                            (uint32_t)__popcll(mt & ((1ull << lane) - 1ull));
                     if (i < nin) {
                         const uint32_t b = mblk[i];
-                        if (take) ou[ord_i + lower_bound_u32(mabv, n_abv, b)] = tb[b];
+                        if (take) {
+                            const uint32_t slot = ord_i + lower_bound_u32(mabv, n_abv, b);
+                            ou[slot] = tb[b];
+                            if (ob) ob[slot] = (int32_t)b;
+                        }
                         mkey[i] = ord_i;
                     }
                     ebase += tot_e;
@@ -696,7 +722,9 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 for (uint32_t j = (uint32_t)t; j < n_abv; j += kThreads) {
                     const uint32_t b = mabv[j];
                     const uint32_t p = lower_bound_u32(mblk, nin, b);
-                    ou[j + (p < nin ? mkey[p] : ord)] = tb[b];
+                    const uint32_t slot = j + (p < nin ? mkey[p] : ord);
+                    ou[slot] = tb[b];
+                    if (ob) ob[slot] = (int32_t)b;
                 }
                 if (t == 0) sh_out = n_abv + ord;
             }
@@ -730,7 +758,10 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         __syncthreads();
         uint32_t before_t, tot_t;
         counts_before<kWaves>(wsum, lane, wave, &before_t, &tot_t);
-        if (take) ou[sh_out + before_t + rt] = tb[b];
+        if (take) {
+            ou[sh_out + before_t + rt] = tb[b];
+            if (ob) ob[sh_out + before_t + rt] = b;
+        }
         taken_eq += tot_e;
         __syncthreads();
         if (t == 0) sh_out += tot_t;
@@ -741,8 +772,17 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     if (t == 0) {
         uint32_t out = sh_out < (uint32_t)topk ? sh_out : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        /* The partial page is block n; the slot carries that index, and the attention skips it by
+         * position exactly as before (`selb` is additive, `sel` is unchanged). */
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         const int32_t su = (int32_t)((out == 0) ? 0 : (out - 1) * (uint32_t)ratio +
                                                       (uint32_t)(p % ratio) + 1u);
@@ -957,11 +997,11 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
         const ParTake r = par_take<LT>(e, k, lane, wave);
         if (r.take && r.slot_ord < (uint32_t)topk) {
             dk[r.slot_ord] = k;
-            /* Store the page, not the block index: resolving it here spreads the dependent load
-             * over many workgroups instead of the merge's few. The merge breaks ties by list
-             * position (block-ordered), never by index. A taken candidate has k != 0, so its
-             * page is live. */
-            di[r.slot_ord] = tb[lo + i];
+            /* The block index, not the page: the merge resolves `tb[b]` once per entry and needs
+             * the index itself for `selb`, so this is the same number of dependent loads. The
+             * merge breaks ties by list position (block-ordered), never by index. A taken
+             * candidate has k != 0, so its page is live. */
+            di[r.slot_ord] = lo + i;
         }
     }
     if (t == 0) cc[(size_t)m * kParWMax + c] =
@@ -975,7 +1015,8 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ cc, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
+    int32_t* __restrict__ sel, int32_t* __restrict__ selb,
+    int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
 
     constexpr int NT = kMergeThreads;
@@ -1036,6 +1077,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
 
     const int32_t* tb = bt  + (size_t)seq * t_ld;
     int32_t*       ou = sel + (size_t)m * o_ld;
+    int32_t*       ob = selb ? selb + (size_t)m * o_ld : nullptr;
     for (int i0 = 0; i0 < tot; i0 += NT) {
         const int i = i0 + t;
         const uint32_t k = i < tot ? sh_key[i] : 0u;
@@ -1044,10 +1086,11 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
             /* The candidate's chunk, from the offsets. */
             int c = nchunk - 1;
             while (c > 0 && sh_off[c] > i) --c;
-            /* Already a page (resolved by the local pass); tb is still needed for the partial
-             * page. */
-            const int32_t page = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
-            ou[r.slot_ord] = page;
+            /* A block index, resolved here: one dependent load per emitted entry either way, and
+             * `selb` needs the index itself. */
+            const int32_t b = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
+            ou[r.slot_ord] = tb[b];
+            if (ob) ob[r.slot_ord] = b;
         }
     }
 
@@ -1059,8 +1102,15 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
          * fewer live blocks, all of them emitted. */
         uint32_t out = sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
-        if (part >= 0) ou[out++] = part;
-        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        if (part >= 0) {
+            ou[out] = part;
+            if (ob) ob[out] = n;
+            ++out;
+        }
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) {
+            ou[i] = -1;
+            if (ob) ob[i] = -1;
+        }
         nsel[m] = (int32_t)out;
         const int32_t su = (int32_t)((out == 0) ? 0
                                    : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
@@ -1083,11 +1133,15 @@ static inline int64_t par_scratch_bytes(long long topk) {
 //   pos   [M]            i32, each query's absolute position
 //   cu    [nseq+1]       i32, cumulative query counts: which sequence a query row belongs to
 //   sel   [M][topk+1]    i32, `o_ld` elements a row (0 = topk+1); -1 padded
+//   selb  [M][topk+1]    i32, the same entries' BLOCK indices (the partial page's is `n`), -1
+//                        padded; absent = not written. `sel` carries page ids, which do not sort
+//                        by block, so a table shared by a query tile needs this
 //   nsel  [M]            i32
 // Signed selects the key order (keyof), from the op's `signed` parameter.
 template <bool Signed>
 static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long cu, long sel,
-                                   long nsel, long seqused, int M, int nb, int topk, int ratio,
+                                   long selb, long nsel, long seqused, int M, int nb, int topk,
+                                   int ratio,
                                    int nseq, int s_ld, int t_ld, int o_ld,
                                    void* scratch, long long scratch_bytes, RadStream stream) {
     if (!score || !bt || !nc || !cu || !sel || !nsel || !seqused) return R4D_NO(RAD_E_INVAL);
@@ -1119,7 +1173,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                         (size_t)nchunk * topk * sizeof(uint32_t), (const uint32_t*)ck,
                         (const int32_t*)ci, (const int32_t*)cc, (const int32_t*)bt,
                         (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                        (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,
+                        (int32_t*)sel, (int32_t*)selb, (int32_t*)nsel, (int32_t*)seqused,
                         nb, topk, ratio, nseq, t_ld, o_ld, nchunk);
     }
 
@@ -1129,8 +1183,8 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
                         dim3(kThreads), 0,
                         (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                         (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,
-                        (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld,
-                        o_ld);
+                        (int32_t*)selb, (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq,
+                        s_ld, t_ld, o_ld);
     }
 
     /* Never more than the table width. */
@@ -1139,7 +1193,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                    (int32_t*)sel, (int32_t*)nsel,
+                    (int32_t*)sel, (int32_t*)selb, (int32_t*)nsel,
                     (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
 }
 
@@ -1153,7 +1207,7 @@ extern "C" int64_t r4d_rad_qsa_select_scratch(const RadArgs* a) {
 // ============================================================== the plugin ABI entry point
 
 enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL_NSEL = 6,
-       QL_SEQ = 7 };
+       QL_SEQ = 7, QL_SELB = 8 };
 
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* sc = r4d_opt(a, QL_SCORE);
@@ -1164,6 +1218,7 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* se = r4d_opt(a, QL_SEL);
     const RadTensor* ns = r4d_opt(a, QL_NSEL);
     const RadTensor* su = r4d_opt(a, QL_SEQ);
+    const RadTensor* sb = r4d_opt(a, QL_SELB);   /* optional: additive, `sel` alone is the table */
     if (!sc || !bt || !nc || !po || !cu || !se || !ns || !su) return R4D_NO(RAD_E_INVAL);
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long topk  = r4d_geti_or(a, "topk", 0);
@@ -1183,12 +1238,17 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     if (se->shape[0] != M || se->shape[1] != topk + 1) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(ns) < M) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(po) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
+    if (sb && (sb->rank != 2 || sb->shape[0] != M || sb->shape[1] != topk + 1))
+        return R4D_NO(RAD_E_SHAPE);
     const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
     if (sp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    /* `selb` is written at `sel`'s row pitch (the kernels carry one pitch for both), so a caller
+     * that pads one and not the other is refused rather than silently misaligned. */
+    if (sb && r4d_row_pitch(sb) != op) return R4D_NO(RAD_E_STRIDE);
     /* Scratch is optional: without enough, the non-split kernels run. */
     auto* const emit = sgn ? r4d_qsa_select_bf16_emit<true> : r4d_qsa_select_bf16_emit<false>;
     return emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
-                r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
+                r4d_addr(cu), r4d_addr(se), r4d_addr(sb), r4d_addr(ns), r4d_addr(su),
                 (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
                 (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
                 stream);

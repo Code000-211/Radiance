@@ -2563,7 +2563,8 @@ order, not a slow one.
 | `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
-| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused`, `selb`? |
+| `qsa_table` | `M`(range) `blocks` `topk` `tile` `ratio` | `selb`, `nsel`, `pos` → `tab`, `tlen`, `mask`, `row_off` |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
@@ -2692,12 +2693,38 @@ with the partial page appended.
   `nsel*ratio`, every selected page fully visible. The op emits it because it is one store off a
   number it already has.
 
+- **The emit is one run in block order**, and `selb` repeats the same entries as block indices. So
+  `sel[j]` and `selb[j]` are the same page, and `selb` ascends. `sel` alone cannot be sorted that
+  way: a page id does not follow its block (a dead block drops out of the block table and the prefix
+  cache re-orders the rest), so a table that has to be shared between queries needs the index the
+  scores were gathered at. `selb` is optional and additive — absent, nothing is written and `sel` is
+  byte for byte what it was.
+
 libr4d's kernel takes scratch (sized by the row's scratch hook; it is not an operand). With it, a
 launch of at most 32 query rows cuts the block list into up to 16 chunks, takes each chunk's own
 top-k and merges them, so a decode step uses more than `1 + n_spec` workgroups. The result is exact,
 because a chunk's local top-k contains every global top-k member of that chunk, and identical in
 output layout too: the attention sums the selected pages in table order and float addition is not
 associative. Without scratch, or above 32 rows, one workgroup per query walks the whole list.
+
+### `qsa_table`
+
+**Prototype, `RADIANCE_QSA_TABLE=1`, plugin `qsatable`.** Turns the per-query selections of one tile
+of query rows into one table they share, so the measurement of MAIN-10 has a test article: a union of
+row selections in block order plus a per-row mask, which is what a shared block table costs and what
+a masked read of it saves.
+
+- **The union is `tile * topk` wide at most**, which is the shape hook's bound
+  (`min(tile * topk, blocks)`); `mask` is `[M][u_max]` i32 and `row_off` sends row `m` to the plane of
+  its tile. `tile` is capped at 32 so a row's membership word is one `unsigned`.
+- **The mask is a filter, not a re-order**, because the emit is one run in block order: `tab` ascends
+  in block index, so a row's own list is its mask's set bits in the order they appear. The test
+  recovers every row's table from the kernel's own `selb` this way, byte for byte.
+- **The partial page is not in the table.** Its block index is `(pos + 1) / ratio` by construction, so
+  the bound `b < own` already keeps it out of the union; a reader appends it after filtering, which
+  is the page it must read last anyway.
+- **It is not wired into the attention.** The read path needs a masked variant of the paged
+  attention, which is libr4d's, not this plugin's; until that exists this op is issued by nothing.
 
 ### `qsa_tail_store`
 
