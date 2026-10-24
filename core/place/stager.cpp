@@ -34,6 +34,19 @@ std::vector<StagedLayer> routed_layers(const Plan& plan, Take take, size_t* clas
 }  /* namespace */
 
 PrefillStager::~PrefillStager() {
+    /* A pass may end with the next pass's first layers still published at the ring
+     * (set_next_prefill), so the stager can die holding copies. The mover outlives it --
+     * Engine::Rank declares the mover first -- and hands its residency table to whatever runs
+     * next, so a place left published would name ring bytes for the rest of the mover's life:
+     * bytes the slab refills once the step lends the arena top, or another stager's ring takes.
+     * Publish those units back at their pool slots before the events they are recorded behind
+     * go. */
+    if (mover_)
+        for (Place& p : place_)
+            if (!p.staged.empty()) {
+                mover_->unstage_units(p.staged);
+                p.staged.clear();
+            }
     for (Place& p : place_) {
         if (p.done) rad_event_destroy(p.done);
         if (p.free) rad_event_destroy(p.free);
@@ -233,15 +246,30 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     if (i < 0) return RAD_OK;
     Place& p = place_[i];
     p.li = li;
-    if (gate) RAD_TRY(rad_event_wait(mover_->transfer_stream(), gate));
+    /* THE PLACE IS OUT OF `spare_` AND NOT YET IN THE RING. A copy that does not issue must give it
+     * back: nothing was published, so no reader is ordered behind it, and the ring keeps its room
+     * and its head for the next op. A device fault that fails one step is transient; a place lost
+     * to it is not -- the table is kPlaces entries, and a server that fails a few steps would stop
+     * staging for good. */
+    auto give_back = [&] {
+        p.li = -1;
+        p.beg = p.end = 0;
+        p.free_rec = p.read = p.retired = false;
+        p.staged.clear();          /* nothing was published: the list names no copy to undo */
+        spare_.push_back(i);
+    };
+    if (gate) {
+        const int rc = rad_event_wait(mover_->transfer_stream(), gate);
+        if (rc < 0) { give_back(); return rc; }
+    }
     /* A wrapping place continues at the region's start. */
     const int64_t off = p.beg % ring_, len = p.end - p.beg;
     Mover::StageSpan sp[2] = { { base_ + off, std::min(len, ring_ - off) },
                                { base_, len - std::min(len, ring_ - off) } };
-    RAD_TRY(mover_->stage_units(L.units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
+    const int rc = mover_->stage_units(L.units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged);
+    if (rc < 0) { give_back(); return rc; }
     if (p.staged.empty()) {
-        p.li = -1;
-        spare_.push_back(i);
+        give_back();
         *got = kNone;
         return RAD_OK;
     }
