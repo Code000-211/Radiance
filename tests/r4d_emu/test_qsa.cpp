@@ -14,6 +14,11 @@
  * inside the kernels is predicted from their constants, restated in `Path`; the run fails when the
  * fixtures stop reaching one of them. `sweep N` runs N seeded fixtures at serving sizes instead.
  *
+ * One case is not a kernel against the port: `shared_table_case` takes the kernel's own selections
+ * for a tile of query rows and checks that their union in block order plus a per-row mask gives
+ * every row back (docs/QSA.md, "The emit is one run in block order"), reporting how much the rows
+ * share and where a row's list leaves block order.
+ *
  * Fixtures marked signed run with the op's `signed` parameter: the kernels' signed key order,
  * against the port's signed ranking, over negative, mixed and the sweep's odd scores. The unsigned
  * fixtures are the same as without the parameter. */
@@ -237,8 +242,14 @@ RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape, int64_t ld = 0)
     return t;
 }
 
+/* What a launch wrote, when the caller wants it (the shared-table case keeps the kernel's own
+ * table, not the port's). */
+struct SelOut {
+    std::vector<int32_t> se, ns, su;
+};
+
 /* One launch of `form` against the port. Returns the failures (0 or 1). */
-int run(Fix& f, Form form) {
+int run(Fix& f, Form form, SelOut* out = nullptr) {
     std::vector<int32_t> want, want_n, want_su;
     ref_select(f, want, want_n, want_su);
     const int M = f.M, W = f.topk + 1;
@@ -292,6 +303,11 @@ int run(Fix& f, Form form) {
             std::printf(", %d slot(s) differ, first slot %d: %d want %d", diff, first, se[(size_t)m * f.o_ld + first], w);
         }
         std::printf("\n");
+    }
+    if (out) {
+        out->se.assign(se.begin(), se.begin() + (size_t)M * f.o_ld);
+        out->ns.assign(ns.begin(), ns.begin() + M);
+        out->su.assign(su.begin(), su.begin() + M);
     }
     return bad_rows ? 1 : 0;
 }
@@ -451,6 +467,182 @@ Fix fix_few_live() {
     }
     f.cu[S] = S;
     return f;
+}
+
+/* ---- one block table per tile -------------------------------------------------------------------
+ *
+ * The lever this case guards: the sparse attention reads one block table per tile of query rows,
+ * a stable mixture of the rows' own selections, with membership as a per-row mask, instead of one
+ * table per row. The mixture is that tile's pages in block order, so every row's selection is a
+ * subsequence of it and is read back unchanged -- the case checks that on the kernel's own output
+ * rather than on the port, and reports how much the rows share.
+ *
+ * Two properties carry it. A row's list is in block order except for one run at the tail, the
+ * threshold bin's ties (the tie rule picks them, so they cannot sit in place): a row whose list is
+ * already in block order comes back byte for byte, and one that is not keeps its selection but is
+ * read in the table's order, which is a different sum (docs/QSA.md, "The emit is one run in block
+ * order"). And the partial page -- decided by the row's position -- stays out of the shared table
+ * and is appended per row, so a page the chunk itself is filling cannot leak into a row that may
+ * not see it. Both counts are reported; the tail run and the descents are also checked, since a
+ * layout change in the emit would silently make the merge inexact. */
+
+/* The score field a tile sees: one shared block field plus per-row noise, as the rows of a decode
+ * step or of one prefill chunk do. `sigma` is the noise's width in thousandths of the field's, so
+ * 0 is every row the same selection and larger values are rows that agree less; `grid` quantises
+ * the sum, so scores tie exactly and the tie rule decides. */
+Fix fix_shared_scores(const char* name, int M, int nb, int topk, int sigma, int grid, int seed) {
+    Fix f; f.name = name;
+    const int ratio = 4;
+    f.shape(1, M, nb, nb, topk, ratio);
+    f.cu = { 0, M }; f.nc = { nb };
+    for (int b = 0; b < nb; ++b) f.page(0, b) = b;             /* page id = block index */
+    f.page(0, nb) = -1;                                      /* nothing past the history */
+    g_x = 0x853C49E6748FEA9Bull + (uint64_t)seed * 0x9E3779B97F4A7C15ull;
+    std::vector<float> base((size_t)nb);
+    for (auto& v : base) v = (float)(rnd() % 1000003) / 1000003.0f;
+    for (int m = 0; m < M; ++m) {
+        /* One block short of the history's end, a row on and a row off the block boundary: every
+         * block live, the last one partly filled, so half the rows carry a partial page. */
+        f.pos[m] = 4 * (nb - 1) + 2 + m % 2;
+        for (int b = 0; b < nb; ++b) {
+            const float noise = (float)(rnd() % 1000003) / 1000003.0f - 0.5f;
+            float v = base[(size_t)b] + noise * (float)sigma / 1000.0f;
+            if (grid > 0) v = std::floor(v * (float)grid) / (float)grid;
+            f.score(m, b) = v;
+        }
+    }
+    return f;
+}
+
+/* A prefill tile: `rows` query rows of one chunk ending at the history's end, so the rows' visible
+ * counts differ by a block and three rows in four carry a partial page -- the page the chunk is
+ * filling, live in the table and belonging to one row only. */
+Fix fix_shared_prefill(int nb, int rows, int sigma, int seed) {
+    char name[96];
+    std::snprintf(name, sizeof name, "shared: prefill, %d rows, %dK", rows, (nb * 4) / 1024);
+    Fix f = fix_shared_scores(name, rows, nb, 512, sigma, 0, seed);
+    const int base = 4 * nb - rows;
+    for (int m = 0; m < rows; ++m) f.pos[m] = base + m;
+    return f;
+}
+
+/* The row's last table entry is its partial page, exactly when the port appends one: the query's
+ * count is short of the history and its position is off a block boundary, and the sequence's next
+ * block is live (mid-chunk it is; at the end of the history it is not). */
+bool row_has_partial(const Fix& f, int m) {
+    const int n = f.n_of(m);
+    return n < f.nb() && (f.pos[m] + 1) % f.ratio != 0 && f.bt[(size_t)(f.seq_of(m) * f.t_ld + n)] >= 0;
+}
+
+/* One table per tile, from the kernel's own selections, recovered row by row. Returns the failures.
+ *
+ * What is required: every row's selection is a subset of the shared table, so the table plus the
+ * row's mask is that row's selection and nothing else -- its count, its pages, its `seqused`. What
+ * is measured and reported instead: the rows' lists are in block order except for the threshold
+ * bin, whose ties the emit places at the tail (the tie rule picks them, so they cannot sit in
+ * place). A merged read walks the table, so those entries move; for a row already in block order
+ * the table reproduces it byte for byte, and the count of moved entries is the size of the change
+ * in the attention's accumulation order -- zero for every row below the budget. */
+int shared_table_case() {
+    std::vector<Fix> fx = {
+        fix_shared_scores("shared: decode depth 3, 8K", 4, 2048, 512, 300, 0, 1),
+        fix_shared_scores("shared: decode depth 6, 8K", 8, 2048, 512, 300, 0, 2),
+        fix_shared_scores("shared: decode depth 3, 32K", 4, 8192, 512, 300, 0, 3),
+        fix_shared_scores("shared: decode depth 6, 32K", 8, 8192, 512, 300, 0, 4),
+        fix_shared_scores("shared: depth 6, 32K, rows that agree less", 8, 8192, 512, 900, 0, 5),
+        fix_shared_scores("shared: depth 6, 32K, a coarse grid of ties", 8, 8192, 512, 40, 64, 6),
+        fix_shared_prefill(2048, 16, 300, 7),
+        fix_shared_prefill(8192, 32, 300, 8),
+    };
+    int fails = 0;
+    for (Fix& f : fx) {
+        SelOut got;
+        if (run(f, kAuto, &got)) { std::printf("FAIL %-46s launch\n", f.name.c_str()); ++fails; continue; }
+        /* Each row's table: its pages and the partial page the port appends last. */
+        std::vector<std::vector<int32_t>> pages((size_t)f.M);
+        std::vector<int32_t> part((size_t)f.M, -1);
+        std::vector<char> already((size_t)f.M, 0);
+        bool partial_seen = false, partial_absent = false;
+        int64_t total = 0, tail = 0;
+        int in_order = 0, breaks = 0, rows_broken = 0;
+        for (int m = 0; m < f.M; ++m) {
+            const int nsel = got.ns[(size_t)m];
+            const int32_t* row = &got.se[(size_t)m * f.o_ld];
+            const bool has = nsel > 0 && row_has_partial(f, m);
+            partial_seen |= has;
+            partial_absent |= !has;
+            for (int i = 0; i < nsel; ++i) {
+                if (has && i == nsel - 1) { part[(size_t)m] = row[i]; continue; }
+                pages[(size_t)m].push_back(row[i]);
+            }
+            total += (int64_t)pages[(size_t)m].size();
+            /* Block order, which the merge needs of a row: the emit is a run in block order and the
+             * threshold bin's run after it, so a descent count says how far off it is and the last
+             * run's length says how many entries the merge moves. */
+            const std::vector<int32_t>& p = pages[(size_t)m];
+            int last = -1, d = 0;
+            for (size_t i = 0; i + 1 < p.size(); ++i)
+                if (p[i] > p[i + 1]) { ++d; last = (int)i; }
+            breaks += d;
+            rows_broken += d > 1;
+            already[(size_t)m] = last < 0;
+            in_order += already[(size_t)m];
+            tail += last < 0 ? 0 : (int64_t)p.size() - 1 - last;
+            std::sort(pages[(size_t)m].begin(), pages[(size_t)m].end());
+        }
+        /* The shared table: the sorted union of the rows' pages -- the stable mixture, and the one
+         * order in which every row's selection can be read. */
+        std::vector<int32_t> tab;
+        for (const auto& p : pages) tab.insert(tab.end(), p.begin(), p.end());
+        std::sort(tab.begin(), tab.end());
+        tab.erase(std::unique(tab.begin(), tab.end()), tab.end());
+        /* Recover each row: walk the table, take its members, then its own partial page. */
+        int bad_rows = 0;
+        for (int m = 0; m < f.M; ++m) {
+            std::vector<int32_t> rec;
+            size_t i = 0;
+            for (int32_t b : tab) {
+                while (i < pages[(size_t)m].size() && pages[(size_t)m][i] < b) ++i;
+                if (i < pages[(size_t)m].size() && pages[(size_t)m][i] == b) rec.push_back(b);
+            }
+            if (part[(size_t)m] >= 0) rec.push_back(part[(size_t)m]);
+            const int32_t su = rec.empty() ? 0
+                             : (int32_t)(((int)rec.size() - 1) * f.ratio + f.pos[m] % f.ratio + 1);
+            bool same = (int)rec.size() == got.ns[(size_t)m] && got.su[(size_t)m] == su;
+            /* The row's padding, and -- for a list already in block order -- the whole row, byte
+             * for byte as the kernel wrote it. A row that was not keeps its selection, but the
+             * merge reads it in the table's order. */
+            for (int k = (int)rec.size(); same && k <= f.topk; ++k)
+                same = got.se[(size_t)m * f.o_ld + k] == -1;
+            for (int k = 0; already[(size_t)m] && same && k < (int)rec.size(); ++k)
+                same = got.se[(size_t)m * f.o_ld + k] == rec[(size_t)k];
+            if (!same && ++bad_rows <= 3)
+                std::printf("FAIL %-46s row %d: the shared table does not recover this row\n",
+                            f.name.c_str(), m);
+        }
+        const int64_t per_row = total / (int64_t)f.M;
+        const double factor = tab.empty() ? 0.0 : (double)total / (double)tab.size();
+        std::printf("  %-46s %d rows x %lld pages -> %zu blocks (%.1fx fewer), mask %zu B/row, "
+                    "%d/%d rows recovered\n", f.name.c_str(), f.M, (long long)per_row, tab.size(),
+                    factor, (tab.size() + 7) / 8, f.M - bad_rows, f.M);
+        std::printf("  %-46s %d/%d rows already in block order, %.1f entries in the tail run, %d "
+                    "break(s)\n", "", in_order, f.M, (double)tail / f.M, breaks);
+        /* The emit is one run in block order and the threshold bin's run after it: that is what
+         * makes the table's order the rows' order apart from one group, so check it. */
+        if (rows_broken) {
+            std::printf("FAIL %-46s %d row(s) not one run in block order plus the tail\n",
+                        f.name.c_str(), rows_broken);
+            ++fails;
+        }
+        if (!partial_seen || !partial_absent) {
+            std::printf("FAIL %-46s partial page seen %d, absent %d\n", f.name.c_str(),
+                        (int)partial_seen, (int)partial_absent);
+            ++fails;
+        }
+        fails += bad_rows ? 1 : 0;
+    }
+    std::printf("shared table: %zu tiles, %d failure(s)\n", fx.size(), fails);
+    return fails;
 }
 
 /* A 70-row prefill chunk: wider than the key cache's gate, so the automatic choice is the wide
@@ -628,6 +820,7 @@ int main(int argc, char** argv) {
         Fix f = make();
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
     }
+    if (!sweep) fails += shared_table_case();
     if (sweep) {
         for (const auto& [p, c] : g_paths) std::printf("  %5d row(s): %s\n", c, p.c_str());
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
