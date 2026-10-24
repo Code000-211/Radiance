@@ -25,6 +25,7 @@
  * fixtures are the same as without the parameter. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "qsaattn.h"
 #include "qsatable.h"
 #include "r4d_plugin.h"
 
@@ -518,7 +519,6 @@ Fix fix_shared_scores(const char* name, int M, int nb, int topk, int sigma, int 
     f.shape(1, M, nb, nb, topk, ratio);
     f.cu = { 0, M }; f.nc = { nb };
     for (int b = 0; b < nb; ++b) f.page(0, b) = b;             /* page id = block index */
-    f.page(0, nb) = -1;                                      /* nothing past the history */
     g_x = 0x853C49E6748FEA9Bull + (uint64_t)seed * 0x9E3779B97F4A7C15ull;
     std::vector<float> base((size_t)nb);
     for (auto& v : base) v = (float)(rnd() % 1000003) / 1000003.0f;
@@ -657,7 +657,7 @@ int shared_table_case() {
                             f.name.c_str(), m);
         }
         if (unordered) { std::printf("FAIL %-46s a table is not in block order\n", f.name.c_str()); ++fails; }
-        if (off_rows) { std::printf("FAIL %-46s %d row(s) with a wrong row_off\n", f.name.c_str(), off_rows); ++fails; }
+        if (off_rows) { std::printf("FAIL %-46s %lld row(s) with a wrong row_off\n", f.name.c_str(), (long long)off_rows); ++fails; }
         const double factor = union_ ? (double)total / (double)union_ : 0.0;
         std::printf("  %-46s %d rows x %lld pages -> %lld blocks in %lld tile(s) (%.1fx fewer), "
                     "mask %lld B/row (a bitmask would be %lld), %d/%d rows recovered\n",
@@ -666,6 +666,155 @@ int shared_table_case() {
         fails += bad_rows ? 1 : 0;
     }
     std::printf("shared table: %zu tiles, %d failure(s)\n", fx.size(), fails);
+    return fails;
+}
+
+/* ---- The masked read of the shared table (plugin/qsatable's `qsa_attn`). ----
+ *
+ * The premise of the measurement, checked from the other end: if a row's table is a subsequence of
+ * the tile's union, then reading the union through the row's membership mask must give the row's own
+ * result. The case runs the same rows through the same op twice -- once with a table per row (tile 1,
+ * every entry the row's own, mask all ones) and once with the tile's union in block order (tile 16)
+ * -- and requires the outputs to be equal **byte for byte**. Byte equality is the claim: softmax is
+ * summed in table order and float addition is not associative, so anything less than the same keys
+ * in the same order would show up here as a difference, not as a rounding.
+ *
+ * The keys are real: a KV cache of the fixtures' pages, a bf16 query, and the row's position from the
+ * fixture. The op's f64 host reference is run on the per-row table too, so the case also holds the
+ * read to the definition of the op -- the partial page included, which is position-decided and
+ * appended by the reader rather than read off the table. */
+
+/* Round-to-nearest-even bf16, so the query and the cache are values the op can actually read back. */
+uint16_t bf16_of(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+struct SharedTab {
+    int64_t tile = 1, tiles = 1, u_max = 1;
+    std::vector<int32_t> tab, tlen, mask, roff;
+};
+
+/* One table for the tile of rows starting at `tile`, built by the op that builds it: the union of the
+ * rows' `selb` in block order, the membership mask and `row_off`. */
+int build_table(const Fix& f, const SelOut& got, int64_t tile, SharedTab& t) {
+    const int M = f.M, W = f.topk + 1;
+    t.tile = tile;
+    t.tiles = (M + tile - 1) / tile;
+    t.u_max = rad_qsa_table_u_max(tile, f.topk, f.nb());
+    if (t.u_max < 1) return RAD_E_SHAPE;
+    t.tab.assign((size_t)(t.tiles * t.u_max), kSentinel);
+    t.tlen.assign((size_t)t.tiles, kSentinel);
+    t.mask.assign((size_t)M * t.u_max, kSentinel);
+    t.roff.assign((size_t)M, kSentinel);
+    RadTensor a[7] = {
+        tens((void*)got.sb.data(), RAD_I32, {M, W}, f.o_ld), tens((void*)got.ns.data(), RAD_I32, {M}),
+        tens((void*)f.pos.data(), RAD_I32, {M}),  tens(t.tab.data(), RAD_I32, {t.tiles, t.u_max}),
+        tens(t.tlen.data(), RAD_I32, {t.tiles}),  tens(t.mask.data(), RAD_I32, {M, t.u_max}),
+        tens(t.roff.data(), RAD_I32, {M}),
+    };
+    RadParam p[5]{};
+    p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()};
+    p[2] = {"topk", RAD_P_INT, f.topk}; p[3] = {"tile", RAD_P_INT, (int)tile};
+    p[4] = {"ratio", RAD_P_INT, f.ratio};
+    RadArgs args{}; args.t = a; args.n_t = 7; args.p = p; args.n_p = 5;
+    return rad_qsa_table_launch(&args, nullptr);
+}
+
+/* The read: one launch of `qsa_attn` over `t`, or over its host reference when `ref` is set. */
+int read_table(const Fix& f, const SharedTab& t, int64_t hd, int64_t nh, int64_t gqa, int64_t blocks,
+                int64_t npages, const std::vector<uint16_t>& q, const std::vector<uint16_t>& kv,
+                std::vector<uint16_t>& out, bool ref) {
+    const int M = f.M;
+    out.assign((size_t)(M * nh * hd), 0);
+    RadTensor a[10] = {
+        tens((void*)q.data(), RAD_BF16, {M, nh * hd}), tens((void*)kv.data(), RAD_BF16, {npages, nh / gqa, f.ratio, 2 * hd}),
+        tens((void*)t.tab.data(), RAD_I32, {t.tiles, t.u_max}), tens((void*)t.tlen.data(), RAD_I32, {t.tiles}),
+        tens((void*)t.mask.data(), RAD_I32, {M, t.u_max}),       tens((void*)t.roff.data(), RAD_I32, {M}),
+        tens((void*)f.pos.data(), RAD_I32, {M}),                 tens((void*)f.bt.data(), RAD_I32, {f.S, f.nb_t}, f.t_ld),
+        tens((void*)f.cu.data(), RAD_I32, {f.S}),                tens(out.data(), RAD_BF16, {M, nh * hd}),
+    };
+    std::vector<int32_t> seq((size_t)M);
+    for (int m = 0; m < M; ++m) seq[(size_t)m] = f.seq_of(m);
+    a[8] = tens(seq.data(), RAD_I32, {M});
+    std::vector<RadParam> p;
+    auto pi = [&](const char* k, long long v) { RadParam x{}; x.key = k; x.kind = RAD_P_INT; x.ival = v; p.push_back(x); };
+    auto ps = [&](const char* k, const char* v) { RadParam x{}; x.key = k; x.kind = RAD_P_STR; x.sval = v; p.push_back(x); };
+    auto pf = [&](const char* k, double v) { RadParam x{}; x.key = k; x.kind = RAD_P_F64; x.dval = v; p.push_back(x); };
+    pi("M", M); pi("n_head", nh); pi("head_dim", hd); pi("gqa", gqa);
+    pi("block_size", f.ratio); pi("ratio", f.ratio); pi("tile", t.tile);
+    pi("topk", f.topk); pi("blocks", blocks); pi("max_seqs", f.S);
+    pf("scale", 1.0 / std::sqrt((double)hd));
+    ps("q_dtype", "bf16"); ps("kv_dtype", "bf16");
+    RadArgs args{}; args.t = a; args.n_t = 10; args.p = p.data(); args.n_p = (int)p.size();
+    return ref ? rad_ref_qsa_attn(&args) : rad_qsa_attn_launch(&args, nullptr);
+}
+
+int masked_read_case() {
+    std::vector<Fix> fx = {
+        fix_shared_scores("masked read: decode depth 3, 8K", 4, 2048, 512, 300, 0, 21),
+        fix_shared_scores("masked read: decode depth 6, 8K", 8, 2048, 512, 300, 0, 22),
+        fix_shared_scores("masked read: depth 6, 32K, rows that agree less", 8, 8192, 512, 900, 0, 23),
+        fix_shared_scores("masked read: depth 6, 32K, a coarse grid of ties", 8, 8192, 512, 40, 64, 24),
+        fix_shared_prefill(2048, 16, 300, 25),
+        fix_shared_prefill(8192, 32, 300, 26),
+    };
+    /* A small head so the f64 reference stays cheap: the op's arithmetic does not depend on its width. */
+    const int64_t hd = 32, nh = 4, gqa = 1;
+    int fails = 0;
+    for (Fix& f : fx) {
+        SelOut got;
+        if (run(f, kAuto, &got)) { std::printf("FAIL %-52s the selection\n", f.name.c_str()); ++fails; continue; }
+        const int M = f.M, ratio = f.ratio;
+        const int64_t blocks = f.nb(), npages = f.nb() + 1;
+        std::vector<uint16_t> kv((size_t)(npages * (nh / gqa) * ratio * 2 * hd));
+        std::vector<uint16_t> q((size_t)(M * nh * hd));
+        for (auto& v : kv) v = bf16_of((float)(rnd() % 2001) / 1000.0f - 1.0f);
+        for (auto& v : q) v = bf16_of((float)(rnd() % 2001) / 1000.0f - 1.0f);
+
+        SharedTab per_row, shared;
+        int rc = build_table(f, got, 1, per_row);
+        if (rc == RAD_OK) rc = build_table(f, got, std::min<int64_t>(M, 16), shared);
+        if (rc != RAD_OK) { std::printf("FAIL %-52s build_table returned %d\n", f.name.c_str(), rc); ++fails; continue; }
+
+        std::vector<uint16_t> own, uni, oracle;
+        rc = read_table(f, per_row, hd, nh, gqa, blocks, npages, q, kv, own, false);
+        if (rc == RAD_OK) rc = read_table(f, shared, hd, nh, gqa, blocks, npages, q, kv, uni, false);
+        if (rc == RAD_OK) rc = read_table(f, per_row, hd, nh, gqa, blocks, npages, q, kv, oracle, true);
+        if (rc != RAD_OK) { std::printf("FAIL %-52s qsa_attn returned %d\n", f.name.c_str(), rc); ++fails; continue; }
+
+        /* The claim: the shared table's masked read is the per-row read, byte for byte. */
+        if (own != uni) {
+            int bad = 0;
+            for (size_t i = 0; i < own.size(); ++i) bad += own[i] != uni[i];
+            std::printf("FAIL %-52s the shared table's read differs in %d of %zu values\n",
+                        f.name.c_str(), bad, own.size());
+            ++fails;
+            continue;
+        }
+        /* And both against the op's f64 oracle, which reads the per-row table. */
+        double worst = 0.0;
+        for (size_t i = 0; i < own.size(); ++i) {
+            const double a = rad_bf16_to_f32(own[i]), b = rad_bf16_to_f32(oracle[i]);
+            worst = std::max(worst, std::fabs(a - b));
+        }
+        if (!(worst < 2e-2)) {
+            std::printf("FAIL %-52s the read is %.3g from the oracle\n", f.name.c_str(), worst);
+            ++fails;
+            continue;
+        }
+        /* Report the sharing the read path actually walked. */
+        int64_t listed = 0, unioned = 0;
+        for (int m = 0; m < M; ++m) listed += got.ns[(size_t)m];
+        for (int64_t t = 0; t < shared.tiles; ++t) unioned += shared.tlen[(size_t)t];
+        std::printf("  %-52s %d rows: %lld pages read -> %lld in %lld tile(s) (%.1fx fewer), "
+                    "byte-identical, %.1e from the oracle\n",
+                    f.name.c_str(), M, (long long)listed, (long long)unioned,
+                    (long long)shared.tiles, unioned ? (double)listed / (double)unioned : 0.0, worst);
+    }
+    std::printf("masked read: %zu fixtures, %d failure(s)\n", fx.size(), fails);
     return fails;
 }
 
@@ -845,6 +994,7 @@ int main(int argc, char** argv) {
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
     }
     if (!sweep) fails += shared_table_case();
+    fails += masked_read_case();
     if (sweep) {
         for (const auto& [p, c] : g_paths) std::printf("  %5d row(s): %s\n", c, p.c_str());
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

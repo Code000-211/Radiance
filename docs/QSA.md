@@ -171,8 +171,20 @@ per-row compaction whose sums can drift from the row path's.
 `selb` carries the same entries as `sel`, as block indices, because a page id does not follow its
 block and so cannot be sorted into block order after the fact. A tile's union is what
 `plugin/qsatable`'s `qsa_table` builds from `selb` (prototype: `RADIANCE_QSA_TABLE=1`,
-`docs/OPS.md`). Reading a shared table needs a masked read of it, which the attention does not have
-yet; the table alone is what this measures.
+`docs/OPS.md`).
+
+The read is `qsa_attn`, beside it in the same plugin: paged attention over the union that skips the
+entries a row's mask does not hold, maps each block index through that row's block table and appends
+the row's partial page last. Because the emit is one run in block order, the row's list is a
+subsequence of the union, so the masked read sums the same keys in the same order and gives the same
+bytes as the row path -- `tests/r4d_emu/test_qsa.cpp` (`masked read:`) runs the same rows through a
+table per row (tile 1) and through the tile's union and requires the two outputs to be equal byte for
+byte, and both within rounding of the op's f64 oracle. What the table saves there is what the
+measurement is for: 2.1x to 10x fewer entries for a tile of 4 to 32 rows.
+
+Neither op is issued by the architecture yet: the sparse path in
+`arch/common/rad_block_attn_gated_fp8.h` still issues `attn_paged` once per query row with that row's
+own selection, which is the control arm.
 
 ## Cost
 

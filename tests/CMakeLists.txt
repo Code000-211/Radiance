@@ -407,7 +407,10 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # along so the kernel is held to the definition of the op as well.
 set(R4D_EMU_PLUGIN ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsatable.hip
                   ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsatable.cpp
-                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/ref_qsatable.cpp)
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/ref_qsatable.cpp
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsaattn.hip
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/qsaattn.cpp
+                  ${CMAKE_SOURCE_DIR}/plugin/qsatable/ref_qsaattn.cpp)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")

@@ -2565,6 +2565,7 @@ order, not a slow one.
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused`, `selb`? |
 | `qsa_table` | `M`(range) `blocks` `topk` `tile` `ratio` | `selb`, `nsel`, `pos` → `tab`, `tlen`, `mask`, `row_off` |
+| `qsa_attn` | `M`(range) `n_head` `head_dim` `gqa` `block_size` `ratio` `tile` `topk` `blocks` `max_seqs` `scale`/opt `q_dtype` `kv_dtype` | `q`, `kv`, `tab`, `tlen`, `mask`, `row_off`, `pos`, `bt`, `seq` → `out` |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
@@ -2723,8 +2724,27 @@ a masked read of it saves.
 - **The partial page is not in the table.** Its block index is `(pos + 1) / ratio` by construction, so
   the bound `b < own` already keeps it out of the union; a reader appends it after filtering, which
   is the page it must read last anyway.
-- **It is not wired into the attention.** The read path needs a masked variant of the paged
-  attention, which is libr4d's, not this plugin's; until that exists this op is issued by nothing.
+- **It is not wired into the architecture.** The read is `qsa_attn` below; nothing in `arch/` issues
+  either op yet (the sparse path still issues `attn_paged` per query row, the control arm).
+
+### `qsa_attn`
+
+**Prototype, plugin `qsatable`.** The masked read of `qsa_table`: paged attention over the tile's
+union, skipping the entries the row's membership mask does not hold, mapping each block index
+through the row's block table, and appending the row's partial page last.
+
+- **The keys are the row path's keys in the row path's order**, which is the whole point: softmax is
+  summed in table order and float addition is not associative, so a read that re-ordered a row's
+  list would give a different sum. `tests/r4d_emu/test_qsa.cpp` (`masked read:`) requires byte
+  equality between a per-row table (tile 1) and the tile's union (tile 16) over the same rows.
+- **`tab` carries block indices, not page ids**, and the cache stride set is separate
+  (`kv_sb`/`kv_sh`/`kv_so`/`kv_sd`) so the page layout is the attention group's, not this op's.
+- **The partial page is appended, never read off the table.** Its block index is `(pos + 1) / ratio`
+  by position and only when `(pos + 1) % ratio != 0`, which is also the row whose next block may still
+  be filling.
+- **One lane per (query row, query head), no LDS.** A prototype statement of the op, not a serving
+  kernel: a real one keeps a row's union in LDS and scores the tile's rows in one wave. `head_dim` is
+  capped at 512, and dtypes are bf16, f32 and fp8_e4m3.
 
 ### `qsa_tail_store`
 

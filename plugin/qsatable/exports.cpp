@@ -5,9 +5,10 @@
  * a reference too and the engine's reference gate would refuse to serve it. The device row reports 0
  * and the host row 1 through `rad_kernel_reference`.
  *
- * Nothing outside the plugin decides whether it is used: the architecture issues `qsa_table` only
- * with its own opt-in switch set (arch/common/rad_qsa.h), and the loader never reads that switch.
+ * Nothing outside the plugin decides whether they are used: the architecture issues them only with
+ * its own opt-in switch set (arch/common/rad_qsa.h), and the loader never reads that switch.
  */
+#include "qsaattn.h"
 #include "qsatable.h"
 
 /* Only for the three dispatch-log globals it declares; a host build has no HIP headers. */
@@ -35,28 +36,36 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Mixed library: 0, and the per-row answer below does the classifying. */
 extern "C" int rad_plugin_reference(void) { return 0; }
 
-/* The reference row's launch takes the stream slot the device row takes, which the host ignores. */
+/* The reference rows' launches take the stream slot the device rows take, which the host ignores. */
 namespace {
-int ref_launch(const RadArgs* a, void*) { return rad_ref_qsa_table(a); }
+int ref_table_launch(const RadArgs* a, void*) { return rad_ref_qsa_table(a); }
+int ref_attn_launch(const RadArgs* a, void*)  { return rad_ref_qsa_attn(a); }
 }  /* namespace */
 
 extern "C" int rad_kernel_reference(int i) {
 #ifdef RAD_QSATABLE_WITH_DEVICE
-    return i == 0 ? 0 : 1;
+    return (i == 0 || i == 2) ? 0 : 1;
 #else
     (void)i;
     return 1;
 #endif
 }
 
-extern "C" int rad_kernel_schema_count(void) { return rad_qsatable_schema_count(); }
-extern "C" const RadOpSchema* rad_kernel_schema_at(int i) { return rad_qsatable_schema_at(i); }
+extern "C" int rad_kernel_schema_count(void) {
+    return rad_qsatable_schema_count() + rad_qsaattn_schema_count();
+}
+extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
+    const int n = rad_qsatable_schema_count();
+    return i < n ? rad_qsatable_schema_at(i) : rad_qsaattn_schema_at(i - n);
+}
 
+/* Two ops, each with a device row and a host reference: qsa_table 0/1, qsa_attn 2/3 (host build:
+ * references only, in the same order). */
 extern "C" int rad_kernel_count(void) {
 #ifdef RAD_QSATABLE_WITH_DEVICE
-    return 2;
+    return 4;
 #else
-    return 1;
+    return 2;
 #endif
 }
 
@@ -66,16 +75,28 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
         static const RadKernelInfo dev = rad_qsatable_row(rad_qsa_table_launch);
         return &dev;
     }
-    if (i != 1) return nullptr;
+    if (i == 2) {
+        static const RadKernelInfo dev = rad_qsaattn_row(rad_qsa_attn_launch);
+        return &dev;
+    }
+    if (i != 1 && i != 3) return nullptr;
 #else
-    if (i != 0) return nullptr;
+    if (i != 0 && i != 1) return nullptr;
 #endif
-    static const RadKernelInfo ref = [] {
-        RadKernelInfo x = rad_qsatable_row(ref_launch);
+    const bool attn = i >= 2;
+    static const RadKernelInfo ref_tab = [] {
+        RadKernelInfo x = rad_qsatable_row(ref_table_launch);
         x.name = "ref_qsa_table";
         x.domain = RAD_DOMAIN_HOST;
         x.priority = 0;
         return x;
     }();
-    return &ref;
+    static const RadKernelInfo ref_attn = [] {
+        RadKernelInfo x = rad_qsaattn_row(ref_attn_launch);
+        x.name = "ref_qsa_attn";
+        x.domain = RAD_DOMAIN_HOST;
+        x.priority = 0;
+        return x;
+    }();
+    return attn ? &ref_attn : &ref_tab;
 }
