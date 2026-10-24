@@ -1,0 +1,44 @@
+{
+  "description": "Folded GDN decode (gdn_conv_recurrent_update) from the source tree's shared-norm probe, ported to radiance 1.10.0 / RAD_ABI_VERSION 26: the l2 scales of q and k are closed once per token by the first thread pair (the original ascending 64-term FP32 sums and lane-1 exchange), q and k are re-read from the plugin's LDS conv staging by their consumers instead of being held across the delta-rule update, and every BF16 intermediate, ascending FP32 accumulation, anchor/state semantic, conv padding guard and INT8 quantiser epilogue is unchanged. One payload owns the engine scratch: the row dispatches a real 256-thread counter-clear kernel on the caller's stream before every main dispatch, so reused and uninitialised scratch cannot stall the last-arriver protocol; no hipMalloc, hipMemset or synchronisation. That clear is the SOURCE candidate's own code, and it has NEVER BEEN RUN in either tree: the source's 171-VGPR/0-spill register record and its timings come from an older query-only prototype whose CALLER zeroed the counters, which is a different program. So no measurement anywhere covers clear-plus-folded-dispatch. ABI 26 has no RadDescribeFn, so there is one launch entry and no describe path to drift from it. Fixed served specialisation: head_k/head_v 128, conv width 4, anchor state_form (the only form this fork instantiates), 1..16 tokens per sequence, N*Hg <= 4096 counters, 16384 B scratch; everything else is refused at selection (constraints) or at launch, so the row claims no generic coverage. Priority 60 is intra-plugin only. COMPILED AND LOADED, NOT GATED: against the tree this port is checked into (b679448, ABI 26) the plugin configures, builds and is accepted by the loader (rad-info --plugins, host backend, no card), and the in-tree target builds the A/B harness (gdn_query_reload_compare). NOT RUN ON A CARD in this tree: no launch, no timing, no comparison against the frozen libr4d row, and no declare pass, so row selection is unverified. The two instantiations this port adds beyond the source's single one -- f16 state cache and the fp8-e4m3 code path -- have never executed anywhere, and no kbench case covers this op (data/kernels.rkb has none for gdn_conv_recurrent_update). `numerics: bitexact` states the fork's arithmetic contract (fp32 accumulation, RNE, -ffp-contract=off), not a measured result for any of these paths.",
+  "numerics": "bitexact",
+  "engine_env": {
+    "RADIANCE_KERNELS": "gdn_query_reload,libr4d"
+  },
+  "engine_args": [
+    "--kernels", "gdn_query_reload,libr4d",
+    "--num-speculative-tokens", "3"
+  ],
+  "candidate_root": "candidates/gdn-query-reload",
+  "kernel_hierarchy": "gdn_query_reload is listed before libr4d so its single row takes gdn_conv_recurrent_update; libr4d keeps every other op. libref is left unnamed so the engine's default ranking places it below both.",
+  "optional_local_harness_profile": {
+    "_note": "Review metadata only. These names are the source tree's (scripts/lever_queue.py reads gate.json's engine_env and engine_args for its own A/B runner); none of RADIANCE_GDN_ANCHOR, TP_WIRE, GPU_HEADROOM_MIB, VRAM_KV_MIB, RADIANCE_DARTREE, RADIANCE_ADAPTIVE_SPEC, RADIANCE_SPECHUB, RADIANCE_MTP_*, RADIANCE_HC_UP_WMMA, RADIANCE_PREFILL_BUFFERS, RADIANCE_NO_PROMPT_LOOKUP, RADIANCE_GDN_BOLE_EXACT, R4D_MOE_DOWN2, GPU_KEEP_ALIVE, MAX_MODEL_LEN, PORT, RADIANCE_ENGINE_* or RADIANCE_EXTRA_ARGS exists in this engine (verified by grep over core/ and docs/). They are recorded as the conditions the old-tree numbers were taken under, not as flags this engine accepts.",
+    "HIP_VISIBLE_DEVICES": "0,1",
+    "ROCR_VISIBLE_DEVICES": "0,1",
+    "TP": "2",
+    "TP_WIRE": "exact",
+    "NUM_SPECULATIVE_TOKENS": "3",
+    "RADIANCE_DARTREE": "0",
+    "RADIANCE_ADAPTIVE_SPEC": "0",
+    "RADIANCE_GDN_ANCHOR": "1",
+    "RADIANCE_KERNELS": "mine,gdn_query_reload",
+    "GPU_HEADROOM_MIB": "640",
+    "VRAM_KV_MIB": "1600",
+    "MAX_MODEL_LEN": "65536",
+    "RADIANCE_HEAT_RESIDENCY": "0",
+    "GPU_KEEP_ALIVE": "0",
+    "R4D_MOE_DOWN2": "0",
+    "RADIANCE_SPECHUB": "0",
+    "RADIANCE_MTP_TREE_POLICY": "off",
+    "RADIANCE_MTP_TREE_ROUNDS": "3",
+    "RADIANCE_NO_PROMPT_LOOKUP": "1",
+    "RADIANCE_GDN_BOLE_EXACT": "1",
+    "PORT": "8013",
+    "RADIANCE_EXTRA_ARGS": "",
+    "RADIANCE_ENGINE_PREFIX": "",
+    "RADIANCE_ENGINE_FOREGROUND": "0",
+    "RADIANCE_PROFILE_OPS": "0",
+    "RADIANCE_MTP_COUPLED": "1",
+    "RADIANCE_HC_UP_WMMA": "0",
+    "RADIANCE_PREFILL_BUFFERS": "2"
+  }
+}

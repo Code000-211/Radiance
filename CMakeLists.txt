@@ -20,6 +20,7 @@ set(RAD_WITH_FFMPEG "AUTO" CACHE STRING
     "ON | OFF | AUTO -- decode image, video and audio parts with libavformat/libavcodec/libswscale/libswresample")
 set_property(CACHE RAD_WITH_FFMPEG PROPERTY STRINGS ON OFF AUTO)
 option(RAD_BUILD_TESTS "Build the test suite"                            ON)
+option(RAD_BUILD_CANDIDATES "Build the candidates/ ports (built, never installed)" OFF)
 option(RAD_ASAN        "Build host code with AddressSanitizer and UBSan"  OFF)
 option(RAD_TSAN        "Build host code with ThreadSanitizer"             OFF)
 # LLVM 24's VOPD pairing is not repeatable unless patched (docker/llvm-vopd-pairing.patch); when
@@ -309,6 +310,12 @@ add_subdirectory(arch)
 # the experimental line owns. Built by default so the flag's kernels exist in the same tree that
 # enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
 add_subdirectory(plugin/spechub)
+# candidates/: ports of out-of-tree candidates, opted in one directory at a time. Each is built as
+# its own project shape (see candidates/gdn-query-reload/CMakeLists.txt) and never installed, so a
+# default build is unchanged.
+if(RAD_BUILD_CANDIDATES)
+  add_subdirectory(candidates/gdn-query-reload)
+endif()
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()
