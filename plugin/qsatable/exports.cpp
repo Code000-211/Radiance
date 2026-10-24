@@ -35,6 +35,11 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Mixed library: 0, and the per-row answer below does the classifying. */
 extern "C" int rad_plugin_reference(void) { return 0; }
 
+/* The reference row's launch takes the stream slot the device row takes, which the host ignores. */
+namespace {
+int ref_launch(const RadArgs* a, void*) { return rad_ref_qsa_table(a); }
+}  /* namespace */
+
 extern "C" int rad_kernel_reference(int i) {
 #ifdef RAD_QSATABLE_WITH_DEVICE
     return i == 0 ? 0 : 1;
@@ -66,7 +71,7 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i != 0) return nullptr;
 #endif
     static const RadKernelInfo ref = [] {
-        RadKernelInfo x = rad_qsatable_row(rad_ref_qsa_table);
+        RadKernelInfo x = rad_qsatable_row(ref_launch);
         x.name = "ref_qsa_table";
         x.domain = RAD_DOMAIN_HOST;
         x.priority = 0;

@@ -118,8 +118,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
     /* Optional, last: the same entries as block indices. */
-    const RadTensor *sb = a->n_t > 8 ? &a->t[8] : nullptr;
-    if (sb && (sb->rank != 2 || sb->shape[0] < M || sb->shape[1] < topk + 1)) return RAD_E_SHAPE;
+    const RadTensor* sb = a->n_t > 8 ? &a->t[8] : nullptr;
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
     const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
@@ -131,6 +130,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
     if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
     if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    if (sb && (sb->rank != 2 || sb->shape[0] < M || sb->shape[1] < topk + 1)) return RAD_E_SHAPE;
     for (int64_t s = 0; s < n_seq; ++s)
         if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
     for (int64_t m = 0; m < M; ++m)
