@@ -492,6 +492,19 @@ int Engine::finish_serial_drafter(const StepOut& so) {
                                                       st == RAD_OK ? n_bound : 0);
             if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
         }
+        /* RADIANCE_DRAFT_CONFIDENCE and --draft-window confidence: the bound rounds are this
+         * publication's drafts in order, each with the Q it was drawn from. A round without a
+         * valid sampled Q ends the q prefix; a publication with none records nothing
+         * (draft_confidence.h) and drafts the ceiling next (draft.h). */
+        if (st == RAD_OK && n_bound > 0 && sched_.wants_draft_confidence()) {
+            float q[RAD_MTP_COUPLE_MAX_ROUNDS], qm[RAD_MTP_COUPLE_MAX_ROUNDS];
+            int m = 0;
+            while (m < n_bound &&
+                   mtp_draft_confidence(couple_bound_[m], meta_.n_vocab, &q[m], &qm[m]))
+                ++m;
+            const int cs = sched_.set_draft_confidence(seq, q, qm, m);
+            if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
+        }
     }
     /* The snapshot ends with hold's scope, after the publish: serial_end releases the hold that
      * defers the release of a request cancelled or reaped while the rounds ran. Dropped earlier,

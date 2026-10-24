@@ -1,8 +1,9 @@
 /* draft_policy.cpp -- the cost-based draft-depth policy. See draft_policy.h.
  *
  * The objective is the issue's: expected output tokens of the whole batch over its expected
- * batch time. A row that does not draft still emits its one token, so it adds 1 to the yield and
- * costs a verify row at K 0.
+ * batch time -- the time of the stationary pass that verifies those tokens (the horizon score,
+ * draft_policy.h), not of this cycle's frozen-window pass. A row that does not draft still emits
+ * its one token, so it adds 1 to the yield and costs a verify row at K 0.
  */
 #include "draft_policy.h"
 
@@ -115,10 +116,13 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
         fr_gen_.assign((size_t)c_.max_seqs, 0);
         fr_k_.assign((size_t)c_.max_seqs, 0);
     }
+    if (c_.hold_reductions && c_.max_seqs > 0 && held_k_.size() < (size_t)c_.max_seqs)
+        held_k_.assign((size_t)c_.max_seqs, 0);
     if (c_.mode == DraftPolicyMode::Cost)
         RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), a raise needs %.0f%% and %d "
-                 "cycles", (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
-                 (int)c_.n_tiers, 100.0 * c_.hyst, (int)c_.hold);
+                 "cycles%s", (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
+                 (int)c_.n_tiers, 100.0 * c_.hyst, (int)c_.hold,
+                 c_.hold_reductions ? ", and so does a reduction" : "");
     return RAD_OK;
 }
 
@@ -155,7 +159,7 @@ int32_t DraftPlanner::frozen_k_of(const DraftBatchView& view, int32_t i) const {
 }
 
 void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
-                            DraftVerifyShape* s) const {
+                            DraftVerifyShape* s, bool horizon) const {
     *s = DraftVerifyShape{};
     s->n_rows = view.n_seq;
     s->prefill_tokens = view.prefill_tokens;
@@ -181,8 +185,9 @@ void DraftPlanner::shape_of(const DraftBatchView& view, const int32_t* k, int32_
          * the plan is issued ahead (publish-then-verify) does it verify the frozen previous
          * plan's window instead. The key names the window the paired step executes: the declared
          * frozen window on the ahead path, that window re-capped per row to this candidate's own
-         * K on the direct path (Scheduler::draft_cap). */
-        const int32_t fk = verify_k_of(view, i, ki);
+         * K on the direct path (Scheduler::draft_cap). The horizon shape verifies the row's own K:
+         * the pass that will verify what this candidate drafts, if the next cycle keeps it. */
+        const int32_t fk = horizon ? ki : verify_k_of(view, i, ki);
         if (fk > s->verify_k) s->verify_k = fk;
         s->verify_tokens += 1 + fk;
         for (int32_t j = 1; j <= fk; ++j) ++s->rows[j];
@@ -263,14 +268,35 @@ int32_t DraftPlanner::total_k(const int32_t* k, int32_t n, int32_t* max_k) {
 
 int DraftPlanner::price(const DraftBatchView& view, const DraftPredictions& pred,
                         const DraftCostModel& costs, const int32_t* k, int32_t clamp_to,
-                        int* evals, Priced* out) const {
+                        int limit, int* evals, Priced* out) const {
     *out = Priced{};
-    if (*evals >= c_.max_evals) return RAD_OK;
-    ++*evals;
+
+    /* The horizon cost (draft_policy.h): the exact stationary shape that verifies this candidate's
+     * own drafts. One shape when every row already verifies its own k; otherwise both are asked or
+     * neither -- a candidate is never scored on one lookup of two. The horizon is asked first, so
+     * the cycle's last estimate call is still the issued plan's execution shape. */
+    bool same = true;
+    for (int32_t i = 0; same && i < view.n_seq; ++i) {
+        const int32_t ki = clamp_to >= 0 && k[i] > clamp_to ? clamp_to : k[i];
+        if (verify_k_of(view, i, ki) != ki) same = false;
+    }
+    if (*evals + (same ? 1 : 2) > limit) return RAD_OK;   /* not priced: no budget for it */
 
     DraftVerifyShape shape;
-    shape_of(view, k, clamp_to, &shape);
+    bool   hpriced = same;
+    double hms = 0.0;
+    if (!same) {
+        ++*evals;
+        shape_of(view, k, clamp_to, &shape, /*horizon=*/true);
+        DraftCostEstimate h;
+        const int hrc = costs.estimate(costs.ctx, shape, &h);
+        if (hrc < 0 && hrc != RAD_E_INVAL) return hrc;
+        hpriced = hrc >= 0 && h.valid && h.ms > 0.0 && std::isfinite(h.ms);
+        if (hpriced) hms = h.ms;
+    }
 
+    ++*evals;
+    shape_of(view, k, clamp_to, &shape);
     DraftCostEstimate est;
     const int rc = costs.estimate(costs.ctx, shape, &est);
     /* A model refuses a shape it has no key for (draft_shape_priceable, e.g. the replay dimension
@@ -279,6 +305,10 @@ int DraftPlanner::price(const DraftBatchView& view, const DraftPredictions& pred
     if (rc == RAD_E_INVAL) return RAD_OK;
     if (rc < 0) return rc;
     if (!est.valid || !(est.ms > 0.0) || !std::isfinite(est.ms)) return RAD_OK;   /* not priced */
+    /* No exact stationary price: not scored. The execution price is another shape's, not a
+     * substitute for it, whichever way the verify window moved. */
+    if (!hpriced) return RAD_OK;
+    if (same) hms = est.ms;
 
     double y = 0.0;
     for (int32_t i = 0; i < view.n_seq; ++i) {
@@ -290,6 +320,7 @@ int DraftPlanner::price(const DraftBatchView& view, const DraftPredictions& pred
     out->yield = y;
     out->ms    = est.ms;
     out->unc   = est.unc_ms > 0.0 && std::isfinite(est.unc_ms) ? est.unc_ms : 0.0;
+    out->hms   = hms;
     out->valid = true;
     return RAD_OK;
 }
@@ -395,17 +426,24 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     if (!costs.estimate) return RAD_E_UNSUPPORTED;
 
     int evals = 0;
+    /* The budget after the search: the cut's re-price, the incumbent and the issued plan's own
+     * price, at most two lookups each when pipelined. The alternatives below the deepest gate stop
+     * short of that reserve; the gate itself may spend the whole budget, since without it nothing
+     * is decided. A budget too small for a call leaves that call unpriced, never half-priced: the
+     * cut plan is issued as a Resources fallback, the raise is refused, last_price() is invalid. */
+    const int search_limit = c_.max_evals - 3 * (view.pipeline_depth > 0 ? 2 : 1);
     /* From here on a price was asked for: the trace may report a price or its absence, but never
      * as "no search ran" (which is what a calibration or a legacy plan says). */
     last_price_known_ = true;
     last_n_tier_price_ = c_.n_tiers;
 
-    /* Stage 1: the homogeneous baselines. The deepest offered plan is the coverage gate: if it
-     * cannot be priced, the batch takes the named baseline -- never a shallower tier that happens
-     * to be priced. A missing measurement for the deeper alternative is not evidence that the
-     * shallow one is cheaper, and letting the shallow tier decide would present an uncovered
-     * depth as a cost decision. The deepest candidate is the last tier clamped to each row's own
-     * cap; every other tier must be priced on its own to beat it. */
+    /* Stage 1: the homogeneous baselines. Every offered tier is a candidate on its own exact price;
+     * an unpriced one is simply not compared. The deepest is asked first and may spend the whole
+     * budget. A missing price for it says nothing about the shallower tiers either way, so it no
+     * longer discards them: the deepest wins only when priced and not beaten, and with no price it
+     * is out. Only a cycle that prices no tier at all takes the named baseline. Each candidate is
+     * its tier clamped to each row's own cap. Ties keep the deepest when it is priced, the
+     * shallowest priced tier otherwise. */
     const int32_t deepest = c_.tiers[c_.n_tiers - 1];
     for (int32_t i = 0; i < view.n_seq; ++i) {
         const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
@@ -414,18 +452,41 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     Priced  best_p;
     int32_t best_tier = deepest;
     {
-        const int rc = price(view, pred, costs, out->k, -1, &evals, &best_p);
+        const int rc = price(view, pred, costs, out->k, -1, c_.max_evals, &evals, &best_p);
         if (rc < 0) return rc;
         last_tier_price_[c_.n_tiers - 1] =
-            DraftTierPrice{deepest, best_p.valid, best_p.ms, best_p.unc};
+            DraftTierPrice{deepest, best_p.valid, best_p.ms, best_p.unc, best_p.hms};
+    }
+
+    /* Counted whether or not it wins: the question the ledger answers is "were both depths
+     * compared", not "which one won" -- a Cost plan at one tier alone cannot say whether the other
+     * lost or was never priced. It is a search metric: the resource cut and the re-price below
+     * change what is issued, not what the search weighed, so the count is not the issued depth
+     * (that is the plan's max_k, and the price of the plan as issued is last_price()). */
+    int32_t tiers_priced = best_p.valid ? 1 : 0;
+    for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
+        for (int32_t i = 0; i < view.n_seq; ++i) {
+            const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+            out->k[i] = c_.tiers[t] < c ? c_.tiers[t] : c;
+        }
+        Priced p;
+        const int rc = price(view, pred, costs, out->k, -1, search_limit, &evals, &p);
+        if (rc < 0) return rc;
+        last_tier_price_[t] = DraftTierPrice{c_.tiers[t], p.valid, p.ms, p.unc, p.hms};
+        if (!p.valid) continue;
+        ++tiers_priced;
+        if (!best_p.valid || p.yield / p.hms > best_p.yield / best_p.hms) {
+            best_p    = p;
+            best_tier = c_.tiers[t];
+        }
     }
 
     if (!best_p.valid) {
-        /* The deepest offered plan has no measurement. R's named baseline is evidence only when it
-         * runs the offered top's own shape: the default ladder (fallback_k == the deepest tier) or
-         * rows whose remaining budget clamps both to the same k. When the baseline would run at a
+        /* No offered tier has a measurement. R's named baseline is evidence only when it runs the
+         * offered top's own shape: the default ladder (fallback_k == the deepest tier) or rows
+         * whose remaining budget clamps both to the same k. When the baseline would run at a
          * deeper k -- an explicit ladder below exec_depth -- its bucket can never be queried by
-         * this ladder, so the run would stay in the fallback and never price the offered top.
+         * this ladder, so the run would stay in the fallback and never price an offered tier.
          * Diagnose that cycle and issue nothing: extending the ladder or moving the baseline is
          * the operator's call, and a sample must not be learnt at a depth the ladder never offers. */
         if (c_.fallback_k > deepest) {
@@ -448,8 +509,11 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                 return RAD_E_UNSUPPORTED;
             }
         }
-        /* The deepest offered plan has no measurement: a named baseline, not an invented price --
-         * and specifically not the price of a shallower plan this batch did not offer as deep. */
+        /* No tier priced: the named, configured baseline, not an invented price. It is the
+         * executable depth (Scheduler: fallback_k = exec_depth) because a record-only calibration
+         * and a live table's feedback both measure the offered top through it; it is not a policy
+         * choice, so the hysteresis incumbent does not move. Every tier was asked, and the trace
+         * lists each as unpriced. */
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
             out->k[i] = c_.fallback_k < c ? c_.fallback_k : c;
@@ -458,40 +522,10 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         for (int32_t i = 0; i < view.n_seq; ++i)
             if (out->k[i] > top) top = out->k[i];
         last_price_.k = top;
-        /* The gate stopped the search here: the deepest offered tier is the only depth anything
-         * was asked about, and its price was not obtained. The shallower alternatives were never
-         * compared, so the trace lists one depth, not a ladder of unasked ones. */
-        last_tier_price_[0] = DraftTierPrice{deepest, best_p.valid, best_p.ms, best_p.unc};
-        last_n_tier_price_  = 1;
         return finish(view, top, DraftPlanSource::Fallback, DraftFallback::UnknownShape, out);
     }
 
     gap_reported_ = false;   /* a priced cycle re-arms the one diagnosis */
-
-    /* The deepest tier priced (or the code above would have returned), and every shallower one
-     * that did. Counted whether or not it wins: the question the ledger answers is "were both
-     * depths compared", not "which one won" -- a Cost plan at the deep tier alone cannot say
-     * whether the shallow alternative lost or was never priced. It is a search metric: the
-     * resource cut and the re-price below change what is issued, not what the search weighed, so
-     * the count is not the issued depth (that is last_k, and the price of the plan as issued is
-     * last_price()). */
-    int32_t tiers_priced = 1;
-    for (int32_t t = 0; t + 1 < c_.n_tiers; ++t) {
-        for (int32_t i = 0; i < view.n_seq; ++i) {
-            const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
-            out->k[i] = c_.tiers[t] < c ? c_.tiers[t] : c;
-        }
-        Priced p;
-        const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
-        if (rc < 0) return rc;
-        last_tier_price_[t] = DraftTierPrice{c_.tiers[t], p.valid, p.ms, p.unc};
-        if (!p.valid) continue;
-        ++tiers_priced;
-        if (p.yield / p.ms > best_p.yield / best_p.ms) {
-            best_p    = p;
-            best_tier = c_.tiers[t];
-        }
-    }
     last_tiers_priced_ = tiers_priced;
 
     /* Take the winning baseline as the search's starting assignment. */
@@ -499,26 +533,26 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
         out->k[i] = best_tier < c ? best_tier : c;
     }
-    double best_score = best_p.yield / best_p.ms;
+    double best_score = best_p.yield / best_p.hms;
 
     /* Stage 2: deterministic coordinate passes. A pass walks the requests in index order and
      * keeps a tier only when it improves the whole batch's tokens per millisecond. */
     for (int32_t pass = 0; pass < c_.passes; ++pass) {
         bool moved = false;
-        for (int32_t i = 0; i < view.n_seq && evals < c_.max_evals; ++i) {
+        for (int32_t i = 0; i < view.n_seq && evals < search_limit; ++i) {
             const int32_t cap_i = cap_of(view.seq[i], c_.k_ceiling);
             if (cap_i <= 0) continue;
             const int32_t keep = out->k[i];
             int32_t accepted = keep;
-            for (int32_t t = 0; t < c_.n_tiers && evals < c_.max_evals; ++t) {
+            for (int32_t t = 0; t < c_.n_tiers && evals < search_limit; ++t) {
                 const int32_t cand = c_.tiers[t] < cap_i ? c_.tiers[t] : cap_i;
                 if (cand == accepted) continue;
                 out->k[i] = cand;
                 Priced p;
-                const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
+                const int rc = price(view, pred, costs, out->k, -1, search_limit, &evals, &p);
                 if (rc < 0) { out->k[i] = keep; return rc; }
-                if (p.valid && p.yield / p.ms > best_score) {
-                    best_score = p.yield / p.ms;
+                if (p.valid && p.yield / p.hms > best_score) {
+                    best_score = p.yield / p.hms;
                     best_p     = p;
                     accepted   = cand;
                     moved      = true;
@@ -526,7 +560,51 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
             }
             out->k[i] = accepted;
         }
-        if (!moved || evals >= c_.max_evals) break;
+        if (!moved || evals >= search_limit) break;
+    }
+
+    /* held_ counts the cycles since last_k_ last moved (a cycle only the rows' caps reduced
+     * counts too, it never left the incumbent); the plan issued here is not one of them
+     * yet, and a cycle with no rows is not a cycle at the depth. */
+    if (view.n_seq == 0) {
+        /* nothing ran: the depth did not hold, it had nothing to hold over */
+    } else if (chosen_) {
+        if (held_ < INT32_MAX) ++held_;
+    } else {
+        held_ = 0;
+    }
+
+    /* --draft-hysteresis both: the search's reduction waits for the hold and the margin, as a raise
+     * does below. Taken at once, every dip of the acceptance estimate pulled the depth down for
+     * at least `hold` cycles before a raise could undo it, so under a noisy estimate the plan sat
+     * below the depth its mean asks for. It is judged before the resource cut, which still
+     * applies at once, against the incumbent's own assignment: a row its cap holds under the
+     * incumbent is no policy reduction, and an incumbent with no price is no reason to stay.
+     * At most one incumbent is priced per cycle -- a held reduction never reaches the raise. */
+    if (c_.hold_reductions && chosen_ && view.n_seq > 0) {
+        int32_t search_top = 0;
+        total_k(out->k, view.n_seq, &search_top);
+        if (search_top < last_k_) {
+            if (held_k_.size() < (size_t)view.n_seq) held_k_.resize((size_t)view.n_seq);
+            bool reduced = false;
+            for (int32_t i = 0; i < view.n_seq; ++i) {
+                const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+                held_k_[(size_t)i] = last_k_ < c ? last_k_ : c;
+                if (out->k[i] < held_k_[(size_t)i]) reduced = true;
+            }
+            if (reduced) {
+                Priced incumbent;
+                const int rc = price(view, pred, costs, held_k_.data(), -1, c_.max_evals, &evals,
+                                     &incumbent);
+                if (rc < 0) return rc;
+                if (incumbent.valid && (held_ < c_.hold ||
+                    !(best_p.yield / best_p.hms >
+                      incumbent.yield / incumbent.hms * (1.0 + c_.hyst)))) {
+                    for (int32_t i = 0; i < view.n_seq; ++i) out->k[i] = held_k_[(size_t)i];
+                    best_p = incumbent;
+                }
+            }
+        }
     }
 
     /* Budgets: a positive token or KV budget caps the summed drafts. Scaling every K down is
@@ -543,43 +621,44 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     bool issued_priced = true;
     if (cut) {
         Priced p;
-        if (evals < c_.max_evals) {
-            const int rc = price(view, pred, costs, out->k, -1, &evals, &p);
-            if (rc < 0) return rc;
-        }
+        const int rc = price(view, pred, costs, out->k, -1, c_.max_evals, &evals, &p);
+        if (rc < 0) return rc;
         issued_priced = p.valid;
         if (p.valid) best_p = p;
     }
 
-    /* held_ counts the cycles that have run at last_k_; the plan issued here is not one of them
-     * yet, and a cycle with no rows is not a cycle at the depth. */
-    if (view.n_seq == 0) {
-        /* nothing ran: the depth did not hold, it had nothing to hold over */
-    } else if (chosen_) {
-        if (held_ < INT32_MAX) ++held_;
-    } else {
-        held_ = 0;
-    }
-
-    /* Hysteresis and hold: a raise waits, a reduction is immediate. A raise is judged
-     * pessimistically (`ms + unc`), the incumbent at its known cost; with no price for the
-     * incumbent it is refused. `ms + unc` is a heuristic ordering of two measured means, not a
-     * bound on a future cycle: at n=1 `unc` is 0, and the brackets behind a bucket cover only the
-     * shapes that ran, so it neither proves dominance nor justifies a raise on its own. */
+    /* Hysteresis and hold: a raise waits; a reduction is immediate unless held above. A raise needs
+     * the hold and `hyst` more yield per horizon millisecond than the incumbent, both at their
+     * measured means; with no price for the incumbent it is refused. `unc` takes no part: it is the
+     * largest deviation any one sample showed (DraftCostTable::record), 0 at n=1 and only growing
+     * with n, so as a penalty it blocked raises to the depths measured most and spared the ones
+     * measured least. Added to the raise alone it made every reduction permanent -- with a
+     * reference's (3,3) at 30.3 +- 29.4 ms no acceptance could lift a K3 incumbent again. */
     if (chosen_ && top > last_k_) {
         Priced incumbent;
-        const int rc = price(view, pred, costs, out->k, last_k_, &evals, &incumbent);
+        const int rc = price(view, pred, costs, out->k, last_k_, c_.max_evals, &evals, &incumbent);
         if (rc < 0) return rc;
-        const double raised = issued_priced ? best_p.yield / (best_p.ms + best_p.unc) : 0.0;
+        const double raised = issued_priced ? best_p.yield / best_p.hms : 0.0;
         if (!issued_priced || held_ < c_.hold || !incumbent.valid ||
-            !(raised > incumbent.yield / incumbent.ms * (1.0 + c_.hyst))) {
+            !(raised > incumbent.yield / incumbent.hms * (1.0 + c_.hyst))) {
             for (int32_t i = 0; i < view.n_seq; ++i)
                 if (out->k[i] > last_k_) out->k[i] = last_k_;
             top = last_k_;
         }
     }
-    if (top != last_k_) held_ = 0;   /* a new depth starts a new hold */
-    last_k_ = top;
+    /* A reduction that only the rows' own caps forced (remaining output, eligibility) is not a
+     * policy depth: every row runs at min(incumbent, its cap). Keeping the incumbent here stops a
+     * request that ends at max_tokens from dragging the next request's raise down to a depth the
+     * profile cannot price as incumbent (e.g. K0 with a frozen window 0), which held it forever. */
+    bool forced = chosen_ && top < last_k_ && view.n_seq > 0;
+    for (int32_t i = 0; forced && i < view.n_seq; ++i) {
+        const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
+        if (out->k[i] < (last_k_ < c ? last_k_ : c)) forced = false;
+    }
+    if (!forced) {
+        if (top != last_k_) held_ = 0;   /* a new depth starts a new hold */
+        last_k_ = top;
+    }
     chosen_ = true;
 
     /* The issued assignment's own estimate -- after the budget cut and the hysteresis, so it
@@ -587,12 +666,13 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
      * error here must not refuse a plan the search already decided, so it only leaves the price
      * invalid. The extra estimate spends from the same budget, after every decision was made. */
     last_price_.k = top;
-    if (evals < c_.max_evals) {
+    {
         Priced p;
-        if (price(view, pred, costs, out->k, -1, &evals, &p) >= 0) {
+        if (price(view, pred, costs, out->k, -1, c_.max_evals, &evals, &p) >= 0) {
             last_price_.valid  = p.valid;
             last_price_.ms     = p.ms;
             last_price_.unc_ms = p.unc;
+            last_price_.horizon_ms = p.hms;
         }
     }
 

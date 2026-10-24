@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace rad {
 
@@ -39,7 +41,8 @@ static bool draft_trace_on() {
 /* A cycle's plan as issued: what the policy chose, why, for which rows, and -- when a cost search
  * ran -- the prices it actually obtained: the issued assignment's own estimate and, per offered
  * depth, whether that alternative had a price at all. A calibration or legacy plan priced nothing:
- * `price=-` and `tiers=[]` say so, and are not `price=invalid` (a search that found none). The
+ * `price=-` and `tiers=[]` say so, and are not `price=invalid` (a search that found none). Each
+ * price is `ms+-unc` of the execution shape and `/h` the horizon cost the ranking divided by. The
  * price shape itself is logged from the sample, where it is exact. */
 void Scheduler::draft_trace_plan(const DraftPlan& p) {
     if (!draft_trace_on() || draft_trace_left_ <= 0) return;
@@ -54,7 +57,8 @@ void Scheduler::draft_trace_plan(const DraftPlan& p) {
     if (!pl.last_price_known()) {
         s += "-";
     } else if (pl.last_price().valid) {
-        snprintf(b, sizeof b, "ok:%.3f+-%.3f", pl.last_price().ms, pl.last_price().unc_ms);
+        snprintf(b, sizeof b, "ok:%.3f+-%.3f/h%.3f", pl.last_price().ms, pl.last_price().unc_ms,
+                 pl.last_price().horizon_ms);
         s += b;
     } else {
         s += "invalid";
@@ -62,8 +66,8 @@ void Scheduler::draft_trace_plan(const DraftPlan& p) {
     s += " tiers=[";
     const DraftTierPrice* tp = pl.last_tier_prices();
     for (int32_t t = 0; t < pl.last_n_tier_prices(); ++t) {
-        if (tp[t].valid) snprintf(b, sizeof b, "%s%d:ok:%.3f+-%.3f", t ? "," : "", tp[t].k,
-                                  tp[t].ms, tp[t].unc_ms);
+        if (tp[t].valid) snprintf(b, sizeof b, "%s%d:ok:%.3f+-%.3f/h%.3f", t ? "," : "", tp[t].k,
+                                  tp[t].ms, tp[t].unc_ms, tp[t].horizon_ms);
         else            snprintf(b, sizeof b, "%s%d:invalid", t ? "," : "", tp[t].k);
         s += b;
     }
@@ -324,6 +328,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (draft_record_)
         draft_head_depth_ = prog.drafter.depth < cfg.n_spec ? prog.drafter.depth : cfg.n_spec;
 
+    /* RADIANCE_DRAFT_CONFIDENCE=PATH: the head's q per verified draft (draft_confidence.h). */
+    if (const char* conf = std::getenv("RADIANCE_DRAFT_CONFIDENCE"); conf && *conf)
+        enable_draft_confidence(conf);
+
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
     /* The plan's caller-provided arrays are sized at max_seqs (draft_types.h). */
@@ -384,6 +392,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
      * depth is the executable one, or a cost deployment would plan past what the head can run. */
     dp.policy.fallback_k = exec_depth;
+    /* --draft-hysteresis both: only the cost policy has a hold to apply to a reduction; anywhere
+     * else the flag would parse and do nothing, so it is refused by name. */
+    if (cfg.draft_hold_reductions && cfg.draft_policy != DraftPolicyKind::Cost) {
+        RAD_ERR("--draft-hysteresis both needs --draft-policy cost: the %s policy has no hold",
+                draft_policy_name(cfg.draft_policy));
+        return RAD_E_UNSUPPORTED;
+    }
+    dp.policy.hold_reductions = cfg.draft_hold_reductions;
     /* --draft-calib-k: copied as given; DraftPlanner::configure() checks every value against the
      * effective ladder above (after the trim and dedup), which is the list the serving policy
      * offers. Engine::begin_draft_calibration refuses the flag outside a reference calibration. */
@@ -449,6 +465,35 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                          "proposed whole, and each sequence verifies the first min(D, its stop) "
                          "of it", dd.depth);
         }
+    }
+    /* The confidence window (draft.h) reads a serial head's q, so a serial drafter only; it and a
+     * cost plan would both decide the cycle's window. The rule given without the window would
+     * parse and do nothing, so it is refused by name. */
+    if (cfg.draft_window == DraftWindow::Confidence) {
+        const RadDrafterDecl& dd = prog.drafter;
+        if (cfg.draft_policy == DraftPolicyKind::Cost) {
+            RAD_ERR("--draft-window confidence and --draft-policy cost both decide each cycle's "
+                    "window; give one of them");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg.n_spec <= 0)
+            RAD_WARN("--draft-window confidence: this deployment does not speculate "
+                     "(--num-speculative-tokens %d), so there is no window to set", cfg.n_spec);
+        else if (dd.kind != RAD_DRAFT_SERIAL || dd.depth <= 0)
+            RAD_WARN("--draft-window confidence: the window is fixed at %d -- the rule reads the q "
+                     "of a serial draft head, and this deployment has none", cfg.n_spec);
+        else {
+            dp.confidence  = true;
+            dp.conf_scale  = cfg.draft_conf_scale;
+            dp.conf_offset = cfg.draft_conf_offset;
+            dp.conf_floor  = cfg.draft_conf_floor;
+            dp.conf_fallback = cfg.draft_conf_fallback;
+        }
+    } else if (cfg.draft_conf_rule_set || cfg.draft_conf_fallback_set) {
+        RAD_ERR("%s needs --draft-window confidence: the %s window has no rule",
+                cfg.draft_conf_rule_set ? "--draft-confidence-rule" : "--draft-confidence-fallback",
+                draft_window_name(cfg.draft_window));
+        return RAD_E_UNSUPPORTED;
     }
     RAD_TRY(draft_.configure(dp));
     draft_est_.clear();
@@ -577,7 +622,18 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
 
     int32_t slot;
     if (!free_slots_.empty()) { slot = free_slots_.back(); free_slots_.pop_back(); }
-    else { slot = (int32_t)reqs_.size(); reqs_.emplace_back(); }
+    else {
+        slot = (int32_t)reqs_.size();
+        /* Waiting requests hold slots too, so slots outgrow max_seqs: B's table follows them, or
+         * a running row on such a slot makes predict() refuse the whole cycle. */
+        if ((size_t)slot >= draft_predict_state_.size() && !draft_predict_state_.empty()) {
+            draft_predict_state_.resize((size_t)slot + 1);
+            const int rc = draft_predict_.grow(draft_predict_state_.data(),
+                                               (int32_t)draft_predict_state_.size());
+            if (rc < 0) { server::sink_fail(r->sink, rc, "draft predictor table"); return rc; }
+        }
+        reqs_.emplace_back();
+    }
     if (!reqs_[(size_t)slot]) reqs_[(size_t)slot] = std::make_unique<SchedReq>();
 
     SchedReq& s = *reqs_[(size_t)slot];
@@ -590,9 +646,11 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
-    /* A new request's text, so a new estimate. */
+    /* A new request's text, so a new estimate, and no confidence window yet. */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
+    s.conf_window = 0;
+    s.conf_window_next = 0;
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -651,6 +709,10 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     if (it == by_id_.end()) return RAD_E_NOTFOUND;
     SchedReq& s = *reqs_[(size_t)it->second];
     if (n < 0) return RAD_E_INVAL;
+    /* A new publication: the head's q, if any, follows in set_draft_confidence, and so does the
+     * confidence window it makes. */
+    s.conf_n = 0;
+    s.conf_window_next = 0;
 
     /* The step issued ahead already verifies these: it was planned with the drafter's count and
      * the card has the tokens. The host copy is what its commit emits accepted tokens from, so it
@@ -663,7 +725,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
          * both, so a cycle whose execution the plan cannot express is refused rather than priced
          * from the truncated publication. */
         const int32_t ran = n;
-        if ((draft_.adaptive() || draft_.cost_policy()) && n > s.draft_next) n = s.draft_next;
+        if (per_seq_window() && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -695,6 +757,114 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     s.req->draft = s.draft;
     draft_ring_publish(s, n, n, DraftOrigin::Head);
     draft_freeze_published(s, n);
+    return RAD_OK;
+}
+
+/* ---------------------------------------------------------- RADIANCE_DRAFT_CONFIDENCE */
+
+/* Bounded so a long run cannot grow it without limit: a BetterBench run verifies a few ten
+ * thousand windows; past this the records are counted, not kept. */
+static constexpr size_t kMaxConfRecords = (size_t)1 << 20;
+
+void Scheduler::enable_draft_confidence(const std::string& path) {
+    std::lock_guard<std::mutex> lk(mu_);
+    conf_on_ = true;
+    conf_path_ = path;
+    conf_rec_.reserve(65536);
+    RAD_INFO("draft confidence: recording the head's q per verified draft, written to '%s' at stop",
+             path.c_str());
+}
+
+int Scheduler::set_draft_confidence(uint64_t id, const float* q, const float* q_max, int n) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!conf_on_ && !draft_.confidence()) return RAD_OK;
+    if (n < 0 || (n > 0 && (!q || !q_max))) return RAD_E_INVAL;
+    auto it = by_id_.find(id);
+    if (it == by_id_.end()) return RAD_E_NOTFOUND;
+    SchedReq& s = *reqs_[(size_t)it->second];
+    /* What set_draft kept: a publication cut to the window has no verify past its own count. */
+    if (n > s.n_draft) n = s.n_draft;
+    if (n > RAD_MTP_COUPLE_MAX_ROUNDS) n = RAD_MTP_COUPLE_MAX_ROUNDS;
+    /* The confidence window: what the sequence drafts once the next cycle opens (draft_cycle). */
+    s.conf_window_next = draft_.confidence_window(q, n);
+    if (!conf_on_) return RAD_OK;
+    for (int j = 0; j < n; ++j) {
+        s.conf_q[j] = q[j];
+        s.conf_qmax[j] = q_max[j];
+    }
+    s.conf_n = n;
+    return RAD_OK;
+}
+
+/* The commit of the step that verified a head publication: one record of what the verify made of
+ * it, then the publication's q is spent. A lookup window, an empty one or a publication without q
+ * records nothing; one verified past the drafts that have a q is counted, not recorded. */
+void Scheduler::draft_conf_report(SchedReq& s, const StepEntry& e, int32_t accepted, int32_t raw,
+                                  int32_t rows) {
+    if (!conf_on_) return;
+    const int32_t n = s.conf_n;
+    s.conf_n = 0;
+    if (e.ngram || e.n_spec <= 0 || n <= 0) return;
+    if (e.n_spec > n) { ++conf_short_; return; }
+    if (conf_rec_.size() >= kMaxConfRecords) { ++conf_dropped_; return; }
+    DraftConfRecord c;
+    c.rows     = (uint8_t)(rows < 255 ? rows : 255);
+    c.verified = (uint8_t)e.n_spec;
+    c.accepted = (uint8_t)accepted;
+    c.raw      = (uint8_t)raw;
+    for (int32_t j = 0; j < e.n_spec; ++j) {
+        c.q[j] = s.conf_q[j];
+        c.q_max[j] = s.conf_qmax[j];
+    }
+    conf_rec_.push_back(c);
+}
+
+void Scheduler::report_draft_window() const {
+    if (!draft_.confidence()) return;
+    std::string by;
+    int64_t n = 0, sum = 0;
+    for (int d = 1; d <= draft_.params().max_depth; ++d) {
+        const int64_t v = draft_.verified_at(d);
+        by += (by.empty() ? "" : "  ") + std::to_string(d) + ":" + std::to_string((long long)v);
+        n += v;
+        sum += v * d;
+    }
+    RAD_INFO("draft depth: confidence, %lld window(s) verified by depth %s (mean %.2f)",
+             (long long)n, by.c_str(), n ? (double)sum / (double)n : 0.0);
+}
+
+/* One header line, then one line per window: rows, verified, accepted, raw, then q(x) and max q of
+ * each verified draft as `q1..qK` and `qmax1..qmaxK` columns (empty past `verified`). An existing
+ * file is not overwritten. */
+int Scheduler::write_draft_confidence() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!conf_on_) return RAD_OK;
+    FILE* f = std::fopen(conf_path_.c_str(), "wx");
+    if (!f) {
+        RAD_ERR("draft confidence: cannot create '%s' (%s); %zu record(s) not written",
+                conf_path_.c_str(), std::strerror(errno), conf_rec_.size());
+        return RAD_E_IO;
+    }
+    constexpr int K = RAD_MTP_COUPLE_MAX_ROUNDS;
+    std::fprintf(f, "rows\tverified\taccepted\traw");
+    for (int j = 1; j <= K; ++j) std::fprintf(f, "\tq%d", j);
+    for (int j = 1; j <= K; ++j) std::fprintf(f, "\tqmax%d", j);
+    std::fputc('\n', f);
+    for (const DraftConfRecord& c : conf_rec_) {
+        std::fprintf(f, "%d\t%d\t%d\t%d", c.rows, c.verified, c.accepted, c.raw);
+        for (const float* v : {c.q, c.q_max})
+            for (int j = 0; j < K; ++j)
+                j < c.verified ? (void)std::fprintf(f, "\t%.6f", v[j]) : (void)std::fputc('\t', f);
+        std::fputc('\n', f);
+    }
+    const bool ok = std::fclose(f) == 0;
+    if (!ok) {
+        RAD_ERR("draft confidence: writing '%s' failed", conf_path_.c_str());
+        return RAD_E_IO;
+    }
+    RAD_INFO("draft confidence: %zu window(s) written to '%s' (%lld past the bound not kept, %lld "
+             "verified past their q)", conf_rec_.size(), conf_path_.c_str(),
+             (long long)conf_dropped_, (long long)conf_short_);
     return RAD_OK;
 }
 
@@ -2040,6 +2210,28 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle(bool direct_step) {
     if (draft_.cost_policy()) { draft_cost_cycle(direct_step); return; }
+    /* The confidence window: the window each sequence's last publication made is the one this
+     * cycle's four sites read. On the ahead path that publication is the window the step being
+     * promoted verifies, so the window drafted now follows its q (draft.h). On the direct path the
+     * step built next verifies that same publication and re-caps it to the new window, which only
+     * ever cuts it shorter. */
+    if (draft_.confidence()) {
+        /* At more than one decoding row every row drafts the fallback (draft.h): the rule was
+         * fitted on single-row windows, and the head runs the deepest window's rounds for all. */
+        int n_rows = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || !s.running) continue;
+            const Request& r = *s.req;
+            if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len())
+                continue;
+            ++n_rows;
+        }
+        for (int32_t slot : running_) {
+            SchedReq& s = *reqs_[(size_t)slot];
+            s.conf_window = n_rows > 1 ? 0 : s.conf_window_next;
+        }
+    }
     if (draft_.adaptive()) {
         /* The rows the opening step will decode: every running sequence past its prompt. Those
          * that may speculate choose D through their estimates; the rest emit one token each, which
@@ -2693,7 +2885,7 @@ void Scheduler::expect_draft(uint64_t id, int n) {
      * first of them up to its own window. The same holds for a cost plan, whose K per request is
      * the frozen choice. That is the cap serial_begin used: nothing commits between the two, and
      * D is the cycle's (draft_cycle). */
-    if ((draft_.adaptive() || draft_.cost_policy()) && n > 0) {
+    if (per_seq_window() && n > 0) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
@@ -2914,6 +3106,7 @@ int Scheduler::commit(const StepResult& res) {
             if (raw > e.n_spec) raw = e.n_spec;
             /* The verify half of the cycle whose proposals this step ran. */
             draft_ring_report(s, e, a, (uint64_t)raw);
+            draft_conf_report(s, e, a, raw, res.n_seq);
             /* A row issued ahead was staged at the furthest reachable context; it really
              * continued from the committed end. */
             const int64_t ctx0 = e.dev ? r.n_computed : (int64_t)e.ctx_len;
@@ -3061,8 +3254,9 @@ void Scheduler::draft_drift_note(int64_t moves_since_bind) {
                  draft_costs_.reason().c_str());
     } else if (draft_record_) {
         RAD_WARN("draft cost: residency drifted from the fingerprint's start placement; "
-                 "the calibration keeps recording and the export leaves every cycle after it "
-                 "out");
+                 "the calibration keeps recording and marks every cycle after it `placement` "
+                 "(left out of the export, kept flagged only by a live --draft-calib-k "
+                 "diagnostic)");
     }
 }
 
@@ -3207,7 +3401,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * them (expect_draft, set_draft); a round past the deepest window drafts for nobody. Only a
      * row that will draft counts. With none, the rounds stay as they are, because round 0 is the
      * history pass. The lookahead reservation below then matches the rounds that will run. */
-    if (may_draft && (draft_.adaptive() || draft_.cost_policy())) {
+    if (may_draft && per_seq_window()) {
         int want = 0;
         for (const StepEntry& e : plan_.e) {
             if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;

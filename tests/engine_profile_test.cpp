@@ -304,6 +304,91 @@ TEST(the_export_refuses_a_calibration_with_no_priceable_bucket) {
     CHECK(!std::ifstream(out).good());
 }
 
+/* A live diagnostic (--draft-calib-k without --draft-reference) measures the residency serving
+ * runs, which moves: it keeps the placement-affected bucket, flag and all, and the flag is what
+ * keeps a reader from pricing it. A reference calibration with the same sequence still leaves it
+ * out, and a live diagnostic made only of other diagnostics is still refused. */
+Config live_diagnostic(const std::string& in, const std::string& out, bool reference) {
+    Config cfg;
+    cfg.draft_profile     = in;
+    cfg.draft_profile_out = out;
+    cfg.draft_policy      = rad::DraftPolicyKind::Cost;
+    cfg.draft_calib_k[0]  = 3;
+    cfg.draft_calib_k[1]  = 2;
+    cfg.draft_calib_n     = 2;
+    cfg.draft_reference   = reference;
+    return cfg;
+}
+
+TEST(a_live_diagnostic_export_keeps_the_placement_affected_bucket_flagged) {
+    const std::string out = radtest::tmp_path("engine_calib_live_diag.json");
+    const std::string in = write_case_file("engine_calib_live_diag_in.json",
+                                           calibrated_profile(bucket_json(0, R"("ahead")") + "," +
+                                                              bucket_json(1, R"("placement")")));
+    Engine e(live_diagnostic(in, out, /*reference=*/false));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    REQUIRE_EQ(EngineTestPeer::export_calibration(e), RAD_OK);
+
+    rad::DraftCostProfile written;
+    std::string err;
+    REQUIRE_EQ(rad::draft_cost_profile_read(out, &written, &err), RAD_OK);
+    REQUIRE_EQ((int)written.buckets.size(), 2);
+    int flagged = 0;
+    for (const rad::DraftCostBucket& b : written.buckets) {
+        if (!(b.flags & rad::kDraftSamplePlacement)) continue;
+        ++flagged;
+        CHECK_EQ(b.shape.ctx_class, 1);
+        CHECK(!rad::draft_bucket_usable(b));   /* read back, it prices nothing */
+    }
+    CHECK_EQ(flagged, 1);
+}
+
+TEST(a_live_diagnostic_export_of_placement_affected_buckets_alone_is_written) {
+    const std::string out = radtest::tmp_path("engine_calib_live_diag_only.json");
+    const std::string in = write_case_file("engine_calib_live_diag_only_in.json",
+                                           calibrated_profile(bucket_json(0, R"("placement")")));
+    Engine e(live_diagnostic(in, out, /*reference=*/false));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    REQUIRE_EQ(EngineTestPeer::export_calibration(e), RAD_OK);
+
+    rad::DraftCostProfile written;
+    std::string err;
+    REQUIRE_EQ(rad::draft_cost_profile_read(out, &written, &err), RAD_OK);
+    REQUIRE_EQ((int)written.buckets.size(), 1);
+    CHECK(written.buckets[0].flags & rad::kDraftSamplePlacement);
+    CHECK(!rad::draft_bucket_usable(written.buckets[0]));
+}
+
+TEST(a_reference_calibration_with_a_sequence_still_leaves_the_placement_bucket_out) {
+    const std::string out = radtest::tmp_path("engine_calib_ref_seq.json");
+    const std::string in = write_case_file("engine_calib_ref_seq_in.json",
+                                           calibrated_profile(bucket_json(0, R"("ahead")") + "," +
+                                                              bucket_json(1, R"("placement")")));
+    Engine e(live_diagnostic(in, out, /*reference=*/true));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    REQUIRE_EQ(EngineTestPeer::export_calibration(e), RAD_OK);
+
+    rad::DraftCostProfile written;
+    std::string err;
+    REQUIRE_EQ(rad::draft_cost_profile_read(out, &written, &err), RAD_OK);
+    REQUIRE_EQ((int)written.buckets.size(), 1);
+    CHECK_EQ((int)(written.buckets[0].flags & rad::kDraftSamplePlacement), 0);
+}
+
+TEST(a_live_diagnostic_of_other_diagnostics_alone_is_still_refused) {
+    const std::string out = radtest::tmp_path("engine_calib_live_diag_record.json");
+    const std::string in = write_case_file("engine_calib_live_diag_record_in.json",
+                                           calibrated_profile(bucket_json(0, R"("record")")));
+    Engine e(live_diagnostic(in, out, /*reference=*/false));
+    REQUIRE_EQ(EngineTestPeer::load_profile(e, matching_runtime()), RAD_OK);
+    EngineTestPeer::set_calibrating(e, matching_runtime());
+    CHECK_EQ(EngineTestPeer::export_calibration(e), RAD_E_INVAL);
+    CHECK(!std::ifstream(out).good());
+}
+
 TEST(the_export_of_an_unarmed_run_writes_nothing) {
     const std::string path = radtest::tmp_path("engine_calib_unarmed.json");
     Config cfg;

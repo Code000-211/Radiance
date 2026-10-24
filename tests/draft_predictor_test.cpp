@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace rad;
 
@@ -205,6 +206,24 @@ TEST(predict_starts_every_position_at_the_prior_with_no_evidence) {
     /* Past the configured depth there is nothing to predict. */
     CHECK_EQ(r.pseq[0].a[4], 0.0f);
     CHECK_EQ(r.pseq[0].n[4], 0);
+}
+
+TEST(grow_keeps_every_learned_slot_and_refuses_a_smaller_table) {
+    Rig r(6);
+    REQUIRE_EQ(predicted(r, 10, 0).valid, 0u);
+    CHECK_OK(r.observe(10, 6, 2));
+    std::vector<DraftPredictState> big(r.state, r.state + kCap);
+    big.resize((size_t)kCap + 2);
+    big[(size_t)kCap].req_id = 99;   /* stale bytes the new tail must not keep */
+    CHECK_EQ(r.model.grow(big.data(), kCap - 1), RAD_E_INVAL);
+    CHECK_OK(r.model.grow(big.data(), (int32_t)big.size()));
+    CHECK_NEAR(big[0].a[0], 0.84, 1e-6);   /* the learned slot carried over */
+    CHECK_EQ(big[0].n[0], 1);
+    CHECK_EQ(big[(size_t)kCap].req_id, 0u);
+    CHECK_EQ(big[(size_t)kCap].a[0], 0.8f);
+    /* A slot past the old cap is predicted, not refused. */
+    REQUIRE_EQ(predicted(r, 11, kCap).valid, 0u);
+    CHECK_EQ(big[(size_t)kCap].req_id, 11u);
 }
 
 TEST(labels_are_the_accepted_prefix_and_the_first_rejection) {

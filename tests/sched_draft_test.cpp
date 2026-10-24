@@ -17,7 +17,9 @@
 #include "sched/scheduler.h"
 #include "sched/draft_cost.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -1479,25 +1481,29 @@ void install_table(Fixture& f, const DraftCostProfile& p) {
 }
 
 /* The fall's table: K3 wins the cold cycle, K2 the cycle after it -- on the ahead path from the
- * declared (2,3), on the direct path from the capped (2,2) that cycle executes. */
+ * declared (2,3), on the direct path from the capped (2,2) that cycle executes. Candidates are ranked
+ * on their stationary horizon (draft_policy.h), (3,3) and (2,2), in both cycles; the cold cycle keeps
+ * K3 because K2's cold (2,0) is not measured, so only K3 can run there. */
 void install_cost_table(Fixture& f) {
     DraftCostProfile p = cost_profile();
-    add_bucket(&p, row_key(3, 0),  6.0);   /* cold cycle: 3.439 tokens / 6.0 ms beat K2 */
-    add_bucket(&p, row_key(2, 0),  5.0);
+    add_bucket(&p, row_key(3, 0),  6.0);   /* cold: the one priced execution shape */
     add_bucket(&p, row_key(3, 3), 12.0);   /* after K3: 3.439 / 12.0 ... */
-    add_bucket(&p, row_key(2, 3),  9.0);   /* ... loses to 2.71 / 9.0 ahead ... */
-    add_bucket(&p, row_key(2, 2),  8.0);   /* ... and to 2.71 / 8.0 on the direct path */
+    add_bucket(&p, row_key(2, 3),  9.0);   /* ... loses to K2, which runs (2,3) ahead ... */
+    add_bucket(&p, row_key(2, 2),  8.0);   /* ... and (2,2) direct, scored 2.71 / 8.0 on both */
     install_table(f, p);
 }
 
 /* The upshift's table: K2 wins the cold cycle and K3 the cycle after it (after K2 both paths
- * verify two, so the two price the same shape). */
+ * verify two, so the two price the same shape). Both cycles rank on the stationary (2,2) and
+ * (3,3), so the predictor's third position rises between them (upshift()): cold 2.791 / 9.0 loses
+ * to 2.71 / 8.0, after it 3.439 / 9.0 wins -- and clears the raise against (2,2). */
 void install_upshift_table(Fixture& f) {
     DraftCostProfile p = cost_profile();
-    add_bucket(&p, row_key(2, 0),  4.0);   /* cold: 2.71 / 4.0 beats 3.439 / 20.0 */
+    add_bucket(&p, row_key(2, 0),  4.0);
     add_bucket(&p, row_key(3, 0), 20.0);
     add_bucket(&p, row_key(2, 2),  8.0);
-    add_bucket(&p, row_key(3, 2),  6.0);   /* after K2: 3.439 / 6.0 beats 2.71 / 8.0 */
+    add_bucket(&p, row_key(3, 2),  6.0);   /* what K3 runs after K2 */
+    add_bucket(&p, row_key(3, 3),  9.0);   /* K3's stationary horizon */
     install_table(f, p);
 }
 
@@ -1653,7 +1659,7 @@ void upshift(Fixture& f, bool ahead, Coupled& c) {
     Predictions& pred = c.pred;
     const uint64_t id = f.submit(160);
     c.id = id;
-    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    pred.set(id, { 0.9f, 0.9f, 0.1f, 0.9f, 0.9f, 0.9f });   /* raised after cycle A */
 
     QueryLog& log = c.log;
     log.table = &f.sch.draft_costs();
@@ -1697,6 +1703,7 @@ void upshift(Fixture& f, bool ahead, Coupled& c) {
     }
     CHECK_OK(f.sch.set_draft(id, two, 2));
     f.sch.step_finished(live);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });   /* the third draft now pays */
     if (ahead) {
         f.sch.promote_next();
     } else {
@@ -1840,11 +1847,12 @@ void budget_cut(Fixture& f, bool ahead, Coupled& c) {
     }
 }
 
-/* The failed open's table: K2 wins the cold cycle (2.71 tokens / 5.0 ms against 3.439 / 7.0), and
- * the cycle after the legacy K3 must price K3 on that window (3.439 / 8.0 against 2.71 / 9.0). The
- * (3,2) bucket is what a plan still naming the pre-failure window would price instead, so the
- * issued depth alone does not tell the two apart. (2,2) prices the incumbent the direct path's
- * raise check re-caps to the previous K; dear enough that K3's raise still clears it. */
+/* The failed open's table, ranked on the stationary horizon (draft_policy.h): K2 wins the cold
+ * cycle while the third draft is still poor (2.71 tokens / 7.0 ms on (2,2) against 2.791 / 8.0 on
+ * (3,3)), and once it pays the cycle after the legacy K3 prices K3 on that window (3.439 / 8.0
+ * against 2.71 / 7.0). The (3,2) bucket is what a plan still naming the pre-failure window would
+ * price instead, so the issued depth alone does not tell the two apart. (2,2) also prices the
+ * incumbent of the raise check; dear enough that K3's raise still clears it. */
 void install_no_plan_table(Fixture& f) {
     DraftCostProfile p = cost_profile();
     add_bucket(&p, row_key(2, 0), 5.0);
@@ -1908,7 +1916,7 @@ void failed_opens(Fixture& f, Coupled& c, const FailOpts& o) {
     Predictions& pred = c.pred;
     const uint64_t id = f.submit(160, o.max_tokens);
     c.id = id;
-    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    pred.set(id, { 0.9f, 0.9f, 0.1f, 0.9f, 0.9f, 0.9f });   /* raised after cycle A */
 
     QueryLog& log = c.log;
     log.table = &f.sch.draft_costs();
@@ -1954,6 +1962,7 @@ void failed_opens(Fixture& f, Coupled& c, const FailOpts& o) {
     }
     CHECK_OK(f.sch.set_draft(id, two, 2));
     f.sch.step_finished(live);
+    pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });   /* the third draft pays from here on */
 
     if (o.ineligible) f.sch.find(id)->may_speculate = false;
 
@@ -2325,7 +2334,7 @@ TEST(a_row_that_publishes_nothing_in_a_refused_cycle_comes_back_with_an_empty_wi
         CHECK_OK(f.start(DraftReplay::None));
 
         const uint64_t id = f.submit(160);
-        c.pred.set(id, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+        c.pred.set(id, { 0.9f, 0.9f, 0.1f, 0.9f, 0.9f, 0.9f });   /* K2 on the stationary table */
         QueryLog& log = c.log;
         log.table = &f.sch.draft_costs();
         DraftController::Params dp = f.sch.draft().params();
@@ -2440,7 +2449,7 @@ TEST(a_recycled_slot_does_not_inherit_the_frozen_window) {
     const int32_t three[3] = { 21, 22, 23 };
 
     const uint64_t a = f.submit(160);
-    c.pred.set(a, { 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f });
+    c.pred.set(a, { 0.9f, 0.9f, 0.1f, 0.9f, 0.9f, 0.9f });   /* K2 on the stationary table */
     f.prefill(a);
     REQUIRE(f.sch.step() != nullptr);
     const int32_t a_slot = f.sch.draft().plan()->slot[0];
@@ -2966,13 +2975,17 @@ TEST(an_older_plan_keeps_its_rows_when_the_next_cycle_opens) {
 
 /* One bucket keyed the way this fixture runs: publish-then-verify at pipeline depth 1, one row,
  * the previous cycle's window still empty on the first cycle. */
-std::string seam_bucket(int cls, int k, double ms) {
+std::string seam_bucket(int cls, int k, double ms, int verify = 0) {
     std::string draft = "0";
     for (int j = 1; j <= k; ++j) draft += ",1";
+    std::string rows = "0";
+    for (int j = 1; j <= verify; ++j) rows += ",1";
+    const std::string vt = std::to_string(1 + verify);
     return "{\"ctx_class\": " + std::to_string(cls) +
-           ", \"shape\": {\"n_rows\": 1, \"verify_k\": 0, \"verify_tokens\": 1"
-           ", \"history_tokens\": 1, \"prefill_tokens\": 0, \"pipeline_depth\": 1"
-           ", \"rows\": [0], \"draft_k\": " + std::to_string(k) +
+           ", \"shape\": {\"n_rows\": 1, \"verify_k\": " + std::to_string(verify) +
+           ", \"verify_tokens\": " + vt +
+           ", \"history_tokens\": " + vt + ", \"prefill_tokens\": 0, \"pipeline_depth\": 1"
+           ", \"rows\": [" + rows + "], \"draft_k\": " + std::to_string(k) +
            ", \"draft_rows\": [" + draft + "]"
            ", \"origins\": [\"head\"], \"sampling\": \"greedy\", \"replay\": \"none\""
            ", \"drafter\": \"serial\"},"
@@ -3005,14 +3018,16 @@ TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     pred.set(id, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f });
 
     const int cls = draft_ctx_class(8);
-    auto bucket = [&](int k, double ms) { return seam_bucket(cls, k, ms); };
-    /* 1 token / 2.0 ms, 3 / 1.3, 7 / 5.0: K=2 pays, K=6 does not. */
+    auto bucket = [&](int k, double ms, int verify = 0) { return seam_bucket(cls, k, ms, verify); };
+    /* The cold cycle runs (k,0) and is ranked on the stationary (k,k): 1 token / 2.0 ms, 3 / 2.0,
+     * 7 / 6.0 -- K=2 pays, K=6 does not. */
     const std::string profile =
         "{\"format\": \"rad-draft-profile/4\", \"fingerprint\": {\"model\": \"m\", \"quant\": \"q\", "
         "\"tp\": 1, \"tp_wire\": \"w\", \"gpus\": \"g\", \"kernels\": \"k\", \"kv_format\": \"bf16\", "
         "\"placement\": \"vram\", \"basis\": \"live\", \"arena\": \"none\", "
         "\"live_loan\": \"flex=0 lend=0\"}, \"execution\": \"rectangular\", \"buckets\": [" +
-        bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "]}";
+        bucket(0, 2.0) + "," + bucket(2, 1.3) + "," + bucket(6, 5.0) + "," +
+        bucket(2, 2.0, 2) + "," + bucket(6, 6.0, 6) + "]}";
 
     DraftCostProfile parsed;
     std::string err;
@@ -3098,11 +3113,12 @@ TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     CHECK_EQ(draft_plan_valid(*pg), RAD_OK);
 }
 
-/* The deepest offered plan is the coverage gate. A batch whose ladder is 0/2/6 against a profile
- * that priced only 0 and 2 does not take K2 because it happens to be priced: the deeper
- * alternative was not measured, and a shallower price is not evidence about it. The plan is the
- * named baseline, at the baseline depth -- not a cost decision. */
-TEST(an_unpriced_deepest_tier_falls_back_instead_of_choosing_a_shallower_price) {
+/* An unpriced deepest tier does not discard a priced cheaper one. A batch whose ladder is 0/2/6
+ * against a profile that measured (0,0) and (2,0) -- no K6 shape at all, and no stationary (2,2)
+ * -- prices only K0 with both exact shapes, so the cycle is a Cost plan at K0, not the named
+ * baseline at the baseline depth: a missing deep price says nothing about the cheaper tier. K2
+ * stays unscored without its own stationary price. */
+TEST(an_unpriced_deepest_tier_still_chooses_the_priced_cheaper_tier) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
@@ -3148,9 +3164,10 @@ TEST(an_unpriced_deepest_tier_falls_back_instead_of_choosing_a_shallower_price) 
     REQUIRE(f.sch.step() != nullptr);
     const DraftPlan* p = f.sch.draft().plan();
     REQUIRE(p != nullptr);
-    CHECK(p->source == DraftPlanSource::Fallback);
-    CHECK(p->fallback == DraftFallback::UnknownShape);
-    CHECK_EQ(p->k[0], 5);
+    CHECK(p->source == DraftPlanSource::Cost);
+    CHECK(p->fallback == DraftFallback::None);
+    CHECK_EQ(p->k[0], 0);   /* not the baseline 5, and not the unscored K2 */
+    CHECK_EQ(f.sch.draft().planner().last_tiers_priced(), 1);
     CHECK_EQ(draft_plan_valid(*p), RAD_OK);
 }
 
@@ -3423,6 +3440,80 @@ TEST(a_preempted_slot_keeps_its_history_and_its_cycle_is_dropped) {
         }
     }
     CHECK(preempted);
+}
+
+/* A slot indexes the request table, which also holds waiting requests, so with more requests than
+ * max_seqs a running row can name a slot at or above max_seqs. B's table must cover that slot (the
+ * TP2 C8 run refused every such cycle: "names slot 8 outside 0..7", then no plan), and growing it
+ * must keep the histories already learned -- a waiting or preempted request's included. */
+TEST(a_slot_above_max_seqs_is_predicted_and_growth_keeps_learned_histories) {
+    Fixture f;
+    f.build();
+    f.cfg.max_seqs = 2;
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f);
+    CHECK_OK(f.start());
+
+    int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    const auto all = [](const StepEntry& e) { return e.n_spec; };
+    const uint64_t a = f.submit(64, 512);
+    REQUIRE(a);
+    f.prefill(a);
+    int32_t slot_a = -1;
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        if (const StepEntry* e = entry_of(f.sch, a)) slot_a = e->slot;
+        CHECK_OK(f.commit(11, 0, all));
+        CHECK_OK(f.sch.set_draft(a, drafts, 6));
+    }
+    REQUIRE(slot_a >= 0);
+    const DraftPredictState* st = f.sch.draft_predict_state(slot_a);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, a);
+    const uint32_t gen_a = st->slot_gen;
+    uint16_t n_a[RAD_SCHED_MAX_SPEC] = {};
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) n_a[j] = st->n[j];
+    REQUIRE(n_a[0] > 0);   /* a real history, not an empty table */
+
+    /* Three more requests than max_seqs leaves room for: their slots reach 3. b leaves while it
+     * waits, so c is admitted beside a on a slot at or above max_seqs. */
+    const uint64_t b = f.submit(64, 512);
+    const uint64_t c = f.submit(64, 512);
+    const uint64_t d = f.submit(64, 512);
+    REQUIRE(b && c && d);
+    CHECK_OK(f.sch.cancel(b));
+
+    /* The table grew; a's history is the same request's, unchanged. */
+    st = f.sch.draft_predict_state(slot_a);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, a);
+    CHECK_EQ(st->slot_gen, gen_a);
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(st->n[j], n_a[j]);
+
+    f.prefill(c);
+    const int64_t no_plan0 = f.sch.metrics().draft_cost_no_plan;
+    int32_t slot_c = -1;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry* e = entry_of(f.sch, c);
+        REQUIRE(e != nullptr);
+        slot_c = e->slot;
+        CHECK_OK(f.commit(11, 0, all));
+        for (uint64_t id : { a, c }) CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    }
+    CHECK(slot_c >= (int32_t)f.cfg.max_seqs);
+    CHECK_EQ(f.sch.metrics().draft_cost_no_plan, no_plan0);   /* every cycle was planned */
+    st = f.sch.draft_predict_state(slot_c);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, c);
+    CHECK(st->n[0] > 0);        /* c's delivered cycles taught its own slot */
+    st = f.sch.draft_predict_state(slot_a);
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->req_id, a);
+    CHECK(st->n[0] > n_a[0]);   /* a kept learning on top of its history */
 }
 
 /* Review 2, finding 2: the labels a cycle's verify reports measure the window it consumed -- the
@@ -5245,4 +5336,384 @@ TEST(a_long_idle_phase_does_not_spend_the_draft_trace) {
     CHECK(!has(out, "rows=0 "));
 }
 
+/* RADIANCE_DRAFT_CONFIDENCE: q(x) of a coupled round is the Q entry of the token it drew, max q
+ * the largest entry; a state that is not a valid sampled draw has no Q to read. */
+TEST(the_head_confidence_of_a_round_is_q_of_its_drawn_token) {
+    RadMtpCoupleState s{};
+    s.draw.mode = 1;
+    s.status = 1;
+    s.round  = 1;
+    s.count  = 3;
+    s.x      = 9;
+    const int32_t ids[8] = { 5, 9, 2, -1, -1, -1, -1, -1 };
+    const double  q[8]   = { 0.5, 0.3, 0.2, 0, 0, 0, 0, 0 };
+    for (int i = 0; i < 8; ++i) { s.ids[i] = ids[i]; s.q[i] = q[i]; }
+    float qx = -1, qm = -1;
+    REQUIRE(mtp_draft_confidence(s, 100, &qx, &qm));
+    CHECK_NEAR(qx, 0.3, 1e-6);
+    CHECK_NEAR(qm, 0.5, 1e-6);
+
+    RadMtpCoupleState greedy = s;
+    greedy.status = 0;   /* a greedy proposal kept: no Q */
+    CHECK(!mtp_draft_confidence(greedy, 100, &qx, &qm));
+    RadMtpCoupleState lost = s;
+    lost.x = 7;          /* x outside its own shortlist */
+    CHECK(!mtp_draft_confidence(lost, 100, &qx, &qm));
+}
+
+/* The record is joined at the commit of the step that verified the publication: verified,
+ * accepted and the q of each verified draft. A publication without q, or with fewer q than the
+ * window verified, records nothing; nothing here changes what is drafted or verified. */
+TEST(the_draft_confidence_records_the_window_the_next_commit_verified) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    CHECK_OK(f.start());
+    const std::string path = radtest::tmp_path("sched_draft_confidence.tsv");
+    std::remove(path.c_str());
+    f.sch.enable_draft_confidence(path);
+    REQUIRE(f.sch.draft_confidence_on());
+
+    const int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    const float   q[6]      = { 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f };
+    const float   qm[6]     = { 0.95f, 0.85f, 0.75f, 0.65f, 0.55f, 0.45f };
+    const auto two = [](const StepEntry& e) { return e.n_spec < 2 ? e.n_spec : 2; };
+    const uint64_t a = f.submit(64, 512);
+    REQUIRE(a);
+    f.prefill(a);
+
+    /* A publication with q, verified by the next step: one record. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(11, 0, two));
+    CHECK_OK(f.sch.set_draft(a, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(a, q, qm, 6));
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* e = entry_of(f.sch, a);
+    REQUIRE(e != nullptr);
+    const int verified = e->n_spec;
+    REQUIRE(verified > 0);
+    CHECK_OK(f.commit(11, 0, two));
+
+    /* One without q: nothing. One with fewer q than the window verifies: counted, not kept. */
+    CHECK_OK(f.sch.set_draft(a, drafts, 6));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(11, 0, two));
+    CHECK_OK(f.sch.set_draft(a, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(a, q, qm, verified - 1));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(11, 0, two));
+
+    REQUIRE_EQ(f.sch.write_draft_confidence(), RAD_OK);
+    std::ifstream in(path);
+    std::string header, line, extra;
+    REQUIRE(std::getline(in, header));
+    CHECK(header.rfind("rows\tverified\taccepted\traw\tq1", 0) == 0);
+    REQUIRE(std::getline(in, line));
+    CHECK(!std::getline(in, extra));   /* exactly one window */
+    std::vector<std::string> col;
+    for (size_t at = 0;;) {
+        const size_t tab = line.find('\t', at);
+        col.push_back(line.substr(at, tab == std::string::npos ? std::string::npos : tab - at));
+        if (tab == std::string::npos) break;
+        at = tab + 1;
+    }
+    REQUIRE_EQ((int)col.size(), 4 + 2 * RAD_MTP_COUPLE_MAX_ROUNDS);
+    CHECK_EQ(std::stoi(col[0]), 1);
+    CHECK_EQ(std::stoi(col[1]), verified);
+    CHECK_EQ(std::stoi(col[2]), 2);
+    CHECK_EQ(std::stoi(col[3]), 2);
+    for (int j = 0; j < verified; ++j) {
+        CHECK_NEAR(std::stod(col[4 + j]), q[j], 1e-6);
+        CHECK_NEAR(std::stod(col[4 + RAD_MTP_COUPLE_MAX_ROUNDS + j]), qm[j], 1e-6);
+    }
+    for (int j = verified; j < RAD_MTP_COUPLE_MAX_ROUNDS; ++j) CHECK(col[4 + j].empty());
+
+    /* An existing file is not overwritten. */
+    CHECK_EQ(f.sch.write_draft_confidence(), RAD_E_IO);
+}
+
 RAD_TEST_MAIN()
+
+/* ================================================================== the confidence window */
+
+/* --draft-window confidence: the next window is ceil(scale * E + offset), E = sum_j prod_{i<=j}
+ * q_i over the drafts of the publication in flight, clamped to floor..max_depth. No q, or the
+ * policy off, is 0: the caller drafts the ceiling. */
+TEST(the_confidence_window_is_the_expected_accepted_drafts_scaled_and_clamped) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth  = 6;
+    p.confidence = true;   /* the default rule: 1.25, 0, floor 2 */
+    CHECK_OK(c.configure(p));
+    REQUIRE(c.confidence());
+    CHECK(!c.adaptive());
+
+    const float all[6] = { 1, 1, 1, 1, 1, 1 };
+    CHECK_EQ(c.confidence_window(all, 6), 6);        /* E 6: 7.5, the ceiling */
+    CHECK_EQ(c.confidence_window(all, 2), 3);        /* E 2: 2.5, one window grows by a quarter */
+    const float two[2] = { 0.9f, 0.8f };
+    CHECK_EQ(c.confidence_window(two, 2), 3);        /* E 0.9 + 0.72: 2.025 */
+    const float low[6] = { 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f };
+    CHECK_EQ(c.confidence_window(low, 6), 2);        /* E 0.11: 0.14, the floor */
+    CHECK_EQ(c.confidence_window(low, 0), 0);        /* no q: the ceiling */
+    CHECK_EQ(c.confidence_window(nullptr, 3), 0);
+    const float odd[3] = { std::nanf(""), 2.0f, -1.0f };
+    CHECK_EQ(c.confidence_window(odd, 3), 2);        /* not a probability: 0, so the floor */
+
+    /* A value that lands on a whole number stays there although q is a float. */
+    DraftController w;
+    p.conf_scale = 2.5;
+    p.conf_floor = 1;
+    CHECK_OK(w.configure(p));
+    const float eight[1] = { 0.8f };
+    CHECK_EQ(w.confidence_window(eight, 1), 2);
+    p.conf_offset = 0.5;
+    CHECK_OK(w.configure(p));
+    CHECK_EQ(w.confidence_window(eight, 1), 3);
+
+    /* The fallback: 3 by default, 0 is the ceiling, above the ceiling refused. */
+    CHECK_EQ(c.confidence_fallback(), 3);
+    DraftController z;
+    DraftController::Params zp;
+    zp.max_depth = 6;
+    zp.confidence = true;
+    zp.conf_fallback = 0;
+    CHECK_OK(z.configure(zp));
+    CHECK_EQ(z.confidence_fallback(), 6);
+    zp.conf_fallback = 7;
+    CHECK_EQ(z.configure(zp), RAD_E_INVAL);
+
+    /* Off, nothing: the configured depth stands. A floor above the ceiling is refused. */
+    DraftController off;
+    DraftController::Params q;
+    q.max_depth = 6;
+    CHECK_OK(off.configure(q));
+    CHECK(!off.confidence());
+    CHECK_EQ(off.confidence_window(all, 6), 0);
+    DraftController bad;
+    p.conf_floor = 7;
+    CHECK_EQ(bad.configure(p), RAD_E_INVAL);
+    CHECK(!bad.confidence());
+}
+
+namespace {
+void use_confidence_window(Fixture& f) {
+    f.build();
+    f.cfg.n_spec         = 6;
+    f.cfg.draft_window   = DraftWindow::Confidence;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+}
+const auto every = [](const StepEntry& e) { return e.n_spec; };
+}  /* namespace */
+
+/* The direct path: the window a publication's q makes is the one the next cycle opens with, so the
+ * step built after it verifies that publication cut to it -- only ever shorter -- and the rounds
+ * after it draft into it. A publication holds what its window let the head draft, so E is at most
+ * that window and the rule at 1.25 grows a window by a quarter at most: 2, 3, 4, 5, 6. Before any
+ * q, and after a publication without q (a greedy request, coupling off), the fallback: 3. */
+TEST(a_confidence_window_follows_the_q_of_the_window_in_flight) {
+    Fixture f;
+    use_confidence_window(f);
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().confidence());
+    REQUIRE(f.sch.wants_draft_confidence());
+    CHECK(!f.sch.draft_confidence_on());   /* the policy needs q, not the diagnostic's file */
+
+    const uint64_t id = f.submit(160, 2048);
+    REQUIRE(id);
+    f.prefill(id);
+    const int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    const float lo[6] = { 0.3f, 0.2f, 0.2f, 0.2f, 0.2f, 0.2f };
+    const float hi[6] = { 1, 1, 1, 1, 1, 1 };
+    Scheduler::SerialRow rows[4];
+    /* One cycle: open it, run the rounds it allows, commit, publish `n` drafts with `q`. Returns
+     * the rounds and leaves the verified window in `verified`. */
+    int verified = -1;
+    auto cycle = [&](int n, const float* q) -> int {
+        const bool opened = f.sch.step() != nullptr;
+        CHECK(opened);
+        if (!opened) return -1;
+        verified = entry_of(f.sch, id)->n_spec;
+        int rounds = 6;
+        CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+        CHECK_OK(f.commit(11, 0, every));
+        f.sch.serial_end(rounds);
+        CHECK_OK(f.sch.set_draft(id, drafts, n));
+        if (q) CHECK_OK(f.sch.set_draft_confidence(id, q, q, n));
+        return rounds;
+    };
+
+    /* Nothing published yet: the fallback. Its three, low q (E 0.37): the floor, and the three
+     * published are verified cut to two. */
+    CHECK_EQ(cycle(6, lo), 3);
+    CHECK_EQ(verified, 0);
+    CHECK_EQ(cycle(6, hi), 2);
+    CHECK_EQ(verified, 2);
+    /* The publication holds the two that ran (set_draft cuts it), all of q 1: E 2, three. */
+    CHECK_EQ(cycle(6, hi), 3);
+    CHECK_EQ(verified, 2);
+    CHECK_EQ(cycle(6, hi), 4);
+    CHECK_EQ(verified, 3);
+    CHECK_EQ(cycle(6, hi), 5);
+    CHECK_EQ(cycle(6, lo), 6);              /* E 5: 6.25, the ceiling */
+    CHECK_EQ(verified, 5);
+    /* Low q on six: the floor, which on the direct path also cuts the verify of those six (the
+     * step is built after the cycle opens); then a publication without q: the fallback. */
+    CHECK_EQ(cycle(6, nullptr), 2);
+    CHECK_EQ(verified, 2);
+    CHECK_EQ(cycle(6, hi), 3);
+    CHECK_EQ(verified, 2);
+}
+
+/* At more than one decoding row the rule has no say: every row drafts the fallback whatever its q,
+ * so the head runs the fallback's rounds rather than the deepest window's. Back at one row the
+ * rule takes over from the q of the sequence's last publication. */
+TEST(a_batched_cycle_drafts_the_confidence_fallback) {
+    Fixture f;
+    use_confidence_window(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 2048), b = f.submit(170, 2048);
+    REQUIRE(a);
+    REQUIRE(b);
+    f.prefill(a);
+    f.prefill(b);
+    const int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    const float hi[6] = { 1, 1, 1, 1, 1, 1 };
+    const float lo[6] = { 0.3f, 0.2f, 0.2f, 0.2f, 0.2f, 0.2f };
+    Scheduler::SerialRow rows[4];
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(11, 0, every));
+    CHECK_OK(f.sch.set_draft(a, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(a, hi, hi, 6));
+    CHECK_OK(f.sch.set_draft(b, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(b, lo, lo, 6));
+
+    /* Two rows: both at three, though a's q asks for more and b's for less. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(entry_of(f.sch, a)->n_spec, 3);
+    CHECK_EQ(entry_of(f.sch, b)->n_spec, 3);
+    int rounds = 6;
+    REQUIRE_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 3);
+    CHECK_OK(f.commit(11, 0, every));
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, drafts, 3));
+    CHECK_OK(f.sch.set_draft_confidence(a, hi, hi, 3));
+
+    /* b leaves: one row, and a's window follows its q again (E 3 from its three: four). */
+    f.sch.cancel(b);
+    REQUIRE(f.sch.step() != nullptr);
+    rounds = 6;
+    REQUIRE_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 4);
+    CHECK_OK(f.commit(11, 0, every));
+    f.sch.serial_end(rounds);
+}
+
+/* The ahead path: the step issued ahead keeps the window it was built with, and the q published
+ * while it is in flight decides only the window drafted once it is promoted. Within a cycle the
+ * four sites agree although set_draft_confidence() runs inside it. */
+TEST(a_confidence_window_set_inside_a_cycle_waits_for_the_next_one) {
+    Fixture f;
+    use_confidence_window(f);
+    CHECK_OK(f.start());
+    const uint64_t id = f.submit(160, 2048);
+    REQUIRE(id);
+    f.prefill(id);
+    f.sch.find(id)->speculation_fixed = true;
+    const int32_t drafts[6] = { 21, 22, 23, 24, 25, 26 };
+    const float lo[6] = { 0.3f, 0.2f, 0.2f, 0.2f, 0.2f, 0.2f };
+    const float hi[6] = { 1, 1, 1, 1, 1, 1 };
+
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(id, lo, lo, 6));
+
+    /* The cycle opens at the floor; the rounds and expect_draft() read it. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(entry_of(f.sch, id)->n_spec, 2);
+    f.sch.expect_draft(id, 6);
+    /* The publication of what ran: a longer proposal is cut to the planned two, and its q (two
+     * drafts of q 1, E 2) is the next cycle's -- not this one's. */
+    CHECK_OK(f.sch.set_draft(id, drafts, 6));
+    CHECK_OK(f.sch.set_draft_confidence(id, hi, hi, 6));
+    const RadBatch* ahead = f.sch.step_next();
+    REQUIRE(ahead != nullptr);
+    CHECK_EQ(ahead->n_spec, 2);
+    CHECK_OK(f.commit(11, 0, every));
+    f.sch.promote_next();
+    REQUIRE(f.sch.plan().e.size() == 1);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 2);   /* built at two */
+
+    /* The promoted cycle reads E 2: three. */
+    Scheduler::SerialRow rows[4];
+    int rounds = 6;
+    REQUIRE_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 3);
+    f.sch.expect_draft(id, 6);
+    CHECK_OK(f.sch.set_draft(id, drafts, 3));
+    ahead = f.sch.step_next();
+    REQUIRE(ahead != nullptr);
+    CHECK_EQ(ahead->n_spec, 3);
+    CHECK_OK(f.commit(11, 0, every));
+    f.sch.serial_end(rounds);
+    f.sch.promote_next();
+    CHECK_OK(f.commit(11, 0, every));
+
+    /* The windows verified are counted per depth for the stop line. */
+    CHECK(f.sch.draft().verified_at(2) >= 2);
+    CHECK(f.sch.draft().verified_at(3) >= 1);
+}
+
+/* The rule without the window would parse and do nothing, and the window beside a cost plan would
+ * decide the same thing twice: both are refused at init. A block drafter has no q, so the window
+ * stays fixed (warned, not refused). */
+TEST(the_confidence_window_is_refused_where_it_cannot_decide) {
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_conf_rule_set = true;
+        CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f;
+        use_confidence_window(f);
+        f.cfg.draft_policy = DraftPolicyKind::Cost;
+        CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f;
+        use_confidence_window(f);
+        f.cfg.draft_conf_floor = 7;   /* above the ceiling of six */
+        f.cfg.draft_conf_rule_set = true;
+        CHECK_EQ(f.start(), RAD_E_INVAL);
+    }
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_conf_fallback_set = true;
+        CHECK_EQ(f.start(), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f;
+        use_confidence_window(f);
+        f.cfg.draft_conf_fallback = 7;
+        f.cfg.draft_conf_fallback_set = true;
+        CHECK_EQ(f.start(), RAD_E_INVAL);
+    }
+    {
+        Fixture f;
+        use_confidence_window(f);
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        CHECK_OK(f.start());
+        CHECK(!f.sch.draft().confidence());
+        CHECK(!f.sch.wants_draft_confidence());
+    }
+}

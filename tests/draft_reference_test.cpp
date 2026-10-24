@@ -80,10 +80,11 @@ DraftPolicyConfig cost_config(int n_tiers, std::initializer_list<int32_t> tiers)
     return c;
 }
 
-/* R: the deepest offered candidate is `tiers[n_tiers - 1]` (the ceiling here allows it). Tiers 2
- * and 3 are measured, 6 is not. Pre-R the policy prices what it can and issues a Cost plan at 3;
- * under R the missing depth is not a reason to run flatter, so the named baseline runs. */
-TEST(the_deepest_offered_candidate_unpriced_is_the_named_baseline) {
+/* R: the deepest offered candidate is `tiers[n_tiers - 1]` (the ceiling here allows it). Tiers 0, 2
+ * and 3 are measured, 6 is not. The missing deepest price is not evidence about the measured
+ * tiers, so they are still compared and the best of them is a Cost plan; only a cycle that prices
+ * no tier at all runs the named baseline. */
+TEST(the_deepest_offered_candidate_unpriced_leaves_the_priced_tiers_compared) {
     Cycle c(cost_config(5, { 0, 2, 3, 4, 6 }));
     c.pred.a = 0.95f;
     c.add(0, 1);
@@ -91,11 +92,20 @@ TEST(the_deepest_offered_candidate_unpriced_is_the_named_baseline) {
     c.measure_only({ 0, 2, 3 });
 
     CHECK_EQ(c.choose(), RAD_OK);
-    CHECK(c.f.plan.source == DraftPlanSource::Fallback);
-    CHECK(c.f.plan.fallback == DraftFallback::UnknownShape);
-    CHECK_EQ(c.f.plan.k[0], 1);   /* cfg.fallback_k, not the measured tier 3 */
-    CHECK_EQ(c.f.plan.k[1], 1);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK(c.f.plan.fallback == DraftFallback::None);
+    CHECK_EQ(c.f.plan.k[0], 3);   /* the measured tier 3, not cfg.fallback_k */
+    CHECK_EQ(c.f.plan.k[1], 3);
     CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
+
+    Cycle none(cost_config(5, { 0, 2, 3, 4, 6 }));
+    none.pred.a = 0.95f;
+    none.add(0, 1);
+    none.measure_only({ 1 });     /* priced, but not an offered tier */
+    CHECK_EQ(none.choose(), RAD_OK);
+    CHECK(none.f.plan.source == DraftPlanSource::Fallback);
+    CHECK(none.f.plan.fallback == DraftFallback::UnknownShape);
+    CHECK_EQ(none.f.plan.k[0], 1);   /* cfg.fallback_k */
 }
 
 /* The other side of R, and the state a reference calibration actually produces: one measured

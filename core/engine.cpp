@@ -1965,16 +1965,23 @@ int Engine::begin_draft_calibration() {
                 "profile and does not read one; pass only one of the two");
         return RAD_E_INVAL;
     }
-    /* The forced sequence is a measurement switch, never a serving one: it has a meaning only in
-     * the reference calibration (the depths it forces must be the ones the serving ladder offers,
-     * and only the cost policy has a ladder). Refused here, at startup, so no serving run can
-     * carry it and mistake a forced depth for a decision. */
-    if (cfg_.draft_calib_n > 0 &&
-        (cfg_.draft_policy != DraftPolicyKind::Cost || !cfg_.draft_reference)) {
-        RAD_ERR("--draft-calib-k needs --draft-policy cost and --draft-reference: it forces the "
-                "calibration's depths, and a serving run decides them by cost");
+    /* The forced sequence is a measurement switch, never a serving one: it needs an output path
+     * (above) and the cost policy, whose ladder the depths it forces must come from. Refused here,
+     * at startup, so no serving run can carry it and mistake a forced depth for a decision. With
+     * --draft-reference it measures the no-loan reference. Without it the run is a live
+     * diagnostic: lenders and expert moves run as they do in serving, so after the first move
+     * every bracket is placement-affected, and the export keeps those buckets with their
+     * `placement` flag (export_draft_cost_profile) -- a file to compare the live cost curve with,
+     * which no reader prices from. */
+    if (cfg_.draft_calib_n > 0 && cfg_.draft_policy != DraftPolicyKind::Cost) {
+        RAD_ERR("--draft-calib-k needs --draft-policy cost: it forces depths from the cost "
+                "policy's ladder, and a serving run decides them by cost");
         return RAD_E_INVAL;
     }
+    if (cfg_.draft_calib_n > 0 && !cfg_.draft_reference)
+        RAD_WARN("--draft-calib-k without --draft-reference: a live diagnostic calibration -- "
+                 "lenders and expert moves run as in serving, and the export keeps every "
+                 "placement-affected bucket with its flag, which no reader prices");
     const bool cost = cfg_.draft_policy == DraftPolicyKind::Cost;
     if (cfg_.kld()) {
         RAD_ERR("--draft-profile-out: the KL mode scores the trunk and drafts nothing, so it "
@@ -2070,10 +2077,23 @@ int Engine::export_draft_cost_profile() {
      * name. The file has no field that could name that residency, so those observations are left
      * out -- only the affected ones: a cycle before the change still measured the start plan and
      * stays. */
+    /* A live diagnostic (--draft-calib-k without --draft-reference) keeps them instead, flag and
+     * all: its point is the cost of the residency serving really runs, and the flag is what keeps
+     * any reader from pricing them. It still needs one measurement of normal operation -- a
+     * bucket whose only disturbance is the placement -- or it is a file of diagnostics too. */
+    const bool live_diag = cfg_.draft_calib_n > 0 && !cfg_.draft_reference;
     int32_t placement = 0;
     int32_t usable = 0;
     for (const DraftCostBucket& b : sched_.draft_costs().buckets()) {
-        if (b.flags & kDraftSamplePlacement) { ++placement; continue; }
+        if (b.flags & kDraftSamplePlacement) {
+            ++placement;
+            if (!live_diag) continue;
+            DraftCostBucket settled = b;
+            settled.flags = (uint16_t)(settled.flags & ~kDraftSamplePlacement);
+            if (draft_bucket_usable(settled)) ++usable;
+            p.buckets.push_back(b);
+            continue;
+        }
         if (draft_bucket_usable(b)) ++usable;
         p.buckets.push_back(b);
     }
@@ -2114,7 +2134,11 @@ int Engine::export_draft_cost_profile() {
     if (skipped > 0)
         RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
                  "their flag)", skipped);
-    if (placement > 0)
+    if (placement > 0 && live_diag)
+        RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) kept with their flag (a "
+                 "live diagnostic: they measured the residency serving runs, and no reader "
+                 "prices from them)", (int)placement);
+    else if (placement > 0)
         RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) left out (a placement "
                  "change inside the bracket: a mover move or a staged prefill pass; the "
                  "fingerprint names the plan, not the residency the bracket ran under)",
@@ -2424,6 +2448,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * engine's status. A run the step loop aborted measured nothing a profile could stand on, so
      * it writes no file. The step-loop error still wins when both are non-zero. */
     const int ls = loop_status_.load(std::memory_order_acquire);
+    /* A diagnostic: its failure is logged, never the run's status. */
+    (void)sched_.write_draft_confidence();
+    sched_.report_draft_window();
     const int xrc = ls < 0 ? RAD_OK : export_draft_cost_profile();
     if (ls < 0) return ls;
     if (xrc != RAD_OK) return xrc;

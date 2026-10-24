@@ -36,6 +36,20 @@
  * shape is not in its own estimate, and a depth change under issue_ahead() is priced on the verify
  * window until the shared contract carries both (see the cost request in the issue).
  *
+ * Execution price and horizon score are two numbers. The execution price is the shape above --
+ * candidate drafts, frozen verify -- and is what the plan reports as its own (last_price().ms). The
+ * candidate's yield E(K) is not earned in that pass: it is verified by the next one. Ranking
+ * E(K) against the frozen window's cost let an inferior depth hold itself (each cycle's price
+ * carried the window it froze), so candidates are ranked by a horizon score: E(K) over the price of
+ * the stationary shape that verifies K -- the same shape with every row's verify window set to its
+ * own k (one cycle ahead, assuming the next cycle keeps K; prefill and the other dimensions as
+ * this cycle's). At pipeline_depth 0, and wherever the candidate equals the frozen window, the two
+ * shapes are one and one estimate is asked. A candidate is scored only when both shapes have their
+ * own exact price: a missing stationary price is never stood in for by the execution price (nor
+ * the other way round), whether the verify window steps up or down, so such a candidate is not
+ * scored -- and as the deepest gate that is the named baseline. No price is invented for a shape
+ * the step will not run, nor for one the ranking divides by.
+ *
  * The priced shape is written down, not left at its defaults. `history_tokens` is the history the
  * paired step owes per row (one row for the verified token plus one per draft it verifies, the
  * serial head's rule), `prefill_tokens` comes from the view, `drafter` names what is loaded. The
@@ -48,8 +62,12 @@
  * "policy K0 with history", and the n-gram fallback is a drafter too, barred where `k[]` is 0.
  *
  * No allocation per candidate: every candidate is written into the caller's `out->k`, and every
- * evaluation is one call to the cost model's `estimate`. The frozen window is reserved at
- * configure(), or grown once on the first cycle when the caller did not size it.
+ * evaluation is one call to the cost model's `estimate`. A candidate whose horizon shape differs
+ * from its execution shape needs two of `max_evals` and is not priced at all when fewer remain.
+ * The search past the deepest gate leaves three such prices of `max_evals` to the calls after it
+ * (the cut's re-price, the incumbent, the issued plan's own price); see `max_evals`. The frozen
+ * window is reserved at configure(), or grown once on the first cycle when the caller did not
+ * size it.
  */
 #pragma once
 #include "draft_types.h"
@@ -78,13 +96,25 @@ struct DraftPolicyConfig {
     int32_t tiers[RAD_DRAFT_MAX_TIERS] = { 0, 2, 3, 4, 6 };
     int32_t n_tiers = 5;
     /* A raise needs this much more yield and this many cycles since the last move. Reductions
-     * happen at once. Both are starting values (the issue's 2%/eight steps). The hold is on the
-     * plan's deepest K: a reallocation of drafts below it is judged by the model's price for the
-     * whole shape, and a per-request hold would need identity-keyed state in the policy. */
+     * happen at once unless `hold_reductions`. Both are starting values (the issue's 2%/eight
+     * steps). The hold is on the incumbent depth (the deepest K the policy last chose, not one a
+     * row's own cap forced): a reallocation of drafts below it is judged by the model's price for
+     * the whole shape, and a per-request hold would need identity-keyed state in the policy. */
     double  hyst = 0.02;
     int32_t hold = 8;
+    /* --draft-hysteresis both: a reduction waits for the same hold and margin a raise does,
+     * against the incumbent's own assignment (every row at min(incumbent, its cap)), as the
+     * adaptive window does both ways. Not held up: a reduction the rows' own caps force, the
+     * resource cut, and a reduction from an incumbent with no price of its own. Off: reductions
+     * happen at once. */
+    bool    hold_reductions = false;
     /* Deterministic coordinate passes over the requests, and the whole cycle's estimate call
-     * budget. The budget bounds a large batch's per-cycle host time. */
+     * budget. The budget bounds a large batch's per-cycle host time. The deepest gate may spend all
+     * of it; the other alternatives stop 6 calls short (3 at pipeline_depth 0), kept for the
+     * cut's re-price, the incumbent and the issued price. Below 2 + 6 a pipelined cycle compares
+     * no alternative to the deepest tier; below 2 (or 1 at depth 0) it prices nothing and takes
+     * the named baseline. A call the budget cannot cover is unpriced: the cut plan is a Resources
+     * fallback, a raise is refused, last_price() is invalid. */
     int32_t passes = 2;
     int32_t max_evals = 136;
     /* --draft-calib-k: a fixed sequence of depths, one per non-empty cycle, taken in the order
@@ -103,8 +133,9 @@ struct DraftPolicyConfig {
 struct DraftTierPrice {
     int32_t k         = 0;
     bool    valid     = false;
-    double  ms        = 0.0;
+    double  ms        = 0.0;   /* the execution price: the shape this cycle's step runs */
     double  unc_ms    = 0.0;
+    double  horizon_ms = 0.0;  /* the cost the ranking divided E(K) by (see the header) */
 };
 
 class DraftPlanner {
@@ -125,7 +156,8 @@ public:
         return static_cast<DraftPlanner*>(ctx)->choose(view, pred, costs, out);
     }
 
-    /* The last chosen `max_k`; for tests and logs. */
+    /* The hysteresis incumbent: the last chosen `max_k`, kept across a cycle that only the rows'
+     * own caps reduced. For tests and logs; the issued depth is the plan's `max_k`. */
     int32_t last_k() const { return last_k_; }
 
     /* How many of the ladder's depths the last choose() found a price for: the deepest offered
@@ -134,7 +166,7 @@ public:
      * ledger -- a Cost plan at the deep tier alone does not show whether the shallow one lost or
      * was never priced. A search metric, not an output one: a resource cut or the hysteresis can
      * change the issued depth afterwards without changing how many depths the search weighed, so
-     * read the issued depth from last_k() and its own price from last_price(). Reset to 0 by
+     * read the issued depth from the plan's `max_k` and its own price from last_price(). Reset to 0 by
      * reset() and by a plan that is not a Cost decision. */
     int32_t last_tiers_priced() const { return last_tiers_priced_; }
 
@@ -168,19 +200,22 @@ public:
     void remember_published(uint64_t req_id, int32_t slot, uint32_t slot_gen, int32_t k);
 
 private:
-    /* One candidate assignment's expected tokens and price. `valid` false: nothing to compare. */
+    /* One candidate assignment's expected tokens, execution price (`ms`, `unc`) and horizon cost
+     * (`hms`); the score is yield / hms. `valid` false: nothing to compare. */
     struct Priced {
         double yield = 0.0;
         double ms = 0.0;
         double unc = 0.0;
+        double hms = 0.0;
         bool   valid = false;
     };
 
-    /* Price the assignment in `k[]`, with every k clamped to `clamp_to` first when that is >= 0.
-     * Returns RAD_OK, or the model's negative error. */
+    /* Price the assignment in `k[]`, with every k clamped to `clamp_to` first when that is >= 0:
+     * its stationary horizon shape (when it differs), then its execution shape. Both must fit
+     * under `limit` evaluations or neither is asked. Returns RAD_OK, or the model's negative error. */
     int  price(const DraftBatchView& view, const DraftPredictions& pred,
-               const DraftCostModel& costs, const int32_t* k, int32_t clamp_to, int* evals,
-               Priced* out) const;
+               const DraftCostModel& costs, const int32_t* k, int32_t clamp_to, int limit,
+               int* evals, Priced* out) const;
     /* E(K) for request i: 1 + the sum of prefix survival probabilities, capped by its remaining
      * output. */
     static double expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k);
@@ -200,16 +235,16 @@ private:
     /* The shape assignment `k[]` verifies (clamped to `clamp_to` when that is >= 0), with the
      * history the paired step owes and the drafter that is loaded. A row's verify is
      * verify_k_of(): the frozen plan's window, re-capped to this candidate's K on the direct
-     * path only. */
+     * path only. `horizon` instead verifies every row at its own k: the stationary shape. */
     void    shape_of(const DraftBatchView& view, const int32_t* k, int32_t clamp_to,
-                     DraftVerifyShape* s) const;
+                     DraftVerifyShape* s, bool horizon = false) const;
     void    remember(const DraftBatchView& view, const int32_t* k);
     /* This view's rows' identity in the frozen storage, growing it only when configure() did not
      * size it; every caller then fills fr_k_ itself. */
     void    fit_frozen(const DraftBatchView& view);
 
     DraftPolicyConfig c_{};
-    int32_t last_k_ = 0;     /* the previous cycle's depth; 0 until one was chosen */
+    int32_t last_k_ = 0;     /* the hysteresis incumbent; 0 until one was chosen */
     int32_t held_   = 0;     /* cycles since it last moved */
     bool    chosen_ = false;
     /* The calibration sequence's position. It advances only on a cycle that has rows: an empty
@@ -234,6 +269,9 @@ private:
     std::vector<uint32_t> fr_gen_;
     std::vector<int32_t>  fr_k_;
     size_t                fr_n_ = 0;
+    /* The incumbent's own assignment a held reduction is priced against (hold_reductions);
+     * reserved with the frozen window, grown on first use otherwise. */
+    std::vector<int32_t>  held_k_;
 };
 
 }  /* namespace rad */

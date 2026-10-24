@@ -446,6 +446,186 @@ TEST(a_raise_is_taken_once_the_hold_has_passed) {
     CHECK_EQ(c.f.plan.k[0], 6);
 }
 
+/* A reference's single-row play buckets, (k,k) at context class 0, as a TP2 no-loan calibration
+ * left them: means and the bucket's `unc`, the largest deviation one sample showed. The well
+ * measured buckets carry the widest `unc` (n is 1034..2003 behind each of these). */
+namespace {
+const double kRefMs[7]  = { 15.701, 21.057, 25.713, 30.348, 34.376, 39.616, 44.415 };
+const double kRefUnc[7] = { 3.566, 5.929, 6.640, 29.420, 8.914, 158.719, 12.013 };
+int reference_estimate(void*, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    *out = DraftCostEstimate{};
+    if (s.n_rows != 1 || s.verify_k < 0 || s.verify_k > 6) return RAD_OK;
+    out->ms = kRefMs[s.verify_k];
+    out->unc_ms = kRefUnc[s.verify_k];
+    out->coverage = 1000;
+    out->source = DraftCostSource::Measured;
+    out->valid = true;
+    return RAD_OK;
+}
+}  /* namespace */
+
+/* A reduction is not permanent. Prose-like acceptance takes the plan from K4 to K2 at once; when
+ * code-like acceptance returns, K4 is back once the hold has passed. Scoring the raise on
+ * `ms + unc` refused it forever: 3.935 / (34.376 + 8.914) is under K2's 2.654 / 25.713 * 1.02 at
+ * any acceptance this text has, and that is how a BetterBench run stayed shallow after its first
+ * category. Pipeline depth 0, so the executed and the stationary shape are the same (k,k). */
+TEST(a_reduction_is_not_permanent_when_the_deeper_bucket_is_well_measured) {
+    DraftPolicyConfig cfg = cost_config();
+    for (int32_t t = 0; t <= 6; ++t) cfg.tiers[t] = t;
+    cfg.n_tiers = 7;
+    cfg.fallback_k = 6;
+    Cycle c(6, cfg);
+    c.add(0, 1, 10000);
+    const DraftCostModel model{ nullptr, reference_estimate };
+    const auto accept = [&](float a) {
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = a;
+    };
+
+    accept(0.88f);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 4);   /* 3.935 / 34.376 beats K5's 4.463 / 39.616 */
+
+    accept(0.68f);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 2);   /* a reduction is immediate */
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+
+    /* Code-like again: the hold still applies, a raise waits for it ... */
+    accept(0.88f);
+    for (int32_t n = 1; n < cfg.hold; ++n) {
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        CHECK_EQ(c.f.plan.max_k, 2);
+    }
+    /* ... and is then taken, although (4,4) carries 8.9 ms of `unc`. */
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 4);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.planner.last_k(), 4);
+
+    /* The margin still applies: at a = .93 K6 is the best depth, but only 1.3% over K4, so the
+     * plan stays at K4 however long it holds ... */
+    accept(0.93f);
+    for (int n = 0; n < 3 * cfg.hold; ++n) {
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        CHECK_EQ(c.f.plan.max_k, 4);
+    }
+    /* ... and at a = .95 it is 3.2% over K4, past the margin, with the hold long spent. */
+    accept(0.95f);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);
+}
+
+/* The same reference, with one depth's buckets taken away on request. */
+namespace {
+struct ReferenceWithout {
+    int32_t missing = -1;   /* the verify depth that has no bucket; -1: none */
+};
+int reference_without(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    if (s.verify_k == static_cast<const ReferenceWithout*>(ctx)->missing) {
+        *out = DraftCostEstimate{};
+        return RAD_OK;
+    }
+    return reference_estimate(nullptr, s, out);
+}
+DraftPolicyConfig held_reductions_config() {
+    DraftPolicyConfig cfg = cost_config();
+    for (int32_t t = 0; t <= 6; ++t) cfg.tiers[t] = t;
+    cfg.n_tiers = 7;
+    cfg.fallback_k = 6;
+    cfg.hold_reductions = true;
+    return cfg;
+}
+}  /* namespace */
+
+/* --draft-hysteresis both: a reduction waits for the hold and the margin a raise needs. A dip of
+ * the estimate no longer takes the depth down at once, so it cannot hold the plan under the
+ * depth its mean asks for while the raise back waits out its own hold. */
+TEST(with_held_reductions_a_reduction_waits_for_the_hold_and_the_margin) {
+    const DraftPolicyConfig cfg = held_reductions_config();
+    Cycle c(6, cfg);
+    c.add(0, 1, 10000);
+    const DraftCostModel model{ nullptr, reference_estimate };
+    const auto accept = [&](float a) {
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = a;
+    };
+    const auto choose = [&]() {
+        CHECK_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        return c.f.plan.max_k;
+    };
+
+    accept(0.88f);
+    CHECK_EQ(choose(), 4);   /* the first choice is free */
+
+    /* Prose-like: K2 is 7.2% ahead of K4, and still waits out the hold. */
+    accept(0.68f);
+    for (int32_t n = 1; n < cfg.hold; ++n) {
+        CHECK_EQ(choose(), 4);
+        CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    }
+    CHECK_EQ(choose(), 2);
+    CHECK_EQ(c.planner.last_k(), 2);
+
+    /* The raise back waits the same way. */
+    accept(0.88f);
+    for (int32_t n = 1; n < cfg.hold; ++n) CHECK_EQ(choose(), 2);
+    CHECK_EQ(choose(), 4);
+
+    /* Under the margin a reduction is refused however long the hold: at a = .78 K3 is the best
+     * depth, 0.3% ahead of K4 (2.863 / 30.348 against 3.233 / 34.376). */
+    accept(0.78f);
+    for (int n = 0; n < 3 * cfg.hold; ++n) CHECK_EQ(choose(), 4);
+    /* At a = .70 K2 is 5.6% ahead, and with the hold long spent it is taken at once. */
+    accept(0.70f);
+    CHECK_EQ(choose(), 2);
+}
+
+/* What a held reduction does not hold up: a row its own remaining output caps, the resource cut,
+ * and an incumbent the model can no longer price. */
+TEST(with_held_reductions_caps_cuts_and_an_unpriced_incumbent_still_act_at_once) {
+    const DraftPolicyConfig cfg = held_reductions_config();
+    ReferenceWithout ref;
+    const DraftCostModel model{ &ref, reference_without };
+
+    Cycle c(6, cfg);
+    const auto accept = [&](float a) {
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = a;
+    };
+    const auto choose = [&]() {
+        CHECK_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        return c.f.plan.max_k;
+    };
+    c.add(0, 1, 10000);
+    accept(0.88f);
+    CHECK_EQ(choose(), 4);
+
+    /* Two tokens left: the row's cap is one draft, within the hold, and the incumbent stays. */
+    c.add(0, 1, 2);
+    accept(0.88f);
+    CHECK_EQ(choose(), 1);
+    CHECK_EQ(c.planner.last_k(), 4);
+
+    /* A token budget of two drafts cuts the plan at once, within the hold. */
+    c.add(0, 2, 10000);
+    accept(0.88f);
+    c.f.view.token_budget = 2;
+    CHECK_EQ(choose(), 2);
+    CHECK(c.f.plan.why[0] == DraftFallback::Resources);
+    c.f.view.token_budget = 0;
+
+    /* An incumbent the model cannot price is no reason to stay: with K4's buckets gone, K2 is
+     * taken at once although the hold has not passed. */
+    Cycle u(6, cfg);
+    u.add(0, 1, 10000);
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) u.f.pred.seq[0].a[j] = 0.88f;
+    REQUIRE_EQ(u.planner.choose(u.f.view, u.f.pred, model, &u.f.plan), RAD_OK);
+    CHECK_EQ(u.f.plan.max_k, 4);
+    ref.missing = 4;
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) u.f.pred.seq[0].a[j] = 0.70f;
+    REQUIRE_EQ(u.planner.choose(u.f.view, u.f.pred, model, &u.f.plan), RAD_OK);
+    CHECK_EQ(u.f.plan.max_k, 2);
+    CHECK(u.f.plan.source == DraftPlanSource::Cost);
+}
+
 TEST(the_controller_freezes_one_plan_per_cycle_and_keys_it_by_identity) {
     draft_fake::Fixture f;
     f.view.cycle_id = 41;
@@ -757,7 +937,7 @@ TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
     c.add(0, 1);
     c.costs.measured = true;
     c.costs.ms[2] = 2.9;
-    c.costs.ms[3] = 3.0;   /* K0 is never asked to price: the deepest is the coverage gate */
+    c.costs.ms[3] = 3.0;   /* K0 is asked and has no price */
     CHECK_EQ(c.choose(), RAD_OK);
     CHECK(c.f.plan.source == DraftPlanSource::Cost);
     REQUIRE(c.planner.last_price_known());
@@ -778,22 +958,24 @@ TEST(every_offered_tier_records_its_price_and_the_issued_plan_its_own) {
     CHECK(c.planner.last_price().valid);
     CHECK_NEAR(c.planner.last_price().ms, 3.0, 1e-9);
 
-    /* An unpriced deepest tier takes the named baseline: a search ran (`last_price_known`), the
-     * gate stopped it before any alternative was compared, and the issued plan's own estimate is
-     * invalid rather than zero. */
+    /* An unpriced deepest tier no longer stops the search: every tier is asked, the priced K2 is
+     * the Cost plan, and the trace keeps the deepest as invalid rather than zero. */
     Cycle u(3, cfg);
     u.pred.a = 0.95f;
     u.add(0, 1);
     u.costs.measured = true;
-    u.costs.ms[2] = 2.9;   /* a shallow price exists, and is not evidence for the deep gate */
+    u.costs.ms[2] = 2.9;   /* the only priced tier */
     CHECK_EQ(u.choose(), RAD_OK);
-    CHECK(u.f.plan.source == DraftPlanSource::Fallback);
+    CHECK(u.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(u.f.plan.max_k, 2);
     CHECK(u.planner.last_price_known());
-    REQUIRE_EQ(u.planner.last_n_tier_prices(), 1);   /* only the gate was asked */
-    CHECK_EQ(u.planner.last_tier_prices()[0].k, 3);
-    CHECK(!u.planner.last_tier_prices()[0].valid);
-    CHECK_EQ(u.planner.last_tiers_priced(), 0);
-    CHECK(!u.planner.last_price().valid);
+    REQUIRE_EQ(u.planner.last_n_tier_prices(), 3);
+    CHECK_EQ(u.planner.last_tier_prices()[2].k, 3);
+    CHECK(!u.planner.last_tier_prices()[2].valid);
+    CHECK(u.planner.last_tier_prices()[1].valid);
+    CHECK_EQ(u.planner.last_tiers_priced(), 1);
+    CHECK(u.planner.last_price().valid);
+    CHECK_NEAR(u.planner.last_price().ms, 2.9, 1e-9);
 
     /* A calibration prices nothing at all: empty list, and "no search ran" is a different fact
      * from "the search found no price". */
@@ -825,6 +1007,7 @@ TEST(the_price_lookup_asks_for_the_frozen_verify_window_and_the_cut_reprices_it)
     a_d.add(key_shape(4, 3, 0, 1), 9.0);
     a_d.add(key_shape(4, 3, 3, 1), 12.0);
     a_d.add(key_shape(4, 2, 3, 1), 11.0);   /* measured, and does not beat the deep window */
+    a_d.add(key_shape(4, 2, 2, 1), 11.0);   /* K2's own stationary horizon: 2.44 / 11 < 2.952 / 12 */
     a_d.build();
     ReferenceTable a_only;
     a_only.add(key_shape(4, 3, 3, 1), 12.0);
@@ -918,7 +1101,7 @@ TEST(an_upshift_and_a_pipeline_zero_cycle_keep_the_verify_window_they_had) {
     REQUIRE(up != nullptr);      /* frozen 2, candidate 3: the frozen window is still the bound */
     CHECK_EQ(up->verify_tokens, 12);
     CHECK_EQ(up->history_tokens, 12);
-    CHECK(spy.find(3, 3) == nullptr);
+    /* (3,3) is asked only as K3's stationary horizon, never as the window this step verifies. */
     CHECK(spy.find(2, 3) == nullptr);
     CHECK_EQ(f.plan.verify_k, 2);   /* the declared window is the frozen one, unchanged */
 
@@ -1129,6 +1312,471 @@ TEST(alternating_plans_are_read_per_request_and_never_mixed) {
     CHECK_EQ(dc.planned_k(104, 7, 1), p2->k[3]);
     CHECK_EQ(dc.planned_k(104, 7, 2), -1);   /* another generation of the slot is another request */
     CHECK_EQ(draft_plan_valid(*p2), RAD_OK);
+}
+
+/* A request that ends at max_tokens is capped to K1/K0 by its own remaining output. That is not a
+ * policy reduction: the next request must be planned at the incumbent depth again. Before the fix
+ * the cap became the hysteresis incumbent, and a fresh request's raise was priced against (K1,
+ * frozen 0) -- a shape no calibration runs -- so it was refused and every later request stayed
+ * shallow (BetterBench single-stream, all requests finishing on `length`). */
+TEST(a_request_capped_by_its_remaining_output_does_not_hold_the_next_request_shallow) {
+    DraftPolicyConfig cfg = cost_config(3);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    cfg.fallback_k = 3;
+
+    ReferenceTable t;   /* the single-row play buckets a K3,2,2,3 calibration leaves */
+    t.add(key_shape(1, 3, 0, 1), 17.75);
+    t.add(key_shape(1, 3, 3, 1), 15.5);
+    t.add(key_shape(1, 2, 3, 1), 14.0);
+    t.add(key_shape(1, 1, 3, 1), 13.0);
+    t.add(key_shape(1, 0, 2, 1), 11.0);
+    t.build();
+
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    pred.a = 0.8f;
+    f.view.k_ceiling = 3;
+    f.view.pipeline_depth = 1;
+    f.view.replay = DraftReplay::Play;
+    f.add(0, 1, 64);
+    draft_fake::predict(&pred, f.view, &f.pred);
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    const DraftCostModel model{ &t.t, &DraftCostTable::estimate_thunk };
+
+    CHECK_EQ(planner.choose(f.view, f.pred, model, &f.plan), RAD_OK);   /* frozen 0: (3,0) */
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK_EQ(planner.choose(f.view, f.pred, model, &f.plan), RAD_OK);   /* frozen 3: (3,3) */
+    CHECK_EQ(f.plan.max_k, 3);
+
+    /* Two tokens left: the row's cap is one draft, and the plan says so at once. */
+    f.add(0, 1, 2);
+    draft_fake::predict(&pred, f.view, &f.pred);
+    CHECK_EQ(planner.choose(f.view, f.pred, model, &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 1);
+    CHECK_EQ(planner.last_k(), 3);   /* the cap is not the incumbent */
+
+    /* The next request starts with no frozen window and drafts at the incumbent again. */
+    f.add(0, 2, 64);
+    draft_fake::predict(&pred, f.view, &f.pred);
+    for (int cycle = 0; cycle < 4; ++cycle) {
+        CHECK_EQ(planner.choose(f.view, f.pred, model, &f.plan), RAD_OK);
+        CHECK_EQ(f.plan.max_k, 3);
+        CHECK(f.plan.source == DraftPlanSource::Cost);
+    }
+}
+
+/* The horizon-score regression. Single-row ahead path, acceptance .5, ladder {3,6}, exact prices:
+ * K3 stationary (3,3) 153.61, K3 after a frozen K6 (3,6) 191.84, any K6 192.09. K3 is better at
+ * steady state (1.875/153.61 > 1.984375/192.09), but its first step down still pays the frozen K6
+ * verify. Ranking E(3) against that execution price kept K6 forever; the horizon score ranks it
+ * against the pass that verifies its own drafts. Prices the model lacks stay invalid. */
+namespace {
+int horizon_estimate(void*, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    *out = DraftCostEstimate{};
+    if (s.draft_k == 3 && s.verify_k == 3) out->ms = 153.61;
+    else if (s.draft_k == 3 && s.verify_k == 6) out->ms = 191.84;
+    else if (s.draft_k == 6) out->ms = 192.09;
+    else return RAD_OK;
+    out->valid = true;
+    out->coverage = 20;
+    out->source = DraftCostSource::Measured;
+    return RAD_OK;
+}
+DraftPolicyConfig horizon_config() {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 3; cfg.tiers[1] = 6; cfg.n_tiers = 2;
+    cfg.fallback_k = 6;
+    return cfg;
+}
+}  /* namespace */
+
+TEST(the_pipeline_score_does_not_lock_into_an_inferior_stationary_depth) {
+    Cycle c(6, horizon_config());
+    c.pred.a = 0.5f;
+    c.f.view.pipeline_depth = 1;
+    c.add(0, 1, 10000);
+    const DraftCostModel model{ nullptr, horizon_estimate };
+    CHECK(1.875 / 153.61 > 1.984375 / 192.09);
+
+    /* Cycle 1: nothing frozen, only K6 has an execution price (3,0 is not measured). */
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);
+    /* Cycle 2: K3 runs (3,6) now and is ranked on (3,3); the plan still declares the frozen 6 and
+     * reports the execution price it will run. */
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 3);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.f.plan.verify_k, 6);
+    CHECK_EQ(c.f.plan.history_tokens[0], 7);
+    CHECK_NEAR(c.planner.last_price().ms, 191.84, 1e-9);
+    CHECK_NEAR(c.planner.last_price().horizon_ms, 153.61, 1e-9);
+    CHECK_NEAR(c.planner.last_tier_prices()[1].ms, 192.09, 1e-9);
+    for (int n = 0; n < 30; ++n) {
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        CHECK_EQ(c.f.plan.max_k, 3);
+        CHECK_EQ(c.f.plan.verify_k, 3);
+    }
+}
+
+/* Pipeline 0: the step verifies what this cycle drafts, so the execution shape is the horizon
+ * shape and exactly one estimate is asked per candidate. */
+TEST(at_pipeline_zero_the_horizon_is_the_execution_shape) {
+    Cycle c(6, horizon_config());
+    c.pred.a = 0.5f;
+    c.add(0, 1, 10000);
+    ShapeLog log;
+    const DraftCostModel model{ &log, log_estimate };
+    for (int n = 0; n < 3; ++n) {
+        log.n = 0;
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        for (int i = 0; i < log.n; ++i) CHECK_EQ(log.shape[i].verify_k, log.shape[i].draft_k);
+        CHECK_NEAR(c.planner.last_price().horizon_ms, c.planner.last_price().ms, 1e-12);
+    }
+}
+
+/* A missing stationary price is never substituted. A step down after a frozen K3 runs (2,3), and
+ * that execution price is no stand-in for the missing (2,2) -- substituted, K2 would win here
+ * (5.56 / 9.5 against 5.67 / 12.0). So K2 is not scored and K3 stays. A step up without its own
+ * (3,3) is not scored either, and as the deepest gate that is the named baseline. */
+TEST(a_missing_stationary_price_is_never_substituted) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0] = 2; cfg.tiers[1] = 3; cfg.n_tiers = 2;
+    cfg.fallback_k = 3;
+
+    ReferenceTable t;   /* no (2,2) stationary bucket for the step down */
+    t.add(key_shape(4, 3, 0, 1), 9.0);
+    t.add(key_shape(4, 3, 3, 1), 12.0);
+    t.add(key_shape(4, 2, 3, 1), 9.5);
+    t.build();
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    pred.a = 0.3f;   /* K2 would beat K3 on the execution price */
+    four_rows(&f, &pred, /*depth=*/1);
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    SpiedTable spy;
+    CHECK(4 * (1 + .3 + .09) / 9.5 > 4 * (1 + .3 + .09 + .027) / 12.0);
+
+    spy.reset(&t.t);
+    REQUIRE_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 3);
+    CHECK(spy.find(3, 3) != nullptr);   /* (3,0) runs, (3,3) scores it */
+
+    for (int n = 0; n < 3; ++n) {
+        spy.reset(&t.t);
+        REQUIRE_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+        CHECK(spy.find(2, 2) != nullptr);   /* asked, and not measured */
+        CHECK(spy.find(2, 3) != nullptr);   /* measured, and not a score */
+        CHECK(!planner.last_tier_prices()[0].valid);
+        CHECK_EQ(f.plan.max_k, 3);
+        CHECK(f.plan.source == DraftPlanSource::Cost);
+        CHECK_NEAR(planner.last_price().ms, 12.0, 1e-9);
+        CHECK_NEAR(planner.last_price().horizon_ms, 12.0, 1e-9);
+    }
+
+    /* With (3,2) measured but (3,3) gone, the execution price alone is not a score for a raise. */
+    ReferenceTable up;
+    up.add(key_shape(4, 3, 2, 1), 10.0);
+    up.build();
+    DraftPlanner p2;
+    REQUIRE_EQ(p2.configure(cfg), RAD_OK);
+    p2.remember_published(1, 0, 1, 2);
+    p2.remember_published(2, 1, 1, 2);
+    p2.remember_published(3, 2, 1, 2);
+    p2.remember_published(4, 3, 1, 2);
+    spy.reset(&up.t);
+    REQUIRE_EQ(p2.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK(spy.find(3, 2) != nullptr);
+    CHECK(spy.find(3, 3) != nullptr);
+    CHECK(f.plan.source == DraftPlanSource::Fallback);
+    CHECK(!p2.last_tier_prices()[0].valid);
+}
+
+/* A row capped by its remaining output: both shapes use the capped K, so the horizon of a K1 row
+ * after a frozen K3 is (1,1), and its yield is the capped one. */
+TEST(a_short_row_is_scored_on_its_capped_stationary_shape) {
+    DraftPolicyConfig cfg = cost_config(3);
+    cfg.tiers[0] = 0; cfg.tiers[1] = 2; cfg.tiers[2] = 3; cfg.n_tiers = 3;
+    ReferenceTable t;
+    t.add(key_shape(1, 3, 0, 1), 17.75);
+    t.add(key_shape(1, 3, 3, 1), 15.5);
+    t.add(key_shape(1, 1, 3, 1), 13.0);
+    t.add(key_shape(1, 1, 1, 1), 11.0);
+    t.build();
+    draft_fake::Fixture f;
+    draft_fake::Predictor pred;
+    f.view.k_ceiling = 3;
+    f.view.pipeline_depth = 1;
+    f.view.replay = DraftReplay::Play;
+    f.add(0, 1, 64);
+    draft_fake::predict(&pred, f.view, &f.pred);
+    DraftPlanner planner;
+    REQUIRE_EQ(planner.configure(cfg), RAD_OK);
+    SpiedTable spy;
+    spy.reset(&t.t);
+    REQUIRE_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 3);
+
+    f.add(0, 1, 2);   /* cap 1 */
+    draft_fake::predict(&pred, f.view, &f.pred);
+    spy.reset(&t.t);
+    REQUIRE_EQ(planner.choose(f.view, f.pred, spy.model(), &f.plan), RAD_OK);
+    CHECK_EQ(f.plan.max_k, 1);
+    CHECK_EQ(f.plan.verify_k, 3);
+    CHECK(spy.find(1, 1) != nullptr);
+    CHECK(spy.find(3, 3) == nullptr);   /* never the uncapped stationary shape */
+    CHECK_NEAR(planner.last_price().ms, 13.0, 1e-9);
+    CHECK_NEAR(planner.last_price().horizon_ms, 11.0, 1e-9);
+}
+
+/* Mixed rows: an old row frozen at K6 and a new one with no frozen window. The horizon shape is
+ * per row -- each verifies its own K -- while the plan keeps the executed (6, 0) window. A model
+ * that has no stationary price for the pair leaves the candidate unscored, so the gate falls back
+ * instead of scoring the cheaper execution pass. */
+namespace {
+struct MixedModel {
+    ShapeLog log;
+    bool stationary = true;   /* false: every shape whose rows all verify their drafts is missing */
+};
+int mixed_estimate(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    auto* m = static_cast<MixedModel*>(ctx);
+    if (m->log.n < ShapeLog::kMax) m->log.shape[m->log.n++] = s;
+    *out = DraftCostEstimate{};
+    if (!m->stationary && s.n_rows == 2 && s.rows[1] == 2 && s.draft_k == s.verify_k)
+        return RAD_OK;
+    out->ms = 10.0 + 0.5 * s.verify_tokens + 0.1 * s.draft_k;
+    out->valid = true;
+    out->coverage = 8;
+    out->source = DraftCostSource::Measured;
+    return RAD_OK;
+}
+}  /* namespace */
+
+TEST(mixed_rows_are_scored_on_each_rows_own_stationary_window) {
+    for (int stationary = 1; stationary >= 0; --stationary) {
+        Cycle c(6, horizon_config());
+        c.pred.a = 0.9f;
+        c.f.view.pipeline_depth = 1;
+        c.add(0, 1, 10000);
+        MixedModel m;
+        const DraftCostModel model{ &m, mixed_estimate };
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        REQUIRE_EQ(c.f.plan.max_k, 6);
+
+        c.add(1, 2, 10000);   /* a new request beside the K6 one */
+        m.stationary = stationary != 0;
+        m.log.n = 0;
+        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+        bool exec_seen = false, horizon_seen = false;
+        for (int i = 0; i < m.log.n; ++i) {
+            const DraftVerifyShape& s = m.log.shape[i];
+            if (s.draft_k != 6 || s.draft_rows[6] != 2) continue;
+            if (s.verify_k == 6 && s.rows[1] == 1 && s.verify_tokens == 8) exec_seen = true;
+            if (s.verify_k == 6 && s.rows[1] == 2 && s.rows[6] == 2 && s.verify_tokens == 14 &&
+                s.history_tokens == 14)
+                horizon_seen = true;
+        }
+        CHECK(exec_seen);
+        CHECK(horizon_seen);
+        CHECK_EQ(c.f.plan.verify_k, 6);
+        CHECK_EQ(c.f.plan.history_tokens[0], 7);
+        CHECK_EQ(c.f.plan.history_tokens[1], 1);
+        if (stationary) {
+            CHECK(c.f.plan.source == DraftPlanSource::Cost);
+            CHECK(c.planner.last_price().horizon_ms > c.planner.last_price().ms);
+        } else {
+            CHECK(c.f.plan.source == DraftPlanSource::Fallback);
+            CHECK(!c.planner.last_tier_prices()[0].valid);
+        }
+    }
+}
+
+/* Mixed rows on a small budget. Every candidate's shapes differ (the new row has no frozen
+ * window), so each needs two lookups: it gets both or none, and the search leaves the incumbent
+ * and the issued price their lookups. Before, 10 calls went to the gate, K3 and both rows' K3
+ * moves, the incumbent took the last two and the issued plan was left unpriced. */
+namespace {
+bool stationary(const DraftVerifyShape& s) {
+    if (s.verify_k != s.draft_k) return false;
+    for (int32_t j = 1; j <= s.draft_k; ++j)
+        if (s.rows[j] != s.draft_rows[j]) return false;
+    return true;
+}
+/* Every lookup is a pair: the horizon, then the execution shape of the same drafts. */
+void check_pairs(const ShapeLog& log) {
+    CHECK_EQ(log.n % 2, 0);
+    for (int i = 0; i + 1 < log.n; i += 2) {
+        CHECK(stationary(log.shape[i]));
+        CHECK(!stationary(log.shape[i + 1]));
+        CHECK_EQ(log.shape[i].draft_k, log.shape[i + 1].draft_k);
+        for (int32_t j = 1; j <= log.shape[i].draft_k; ++j)
+            CHECK_EQ(log.shape[i].draft_rows[j], log.shape[i + 1].draft_rows[j]);
+    }
+}
+}  /* namespace */
+
+TEST(a_small_budget_prices_mixed_rows_whole_and_keeps_the_post_search_calls) {
+    DraftPolicyConfig cfg = horizon_config();
+    cfg.max_evals = 10;
+    cfg.hold = 0;
+    Cycle c(6, cfg);
+    c.pred.a = 0.3f;
+    c.f.view.pipeline_depth = 1;
+    c.add(0, 1, 10000);
+    MixedModel m;
+    const DraftCostModel model{ &m, mixed_estimate };
+
+    /* One row, nothing frozen: the gate and K3 (4 lookups), then the issued K3 (2). */
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    REQUIRE_EQ(c.f.plan.max_k, 3);
+    CHECK_EQ(m.log.n, 6);
+    check_pairs(m.log);
+
+    /* A new row beside it, and drafts that now pay: K6 wins and is raised over the K3 incumbent. */
+    c.pred.a = 0.9f;
+    c.add(1, 2, 10000);
+    m.log.n = 0;
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    check_pairs(m.log);
+    CHECK_EQ(m.log.n, 8);   /* gate, K3, incumbent, issued: the search stopped at 4 of 10 */
+    CHECK_EQ(c.f.plan.max_k, 6);   /* the incumbent was priced, so the raise could be judged */
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.planner.last_tiers_priced(), 2);
+    REQUIRE(c.planner.last_price().valid);
+    /* (6,(3,0)) runs: 10 + .5 * (4 + 1) + .6; (6,6)x2 scores it: 10 + .5 * 14 + .6. */
+    CHECK_NEAR(c.planner.last_price().ms, 13.1, 1e-9);
+    CHECK_NEAR(c.planner.last_price().horizon_ms, 17.6, 1e-9);
+    const DraftVerifyShape& last = m.log.shape[m.log.n - 1];   /* the issued execution shape */
+    CHECK_EQ(last.verify_k, 3);
+    CHECK_EQ(last.verify_tokens, 5);
+    CHECK_EQ(last.draft_k, 6);
+
+    /* Below one pair nothing is priced: the named baseline, and no lookup was half-spent. */
+    DraftPolicyConfig tiny = horizon_config();
+    tiny.max_evals = 1;
+    Cycle t(6, tiny);
+    t.f.view.pipeline_depth = 1;
+    t.add(0, 1, 10000);
+    MixedModel tm;
+    const DraftCostModel tmodel{ &tm, mixed_estimate };
+    REQUIRE_EQ(t.planner.choose(t.f.view, t.f.pred, tmodel, &t.f.plan), RAD_OK);
+    CHECK_EQ(tm.log.n, 0);
+    CHECK(t.f.plan.source == DraftPlanSource::Fallback);
+    CHECK(t.f.plan.fallback == DraftFallback::UnknownShape);
+
+    /* At pipeline depth 0 one lookup is a whole price: the gate decides, the issued price starves. */
+    Cycle z(6, tiny);
+    z.add(0, 1, 10000);
+    tm.log.n = 0;
+    REQUIRE_EQ(z.planner.choose(z.f.view, z.f.pred, tmodel, &z.f.plan), RAD_OK);
+    CHECK_EQ(tm.log.n, 1);
+    CHECK(z.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(z.f.plan.max_k, 6);
+    CHECK(!z.planner.last_price().valid);
+}
+
+/* Partial coverage at the deepest tier. The c8 trace ran a K0..K6 ladder whose stationary K6
+ * (6,6) bucket was missing for the cycle's shape (`tiers=[6:invalid]`): the old gate then issued
+ * the named K6 baseline although K0..K5 were priced. A missing deepest price is not evidence
+ * about the cheaper tiers, so the priced alternative is chosen as a Cost plan; only a cycle with
+ * no priced tier takes the baseline (still K6 here), and a priced K6 still wins on its score.
+ * Horizon prices are the trace's; an execution shape whose windows differ costs 10 ms more. */
+namespace {
+const double kTraceH[7] = { 58.722, 98.737, 129.659, 153.613, 162.620, 180.832, 192.095 };
+struct LadderModel {
+    bool deep = true;   /* false: the stationary (6,6) shape is missing */
+    bool any  = true;   /* false: nothing is priced */
+};
+int ladder_estimate(void* ctx, const DraftVerifyShape& s, DraftCostEstimate* out) {
+    const auto* m = static_cast<const LadderModel*>(ctx);
+    *out = DraftCostEstimate{};
+    if (!m->any || (!m->deep && s.draft_k == 6 && s.verify_k == 6)) return RAD_OK;
+    const int32_t hi = s.draft_k > s.verify_k ? s.draft_k : s.verify_k;
+    out->ms = kTraceH[hi] + (s.draft_k != s.verify_k ? 10.0 : 0.0);
+    out->valid = true;
+    out->coverage = 20;
+    out->source = DraftCostSource::Measured;
+    return RAD_OK;
+}
+DraftPolicyConfig ladder_config() {
+    DraftPolicyConfig cfg = cost_config(6);
+    for (int32_t t = 0; t <= 6; ++t) cfg.tiers[t] = t;
+    cfg.n_tiers = 7;
+    cfg.fallback_k = 6;   /* the scheduler's exec_depth baseline */
+    return cfg;
+}
+}  /* namespace */
+
+TEST(a_missing_deepest_price_does_not_discard_the_priced_cheaper_tiers) {
+    for (int32_t depth = 0; depth <= 1; ++depth) {
+        /* a=.9: K6 (5.217/192.095) beats K5 (4.686/180.832), which beats every shallower tier. */
+        CHECK(5.217031 / 192.095 > 4.68559 / 180.832);
+        CHECK(4.68559 / 180.832 > 4.0951 / 162.620);
+
+        LadderModel m;
+        m.deep = false;
+        const DraftCostModel model{ &m, ladder_estimate };
+        Cycle c(6, ladder_config());
+        c.pred.a = 0.9f;
+        c.f.view.pipeline_depth = depth;
+        c.add(0, 1, 10000);
+        for (int n = 0; n < 4; ++n) {
+            REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+            CHECK(c.f.plan.source == DraftPlanSource::Cost);
+            CHECK(c.f.plan.fallback == DraftFallback::None);
+            CHECK_EQ(c.f.plan.max_k, 5);
+            CHECK_EQ(c.f.plan.k[0], 5);
+            CHECK_EQ(c.f.plan.verify_k, depth == 0 || n > 0 ? 5 : 0);
+            REQUIRE_EQ(c.planner.last_n_tier_prices(), 7);
+            CHECK(!c.planner.last_tier_prices()[6].valid);   /* asked, and not priced */
+            CHECK(c.planner.last_tier_prices()[5].valid);
+            CHECK_EQ(c.planner.last_tiers_priced(), 6);
+            REQUIRE(c.planner.last_price().valid);
+            CHECK_NEAR(c.planner.last_price().horizon_ms, 180.832, 1e-9);
+        }
+
+        /* The same partial coverage under a token budget: the cut still applies to the chosen
+         * tier and says so on the row; its own shape is priced, so it is still a Cost plan. */
+        Cycle b(6, ladder_config());
+        b.pred.a = 0.9f;
+        b.f.view.pipeline_depth = depth;
+        b.add(0, 1, 10000);
+        b.f.view.token_budget = 4;
+        REQUIRE_EQ(b.planner.choose(b.f.view, b.f.pred, model, &b.f.plan), RAD_OK);
+        CHECK_EQ(b.f.plan.k[0], 4);
+        CHECK(b.f.plan.why[0] == DraftFallback::Resources);
+        CHECK(b.f.plan.source == DraftPlanSource::Cost);
+
+        /* High acceptance with K6 priced: the deepest tier still wins. */
+        LadderModel full;
+        const DraftCostModel full_model{ &full, ladder_estimate };
+        Cycle h(6, ladder_config());
+        h.pred.a = 0.9f;
+        h.f.view.pipeline_depth = depth;
+        h.add(0, 1, 10000);
+        REQUIRE_EQ(h.planner.choose(h.f.view, h.f.pred, full_model, &h.f.plan), RAD_OK);
+        CHECK(h.f.plan.source == DraftPlanSource::Cost);
+        CHECK_EQ(h.f.plan.max_k, 6);
+        CHECK_EQ(h.planner.last_tiers_priced(), 7);
+
+        /* Nothing priced: the named baseline at fallback_k, every tier listed as unpriced. */
+        LadderModel none;
+        none.any = false;
+        const DraftCostModel none_model{ &none, ladder_estimate };
+        Cycle u(6, ladder_config());
+        u.pred.a = 0.9f;
+        u.f.view.pipeline_depth = depth;
+        u.add(0, 1, 10000);
+        REQUIRE_EQ(u.planner.choose(u.f.view, u.f.pred, none_model, &u.f.plan), RAD_OK);
+        CHECK(u.f.plan.source == DraftPlanSource::Fallback);
+        CHECK(u.f.plan.fallback == DraftFallback::UnknownShape);
+        CHECK_EQ(u.f.plan.k[0], 6);
+        CHECK_EQ(u.planner.last_tiers_priced(), 0);
+        REQUIRE_EQ(u.planner.last_n_tier_prices(), 7);
+        for (int32_t t = 0; t < 7; ++t) CHECK(!u.planner.last_tier_prices()[t].valid);
+        CHECK(!u.planner.last_price().valid);
+    }
 }
 
 RAD_TEST_MAIN()

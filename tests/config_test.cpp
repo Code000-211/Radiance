@@ -436,6 +436,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
         { "--draft-policy", { "cost" } }, { "--draft-depth-tiers", { "0,2" } },
+        { "--draft-hysteresis", { "both" } },
+        { "--draft-confidence-rule", { "1.25,0,2" } },
+        { "--draft-confidence-fallback", { "3" } },
         { "--draft-calib-k", { "3,2,2,3" } },
         { "--draft-profile", { "/p.json" } },
         { "--draft-profile-out", { "/out.json" } },
@@ -712,10 +715,10 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
-/* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
+/* --draft-window takes exactly three names; the default is kDraftWindowDefault, which the help text
  * also states. Whether the window can adapt (a serial drafter, depth above zero) is decided by the
  * scheduler with the program in hand, not the parser. */
-TEST(the_draft_window_is_fixed_or_adaptive) {
+TEST(the_draft_window_is_fixed_adaptive_or_confidence) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.draft_window == kDraftWindowDefault);
@@ -727,11 +730,50 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window", "adaptive", "--num-speculative-tokens", "6" }, &c), RAD_OK);
     CHECK(c.draft_window == DraftWindow::Adaptive);
     CHECK_EQ(c.n_spec, 6);
-    for (const char* bad : { "Adaptive", "auto", "dynamic", "1", "" })
+    CHECK_EQ(parse({ "--draft-window", "confidence" }, &c), RAD_OK);
+    CHECK(c.draft_window == DraftWindow::Confidence);
+    for (const char* bad : { "Adaptive", "auto", "dynamic", "1", "", "Confidence", "lag" })
         CHECK_EQ(parse({ "--draft-window", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+    CHECK_EQ(std::string(draft_window_name(DraftWindow::Confidence)), std::string("confidence"));
+}
+
+/* --draft-confidence-rule is SCALE,OFFSET,FLOOR: two numbers and a whole floor of at least 1. The
+ * default is the cross-validated rule; that it needs --draft-window confidence, and the floor
+ * against the ceiling, are the scheduler's checks. */
+TEST(the_draft_confidence_rule_is_scale_offset_and_floor) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_NEAR(d.draft_conf_scale, 1.25, 1e-6);
+    CHECK_NEAR(d.draft_conf_offset, 0.0, 1e-6);
+    CHECK_EQ(d.draft_conf_floor, 2);
+    CHECK(!d.draft_conf_rule_set);
+    Config c;
+    CHECK_EQ(parse({ "--draft-confidence-rule", "1.5,-0.5,1" }, &c), RAD_OK);
+    CHECK_NEAR(c.draft_conf_scale, 1.5, 1e-6);
+    CHECK_NEAR(c.draft_conf_offset, -0.5, 1e-6);
+    CHECK_EQ(c.draft_conf_floor, 1);
+    CHECK(c.draft_conf_rule_set);
+    for (const char* bad : { "1.25,0", "1.25,0,2,3", "a,0,2", "1,b,2", "1,0,2.5", "1,0,0", "-1,0,2",
+                             "", ",,", "1,,2" }) {
+        Config e;
+        CHECK_EQ(parse({ "--draft-confidence-rule", bad }, &e), RAD_E_INVAL);
+    }
+    CHECK_EQ(parse({ "--draft-confidence-rule" }, &c), RAD_E_INVAL);
+
+    /* --draft-confidence-fallback N: 3 by default, 0 the ceiling; the ceiling itself is the
+     * scheduler's check. */
+    CHECK_EQ(d.draft_conf_fallback, 3);
+    CHECK(!d.draft_conf_fallback_set);
+    CHECK_EQ(parse({ "--draft-confidence-fallback", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_conf_fallback, 0);
+    CHECK(c.draft_conf_fallback_set);
+    for (const char* bad : { "-1", "3.5", "x", "" }) {
+        Config e;
+        CHECK_EQ(parse({ "--draft-confidence-fallback", bad }, &e), RAD_E_INVAL);
+    }
 }
 
 /* --draft-policy takes exactly two names. Whether the deployment can run the cost policy (a serial
@@ -750,6 +792,22 @@ TEST(the_draft_policy_is_legacy_or_cost) {
     CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
+}
+
+/* --draft-hysteresis names which depth moves wait for the hold: raise (the default) or both.
+ * That it needs the cost policy is the scheduler's check, where the policy is known. */
+TEST(the_draft_hysteresis_is_raise_or_both) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_hold_reductions);
+    Config c;
+    CHECK_EQ(parse({ "--draft-hysteresis", "both" }, &c), RAD_OK);
+    CHECK(c.draft_hold_reductions);
+    CHECK_EQ(parse({ "--draft-hysteresis", "raise" }, &c), RAD_OK);
+    CHECK(!c.draft_hold_reductions);
+    for (const char* bad : { "Both", "symmetric", "down", "1", "" })
+        CHECK_EQ(parse({ "--draft-hysteresis", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-hysteresis" }, &c), RAD_E_INVAL);
 }
 
 /* --draft-depth-tiers is the cost policy's ladder: ascending, unique, at most kDraftMaxTiers.

@@ -62,6 +62,17 @@ int DraftPredictModel::configure(const Params& p, DraftPredictState* states, int
     return RAD_OK;
 }
 
+int DraftPredictModel::grow(DraftPredictState* states, int32_t cap) {
+    if (cap < cap_ || (cap > 0 && !states)) {
+        RAD_ERR("draft predictor: cannot grow %d slots to %d", (int)cap_, (int)cap);
+        return RAD_E_INVAL;
+    }
+    for (int32_t i = cap_; i < cap; ++i) start(states[i], 0, 0);
+    states_ = states;
+    cap_ = cap;
+    return RAD_OK;
+}
+
 void DraftPredictModel::start(DraftPredictState& s, uint64_t req_id, uint32_t slot_gen) const {
     s.req_id = req_id;
     s.slot_gen = slot_gen;

@@ -85,6 +85,10 @@ public:
      * prior; re-configuring the same table with the same estimate-shaping parameters keeps what
      * it learned, so a policy-version bump does not erase history or drop live cycles. */
     int configure(const Params& p, DraftPredictState* states, int32_t cap);
+    /* Rebinds to a larger table whose first old-cap entries the caller carried over (a vector
+     * resize does), so every learned history stays; only the new tail starts at the prior. A
+     * request slot indexes the scheduler's request table, which can outgrow max_seqs. */
+    int grow(DraftPredictState* states, int32_t cap);
     const Params& params() const { return p_; }
 
     /* DraftPredictFn: fills out->seq[] in view order, starting a recycled slot at the prior, and

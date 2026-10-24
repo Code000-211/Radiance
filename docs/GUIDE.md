@@ -1086,6 +1086,18 @@ head declines count in the acceptance metrics but do not move the window. At tem
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
+**Confidence window.** With `--draft-window confidence` a serial head under `RADIANCE_MTP_COUPLED`
+sets each sequence's next window from its own q(x) on the window the step in flight verifies:
+`ceil(SCALE * E + OFFSET)` clamped to `FLOOR..--num-speculative-tokens`, E the sum over j of
+q1*...*qj (`--draft-confidence-rule`, default `1.25,0,2`). The window drafted now cannot see its
+own q -- the next step is issued before the rounds are read back -- so the rule reads the window
+before it, whose acceptance is not known yet. A window grows by at most a quarter per step. The
+rule decides at one decoding row only: with more rows every sequence drafts
+`--draft-confidence-fallback` (default 3), because the head runs as many rounds as the deepest
+window and one deep sequence would make every row pay for them; a request without q (greedy
+sampling, coupling off) drafts it too. Not combined with `--draft-policy cost`; the stop line
+counts the windows verified per depth.
+
 ### 4.7 Multiple cards
 
 ```sh
@@ -1634,7 +1646,9 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only; `confidence` follows the head's q on the window in flight (§4.6) |
+| `--draft-confidence-rule S,O,F` | 1.25,0,2 | `--draft-window confidence`'s next window, `ceil(S * E + O)` clamped to `F..N`; refused without that window (§4.6) |
+| `--draft-confidence-fallback N` | 3 | `--draft-window confidence`'s window at more than one decoding row and without q; 0 is N; refused without that window (§4.6) |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**

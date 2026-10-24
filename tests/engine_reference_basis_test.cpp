@@ -309,10 +309,11 @@ TEST(a_reference_calibration_needs_an_output_path_and_the_cost_policy) {
     CHECK_EQ(EngineTestPeer::begin_calibration(c), RAD_E_STATE);
 }
 
-/* --draft-calib-k forces the depths of a measurement, so the engine refuses it outside the
- * reference calibration -- before anything starts, and whether or not a plan resolves, so a
- * serving run cannot carry it. The refusals run before the identity is derived, as above. */
-TEST(the_forced_calibration_sequence_is_refused_outside_a_reference_calibration) {
+/* --draft-calib-k forces the depths of a measurement, so the engine refuses it outside a cost
+ * calibration -- before anything starts, and whether or not a plan resolves, so a serving run
+ * cannot carry it. Without --draft-reference it is the live diagnostic. The refusals run before
+ * the identity is derived, as above. */
+TEST(the_forced_calibration_sequence_is_refused_outside_a_cost_calibration) {
     /* A serving run: no output path, so no calibration at all. */
     Config serving;
     serving.draft_calib_k[0] = 3;
@@ -322,17 +323,29 @@ TEST(the_forced_calibration_sequence_is_refused_outside_a_reference_calibration)
     CHECK_EQ(EngineTestPeer::begin_calibration(a), RAD_E_INVAL);
     CHECK(!EngineTestPeer::sched(a).draft_costs().active());
 
-    /* An output path alone is not enough: the sequence belongs to the reference run that measures
-     * the ladder, so a plain cost calibration is refused. */
-    Config no_reference;
-    no_reference.draft_calib_k[0]  = 3;
-    no_reference.draft_calib_k[1]  = 2;
-    no_reference.draft_calib_n     = 2;
-    no_reference.draft_profile_out = radtest::tmp_path("engine_calib_noref.json");
-    no_reference.draft_policy      = DraftPolicyKind::Cost;
-    Engine b(no_reference);
+    /* An output path alone is not enough: the sequence forces depths from the cost policy's
+     * ladder, so a legacy calibration is refused. */
+    Config legacy;
+    legacy.draft_calib_k[0]  = 3;
+    legacy.draft_calib_k[1]  = 2;
+    legacy.draft_calib_n     = 2;
+    legacy.draft_profile_out = radtest::tmp_path("engine_calib_legacy.json");
+    Engine b(legacy);
     CHECK_EQ(EngineTestPeer::begin_calibration(b), RAD_E_INVAL);
     CHECK(!EngineTestPeer::sched(b).draft_costs().active());
+
+    /* A cost calibration without --draft-reference is the live diagnostic: it passes this gate,
+     * and the refusal is then the deployment's, as below. */
+    Config live;
+    live.draft_calib_k[0]  = 3;
+    live.draft_calib_k[1]  = 2;
+    live.draft_calib_n     = 2;
+    live.draft_profile_out = radtest::tmp_path("engine_calib_live.json");
+    live.draft_policy      = DraftPolicyKind::Cost;
+    live.n_spec            = 6;
+    Engine d(live);
+    EngineTestPeer::drafter(d, serial_head(6));
+    CHECK_EQ(EngineTestPeer::begin_calibration(d), RAD_E_STATE);
 
     /* With both satisfied the flag passes this gate; the refusal is then the deployment's, exactly
      * as for any calibration with no resolved plan. */

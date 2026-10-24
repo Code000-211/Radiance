@@ -14,6 +14,7 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "draft_confidence.h"
 #include "draft_cost.h"
 #include "draft_predictor.h"
 #include "metrics.h"
@@ -52,6 +53,12 @@ struct SchedReq {
     int32_t  draft[RAD_SCHED_MAX_SPEC] = {};
     int32_t  n_draft = 0;
     int32_t  conv_cursor = 0;
+    /* RADIANCE_DRAFT_CONFIDENCE (draft_confidence.h): the head's q(x) and max q for the drafts of
+     * the publication standing in `draft`, from set_draft_confidence(); every set_draft() clears
+     * them, and the commit of the step that verifies the publication records and clears them. */
+    float    conf_q[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    float    conf_qmax[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    int32_t  conf_n = 0;
 
     /* A serial drafter's valid history: positions [0, draft_filled) of the head's own layer hold
      * K and V for the sequence's real tokens. Only the head writes that layer, so before drafting
@@ -73,6 +80,7 @@ struct SchedReq {
         n_draft      = 0;
         draft_next   = 0;
         conv_cursor  = 0;
+        conf_n       = 0;
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
@@ -81,6 +89,14 @@ struct SchedReq {
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
      * drafter_reset(): it describes the text, which preemption does not change. */
     DraftAdapt adapt;
+    /* The confidence window (--draft-window confidence, draft.h): the window in force for this
+     * cycle, taken when the cycle opens (draft_cycle) from `conf_window_next`, which the last
+     * publication's q set (set_draft_confidence) and every publication clears first (set_draft).
+     * 0 is the fallback depth, which a cycle with more than one decoding row also takes. Two
+     * fields so the four sites of one cycle read one window although the engine publishes the
+     * next window's q inside the cycle. */
+    int32_t    conf_window = 0;
+    int32_t    conf_window_next = 0;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
 
@@ -296,6 +312,21 @@ public:
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+
+    /* RADIANCE_DRAFT_CONFIDENCE (draft_confidence.h), a diagnostic that changes no plan: whether
+     * this run records; the head's q(x) and max q for each draft of the publication set_draft()
+     * just made (cut to what it kept); and, at stop, the records written to the path as TSV.
+     * init() reads the path from the environment; enable_draft_confidence() is the same for a
+     * test. */
+    bool     draft_confidence_on() const { return conf_on_; }
+    /* Whether the engine should hand the head's q to set_draft_confidence(): the diagnostic
+     * above, or --draft-window confidence, whose next window is made from it. */
+    bool     wants_draft_confidence() const { return conf_on_ || draft_.confidence(); }
+    /* At stop, under --draft-window confidence: one line with the windows verified per depth. */
+    void     report_draft_window() const;
+    void     enable_draft_confidence(const std::string& path);
+    int      set_draft_confidence(uint64_t id, const float* q, const float* q_max, int n);
+    int      write_draft_confidence();
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps
@@ -565,7 +596,8 @@ private:
 
     /* The window a sequence may draft into: the configured depth, or under the adaptive window
      * min(D, its stop) (DraftController::window_for, which starts the estimate on first use), or
-     * under the cost policy what this cycle's frozen plan assigns it. Every site that caps a
+     * under the cost policy what this cycle's frozen plan assigns it, or under the confidence
+     * window the one this cycle took from the q of the window in flight. Every site that caps a
      * proposal applies it: step(), set_draft(), expect_draft() and the rounds in serial_begin().
      * With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
@@ -577,7 +609,14 @@ private:
              * plan failed outright runs legacy. */
             return draft_.plan() ? 0 : draft_.next_depth();
         }
+        if (draft_.confidence())
+            return s.conf_window > 0 ? s.conf_window : draft_.confidence_fallback();
         return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+    }
+    /* A policy that gives each sequence its own window, which the rounds, expect_draft() and
+     * set_draft() cut to. */
+    bool per_seq_window() const {
+        return draft_.adaptive() || draft_.cost_policy() || draft_.confidence();
     }
 
     /* Whether the plan bars the n-gram fallback from this row (draft_plan_bars_fill). A row the
@@ -755,6 +794,14 @@ private:
                             DraftOrigin origin);
     void draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
                            uint64_t raw_match);
+    /* The confidence record of the head window this commit verified (draft_confidence.h). */
+    void draft_conf_report(SchedReq& s, const StepEntry& e, int32_t accepted, int32_t raw,
+                           int32_t rows);
+    bool                         conf_on_ = false;
+    std::string                  conf_path_;
+    std::vector<DraftConfRecord> conf_rec_;
+    int64_t                      conf_dropped_ = 0;   /* records past the bound, not kept */
+    int64_t                      conf_short_ = 0;     /* windows verified past their q */
     void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);
     void draft_ring_close(uint64_t cycle_id);
     /* Close every record still open, delivering the ones already fully measured and counting the

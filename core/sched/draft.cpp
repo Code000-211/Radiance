@@ -67,6 +67,28 @@ int DraftController::configure(const Params& p) {
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
                  "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
                  kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst, kHold);
+    conf_ = p.confidence && !p.adapt && p.max_depth > 0;
+    if (conf_) {
+        if (p_.conf_fallback < 0 || p_.conf_fallback > p_.max_depth) {
+            RAD_ERR("--draft-confidence-fallback %d: must be in 0..%d (the ceiling; 0 is the "
+                    "ceiling)", p_.conf_fallback, p_.max_depth);
+            conf_ = false;
+            return RAD_E_INVAL;
+        }
+        if (p_.conf_floor < 1 || p_.conf_floor > p_.max_depth || !(p_.conf_scale >= 0.0) ||
+            !std::isfinite(p_.conf_offset)) {
+            RAD_ERR("--draft-confidence-rule %g,%g,%d: the floor must be in 1..%d (the ceiling) "
+                    "and the scale >= 0", p_.conf_scale, p_.conf_offset, p_.conf_floor,
+                    p_.max_depth);
+            conf_ = false;
+            return RAD_E_INVAL;
+        }
+        RAD_INFO("draft depth: confidence, %d..%d; at one decoding row a sequence's next window is "
+                 "ceil(%g * E %+g), E the expected accepted drafts of its window in flight by the "
+                 "head's q; a cycle with more rows and a publication without q draft %d",
+                 p_.conf_floor, p_.max_depth, p_.conf_scale, p_.conf_offset,
+                 confidence_fallback());
+    }
 
     /* The cost policy's seam. It stays off unless a mode was asked for, and it is refused --
      * not silently mapped to legacy -- when either hook it chooses from is missing. */
@@ -163,7 +185,23 @@ void DraftController::observe(int drafted, int accepted, int raw_match) {
         if (j < accepted) ++hit_[j];
     }
     if (drafted > seen_) seen_ = drafted;
-    if (adapt_) ++by_depth_[drafted];
+    if (adapt_ || conf_) ++by_depth_[drafted];
+}
+
+int DraftController::confidence_window(const float* q, int n) const {
+    if (!conf_ || !q || n <= 0) return 0;
+    double p = 1.0, e = 0.0;
+    for (int j = 0; j < n; ++j) {
+        const double qj = q[j];
+        p *= qj > 0.0 ? (qj < 1.0 ? qj : 1.0) : 0.0;   /* a probability: NaN and others clamp */
+        e += p;
+    }
+    /* The margin keeps a value that lands on a whole number (2.5 * 0.8) from rounding up past it:
+     * q arrives as float, whose error is near 1e-7 of the value. */
+    const double w = std::ceil(p_.conf_scale * e + p_.conf_offset - 1e-6);
+    if (!(w >= (double)p_.conf_floor)) return p_.conf_floor;
+    if (w >= (double)p_.max_depth) return p_.max_depth;
+    return (int)w;
 }
 
 /* ------------------------------------------------------------------ the step's cost */
