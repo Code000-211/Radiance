@@ -1170,10 +1170,11 @@ int Engine::arena_step(const RadBatch* b) {
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
     /* Whether the next step continues a prompt, so the stager stages its first layers across the
      * gap between them. Never for a step issued ahead (a decode step whose plan the scheduler does
-     * not hold), and never with --no-prefill-overlap, which is the control arm of the A/B for the
-     * wrap (core/place/stager.h). */
-    const bool more = cfg_.prefill_overlap && b->phase != RAD_PHASE_DECODE &&
-                      sched_.prefill_continues();
+     * not hold), and never with --no-prefill-overlap: that flag turns this cross-step staging off
+     * wherever it happens, at the wrap and at the pass end the stager already staged there before
+     * the wrap, and is the control arm of the A/B for the wrap (core/place/stager.h). */
+    const bool more = prefill_overlap_stages(cfg_.prefill_overlap, b->phase,
+                                             sched_.prefill_continues());
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||

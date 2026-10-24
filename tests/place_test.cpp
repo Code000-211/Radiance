@@ -2908,6 +2908,117 @@ TEST(the_stager_wraps_the_ring_at_the_chunk_boundary_behind_the_reads_it_laps) {
     rad_stream_destroy(compute);
 }
 
+/* Three trunk layers, which is exactly lead(): a pass that routes that many stages all of them for
+ * the next pass, so no later layer of that pass is left to give their places back. Adoption has to
+ * clear `early`, or the wrap and end_pass skip them for good, the ring fills and staging stops with
+ * no error at all -- a pass would stage its own layers once and 0 from then on. */
+TEST(the_stager_gives_back_the_places_it_adopts_from_the_previous_pass) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 3, kE = 8;
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    const int h_tail = 1 + 2 * kL;               /* the pass's op past the last routed layer */
+    f.op("read_state", {}, false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 16;
+    cfg.host_pool_mib = 128;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+    std::vector<std::vector<rad_weight>> pw(kL);
+    int64_t most = 0;
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        REQUIRE(!pw[(size_t)l].empty());
+        most = std::max(most, each * (int64_t)pw[(size_t)l].size());
+    }
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    /* Exactly one pass of room: the next pass can only stage at all if the last one's places came
+     * back before it. */
+    const int64_t ring = most * kL;
+    std::vector<char> region((size_t)ring);
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), nullptr, ring, 64));
+    REQUIRE(st.enabled());
+    REQUIRE(st.n_layers() == (size_t)kL);
+    const int lead = (int)PrefillStager::lead();
+    REQUIRE(lead == kL);                          /* so a pass stages every layer early */
+
+    auto in_ring = [&](int l) {
+        for (rad_weight w : pw[(size_t)l]) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p < region.data() || p >= region.data() + ring) return false;
+        }
+        return true;
+    };
+
+    RadBatch b{};
+    b.n_tok = 128;
+    uint64_t prev = m.stats().stage_layers;
+    for (int pass = 0; pass < 4; ++pass) {
+        st.set_ring(st.ring_full());
+        st.set_next_prefill(true);
+        CHECK(st.begin_pass(&b));
+        bool resync = false;
+        for (int h = 0; h <= 2 * kL; ++h) {
+            CHECK_OK(st.before_op(h, compute, &resync));
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.before_op(h_tail, compute, &resync));
+        CHECK_OK(st.end_pass(compute));
+        const uint64_t now = m.stats().stage_layers;
+        /* The first pass stages its own layers and the next pass's (2 * lead); every pass after it
+         * stages the pass after it, which is the proof its adopted places were given back. */
+        CHECK_EQ(now - prev, (uint64_t)(pass == 0 ? 2 * lead : lead));
+        prev = now;
+        CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+        for (int l = 0; l < kL; ++l) CHECK(in_ring(l));
+        CHECK_OK(rad_stream_sync(compute));
+    }
+
+    /* A pass too small to arm takes the last pass's places home with it. */
+    b.n_tok = 8;
+    CHECK(!st.begin_pass(&b));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* --no-prefill-overlap is the A/B's control arm: the engine asks this with the parsed flag, so a
+ * refactor that drops the flag from the decision leaves the control arm staging anyway. */
+TEST(prefill_overlap_stages_only_a_continuing_prompt_with_the_flag_on) {
+    CHECK(prefill_overlap_stages(true, RAD_PHASE_PREFILL, true));
+    CHECK(prefill_overlap_stages(true, RAD_PHASE_MIXED, true));
+    CHECK(!prefill_overlap_stages(false, RAD_PHASE_PREFILL, true));
+    CHECK(!prefill_overlap_stages(false, RAD_PHASE_MIXED, true));
+    CHECK(!prefill_overlap_stages(true, RAD_PHASE_DECODE, true));
+    CHECK(!prefill_overlap_stages(true, RAD_PHASE_PREFILL, false));
+}
+
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     /* The production path. Pools has already allocated the weights pool as one block; allocating
      * beside it would spend the budget twice and surface later as an unrelated out-of-memory.

@@ -295,6 +295,11 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
             }
             next_ = std::max(next_, n_early_);
             n_early_ = 0;
+            /* The places staged for this pass are this pass's now. Left `early`, the wrap and
+             * end_pass would skip them for good, and a pass with as many routed layers as lead()
+             * has no later layer to give them back at: the ring would fill and staging stop
+             * without a word. */
+            for (int32_t i : ring_order_) place_[i].early = false;
             RAD_TRY(stage_ahead(first_li_ - 1, resync));
         }
     }

@@ -121,6 +121,14 @@ struct StagedLayer {
     int32_t              first_op = -1, last_op = -1;
 };
 
+/* Whether a step stages the next chunk's first layers across the gap to it: only a step that
+ * continues a prompt, is not a decode pass, and has the overlap on. --no-prefill-overlap clears
+ * the flag and is the control arm of the A/B for the wrap (stager.h); the engine's arena_step asks
+ * this, so the flag cannot be dropped from the decision without a test noticing. */
+inline bool prefill_overlap_stages(bool overlap, int phase, bool continues) {
+    return overlap && phase != RAD_PHASE_DECODE && continues;
+}
+
 class PrefillStager final : public OpStager {
 public:
     ~PrefillStager() override;

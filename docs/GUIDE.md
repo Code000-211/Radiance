@@ -1579,7 +1579,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
-| `--no-prefill-overlap` | on | do not let the chunk before a prefill chunk stage its first experts; the control arm of the overlap (§4.5) |
+| `--no-prefill-overlap` | not set (overlap on) | do not let the chunk before a prefill chunk stage its first experts; the control arm of the overlap (§4.5) |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
