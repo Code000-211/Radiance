@@ -30,9 +30,12 @@
 #include "r4d_fp8_wmma.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace {
 
@@ -131,6 +134,318 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     } else {
         dst[0] = f32_to_bf16(v[0] * s);
     }
+}
+
+// ------------------------------------------------------------------ the PLE row cache
+//
+// The n-gram table (arch/common/rad_block_ple.h) is 51.2 GB of E4M3 rows, and with
+// --ngram-placement ram it lives in pinned host memory: every PLE gather then crosses the link and
+// decodes. Its rows recur -- a prompt's n-gram ids repeat across turns, and within one request
+// across the heads whose hashes collide -- so this keeps the decoded rows on the card, four ways a
+// set, and a hit neither crosses the link nor dequantises. The host side below says when it runs.
+//
+// One wave a row: a lane carries eight of the row's 160 entries, so the payload is one 16-byte
+// vector a lane and the tag check is one thread's work. The row width is the model's
+// (rad_block_ple.h) and the entry refuses other widths.
+//
+// A way is a seqlock: `gen` is 0 while empty, odd while one writer owns the way, and even,
+// advancing modulo 2^32, once the row is published. The generation is what makes a reader's recheck
+// sound -- a plain EMPTY/LOADING/READY word cannot tell a row that stayed put from one reclaimed
+// and then rewritten for the same id while the reader was inside its window -- between the lookup
+// that found the way and the recheck that would confirm it -- and the payload comes out of L1, so
+// that stale read would be served again on later launches.
+// Two a publication, so a way's generation wraps to 0 after 2^31 writes: the row reads as empty
+// and is refilled, and only a reader kept across all 2^31 rewrites of that one way could take a
+// stale row for a hit. Sized for the row, not made wraparound-free.
+constexpr uint32_t kPleRow = 160, kPleLanes = kPleRow / 8, kPleWays = 4;
+constexpr uint32_t kPleCacheThreads = 32;
+
+__device__ __forceinline__ uint32_t ple_set(int32_t id, uint32_t mask) {
+    return ((uint32_t)id * 2654435761u) & mask;
+}
+
+__device__ __forceinline__ uint32_t ple_pack2(float a, float b) {
+    return (uint32_t)f32_to_bf16(a) | ((uint32_t)f32_to_bf16(b) << 16);
+}
+
+/* The slot holding `id` and the generation it was found under, or -1. The loads are scoped
+ * atomics, so they read L2 and not the CU's own (non-coherent) L1, and each one invalidates that
+ * L1 for the payload reads that follow. */
+__device__ __forceinline__ int32_t ple_lookup(const int32_t* __restrict__ tags,
+                                              uint32_t* __restrict__ gen, int32_t id,
+                                              uint32_t base, uint32_t* out_gen) {
+    for (uint32_t w = 0; w < kPleWays; ++w) {
+        const uint32_t g =
+            __hip_atomic_load(gen + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (!g || (g & 1u)) continue;                 /* empty, or a writer owns it */
+        if (__hip_atomic_load(tags + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id) {
+            *out_gen = g;
+            return (int32_t)(base + w);
+        }
+    }
+    return -1;
+}
+
+/* Claims a way for `id`: an empty one, else the coldest of the four, so a row that keeps recurring
+ * outlives the rows around it. A way some writer owns (an odd generation) is no candidate, and a
+ * lost compare-and-swap means the choice went stale, so the scan repeats. A writer always publishes
+ * before its block ends, so an odd generation that never clears means the kernel never finished and
+ * the set simply carries one way less from then on. Bumping the generation to
+ * odd *is* the claim, so a reader holding the older even generation sees the change on its
+ * recheck. Lane 0 only. */
+__device__ __forceinline__ int32_t ple_claim(int32_t* __restrict__ tags,
+                                             uint32_t* __restrict__ gen,
+                                             uint32_t* __restrict__ heat, int32_t id,
+                                             uint32_t num_sets) {
+    const uint32_t base = ple_set(id, num_sets - 1u) * kPleWays;
+    for (uint32_t attempt = 0; attempt < kPleWays; ++attempt) {
+        uint32_t pick = kPleWays, coldest = 0xFFFFFFFFu;
+        for (uint32_t w = 0; w < kPleWays; ++w) {
+            const uint32_t g =
+                __hip_atomic_load(gen + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (!g) { pick = w; break; }
+            if (g & 1u) continue;
+            const uint32_t h =
+                __hip_atomic_load(heat + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (pick == kPleWays || h < coldest) { pick = w; coldest = h; }
+        }
+        if (pick == kPleWays) continue;                 /* every way is being written */
+        const uint32_t cur =
+            __hip_atomic_load(gen + base + pick, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (cur & 1u) continue;
+        if (atomicCAS((int*)(gen + base + pick), (int)cur, (int)(cur + 1u)) != (int)cur)
+            continue;                                   /* another writer took it: choose again */
+        tags[base + pick] = id;
+        atomicExch(heat + base + pick, 4u);              /* a new row starts warm */
+        return (int32_t)(base + pick);
+    }
+    return -1;                                          /* four live writers: skip the insert */
+}
+
+/* One row a block. `gen[slot]` is 0 while empty, odd while a writer owns the way, and even once
+ * the row is published; `tags[slot]` is the row id, good only under an even generation. A writer
+ * claims by compare-and-swap (even, or 0, -> odd), writes the tag and the payload, fences, then
+ * publishes the next even generation. A reader loads the payload, fences, and compares the
+ * generation it found at lookup with the one there now: a way reclaimed and rewritten for the same
+ * id in between -- X, Y, X while the reader was in the middle -- has moved on by at least two, so
+ * the reader sees a stale row even though the id matches again, which a bare READY word cannot
+ * tell from a row that stayed put. The fence matters too -- an acquire fence alone leaves the
+ * compiler free to sink the payload load past the check (checked in the emitted code for
+ * gfx12), where a full one keeps it below. Two a publication, so the reader's "moved on" holds
+ * for 2^31 publications of that way, after which its generation wraps back onto `g` and the check
+ * can no longer tell the two apart (the local form of the wrap above).
+ *
+ * The body is one template, so the two entries below cannot drift; `Probe` false is the gather's
+ * translation of it, statement for statement, and the words of r4d_ple_probe (r4d.h) appear only
+ * in the `Probe` true instantiation -- the test's forced window, which no launch of the gather
+ * can enter.
+ *
+ * One statement is not shared: the hit test. `Probe` false asks the two loads directly; `Probe`
+ * true hoists them into `now` and `same_id`, because the window's bookkeeping (the conflict count,
+ * the recheck generation, the retire) needs the generation it saw. Same predicate, different
+ * expression -- so a mutation of the production statement alone leaves the test's path intact, and
+ * `ple_cache`'s red evidence is the test's recheck, not the gather's. See docs/OPS.md. */
+
+/* A park or a wait in the handshake is bounded: a grid whose servant block is never resident (or
+ * whose block 0 never parks) must still end, and it fails on the words below, not by hanging. */
+constexpr uint32_t kPleProbePoll = 1u << 22;
+
+/* Test-only: reclaim the way the parked reader named, write a payload that is no row, and publish
+ * it -- the reclaim-and-rewrite that reader's recheck has to see. One block a run serves: two
+ * would publish a second generation on, and the reader's retire of that way would then lose its
+ * compare-and-swap and leave the poisoned row published. A way a writer already owns is left to
+ * the next block. Returns whether this block rewrote. */
+__device__ __forceinline__ bool ple_probe_rewrite(int32_t* __restrict__ tags,
+                                                  uint32_t* __restrict__ gen,
+                                                  uint8_t* __restrict__ data,
+                                                  uint32_t* __restrict__ probe, uint32_t lane) {
+    int32_t svc = -1;
+    uint32_t svc_odd = 0;
+    if (lane == 0 &&
+        __hip_atomic_load(probe + r4d_ple_probe_parked, __ATOMIC_ACQUIRE,
+                          __HIP_MEMORY_SCOPE_AGENT) &&
+        atomicCAS((int*)(probe + r4d_ple_probe_serve), 0, 1) == 0) {
+        const uint32_t s =
+            __hip_atomic_load(probe + r4d_ple_probe_slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const uint32_t cur = __hip_atomic_load(gen + s, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (!(cur & 1u) && atomicCAS((int*)(gen + s), (int)cur, (int)(cur + 1u)) == (int)cur) {
+            tags[s] = (int32_t)__hip_atomic_load(probe + r4d_ple_probe_id, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT);
+            svc = (int32_t)s;
+            svc_odd = cur + 1u;
+        }
+    }
+    svc = __shfl(svc, 0);
+    svc_odd = __shfl(svc_odd, 0);
+    if (svc < 0) return false;
+    const uint4 bad = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    if (lane < kPleLanes)
+        *(uint4*)(data + (size_t)svc * (kPleRow * 2u) + (size_t)lane * 16u) = bad;
+    __threadfence();
+    __syncwarp();
+    if (lane == 0) {
+        __hip_atomic_store(gen + svc, svc_odd + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        atomicAdd(probe + r4d_ple_probe_rewrites, 1u);
+        __hip_atomic_store(probe + r4d_ple_probe_parked, 0u, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_AGENT);       /* the reader may recheck now */
+    }
+    __syncwarp();
+    return true;
+}
+
+template <bool Probe>
+__device__ __forceinline__ void ple_embed_lookup_q_row(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
+    uint32_t* __restrict__ probe) {
+    const uint32_t lane = threadIdx.x, m = blockIdx.x;
+
+    if constexpr (Probe) {
+        if (blockIdx.x > 0 && probe[r4d_ple_probe_mode]) {
+            /* The test's servant blocks: wait for block 0 to park in its window, before the payload
+             * load that follows, rewrite the way it holds, then gather this row as any launch
+             * would. */
+            for (uint32_t i = 0; i < kPleProbePoll; ++i)
+                if (ple_probe_rewrite(tags, gen, data, probe, lane) ||
+                    __hip_atomic_load(probe + r4d_ple_probe_rewrites, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT))
+                    break;
+        }
+    }
+
+    const int32_t id = tok[m] - vocab_off;
+    const bool keep = id >= 0 && id < n_vocab;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld;
+
+    int32_t slot = -1;
+    uint32_t g = 0;
+    if (keep && lane == 0)
+        slot = ple_lookup(tags, gen, id, ple_set(id, num_sets - 1u) * kPleWays, &g);
+    slot = __shfl(slot, 0);
+    g = __shfl(g, 0);
+
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (slot >= 0) {
+        if constexpr (Probe) {
+            /* The handshake: lane 0 parks here, between the lookup and the payload load, until a
+             * servant has rewritten this way -- so the load reads that rewrite, which is no row,
+             * and only the generation check can still send this reader to the decode path. A park
+             * the bound released sets the timeout word: the case fails on it rather than reading a
+             * row that was never rewritten as if the window had been forced. */
+            if (probe[r4d_ple_probe_mode] && blockIdx.x == 0 && lane == 0 &&
+                atomicCAS((int*)(probe + r4d_ple_probe_claim), 0, 1) == 0) {
+                __hip_atomic_store(probe + r4d_ple_probe_slot, (uint32_t)slot, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __hip_atomic_store(probe + r4d_ple_probe_gen, g, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __hip_atomic_store(probe + r4d_ple_probe_id, (uint32_t)id, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __threadfence();
+                __hip_atomic_store(probe + r4d_ple_probe_parked, 1u, __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                uint32_t i = 0;
+                for (; i < kPleProbePoll; ++i)
+                    if (!__hip_atomic_load(probe + r4d_ple_probe_parked, __ATOMIC_ACQUIRE,
+                                           __HIP_MEMORY_SCOPE_AGENT))
+                        break;
+                if (i == kPleProbePoll)
+                    __hip_atomic_store(probe + r4d_ple_probe_timeout, 1u, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+            }
+            __syncwarp();                  /* every lane waits for lane 0's park, before the load */
+        }
+        if (lane < kPleLanes)
+            v = *(const uint4*)(data + (size_t)slot * (kPleRow * 2u) + (size_t)lane * 16u);
+        __threadfence();                   /* every lane's payload load is done before the recheck */
+        __syncwarp();
+        bool hit = false;
+        if (lane == 0) {
+            if constexpr (Probe) {
+                const uint32_t now =
+                    __hip_atomic_load(gen + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                const bool same_id =
+                    __hip_atomic_load(tags + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id;
+                if (now != g) {
+                    __hip_atomic_store(probe + r4d_ple_probe_recheck_gen, now, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+                    if (same_id) {
+                        atomicAdd(probe + r4d_ple_probe_conflicts, 1u);   /* the window, entered */
+                        /* Retire the way the rewriter published: a row with this id's tag and a
+                         * payload that is no row's would be a hit for the next launch. 0 is empty,
+                         * so it reads as a miss and is refilled; a lost swap means a writer has it,
+                         * and it is then its own to publish. */
+                        atomicCAS((int*)(gen + slot), (int)now, 0);
+                    }
+                }
+                hit = now == g && same_id;
+            } else {
+                hit = __hip_atomic_load(gen + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == g &&
+                      __hip_atomic_load(tags + slot, __ATOMIC_RELAXED,
+                                        __HIP_MEMORY_SCOPE_AGENT) == id;
+            }
+        }
+        hit = __shfl((int)hit, 0) != 0;
+        if (hit) {
+            if (lane < kPleLanes) *(uint4*)(dst + (size_t)lane * 8u) = v;
+            if (lane == 0) atomicAdd(heat + slot, 1u);
+            return;
+        }
+    }
+
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    if (!keep) {
+        if (lane < kPleLanes) *(uint4*)(dst + (size_t)lane * 8u) = zero;
+        return;
+    }
+
+    /* Miss: decode the eight codes this lane carries, in the generic kernel's order and rounding. */
+    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    if (lane < kPleLanes) {
+        const uint2 q = *(const uint2*)(wte + (size_t)id * kPleRow + (size_t)lane * 8u);
+        const v2f a = r4d_fp8::e4m3_pk<false>(q.x), b = r4d_fp8::e4m3_pk<true>(q.x);
+        const v2f c = r4d_fp8::e4m3_pk<false>(q.y), d = r4d_fp8::e4m3_pk<true>(q.y);
+        v = make_uint4(ple_pack2(a.x * s, a.y * s), ple_pack2(b.x * s, b.y * s),
+                       ple_pack2(c.x * s, c.y * s), ple_pack2(d.x * s, d.y * s));
+        *(uint4*)(dst + (size_t)lane * 8u) = v;
+    }
+
+    int32_t islot = -1;
+    if (lane == 0) islot = ple_claim(tags, gen, heat, id, num_sets);
+    islot = __shfl(islot, 0);
+    if (islot < 0) return;
+    if (lane < kPleLanes)
+        *(uint4*)(data + (size_t)islot * (kPleRow * 2u) + (size_t)lane * 16u) = v;
+    __threadfence();                       /* every lane's payload reaches L2 ... */
+    __syncthreads();                       /* ... before lane 0 publishes */
+    if (lane == 0) {
+        const uint32_t odd = __hip_atomic_load(gen + islot, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(gen + islot, odd + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
+/* The gather every launch uses: no probe word in the signature, no probe branch in the body. */
+__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets) {
+    ple_embed_lookup_q_row<false>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
+                                  heat, data, num_sets, nullptr);
+}
+
+/* The test's, not the gather's: the same row with the r4d_ple_probe handshake. No launch outside
+ * r4d_selftest's ple_cache names it, and r4d_ple_probe (r4d.h) is what makes a cache use it. */
+__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_probe_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
+    uint32_t* __restrict__ probe) {
+    ple_embed_lookup_q_row<true>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
+                                 heat, data, num_sets, probe);
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -728,6 +1043,154 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     return rc == RAD_OK ? 0 : -4;
 }
 
+/* ------------------------------------------------------------------ the PLE VRAM row cache
+ *
+ * Opt-in, off by default: RADIANCE_PLE_VRAM_CACHE_SETS names the set count (rounded down to a power
+ * of two, capped at kPleCacheMaxSets); 0 or absent allocates nothing and every gather runs the
+ * generic kernel above, unchanged. 65536 sets is 262144 rows of 320 B, 80 MiB of payload plus 3 MiB
+ * of tags, generations and heat counters; at the cap of 262144 sets it is 1,048,576 rows, 320 MiB
+ * plus 12 MiB. The init prints what it took.
+ *
+ * Why it can pay: with --ngram-placement ram the table is pinned host memory, so the gather reads
+ * 320 B a row over the link and dequantises it, per row and per rank. A row that recurs (a prompt
+ * re-read across turns, a head whose hash collides) is then free. Whether a workload's hit rate
+ * repays the insert traffic is a measurement this change does not make; there is no default on and
+ * no speed claim here (archive PR #2's 16x is an unverified ABI-16 number).
+ *
+ * Lifetime, identity, budget:
+ *   - one per resolved instance, from init() to fini() (rad_abi.h), which is one per PLE gather in
+ *     the program and one model load: a reload re-inits and starts empty, with no table to
+ *     identify.
+ *   - the table a launch passes is bound on the first launch. A launch handing a different table
+ *     bypasses the cache rather than rebinding, so one table's rows can never answer for another
+ *     and no launch has to clear the payload. A cache whose instance outlives its table leaks
+ *     nothing, since the payload is never dereferenced again.
+ *   - the allocation happens in init, which runs before the VRAM budget reads the card, so it is
+ *     part of that budget's "already held" (core/mem/vram_budget.h) and not an unaccounted claim
+ *     on a pool; a failed allocation only leaves the cache off.
+ *
+ * A way is a seqlock rather than a status word: generation 0 is empty, odd is owned by one writer,
+ * even is published. A reader keeps the generation it found at lookup and demands the same one
+ * after its payload load, so a way reclaimed and rewritten for the same id in between -- which a
+ * READY word cannot distinguish from a row that stayed put -- reads as a miss.
+ *
+ * The mechanism is the device kernel above (ple_embed_lookup_q_kernel). Its hit and miss paths
+ * write the same bytes as embed_lookup_q_kernel, which r4d_selftest's `ple_cache` checks against a
+ * host gather at every stage: cold, warm, colliding, after a table change, after a reset, and from
+ * four concurrent streams. That case also attaches the r4d_ple_probe handshake, which forces the
+ * reclaim/rewrite window on one reader and counts the rechecks that land in it -- from the test's
+ * own kernel entry (ple_embed_lookup_q_probe_kernel). The words hang off the instance (probe
+ * below), and the kernel arguments are the gather's plus that word, so what the two entries share
+ * is the row's device code; one host-side test per launch still picks the entry.
+ */
+struct PleVramCache {
+    int32_t*  tags = nullptr;    /* row id per way, valid under an even generation */
+    uint32_t* gen  = nullptr;    /* 0 empty, odd owned by a writer, even published (the seqlock) */
+    uint32_t* heat = nullptr;    /* hit counter per way: the replacement policy's age */
+    uint8_t*  data = nullptr;    /* kPleCacheRowBytes rows, decoded bf16 */
+    uint32_t  sets = 0;
+    int       device = -1;
+    unsigned* probe = nullptr;   /* r4d_ple_probe's words: this instance's launches take the entry */
+    std::atomic<const void*> table{nullptr};
+};
+
+static void ple_cache_free(PleVramCache* c) {
+    if (!c) return;
+    (void)hipFree(c->data);
+    (void)hipFree(c->heat);
+    (void)hipFree(c->gen);
+    (void)hipFree(c->tags);
+    delete c;
+}
+
+constexpr uint32_t kPleCacheWays     = 4;
+constexpr uint32_t kPleCacheRowBytes = 320;          /* 160 bf16, kPleRow above */
+constexpr uint32_t kPleCacheMaxSets  = 1u << 18;     /* 1,048,576 rows: 320 MiB of payload */
+
+static uint32_t ple_cache_sets_from_env() {
+    const char* e = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    if (!e || !*e) return 0;
+    char* end = nullptr;
+    const long want = std::strtol(e, &end, 10);
+    if (end == e) return 0;
+    if (want <= 0) return 0;
+    long sets = 1;
+    while (sets * 2 <= want && (uint32_t)(sets * 2) <= kPleCacheMaxSets) sets *= 2;
+    return (uint32_t)sets;
+}
+
+extern "C" int r4d_rad_embed_lookup_q_init(const RadParam* p, int n_p, int rank, int world,
+                                           void** out) {
+    (void)p; (void)n_p; (void)rank; (void)world;
+    if (out) *out = nullptr;
+    const uint32_t sets = ple_cache_sets_from_env();
+    if (!sets) return RAD_OK;
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess) return RAD_OK;
+    PleVramCache* c = new (std::nothrow) PleVramCache();
+    if (!c) return RAD_OK;
+    c->sets = sets;
+    c->device = dev;
+    const size_t ways = (size_t)sets * kPleCacheWays;
+    const bool got = hipMalloc((void**)&c->tags, ways * sizeof(int32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->gen, ways * sizeof(uint32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->heat, ways * sizeof(uint32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->data, ways * kPleCacheRowBytes) == hipSuccess;
+    if (!got || hipMemset(c->gen, 0, ways * sizeof(uint32_t)) != hipSuccess) {
+        ple_cache_free(c);
+        std::fprintf(stderr, "[r4d] ple cache: device %d could not allocate %u sets; the gathers "
+                             "read the table as before\n", dev, sets);
+        return RAD_OK;
+    }
+    std::fprintf(stderr, "[r4d] ple cache: device %d holds %u sets x %u ways, %.1f MiB "
+                         "(%zu rows)\n", dev, sets, kPleCacheWays,
+                 (double)(ways * (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0), ways);
+    if (out) *out = c;
+    return RAD_OK;
+}
+
+extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
+    ple_cache_free((PleVramCache*)instance);
+}
+
+/* Test hook, not part of the plugin ABI (r4d.h): the probe words the test's kernel entry uses, and
+ * which entry a launch takes. Attached the gathers run ple_embed_lookup_q_probe_kernel with those
+ * words; a run no test attaches launches the gather above, unchanged. Null detaches.
+ *
+ * The words hang off the instance, not off a process-wide symbol: a hook set on one cache leaves
+ * every other instance's launches on the gather's own entry. What survives is one host-side test a
+ * launch (`c->probe` in embed_lookup_q_cached_emit), which picks the entry and passes the words. */
+extern "C" int r4d_ple_probe(void* instance, unsigned* ctl) {
+    if (!instance) return -1;
+    ((PleVramCache*)instance)->probe = ctl;    /* test-owned memory; fini does not free it */
+    return 0;
+}
+
+/* True when this launch may use `c` for `table`: the first table seen binds the instance, and any
+ * other leaves the cache alone. */
+static bool ple_cache_binds(PleVramCache* c, const void* table) {
+    const void* bound = c->table.load(std::memory_order_acquire);
+    if (!bound &&
+        c->table.compare_exchange_strong(bound, table, std::memory_order_acq_rel))
+        return true;
+    return bound == table;
+}
+
+static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, const void* sc,
+                                      bool sc_f32, uint16_t* x, long long M, int32_t n_vocab,
+                                      int32_t vocab_off, long long x_ld, PleVramCache* c,
+                                      RadStream stream) {
+    if (c->probe)                          /* a test attached its words: its own entry, same row */
+        return R4D_EMIT(stream, (ple_embed_lookup_q_probe_kernel), dim3((uint32_t)M),
+                        dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
+                        (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
+                        c->sets, c->probe) == RAD_OK ? 0 : -4;
+    return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
+                    dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
+                    (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
+                    c->sets) == RAD_OK ? 0 : -4;
+}
+
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
                                            int n_vocab, int vocab_off, int x_ld, float scale,
                                            long stream) {
@@ -1234,6 +1697,19 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
     if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
+
+    /* The cached path needs the model's row width, a 16-byte output row and the eight-byte table
+     * read its lanes do; anything else (and the default, where no cache was allocated) takes the
+     * generic kernel above. */
+    PleVramCache* cache = (PleVramCache*)a->instance;
+    if (cache && cache->sets && q && n_embd == (long long)kPleRow && x_ld >= (long long)kPleRow &&
+        x_ld % 8 == 0 && M <= 0x7fffffffLL && r4d_aligned(x->data, 16) &&
+        r4d_aligned(wte->data, 8) && ple_cache_binds(cache, wte->data))
+        return embed_lookup_q_cached_emit((const int32_t*)r4d_addr(tok), (const uint8_t*)r4d_addr(wte),
+                                          sc ? (const void*)r4d_addr(sc) : nullptr,
+                                          sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
+                                          (int)n_vocab, (int)voff, x_ld, cache, stream) == 0
+                   ? RAD_OK : RAD_E_DEVICE;
 
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
                                sc ? (const void*)r4d_addr(sc) : nullptr,

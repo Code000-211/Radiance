@@ -674,6 +674,33 @@ void r4d_mla_matrix_pin_form(int form);
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel
 // of its own, so a pin that is ignored cannot pass by comparing a form with itself.
 int r4d_record_dispatches(const void** fns, int cap);
+// Test hook for the PLE row cache's seqlock (r4d_model_bf16.hip): `ctl` is a device buffer of
+// r4d_ple_probe_words uint32 words, or null to take the probe away. Null is every launch outside
+// a test: the gather then allocates nothing, takes no probe word and compiles to itself -- the
+// words are read by a kernel entry of the test's, not by the gather. The buffer is attached to
+// that one cache instance; every other instance's launches keep the gather's entry.
+// With word 0 set, a reader that found its row parks in its window, before the payload load that
+// follows, and a block that finds it parked reclaims that way, writes a row that is not the row's,
+// and publishes, so the load reads that rewrite and the recheck after it must see the generation,
+// two on, that the rewrite published with release before the reader's acquire load of the word
+// that released its park. Word 1 counts those rechecks, word 9 is a park the handshake's bound released
+// (no block served it: the window was not forced, and the case fails on it), and words 2.. carry
+// the parking handshake. See the words below.
+enum {
+    r4d_ple_probe_mode      = 0,  // 0 off, 1 force the reclaim/rewrite window
+    r4d_ple_probe_conflicts = 1,  // rechecks that found the way rewritten for the same id
+    r4d_ple_probe_parked    = 2,  // a reader is parked, and the way's slot, generation and id
+    r4d_ple_probe_slot      = 3,
+    r4d_ple_probe_gen       = 4,
+    r4d_ple_probe_id        = 5,
+    r4d_ple_probe_rewrites  = 6,  // ways rewritten under a parked reader
+    r4d_ple_probe_claim     = 7,  // one parked reader a run
+    r4d_ple_probe_serve     = 8,  // one block a run serves that park; a second would publish again
+    r4d_ple_probe_timeout   = 9,  // a park the handshake's bound released unserved
+    r4d_ple_probe_recheck_gen = 10,  // the generation the parked reader's recheck saw
+    r4d_ple_probe_words     = 11
+};
+int r4d_ple_probe(void* instance, unsigned* ctl);
 // The narrow GEMM with r4d_gated_quant_fp8 as its epilogue, for a gate_up projection whose only
 // consumer is that quantiser. `wq` is the [2*nout][K] gate_up plane, gate first; outputs are the
 // quantiser's: `q` E4M3 [M][nout], `s` f32 [M][ceil(nout/128)], and `y` the bf16 silu product or 0.

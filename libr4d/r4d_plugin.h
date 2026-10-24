@@ -634,8 +634,12 @@ int r4d_rad_unrelayout_givens_pairs(const RadParam*, int, int, const RadEncoding
  * VRAM and an op with no device launch is a fatal issue. `logits_gemm` is declared with them. */
 int r4d_rad_embed_lookup    (const RadArgs*, RadStream);
 /* The quantised gather (embed_lookup_q) for the n-gram table, read from VRAM or from pinned host
- * memory over the link. */
+ * memory over the link. The L1 cache that keeps recurring rows on the card is opt-in
+ * (RADIANCE_PLE_VRAM_CACHE_SETS) and is the same row's init/fini: with the variable unset or 0 the
+ * row is allocated nothing and the launch is the one above, unchanged. */
 int r4d_rad_embed_lookup_q  (const RadArgs*, RadStream);
+int r4d_rad_embed_lookup_q_init(const RadParam*, int, int, int, void** out);
+void r4d_rad_embed_lookup_q_fini(void*);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);

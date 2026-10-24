@@ -34,6 +34,7 @@
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "r4d.h"            /* r4d_ple_probe, the row cache's test hook and its words */
 #include "r4d_args.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
@@ -145,6 +146,7 @@ struct Plugin {
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
     int (*record)(const void**, int) = nullptr;
+    int (*ple_probe)(void*, unsigned*) = nullptr;
 };
 
 /* Defined after the tiny-tensor helpers it needs; called from the static checks above them. */
@@ -182,6 +184,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
+    okall &= sym(pl->h, "r4d_ple_probe", &pl->ple_probe);
     return okall;
 }
 
@@ -23306,6 +23309,369 @@ static void embed_lookup_q_case(const Plugin& pl) {
     ok(what, bad.empty(), bad);
 }
 
+/* ------------------------------------------------------------------ the PLE row cache */
+/* embed_lookup_q's optional VRAM L1 (r4d_model_bf16.hip, RADIANCE_PLE_VRAM_CACHE_SETS). Every launch
+ * is held to the same host gather embed_lookup_q_case uses, because a cache that changed one byte
+ * would make the n-gram embedding depend on the hit rate:
+ *
+ *   1. cold: every id a miss, so every row is read from the table, stored and returned;
+ *   2. warm: the same ids twice more, served from the ways the first launch filled;
+ *   3. collisions: 4 sets and 16 places against 64 ids, eight shuffles, so rows evict each other
+ *      and the LOADING/READY handshake runs under continuous replacement;
+ *   4. a second table through the same instance, which must bypass the cache -- a hit there would
+ *      return the first table's bytes;
+ *   5. four streams at once, the same ids, so one launch's misses race the next one's hits, and
+ *      then the same on one set of four ways, where every launch reclaims a way another stream
+ *      may be between its payload load and its recheck on -- the X, Y, X the generation exists
+ *      for. Which interleaving a round hits is the card's, so a round that never lands in the
+ *      window costs coverage, never a byte;
+ *   6. and that window forced: one reader parks in it (the r4d_ple_probe handshake) while the same
+ *      launch's other blocks reclaim the way it holds and publish a payload that is no row's, so
+ *      its payload load reads that rewrite and its recheck -- which follows the load -- must land
+ *      on the generation the rewrite published with release, the park having been released by
+ *      that rewrite's acquire store and not by the handshake's bound. The counters have to show
+ *      it did, and the parked reader must still write the table's bytes: the stage that goes red
+ *      when the generation check is taken out. The check it takes out is the probe entry's; the
+ *      gather's own hit test is written as its own expression (r4d_model_bf16.hip), so a mutation
+ *      of that statement leaves this stage green -- the gather's recheck is held to the host
+ *      gather byte for byte above, not by a mutation here.
+ *
+ * Then the instance is freed and re-initialised, which must start cold, and a launch with no
+ * instance (the default, no cache) must write the same bytes as the cached one.
+ *
+ * Its own case name: the row it exercises has one already, and `--case ple_cache` has to select
+ * this stage rather than report a case no block claims. */
+static void ple_cache_case(const Plugin& pl) {
+    if (!sel("ple_cache")) return;
+    const char* what = "PLE row cache vs a host gather, to the bit";
+    const RadKernelInfo* r = find(pl, "embed_lookup_q_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!r->init || !r->fini) { ok(what, false, "the row has no init/fini"); return; }
+
+    const int64_t NV = 64, M = 37, NE = 160;
+    const uint32_t sets = 4;                    /* 16 places: 64 ids must evict */
+    const float scale = rad_bf16_to_f32(rad_f32_to_bf16(1.99317932e-4f));
+    std::string bad;
+
+    /* Every code but the two NaN encodings, as in the case above. */
+    auto make_table = [&](uint32_t seed) {
+        std::vector<uint8_t> t((size_t)(NV * NE));
+        uint32_t rs = seed;
+        for (size_t i = 0; i < t.size(); ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            uint8_t c = (uint8_t)((i * 167 + (rs >> 24)) & 0xFF);
+            if ((c & 0x7F) == 0x7F) c ^= 0x01;
+            t[i] = c;
+        }
+        return t;
+    };
+    const std::vector<uint8_t> table = make_table(0x9e3779b9u);
+    const std::vector<uint8_t> table2 = make_table(0x1234567u);
+    auto want_row = [&](const std::vector<uint8_t>& t, int32_t id, std::vector<uint16_t>& out) {
+        out.assign((size_t)NE, 0);                 /* off the table: a zero row */
+        if (id < 0 || id >= NV) return;
+        for (int64_t i = 0; i < NE; ++i)
+            out[(size_t)i] =
+                rad_f32_to_bf16(rad_fp8e4m3_to_f32(t[(size_t)(id * NE + i)]) * scale);
+    };
+
+    auto dev = [&](const void* h, size_t b) {
+        void* d = dalloc(b);
+        st_memcpy(d, h, b, hipMemcpyHostToDevice);
+        return d;
+    };
+    const uint16_t sc_bits = rad_f32_to_bf16(scale);
+    void* d_tab  = dev(table.data(), table.size());
+    void* d_tab2 = dev(table2.data(), table2.size());
+    void* d_sc   = dev(&sc_bits, 2);
+    void* d_tok  = dalloc((size_t)M * 4);
+    void* d_x    = dalloc((size_t)(M * NE * 2));
+
+    std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }), T(d_tab, RAD_F8E4M3, { NV, NE }),
+                                 T(d_sc, RAD_BF16, { 1 }), T(d_x, RAD_BF16, { M, NE }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n_embd", NE), PI("n_vocab", NV),
+                                PS("dtype", "bf16") };
+
+    auto launch_on = [&](void* tok, void* tab, void* x, hipStream_t st, void* inst) {
+        ts[0].data = tok;
+        ts[1].data = tab;
+        ts[3].data = x;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        a.instance = inst;
+        return r->launch(&a, (RadStream)st);
+    };
+    auto launch = [&](const std::vector<int32_t>& ids, void* tab, void* x, hipStream_t st,
+                      void* inst) {
+        st_memcpy(d_tok, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+        return launch_on(d_tok, tab, x, st, inst);
+    };
+    auto check = [&](const char* stage, const std::vector<int32_t>& ids,
+                     const std::vector<uint8_t>& t, void* x, int rc) {
+        if (rc != RAD_OK) { bad += fmt("%s: rc=%d; ", stage, rc); return; }
+        std::vector<uint16_t> got((size_t)(M * NE));
+        st_memcpy(got.data(), x, got.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<uint16_t> want;
+        int64_t wrong = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            want_row(t, ids[(size_t)m], want);
+            for (int64_t i = 0; i < NE; ++i)
+                wrong += got[(size_t)(m * NE + i)] != want[(size_t)i];
+        }
+        if (wrong)
+            bad += fmt("%s: %lld of %lld entries differ; ", stage, (long long)wrong,
+                       (long long)(M * NE));
+    };
+
+    /* 16 ids, four to a set by the cache's own hash, so the second launch is warm across every
+     * way. Padding and an id past the table are in the mix from the collision stage on. */
+    std::vector<int32_t> by_set[4];
+    for (int32_t id = 0; id < NV; ++id)
+        by_set[((uint32_t)id * 2654435761u) & (sets - 1u)].push_back(id);
+    std::vector<int32_t> ids_fit((size_t)M);
+    for (int64_t m = 0; m < M; ++m)
+        ids_fit[(size_t)m] = by_set[m % 4][(size_t)((m / 4) % 4)];
+    std::vector<int32_t> ids_hit = ids_fit;
+    for (int64_t m = 16; m < M; ++m) ids_hit[(size_t)m] = ids_fit[(size_t)(m - 16)];
+
+    const char* prev = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    const bool had = prev != nullptr;
+    const std::string saved = had ? prev : "";
+    setenv("RADIANCE_PLE_VRAM_CACHE_SETS", std::to_string(sets).c_str(), 1);
+
+    void* inst = nullptr;
+    const int irc = r->init(nullptr, 0, 0, 1, &inst);
+    if (irc != RAD_OK || !inst) {
+        if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
+        else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        ok(what, false, "init allocated no cache: rc=" + std::to_string(irc));
+        return;
+    }
+
+    check("cold", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst));
+    check("warm", ids_hit, table, d_x, launch(ids_hit, d_tab, d_x, nullptr, inst));
+    check("warm again", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst));
+
+    /* 64 ids into 16 places, in eight different orders: every launch evicts. */
+    uint32_t rs = 0x51ed2701u;
+    for (int round = 0; round < 8; ++round) {
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) {
+            rs = rs * 1664525u + 1013904223u;
+            ids[(size_t)m] = (int32_t)((rs >> 8) % (uint32_t)NV);
+        }
+        ids[3] = -1;
+        ids[7] = (int32_t)NV;
+        ids[11] = -2;
+        check(fmt("collisions %d", round).c_str(), ids, table, d_x,
+              launch(ids, d_tab, d_x, nullptr, inst));
+    }
+
+    check("a second table", ids_fit, table2, d_x, launch(ids_fit, d_tab2, d_x, nullptr, inst));
+    check("back to the first table", ids_fit, table, d_x,
+          launch(ids_fit, d_tab, d_x, nullptr, inst));
+
+    /* A round on four streams: a token buffer and an output buffer a stream, the ids copied on
+     * the stream itself out of pinned memory, all four launches enqueued, and only then a sync
+     * and the read-backs. A check() after each launch would put a device-wide copy between them
+     * and the launches would take turns -- the concurrency this stage exists for would never run. */
+    const size_t tok_b = (size_t)M * 4;
+    int32_t* h_tok = nullptr;
+    if (hip_ck(hipHostMalloc((void**)&h_tok, 4 * tok_b), "hipHostMalloc", __LINE__) !=
+        (int)hipSuccess)
+        h_tok = nullptr;
+    void* d_tok_s[4] = { dalloc(tok_b), dalloc(tok_b), dalloc(tok_b), dalloc(tok_b) };
+    auto streams_round = [&](const char* stage, int round, const std::vector<int32_t>& ids,
+                             void* const* out, hipStream_t* ss, void* inst_) {
+        if (!h_tok || !d_tok_s[0]) {
+            bad += fmt("%s %d: no pinned token buffer; ", stage, round);
+            return;
+        }
+        int rc[4];
+        for (int s = 0; s < 4; ++s) {
+            std::memcpy((char*)h_tok + s * tok_b, ids.data(), tok_b);
+            hip_ck(hipMemcpyAsync(d_tok_s[s], (const char*)h_tok + s * tok_b, tok_b,
+                                  hipMemcpyHostToDevice, ss[s]), "hipMemcpyAsync", __LINE__);
+            rc[s] = launch_on(d_tok_s[s], d_tab, out[s], ss[s], inst_);
+        }
+        for (int s = 0; s < 4; ++s) st_stream_sync(ss[s]);
+        for (int s = 0; s < 4; ++s)
+            check(fmt("%s %d/%d", stage, round, s).c_str(), ids, table, out[s], rc[s]);
+    };
+
+    /* Four streams, eight rounds: the same ids, so each stream's rows are the others' hits. */
+    hipStream_t st[4] = { nullptr, nullptr, nullptr, nullptr };
+    void* sx[4] = { dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)),
+                    dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)) };
+    bool streams_ok = true;
+    for (int s = 0; s < 4; ++s)
+        streams_ok = streams_ok && hipStreamCreate(&st[s]) == hipSuccess;
+    if (!streams_ok) {
+        bad += "hipStreamCreate failed; ";
+    } else {
+        for (int round = 0; round < 8; ++round)
+            streams_round("streams", round, ids_fit, sx, st, inst);
+        for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(st[s]), "hipStreamDestroy", __LINE__);
+    }
+
+    /* Freed and re-initialised: a cold cache again, on the same instance pointer or another. */
+    r->fini(inst);
+    void* inst2 = nullptr;
+    const int irc2 = r->init(nullptr, 0, 0, 1, &inst2);
+    if (irc2 != RAD_OK || !inst2) bad += "re-init allocated nothing; ";
+    else {
+        check("after a reset", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst2));
+        r->fini(inst2);
+    }
+
+    /* The default path, no instance, must agree with the cached one. */
+    check("no cache", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, nullptr));
+
+    /* One set, four places, eight ids, four streams, sixteen shuffles: every launch reclaims ways
+     * the other streams are reading, so a round can land a recheck on a way reclaimed and rewritten
+     * for the same id -- the X, Y, X a bare status word cannot see and the generation can. The four
+     * launches of a round are enqueued back to back (streams_round), so they overlap instead of
+     * taking turns; whether a given round lands a reader in that window is the card's, so this
+     * stage is coverage, not proof. The forced stage below is the proof, and this one still holds
+     * every byte to the host gather under the contention. */
+    setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "1", 1);
+    void* inst3 = nullptr;
+    if (r->init(nullptr, 0, 0, 1, &inst3) != RAD_OK || !inst3) {
+        bad += "a one-set init allocated nothing; ";
+    } else {
+        hipStream_t hs[4] = { nullptr, nullptr, nullptr, nullptr };
+        void* hx[4] = { dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)),
+                        dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)) };
+        bool hot_ok = true;
+        for (int s = 0; s < 4; ++s) hot_ok = hot_ok && hipStreamCreate(&hs[s]) == hipSuccess;
+        if (!hot_ok) {
+            bad += "hipStreamCreate failed (one set); ";
+        } else {
+            for (int round = 0; round < 16; ++round) {
+                std::vector<int32_t> ids((size_t)M);
+                for (int64_t m = 0; m < M; ++m) {
+                    rs = rs * 1664525u + 1013904223u;
+                    ids[(size_t)m] = (int32_t)((rs >> 9) % 8u);
+                }
+                streams_round("hot set", round, ids, hx, hs, inst3);
+            }
+            for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(hs[s]), "hipStreamDestroy", __LINE__);
+        }
+        r->fini(inst3);
+    }
+
+    /* The window forced. A round above enters it only if the card interleaves a reader between its
+     * lookup and its recheck, which a run that never does cannot show; here a reader parks in that
+     * window (r4d_ple_probe, r4d.h) while the same launch's other blocks reclaim the way it holds
+     * (ple_claim's protocol: even -> odd, write, publish) and write a payload that is no row's. The
+     * reader then loads that payload and its recheck must land two generations on.
+     *
+     * What the counters have to show, and each is its own assertion because the park, the rewrite
+     * and the recheck are three different events: a rewrite happened under the park; the park was
+     * released by that rewrite and not by the handshake's bound (the timeout word stays 0), since a
+     * reader the bound released could have loaded a row that was never rewritten and the
+     * counters would still look plausible; the recheck read a generation two on from the one the
+     * lookup held -- read with the timeout word, since the difference alone does not order the
+     * rewrite against the load (a rewrite after the load leaves the same two), while the release
+     * store that publishes the way and the acquire load that released the park do; and the row the
+     * reader writes is still the table's. One id a set, so the way rewritten under the reader is
+     * only ever read by that one row -- the poison can reach no other -- and taking the generation
+     * check out of this entry's recheck puts that poison in the output. The gather's own hit test
+     * is a separate expression, so this mutation is the probe entry's alone. */
+    if (!pl.ple_probe) {
+        bad += "no r4d_ple_probe hook; ";
+    } else {
+        const int64_t M2 = 16;
+        const size_t row_b = (size_t)(M2 * NE * 2);
+        std::vector<int32_t> bucket[32];
+        for (int32_t id = 0; id < (int32_t)NV; ++id)
+            bucket[((uint32_t)id * 2654435761u) & 31u].push_back(id);
+        std::vector<int32_t> rd_ids;
+        for (uint32_t s = 0; s < (uint32_t)M2; ++s) rd_ids.push_back(bucket[s][0]);
+        void* d_tok2 = dalloc((size_t)M2 * 4);
+        void* d_x2 = dalloc(row_b);
+        /* Mode 0 for the warming launches: the probe entry, the gather's path -- nothing parks and
+         * no block waits. Only the third launch forces the window. */
+        unsigned words[r4d_ple_probe_words] = { 0 };
+        unsigned* d_probe = (unsigned*)dalloc(sizeof(words));
+        st_memcpy(d_probe, words, sizeof(words), hipMemcpyHostToDevice);
+        auto launch2 = [&](const std::vector<int32_t>& ids, void* out, hipStream_t st, void* inst_) {
+            st_memcpy(d_tok2, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+            std::vector<RadTensor> t2 = { T(d_tok2, RAD_I32, { M2 }), T(d_tab, RAD_F8E4M3, { NV, NE }),
+                                          T(d_sc, RAD_BF16, { 1 }), T(out, RAD_BF16, { M2, NE }) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = t2.data(); a.n_t = (int)t2.size();
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            a.instance = inst_;
+            return r->launch(&a, (RadStream)st);
+        };
+        auto check2 = [&](const char* stage, const std::vector<int32_t>& ids, void* x, int rc) {
+            if (rc != RAD_OK) { bad += fmt("%s: rc=%d; ", stage, rc); return; }
+            std::vector<uint16_t> got((size_t)(M2 * NE));
+            st_memcpy(got.data(), x, got.size() * 2, hipMemcpyDeviceToHost);
+            std::vector<uint16_t> want;
+            int64_t wrong = 0, first_m = -1, first_i = -1;
+            for (int64_t m = 0; m < M2; ++m) {
+                want_row(table, ids[(size_t)m], want);
+                for (int64_t i = 0; i < NE; ++i)
+                    if (got[(size_t)(m * NE + i)] != want[(size_t)i]) {
+                        ++wrong;
+                        if (first_m < 0) { first_m = m; first_i = i; }
+                    }
+            }
+            if (wrong) {
+                const uint16_t g = got[(size_t)(first_m * NE + first_i)];
+                const uint16_t w = want[(size_t)first_i];
+                bad += fmt("%s: %lld of %lld entries differ, first row %lld (id %d) entry %lld: "
+                           "%04x not %04x; ", stage, (long long)wrong, (long long)(M2 * NE),
+                           (long long)first_m, (int)ids[(size_t)first_m], (long long)first_i,
+                           (unsigned)g, (unsigned)w);
+            }
+        };
+
+        setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "32", 1);
+        void* inst4 = nullptr;
+        if (r->init(nullptr, 0, 0, 1, &inst4) != RAD_OK || !inst4) {
+            bad += "a probe init allocated nothing; ";
+        } else if (pl.ple_probe(inst4, d_probe) != 0) {
+            bad += "the probe hook refused the instance; ";
+        } else {
+            /* Warm every row, then one launch whose block 0 parks on its hit while its other
+             * fifteen blocks wait to rewrite the way it holds: one id a set, so the poison lands
+             * in block 0's way alone. Each launch is checked before the next fills the same
+             * output buffer. */
+            check2("probe warm", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
+            check2("probe warm again", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
+            const unsigned on = 1;            /* park and serve; every counter is still zero */
+            st_memcpy(d_probe + r4d_ple_probe_mode, &on, sizeof(on), hipMemcpyHostToDevice);
+            check2("probe reader", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
+            std::vector<unsigned> seen((size_t)r4d_ple_probe_words);
+            st_memcpy(seen.data(), d_probe, seen.size() * 4, hipMemcpyDeviceToHost);
+            ok("PLE row cache: a block reclaims and rewrites the way a parked reader holds",
+               seen[r4d_ple_probe_rewrites] > 0);
+            ok("PLE row cache: that recheck lands on a way rewritten for its own id",
+               seen[r4d_ple_probe_conflicts] > 0);
+            ok("PLE row cache: the rewrite released the park, the handshake's bound did not",
+               seen[r4d_ple_probe_timeout] == 0);
+            ok("PLE row cache: its recheck read the way two generations on from its lookup",
+               seen[r4d_ple_probe_conflicts] > 0 &&
+                   seen[r4d_ple_probe_recheck_gen] - seen[r4d_ple_probe_gen] >= 2);
+            pl.ple_probe(inst4, nullptr);     /* detach before the instance and its words go */
+            r->fini(inst4);
+        }
+    }
+
+    if (h_tok) hip_ck(hipHostFree(h_tok), "hipHostFree", __LINE__);
+    if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
+    else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    ok(what, bad.empty(), bad);
+}
+
 /* ngram_ids' `ahead_ids`: the prompt following the step, hashed in the same launch. Step one runs
  * [5, 6] and [11, 42], with three more tokens of the last sequence, [7, 8, 9], in `tok` behind
  * them. Their ids must equal what step two computes for [7, 8, 9] against the window step one
@@ -23952,6 +24318,7 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     embed_lookup_q_case(pl);
+    ple_cache_case(pl);
     lora_case(pl);
 
     /* --- the paged cache's write side --- */

@@ -3062,6 +3062,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
 | `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
+| `RADIANCE_PLE_VRAM_CACHE_SETS` | libr4d's VRAM L1 for the n-gram table's recurring rows: the set count, rounded down to a power of two and capped at 262144 sets, which is 1048576 rows of 320 B -- 320 MiB of payload and 12 MiB of tags, generations and counters; 65536 sets is a quarter of that, and the startup line prints what it took. Allocated in the gather's `init`, so the VRAM budget counts it in `already held`. Unset or `0` runs the gather as before (docs/OPS.md, "the n-gram gather") |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the
 peer card has pushed, and a prefill-sized fused all-reduce launches more blocks than a card holds at
