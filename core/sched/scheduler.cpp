@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace rad {
 
@@ -389,14 +390,39 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "(deepest tier %d)", (int)exec_depth,
                      (int)dp.policy.tiers[dp.policy.n_tiers - 1]);
     }
-    /* With no profile loaded nothing can be priced, so the cycle is the named fallback plan; its
-     * depth is the executable one, or a cost deployment would plan past what the head can run. */
-    dp.policy.fallback_k = exec_depth;
+    /* The named baseline, run only on a cycle no candidate could be priced for: the ladder's
+     * middle tier, not the ceiling. A profile prices the shapes it measured, keyed by the row count
+     * among others (draft_cost.cpp), so a batch wider than every bucket it holds can price nothing
+     * -- and at the ceiling that made a wide batch run every cycle at its maximum depth. One step
+     * off the top is the depth such a cycle drafts instead; --draft-fallback-k overrides it, and an
+     * explicit baseline deeper than the head is refused below rather than planned past it. */
+    dp.policy.fallback_k = exec_depth;   /* and the depth every other policy keeps */
+    if (cfg.draft_policy == DraftPolicyKind::Cost) {
+        if (dp.policy.n_tiers > 0) dp.policy.fallback_k = dp.policy.tiers[dp.policy.n_tiers / 2];
+        if (cfg.draft_fallback_k >= 0) dp.policy.fallback_k = cfg.draft_fallback_k;
+        /* A recording run measures the depth its export is priced at, so its baseline stays the
+         * executable depth; the middle tier would export buckets for a depth serving then reads
+         * first (docs/ADAPTIVE-MTP.md, --draft-profile-out). */
+        if (!cfg.draft_profile_out.empty()) dp.policy.fallback_k = exec_depth;
+        if (dp.policy.fallback_k > exec_depth) {
+            RAD_ERR("--draft-fallback-k %d is above the executable head depth %d (ceiling %d, "
+                    "drafter depth %d)", (int)dp.policy.fallback_k, (int)exec_depth,
+                    (int)cfg.n_spec, (int)prog.drafter.depth);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     /* --draft-hysteresis both: only the cost policy has a hold to apply to a reduction; anywhere
      * else the flag would parse and do nothing, so it is refused by name. */
     if (cfg.draft_hold_reductions && cfg.draft_policy != DraftPolicyKind::Cost) {
         RAD_ERR("--draft-hysteresis both needs --draft-policy cost: the %s policy has no hold",
                 draft_policy_name(cfg.draft_policy));
+        return RAD_E_UNSUPPORTED;
+    }
+    /* --draft-fallback-k: refused without the policy whose baseline it names, where it would parse
+     * and do nothing (the same rule as --draft-hysteresis). */
+    if (cfg.draft_fallback_k >= 0 && cfg.draft_policy != DraftPolicyKind::Cost) {
+        RAD_ERR("--draft-fallback-k needs --draft-policy cost: the %s policy has no baseline it "
+                "could name", draft_policy_name(cfg.draft_policy));
         return RAD_E_UNSUPPORTED;
     }
     dp.policy.hold_reductions = cfg.draft_hold_reductions;
@@ -659,6 +685,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    s.cost = SchedReq::DraftCostLedger{};
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
@@ -1048,7 +1075,23 @@ void Scheduler::take_completed(std::vector<uint64_t>* out) {
     completed_.resize(keep);
 }
 
+void Scheduler::draft_cost_report(const SchedReq& s) {
+    if (!s.req || s.cost.cycles <= 0) return;
+    std::string hist;
+    for (int32_t t = 0; t <= RAD_DRAFT_MAX_TIERS; ++t) {
+        if (s.cost.tiers[t] <= 0) continue;
+        if (!hist.empty()) hist += ' ';
+        hist += std::to_string(t) + ":" + std::to_string(s.cost.tiers[t]);
+    }
+    RAD_INFO("draft policy: req %llu over %d cost cycle(s), %d without a priced candidate; priced "
+             "tiers per cycle %s", (unsigned long long)s.req->id, (int)s.cost.cycles,
+             (int)s.cost.unpriced, hist.c_str());
+}
+
 void Scheduler::release_locked(SchedReq& s) {
+    /* The request's end, and the only site that reports its cost ledger: a run whose profile prices
+     * no shape of its batch is read here as unpriced cycles, not as depth decisions. */
+    draft_cost_report(s);
     if (s.pending_free) { free_kv(s); s.pending_free = false; --n_deferred_; }
     if (s.reap_pending) { s.reap_pending = false; --n_deferred_; }
     by_id_.erase(s.req->id);
@@ -2505,6 +2548,23 @@ void Scheduler::draft_cost_cycle(bool direct_step) {
              * -- that flag is the bracket stopping below its plan. It is visible here instead. */
             for (int32_t i = 0; i < p->n_seq; ++i)
                 if (p->why[i] == DraftFallback::Resources) { ++m_.draft_calib_cut; break; }
+        }
+        /* The per-request ledger: one counter per planned row and cycle. A forced calibration plan
+         * weighed nothing and is left out, as is the empty planning point returned above. */
+        if (p->source == DraftPlanSource::Cost || p->source == DraftPlanSource::Fallback) {
+            const int32_t priced = draft_.planner().last_tiers_priced();
+            const int32_t bin    = priced < 0                       ? 0
+                                   : priced > RAD_DRAFT_MAX_TIERS ? RAD_DRAFT_MAX_TIERS
+                                                                  : priced;
+            for (int32_t i = 0; i < p->n_seq; ++i) {
+                const int32_t slot = p->slot[i];
+                if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) continue;
+                SchedReq& s = *reqs_[(size_t)slot];
+                if (!s.req || s.req->id != p->req_id[i] || s.gen != p->slot_gen[i]) continue;
+                ++s.cost.cycles;
+                if (bin == 0) ++s.cost.unpriced;
+                ++s.cost.tiers[bin];
+            }
         }
         m_.draft_cost_last_k        = p->max_k;
         m_.draft_cost_last_replay   = (int64_t)p->replay;

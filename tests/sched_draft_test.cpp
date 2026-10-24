@@ -209,6 +209,7 @@ TEST(a_cycle_measures_the_executed_distribution_and_refuses_unknown_evidence) {
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
+    f.cfg.draft_fallback_k = 6;      /* this test files a sample, it is not about the baseline */
     activate_costs(f);
     CHECK_OK(f.start());
 
@@ -3186,6 +3187,7 @@ TEST(the_cost_policy_is_wired_through_config_and_observes_each_cycle_exactly_onc
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
+    f.cfg.draft_fallback_k = 6; /* the depth the wiring test's arithmetic is written at */
     activate_costs(f);          /* the baseline a Cost deployment is admitted with */
     CHECK_OK(f.start());
 
@@ -3755,6 +3757,9 @@ TEST(an_unpriced_explicit_ladder_below_the_executable_depth_stops_the_run) {
     f.cfg.draft_n_tiers   = 2;
     f.cfg.draft_tiers[0]  = 0;
     f.cfg.draft_tiers[1]  = 2;
+    /* The baseline is what makes it a gap, so this is the deployment that configured one above the
+     * ladder: the default baseline is the ladder's own middle tier and needs no such rule. */
+    f.cfg.draft_fallback_k = 6;
     activate_costs(f);                    /* live, empty, fallback admitted */
 
     CHECK_OK(f.start(DraftReplay::None));  /* init accepts it; the cycle diagnoses the gap */
@@ -3809,6 +3814,7 @@ TEST(a_mixed_batch_with_one_row_past_the_ladder_is_refused_whole) {
     f.cfg.draft_n_tiers   = 2;
     f.cfg.draft_tiers[0]  = 0;
     f.cfg.draft_tiers[1]  = 2;
+    f.cfg.draft_fallback_k = 6;      /* a baseline above the ladder is what makes the gap */
     activate_costs(f);
     CHECK_OK(f.start(DraftReplay::None));
 
@@ -3903,18 +3909,21 @@ TEST(an_explicit_ladder_at_the_executable_depth_is_admitted) {
     CHECK_EQ(draft_plan_valid(*p), RAD_OK);
 }
 
-/* The feedback R depends on: the named baseline's measurement is a price for the deepest offered
- * plan, so a later cycle can choose it. A live table starts with no bucket. Cycle A verifies
- * nothing and falls back at six; its bucket is a first-cycle shape (verify_k 0). Cycle B prices
+/* The feedback R depends on: a fallback cycle's measurement is a price for the depth it ran, so a
+ * later cycle can choose that depth. A live table starts with no bucket. Cycle A verifies nothing
+ * and falls back at the baseline; its bucket is a first-cycle shape (verify_k 0). Cycle B prices
  * A's published window, does not find that shape either, falls back once more and measures the
- * exact shape it executed; cycle C prices it and issues a cost plan at the deepest tier. */
-TEST(a_fallback_cycle_measures_the_deepest_offered_plan_for_the_next_cycle) {
+ * exact shape it executed; cycle C prices it and issues a cost plan at that depth. Here the
+ * baseline is configured at the ladder's top (--draft-fallback-k 6), which is the case the old
+ * unconditional baseline produced for every deployment. */
+TEST(a_fallback_cycle_measures_the_depth_it_ran_for_the_next_cycle) {
     Fixture f;
     f.build();
     f.cfg.n_spec = 6;
     f.cfg.draft_policy = DraftPolicyKind::Cost;
     f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
     f.prog.drafter.depth = 6;
+    f.cfg.draft_fallback_k = 6;
     activate_costs(f);                    /* live, empty, fallback admitted */
     CHECK_OK(f.start(DraftReplay::None));
 
@@ -3956,6 +3965,116 @@ TEST(a_fallback_cycle_measures_the_deepest_offered_plan_for_the_next_cycle) {
     CHECK(c->fallback == DraftFallback::None);
     CHECK_EQ(c->k[0], 6);
     CHECK_EQ(c->verify_k, 6);
+}
+
+/* What a wide batch does when the profile cannot price it at all -- the C8 measurement, host-side.
+ * The shipped `draft-profile-0006.json` holds 47 buckets and every one of them has `n_rows = 1`
+ * (`Counter(b["shape"]["n_rows"]) == {1: 47}`), and the cost model's key compares the row count
+ * among others (`draft_cost.cpp`: `a.n_rows == b.n_rows && ...`), so a batch of eight decoding rows
+ * can never match a bucket, whatever its depths. Every cycle of such a batch is the named
+ * baseline. That baseline used to be the executable head depth, which is why a K6 run at batch 8
+ * measured the ceiling rather than a decision -- and why the -19% the arm showed belongs to the
+ * baseline, not to the priced switch.
+ *
+ * The test proves which depth is emitted, on eight rows, through the real key comparison: the
+ * default baseline is the ladder's middle tier (K3 of 0,2,3,4,6) and --draft-fallback-k moves it,
+ * refused above the executable head depth. The per-request ledger line is the counter that tells
+ * this state apart from a policy decision: unpriced cycles, not chosen depths. */
+TEST(a_batch_wider_than_every_bucket_drafts_at_the_ladder_middle_and_not_the_ceiling) {
+    uint64_t ids[8] = {};
+    auto eight_rows = [&ids](Fixture& f) {
+        for (int i = 0; i < 8; ++i) {
+            ids[i] = f.submit(160 + i);
+            f.prefill(ids[i]);
+        }
+        for (int i = 0; i < 8; ++i) {
+            const Request* r = f.sch.find(ids[i]);
+            REQUIRE(r != nullptr);
+            CHECK(r->n_computed >= (int64_t)r->prompt.size());   /* decoding: a cycle sees it */
+        }
+    };
+
+    /* The default: the ladder's middle tier. */
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_policy = DraftPolicyKind::Cost;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 6;
+        activate_costs(f, /*priced=*/true);   /* one measured bucket, n_rows = 1 */
+        CHECK_OK(f.start(DraftReplay::None));
+        eight_rows(f);
+        const uint64_t first = ids[0];
+
+        REQUIRE(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr);
+        CHECK(p->source == DraftPlanSource::Fallback);        /* no candidate priced */
+        CHECK(p->fallback == DraftFallback::UnknownShape);
+        CHECK_EQ(p->n_seq, 8);
+        CHECK_EQ(p->max_k, 3);                                /* not the ceiling 6 */
+        for (int32_t i = 0; i < p->n_seq; ++i) CHECK_EQ(p->k[i], 3);
+        CHECK_EQ(f.sch.metrics().draft_cost_tiers_priced, 0);  /* not one tier was priced */
+        CHECK_EQ(f.sch.metrics().draft_cost_last_rows, 8);
+
+        /* The request's own line, at its end: eight planning cycles were one unpriced fallback
+         * after the other, so the depth above is a baseline and not a decision. */
+        f.commit_plain(11);
+        const std::string line = stderr_of([&] {
+            CHECK_OK(f.sch.cancel(first));
+            CHECK_OK(f.sch.reap(first));
+        });
+        CHECK(has(line, "without a priced candidate"));
+        CHECK(has(line, "priced tiers per cycle 0:"));   /* tier zero: nothing was priced */
+        CHECK(has(line, "req " + std::to_string(first) + " "));   /* the request's own ledger */
+    }
+
+    /* The C8 configuration, restored by name: the same batch at the ceiling. This is the arm that
+     * measured K6 and the 97% -- the depth was never a policy choice there. */
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_policy = DraftPolicyKind::Cost;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 6;
+        f.cfg.draft_fallback_k = 6;
+        activate_costs(f, /*priced=*/true);
+        CHECK_OK(f.start(DraftReplay::None));
+        eight_rows(f);
+        REQUIRE(f.sch.step() != nullptr);
+        const DraftPlan* p = f.sch.draft().plan();
+        REQUIRE(p != nullptr);
+        CHECK(p->source == DraftPlanSource::Fallback);
+        CHECK_EQ(p->max_k, 6);
+    }
+
+    /* Above the executable head depth is refused at startup: the baseline would plan rounds the
+     * head cannot publish, which is the bucket kDraftSampleShortened that no reader prices. */
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_policy = DraftPolicyKind::Cost;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 6;
+        f.cfg.draft_fallback_k = 7;
+        activate_costs(f, /*priced=*/true);
+        const std::string why = stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+        CHECK(has(why, "above the executable head depth 6"));
+    }
+
+    /* And without the policy whose baseline it names, it would parse and do nothing. */
+    {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 6;
+        f.cfg.draft_policy = DraftPolicyKind::Legacy;
+        f.cfg.draft_fallback_k = 3;
+        const std::string why = stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+        CHECK(has(why, "needs --draft-policy cost"));
+    }
 }
 
 /* The replay a cycle is priced under is the last bracket's *observation*, not a capability claim,
@@ -5216,7 +5335,7 @@ TEST(an_idle_or_prefill_step_is_an_empty_planning_point_not_a_fallback) {
     CHECK_EQ(m.draft_cost_fallback, 1);
     CHECK_EQ(m.draft_cost_last_source, (int64_t)DraftPlanSource::Fallback);
     CHECK_EQ(m.draft_cost_last_rows, 1);
-    CHECK_EQ(m.draft_cost_last_k, 6);       /* the executable depth */
+    CHECK_EQ(m.draft_cost_last_k, 3);       /* the ladder's middle tier, not the ceiling */
     f.commit_plain(11);
 
     /* A row that may not speculate plans K0 over a real row: no drafts by decision, not an empty

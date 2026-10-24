@@ -302,7 +302,13 @@ prediction and sample.
   `draft_cost_last_rows`), which describe the last plan **with rows**: an idle or prefill step
   cannot overwrite the last real decision, and they stay 0 until such a plan is issued. A valid
   all-K0 plan is one of them -- `last_k == 0` with `last_rows > 0` is a decision to draft nothing,
-  not an empty ledger. A no-loan reference table absorbs nothing, so it reports what it refused
+  not an empty ledger. Beside it the scheduler keeps a **per-request** ledger and prints it once, at
+  the request's end: `draft policy: req <id> over <n> cost cycle(s), <m> without a priced candidate;
+  priced tiers per cycle <tier>:<cycles> ...`. `m` counts the cycles that issued the named baseline
+  because no candidate could be priced -- a profile keyed by row count prices nothing for a wider
+  batch, so those cycles are a baseline, not a depth decision, and the histogram says how many tiers
+  the priced cycles could weigh. Counter only: no per-step work, no extra synchronisation, one line
+  per request. A no-loan reference table absorbs nothing, so it reports what it refused
   instead (`draft_ref_skipped`), and the per-cycle trace names the same discard on each sample
   (`disposition=reference`) so a cumulative count can be attributed to a cycle. Together these
   separate a policy which never saw a priceable shape from a ladder that had nothing measured -- a
@@ -536,7 +542,8 @@ parses and does nothing would be the fabricated success the contracts forbid.
 | `--draft-policy-shadow` | switch | off | cost choice logged, not applied; with C |
 | `--draft-profile` | path | none | accepted; a `rad-draft-profile/4` file, read once before `Scheduler::init`. An unreadable or malformed file aborts startup; a fingerprint or execution mismatch disables the profile and `reason()` names the first difference. A `no-loan` file is a reference: it loads on a serving run whose loans stay dynamic, is immutable and prices only exact measured buckets. On a generator or embedding model the flag is a start error, because that path never initialises the scheduler that reads it |
 | `--draft-depth-tiers` | ascending unique K list, e.g. `0,2,3,4,6` | `0,2,3,4,6` | accepted; the K values the cost choice weighs, at most eight. The bound is the executable head depth (`min(ceiling, drafter depth)`), not the ceiling alone: a plan above it would execute fewer rounds than it planned and record a shortened bucket. An explicit list with a tier above that depth is refused by name; otherwise the list is the whole ladder. A top **below** it is left as given: when the active profile prices that top, the cycle runs it (a valid reload). Only a cycle whose top is unpriced while the named baseline would run deeper is refused, by the policy that can see the shape, with a one-time diagnostic -- nothing is learnt at a depth the ladder never offers, and the run stops on the fail-closed latch (`draft_cost_aborted` -> `Engine::fail_loop`) instead of drafting on at the ceiling. The default ladder is trimmed to the depth (its deepest value replaced by the depth), so a shallow head does not lock out valid tiers |
-| `--draft-hysteresis` | `raise` / `both` | `raise` | accepted with `--draft-policy cost`, refused by name otherwise. A depth change is priced, not thresholded: the raise (or, with `both`, the reduction) is taken when the dwell's net rate beats staying, `tokens * inc_ms > (1 + margin) * dwell_ms * inc_yield`, where `tokens` is the frozen window's yield plus the candidate's own for the remaining `hold - 1` cycles and `dwell_ms` spends the first of them at the candidate's price -- the one transition cycle, which commits the frozen window's shape but pays the new one's. `hold` (8) is the dwell that rule is priced over and `margin` (2%) the return it demands; neither is the justification. `raise` never prices a reduction (it is immediate), `both` judges it by the same inequality, before the resource cut and against the incumbent's own assignment (every row at min(incumbent, its cap)). Not held up: a reduction the rows' own caps force, the token/KV budget cut, and a reduction from an incumbent with no price of its own. Only measured means enter, as `yield / horizon_ms`; a bucket's `unc` (its largest single deviation) takes no part -- it is 0 at n = 1, so pricing it in would make the best-measured depths unreachable and a reduction permanent |
+| `--draft-fallback-k` | K | the ladder's middle tier | accepted with `--draft-policy cost`, refused by name otherwise. The depth of the named baseline -- the plan a cycle gets when no candidate could be priced at all (`Fallback`, `UnknownShape`). It is deliberately **not** the executable head depth: a profile prices the shapes it measured, keyed by the row count among others (`core/sched/draft_cost.cpp`), so a batch wider than every bucket the file holds (the shipped `draft-profile-0006.json` is 47 buckets, all `n_rows = 1`) can never match one, and at the ceiling such a batch ran every cycle at its maximum depth. The default is one tier below the top and one tier above it (`tiers[n_tiers / 2]`, i.e. K3 on `0,2,3,4,6`); a value above the executable head depth is refused at startup. A recording run (`--draft-profile-out`) keeps the executable depth, because a calibration measures the depth its export is priced at |
+| `--draft-hysteresis` | `raise` / `both` | `raise` | accepted with `--draft-policy cost`, refused by name otherwise. A depth change is priced, not thresholded: the raise (or, with `both`, the reduction) is taken when the dwell's net rate beats staying, `tokens * inc_hms > (1 + margin) * dwell_ms * inc_yield`, where `tokens` is the frozen window's yield plus the candidate's own for the remaining `hold - 1` cycles and `dwell_ms` spends the first of them at the candidate's price -- the one transition cycle, which commits the frozen window's shape but pays the new one's. `hold` (8) is the dwell that rule is priced over and `margin` (2%) the return it demands; neither is the justification. `raise` never prices a reduction (it is immediate), `both` judges it by the same inequality, before the resource cut and against the incumbent's own assignment (every row at min(incumbent, its cap)). Not held up: a reduction the rows' own caps force, the token/KV budget cut, and a reduction from an incumbent with no price of its own. Only measured means enter, as `yield / horizon_ms`; a bucket's `unc` (its largest single deviation) takes no part -- it is 0 at n = 1, so pricing it in would make the best-measured depths unreachable and a reduction permanent |
 | `--draft-reference` | switch | off | a calibration flag: both lenders stay off for the whole run (no KV lend, no arena lend, no recall) and expert placement stays frozen at the one bringup settled (no swap, fill or drop), so the written profile is the plan's start placement without borrowed copies; no cycle is marked for a mover move, but a staged bracket or another placement-marked cycle is still left out at export. Needs `--draft-profile-out` and `--draft-policy cost`; refused otherwise and on a generator/embedding model. The file is stamped `basis: "no-loan"` and verified at export (nothing carved, nothing held, no kv loan), and the loader logs that the reference is an optimisation basis, not a latency bound |
 | `--draft-calib-k` | K sequence, e.g. `3,2,2,3` | none | calibration only: force this fixed sequence of depths, one per **non-empty** cycle, in the given order and keeping duplicates. Needs `--draft-profile-out` and `--draft-policy cost`. With `--draft-reference` it measures the no-loan reference; without it the run is a live diagnostic -- lenders and expert moves as in serving, and the export keeps every placement-affected bucket with its `placement` flag, which no reader prices (a file to compare the live cost curve with, not to serve from; it still needs one bucket whose only disturbance is the placement), and every value must be one of the **effective** `--draft-depth-tiers` after the trim/dedup `Scheduler::init` applies -- both are refused by name at startup, so neither a serving run nor a depth the ladder never offers can carry it. The check is on the nominal value: `cap_of` can still clamp a row by its remaining output, so an executed cycle may land on a depth the ladder does not list (a resource clamp, counted in `calib_cut`). Plans are `source=calibration` (runtime only, never serialized), not cost decisions: no price, no ranking, no hysteresis, and the planner reads no predictor -- but the controller's `open_cycle` still runs `predictor.predict` for the cycle, because the prediction set is the cycle's, not the plan's. The shared token/KV budget cut still applies, and `calib_cut` counts forced **cycles** (not rows) whose plan a plan-time cut touched -- `cap_of` clamps included, not only the budget scaling. An empty view still gets a valid calibration plan (`source=calibration`, no rows, `max_k` 0): it is counted as `empty`, not `calib_forced` -- it has no depth to measure and does not advance the sequence -- and `priced`/`fallback` stay 0 for forced plans |
 | `--draft-explore-rate` | R in [0, 1] | `0.01` | at most 1% of eligible decode cycles |
@@ -775,12 +782,14 @@ are regenerated, never rescaled.
   invented. If no candidate can be priced, the named baseline (`Fallback`, `UnknownShape`) remains.
   A tiny lookup budget may prevent alternatives from being evaluated; it does not relax pricing.
   Coordinate passes and budget-cut re-pricing retain their validity requirements.
-  The named baseline is evidence for the offered top only when it runs that top's own shape. With
-  the default ladder `fallback_k` is the deepest tier, and rows whose remaining budget clamps both
-  to the same k make the two shapes coincide; then a fallback cycle measures the deepest offered
-  plan, and the next cycle can price it (the feedback case). An explicit ladder topping **below**
-  the executable depth breaks that: the baseline would run deeper than the ladder ever offers, so
-  its bucket could never be queried and the run would stay in the fallback forever. That cycle is
+  The named baseline (`fallback_k`, `--draft-fallback-k`) runs when no candidate priced, at the
+  ladder's middle tier by default -- a baseline at the ceiling is what made a batch whose shape the
+  profile cannot key run every cycle at maximum depth. A fallback cycle is evidence for the shape it
+  actually runs: it measures the baseline's own plan, at the baseline's own rows' caps, and the
+  next cycle can price that depth (`verify_k = 0` included). A baseline **above** the ladder's top
+  breaks that: the ladder never offers it, its bucket could never be queried by a later choice from
+  this list, and the cycle is refused instead (below). A baseline **inside** the ladder needs no
+  such rule -- the depth it measures is one the policy may choose. That cycle is
   diagnosed once and refused (`RAD_E_UNSUPPORTED`) instead of issued, so nothing is recorded at a
   depth the ladder never offers. The refusal is fail-closed through the same latch as a residency
   drift (`draft_cost_aborted`): the scheduler issues no plan, `step()`/`promote_next()` return
@@ -799,8 +808,9 @@ are regenerated, never rescaled.
   reload can price no request's first cycle. The depth a calibration measures is the executable
   head depth (`min(ceiling, drafter depth)`), not the ceiling: a cost calibration's tiers are
   bounded by that depth (an explicit tier above it is refused by name, the default ladder is
-  trimmed to it) and its fallback baseline is that depth, so every bucket describes rounds the head
-  can really publish. An explicit ladder may top below that depth. When the loaded profile prices
+  trimmed to it) and its fallback baseline is that depth (a recording run keeps the baseline at the
+  executable depth for exactly this reason, `--draft-fallback-k` notwithstanding), so every bucket
+  describes rounds the head can really publish. An explicit ladder may top below that depth. When the loaded profile prices
   that top, the cycle runs it at that K; this is the ordinary priced reload (calibrate K2, serve
   with a ceiling of 6), and the named baseline is never issued, so the deeper head depth is
   irrelevant. When the top is unpriced, the named baseline would run at the executable depth -- a
@@ -810,11 +820,14 @@ are regenerated, never rescaled.
   at the ceiling without a plan. The list is neither silently extended nor the calibration depth
   moved to fit it: whoever wants to offer only K=2 either prices it or sets the ceiling to 2 as
   well.
-  The default ladder keeps its trimming, and there the fallback shape equals the deepest offered
+  The default ladder keeps its trimming. A recording run's fallback shape equals the deepest offered
   plan's, so a fallback cycle measures it and a later cycle can price it. A reload with a default
   ladder and a deeper ceiling is that case: init trims or extends the ladder to its executable
   depth, the first cycles take the named baseline at that shared shape, and those cycles measure
-  the exact shape they executed, so a later cycle can price the deepest offered plan. Offering a
+  the exact shape they executed, so a later cycle can price the deepest offered plan. A serving run
+  takes the baseline at the ladder's middle tier instead (a batch whose row count no bucket covers
+  prices nothing, and the ceiling is the wrong depth for it), so its fallback cycles measure that
+  depth and the feedback loop is the same one tier lower. Offering a
   tier deeper than the file covers is not a way to run deeper: once the ladder's top is above what
   the profile prices, a cycle is refused by the coverage-gap rule (explicit ladder, which stops the
   run) or takes the named baseline at the same shape (default ladder).

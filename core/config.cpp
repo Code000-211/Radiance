@@ -180,6 +180,7 @@ static const Flag g_flags[] = {
     { "--draft-depth-tiers",  "LIST",   "the K values the cost policy chooses between, ascending\n"
     "                                    and unique, e.g. 0,2,3,4,6; each must be <= the executable\n"
     "                                    head depth. Default 0,2,3,4,6 (trimmed to that depth)" },
+    { "--draft-fallback-k",   "K",      "the depth the cost policy drafts when it can price no\n                                    candidate: a cycle whose shape no bucket matches. Default\n                                    the ladder's middle tier; deeper than the executable head\n                                    depth is refused. Refused without --draft-policy cost" },
     { "--draft-hysteresis",   "MODE",   "which depth moves of the cost policy wait for its hold\n"
     "                                    (8 cycles) and margin (2%): raise (default; a reduction\n"
     "                                    is immediate) or both. Needs --draft-policy cost" },
@@ -770,6 +771,12 @@ int config_parse(int argc, char** argv, Config* c) {
             c->draft_n_tiers = n;
             c->draft_tiers_set = true;
         }
+        else if (S("--draft-fallback-k")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t t = 0;
+            if (!parse_int(a.c_str(), v, 0, INT32_MAX, &t)) return RAD_E_INVAL;
+            c->draft_fallback_k = (int)t;
+        }
         else if (S("--draft-calib-k")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* A sequence, not a ladder: order and duplicates are the point (3,2,2,3), so only
@@ -1249,6 +1256,9 @@ const ShowRow kShow[] = {
     } },
     { "--draft-hysteresis",   [](const Config& c) {
           return std::string(c.draft_hold_reductions ? "both" : "raise"); } },
+    { "--draft-fallback-k",   [](const Config& c) {
+          return c.draft_fallback_k < 0 ? std::string("the ladder's middle tier")
+                                        : num(c.draft_fallback_k); } },
     { "--draft-calib-k",      [](const Config& c) {
         std::string s;
         for (int i = 0; i < c.draft_calib_n; ++i) s += (i ? "," : "") + num(c.draft_calib_k[i]);

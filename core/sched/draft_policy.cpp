@@ -14,6 +14,12 @@ namespace rad {
 
 namespace {
 
+/* The dwell a depth change is priced over: `hold`, and at least two cycles -- the move's own cycle
+ * plus the one that first earns the new depth's yield. A shorter dwell has no steady cycle to gain
+ * in, so it would refuse every move. One definition, so the configure() log names the dwell the rule
+ * really uses. */
+double dwell_of(int32_t hold) { return hold > 2 ? (double)hold : 2.0; }
+
 /* A request's own cap: no draft past its remaining output (the verified token and the bonus token
  * take one each), no draft past the declared ceiling, none at all when it may not draft. */
 int32_t cap_of(const DraftSeqView& v, int32_t ceiling) {
@@ -119,11 +125,11 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
     if (c_.hold_reductions && c_.max_seqs > 0 && held_k_.size() < (size_t)c_.max_seqs)
         held_k_.assign((size_t)c_.max_seqs, 0);
     if (c_.mode == DraftPolicyMode::Cost)
-        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), a depth change is priced "
-                 "against the one cycle it costs over a %d-cycle dwell (%.0f%% net margin)%s",
+        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), baseline K%d, a depth change is "
+                 "priced against the one cycle it costs over a %g-cycle dwell (%.0f%% net margin)%s",
                  (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
-                 (int)c_.n_tiers, (int)c_.hold, 100.0 * c_.hyst,
-                 c_.hold_reductions ? ", and so is a reduction" : "");
+                 (int)c_.n_tiers, (int)c_.fallback_k, dwell_of(c_.hold),
+                 100.0 * c_.hyst, c_.hold_reductions ? ", and so is a reduction" : "");
     return RAD_OK;
 }
 
@@ -257,10 +263,8 @@ double DraftPlanner::expect(const DraftPredictions& pred, int32_t i, int32_t cap
 }
 
 bool DraftPlanner::switch_pays(const Priced& cand, const Priced& inc) const {
-    /* The dwell the new depth is assumed to run: `hold`, and at least two cycles -- the move's own
-     * cycle plus the one that first earns the new depth's yield. A shorter dwell has no steady
-     * cycle to gain in, so it would refuse every move. */
-    const double dwell = c_.hold > 2 ? (double)c_.hold : 2.0;
+    /* The dwell the new depth is assumed to run (dwell_of). */
+    const double dwell = dwell_of(c_.hold);
     /* The move's own cycle is priced, not assumed free: this cycle pays the candidate shape's
      * execution price (`ms`, the pass it will run) while the tokens it commits are the frozen
      * window's, so the dwell's first cycle earns the incumbent's yield at the candidate's price and
@@ -526,11 +530,11 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                 return RAD_E_UNSUPPORTED;
             }
         }
-        /* No tier priced: the named, configured baseline, not an invented price. It is the
-         * executable depth (Scheduler: fallback_k = exec_depth) because a record-only calibration
-         * and a live table's feedback both measure the offered top through it; it is not a policy
-         * choice, so the hysteresis incumbent does not move. Every tier was asked, and the trace
-         * lists each as unpriced. */
+        /* No tier priced: the named, configured baseline, not an invented price. It is the ladder's
+         * middle tier by default (Scheduler: fallback_k, --draft-fallback-k), not the executable
+         * depth: a profile that prices no shape of this batch would otherwise run every one of its
+         * cycles at the maximum depth. It is not a policy choice, so the hysteresis incumbent does
+         * not move. Every tier was asked, and the trace lists each as unpriced. */
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
             out->k[i] = c_.fallback_k < c ? c_.fallback_k : c;

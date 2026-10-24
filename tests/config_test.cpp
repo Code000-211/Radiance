@@ -437,6 +437,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
         { "--draft-policy", { "cost" } }, { "--draft-depth-tiers", { "0,2" } },
         { "--draft-hysteresis", { "both" } },
+        { "--draft-fallback-k", { "3" } },
         { "--draft-confidence-rule", { "1.25,0,2" } },
         { "--draft-confidence-fallback", { "3" } },
         { "--draft-calib-k", { "3,2,2,3" } },
@@ -808,6 +809,24 @@ TEST(the_draft_hysteresis_is_raise_or_both) {
     for (const char* bad : { "Both", "symmetric", "down", "1", "" })
         CHECK_EQ(parse({ "--draft-hysteresis", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-hysteresis" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-fallback-k: the depth the cost policy runs when it can price no candidate at all.
+ * -1 is "the ladder's middle tier", which only the scheduler can resolve (it knows the trimmed
+ * ladder); an out-of-range value is refused here, and everything that needs the executable head
+ * depth stays with the scheduler. */
+TEST(the_draft_fallback_depth_is_a_non_negative_k) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_fallback_k, -1);
+    Config c;
+    CHECK_EQ(parse({ "--draft-fallback-k", "3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_fallback_k, 3);
+    CHECK_EQ(parse({ "--draft-fallback-k", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_fallback_k, 0);
+    for (const char* bad : { "-1", "1.5", "k3", "" })
+        CHECK_EQ(parse({ "--draft-fallback-k", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-fallback-k" }, &c), RAD_E_INVAL);
 }
 
 /* --draft-depth-tiers is the cost policy's ladder: ascending, unique, at most kDraftMaxTiers.

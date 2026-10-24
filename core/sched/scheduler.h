@@ -100,6 +100,20 @@ struct SchedReq {
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
 
+    /* The cost policy's per-request ledger, charged once per cycle that planned this request and
+     * reported once at its end (Scheduler::draft_cost_report): how many such cycles there were, how
+     * many of them the policy could price nothing for, and how many tiers it priced in each. A
+     * cycle whose shape no bucket matches prices nothing and issues the named baseline, so a run
+     * whose profile has no bucket for its row count shows up here as unpriced cycles rather than as
+     * a depth decision -- the distinction the plan ledger alone cannot make on such a run. Reset on
+     * admission; nothing here is read per step or per token. */
+    struct DraftCostLedger {
+        int32_t cycles   = 0;
+        int32_t unpriced = 0;
+        /* Priced tiers per cycle, indexed by how many there were (0 counts the unpriced cycles). */
+        int32_t tiers[RAD_DRAFT_MAX_TIERS + 1] = {};
+    } cost;
+
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
     /* Its index in the next step, already issued while this one runs (step_next), or -1; and the
@@ -699,6 +713,11 @@ private:
      * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
      * the step path does not allocate. */
     void    draft_cost_cycle(bool direct_step);
+    /* The request's own line for the cost policy: `cycles` planning cycles, `unpriced` of them
+     * without a single priced candidate, and the priced-tier histogram. One line per request, at
+     * its end (release_locked) -- never per step, and it costs no synchronisation: the scheduler's
+     * lock is already held, and the counters are charged where the plan is issued. */
+    void    draft_cost_report(const SchedReq& s);
     std::vector<DraftSeqView>    draft_view_seq_;
     std::vector<DraftPrediction> draft_pred_seq_;
     std::vector<uint64_t>        draft_pred_id_;

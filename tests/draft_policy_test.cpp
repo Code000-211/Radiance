@@ -1850,4 +1850,58 @@ TEST(a_missing_deepest_price_does_not_discard_the_priced_cheaper_tiers) {
     }
 }
 
+/* The switch priced ahead of its step. Every test above runs at pipeline_depth 0, where the pass
+ * that verifies a candidate's drafts is the candidate's own shape: `ms` and `hms` are one number
+ * and the rule reduces to a ratio of two prices. Ahead of the step they are two: the cycle the move
+ * spends runs the *frozen* window's shape while committing the candidate's tokens, so the switch
+ * must price the transition at what that shape costs and the rest of the dwell at the candidate's
+ * own. Both shapes are asked here, which is the branch this test exists for. */
+TEST(the_priced_switch_prices_the_frozen_window_its_transition_cycle_runs) {
+    ShapeLog log;
+    const DraftCostModel model{ &log, log_estimate };
+    Cycle c;
+    c.f.view.pipeline_depth = 1;
+    c.pred.a = 0.95f;
+    c.add(0, 1);
+    auto choose = [&] {
+        return c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan);
+    };
+
+    /* Nothing is frozen yet, so the first cycle verifies nothing and every candidate is priced on
+     * its own stationary shape. */
+    REQUIRE_EQ(choose(), RAD_OK);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.f.plan.k[0], 6);
+    bool saw_first_cycle = false;
+    for (int i = 0; i < log.n; ++i)
+        if (log.shape[i].draft_k == 6 && log.shape[i].verify_k == 0) saw_first_cycle = true;
+    CHECK(saw_first_cycle);
+
+    /* Lower acceptance: a reduction is immediate, and its depth is frozen for the next cycle. Not
+     * prose (a = 0.2): at pipeline_depth 1 a K0 plan spends no verify at all, so K0 wins there and
+     * the window the raise would be priced against is empty. */
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = 0.8f;
+    REQUIRE_EQ(choose(), RAD_OK);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    const int32_t shallow = c.f.plan.k[0];
+    REQUIRE(shallow > 0);
+    CHECK(shallow < 6);
+
+    /* Back to code-like text: the raise is priced on both windows -- the frozen one this cycle
+     * runs (draft six, verify the shallow window) and the stationary one it is raised to. */
+    log.n = 0;
+    for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = 0.95f;
+    REQUIRE_EQ(choose(), RAD_OK);
+    CHECK(c.f.plan.source == DraftPlanSource::Cost);
+    CHECK_EQ(c.f.plan.k[0], 6);
+    bool transition = false, stationary = false;
+    for (int i = 0; i < log.n; ++i) {
+        if (log.shape[i].draft_k != 6) continue;
+        if (log.shape[i].verify_k == shallow) transition = true;
+        if (log.shape[i].verify_k == 6) stationary = true;
+    }
+    CHECK(transition);   /* the one cycle the move spends, at the window it really runs */
+    CHECK(stationary);   /* and the dwell's steady shape, which is what the depth is worth */
+}
+
 RAD_TEST_MAIN()

@@ -2053,10 +2053,14 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
     CHECK(!fp.contains("live_loan"));      /* a no-loan reference names no loan */
     REQUIRE(!profile.value("buckets", json::array()).empty());
 
+    /* The baseline is configured above the ladder on purpose: that is the deployment the coverage
+     * gap belongs to. Left at its default the baseline is the ladder's own middle tier (K2), an
+     * offered depth, so an unpriced cycle would simply run there instead of being refused. */
     const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
                                                    "--draft-depth-tiers", "0,2",
                                                    "--draft-window", "fixed",
                                                    "--draft-policy", "cost",
+                                                   "--draft-fallback-k", "6",
                                                    "--draft-profile", out };
 
     /* The first request already has a shape the reference never measured: it is Sampled, the
@@ -2161,10 +2165,14 @@ TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
                 tail(writer.output()).c_str());
     REQUIRE_EQ(writer_exit, 0);
 
+    /* The baseline is configured above the ladder on purpose: that is the deployment the coverage
+     * gap belongs to. Left at its default the baseline is the ladder's own middle tier (K2), an
+     * offered depth, so an unpriced cycle would simply run there instead of being refused. */
     const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
                                                    "--draft-depth-tiers", "0,2",
                                                    "--draft-window", "fixed",
                                                    "--draft-policy", "cost",
+                                                   "--draft-fallback-k", "6",
                                                    "--draft-profile", out };
 
     /* What a stream that ended on the gap has to look like: the committed 200 and event-stream

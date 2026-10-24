@@ -943,6 +943,15 @@ struct Config {
      * Empty: off. */
     int     draft_calib_k[kDraftMaxTiers] = {};
     int     draft_calib_n = 0;
+    /* --draft-fallback-k: the depth the cost policy runs when it can price no candidate at all
+     * (`DraftFallback::UnknownShape`). -1 is the policy's own default, the ladder's middle tier: a
+     * profile measured at one row count (the shipped file's 47 buckets are all n_rows = 1) can
+     * never price a wider batch, and the ceiling is then the wrong depth for every cycle of it --
+     * one step off the top is the depth such a batch runs instead of the maximum. Deeper than the
+     * executable head depth is refused at startup, and a recording run
+     * (--draft-profile-out) keeps the executable depth, because the baseline is the depth its
+     * export is priced at. Refused without --draft-policy cost, where it would do nothing. */
+    int     draft_fallback_k = -1;
     /* --draft-reference: this run calibrates the no-loan reference. Both lenders stay off for the
      * whole run, so the buckets are the plan's start placement without borrowed copies; the file
      * is stamped with that basis and a serving run may load it while its own loans stay dynamic.
