@@ -9,7 +9,7 @@
     "--num-speculative-tokens", "3"
   ],
   "candidate_root": "candidates/gdn-query-reload",
-  "kernel_hierarchy": "gdn_query_reload is listed before libr4d so its single row takes gdn_conv_recurrent_update; libr4d keeps every other op. libref is left unnamed so the engine's default ranking places it below both.",
+  "kernel_hierarchy": "gdn_query_reload is listed before libr4d so its single row takes gdn_conv_recurrent_update; libr4d keeps every other op. libref is left unnamed, and with a non-empty --kernels that means it is not loaded at all: unnamed kernel libraries are closed before registration (core/plugin/loader.cpp), so no A/B run under these flags can be contaminated by it.",
   "optional_local_harness_profile": {
     "_note": "Review metadata only. These names are the source tree's (scripts/lever_queue.py reads gate.json's engine_env and engine_args for its own A/B runner); none of RADIANCE_GDN_ANCHOR, TP_WIRE, GPU_HEADROOM_MIB, VRAM_KV_MIB, RADIANCE_DARTREE, RADIANCE_ADAPTIVE_SPEC, RADIANCE_SPECHUB, RADIANCE_MTP_*, RADIANCE_HC_UP_WMMA, RADIANCE_PREFILL_BUFFERS, RADIANCE_NO_PROMPT_LOOKUP, RADIANCE_GDN_BOLE_EXACT, R4D_MOE_DOWN2, GPU_KEEP_ALIVE, MAX_MODEL_LEN, PORT, RADIANCE_ENGINE_* or RADIANCE_EXTRA_ARGS exists in this engine (verified by grep over core/ and docs/). They are recorded as the conditions the old-tree numbers were taken under, not as flags this engine accepts.",
     "HIP_VISIBLE_DEVICES": "0,1",

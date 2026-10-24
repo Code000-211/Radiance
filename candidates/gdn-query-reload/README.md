@@ -90,9 +90,9 @@ Against a staged SDK prefix built from `b679448`, with the ROCm clang++ named ab
   accepted the ABI version and read the row, and the row declares no schema by design. With
   `libr4d` in the same home and `RADIANCE_KERNELS=gdn_query_reload,libr4d` both load and the
   schema-owner complaint below is gone: `libr4d 0.5.0  kernels  448 kernel(s), 232 schema(s)`.
-  Loaded on its own, the plugin is refused by name — `implements op 'gdn_conv_recurrent_update',
-  which no loaded plugin declares a schema for` — which is the documented consequence of this row
-  owning no schema, not a defect of the port.
+  Loaded on its own, the load fails — `kernel '…' in plugin 'gdn_query_reload' implements op
+  'gdn_conv_recurrent_update', which no loaded plugin declares a schema for` — and that status is
+  fatal to the whole load, not a per-row miss (see "Load").
 
 Not run: `rad-kbench`, the comparator on a card, and any comparison against the frozen libr4d row;
 selection of this row (which needs a declare pass over a model) is unverified for the same reason.
@@ -129,10 +129,21 @@ rad-info --plugins --radiance-home <home containing kernels/gdn_query_reload.so>
 RADIANCE_KERNELS=gdn_query_reload,libr4d radiance --model <container> ...
 ```
 
-The plugin declares no op schema. `gdn_conv_recurrent_update` is libr4d's schema and the first
-plugin to declare an op fixes its vocabulary; this DSO only implements it. Load it after libr4d in
-`--kernels` order (the first plugin with a matching row supplies the op, and this row is the
-override).
+The plugin declares no op schema. `gdn_conv_recurrent_update` is libr4d's schema — the first plugin
+to declare an op fixes its vocabulary — and this DSO only implements it. Selection is first-match in
+hierarchy order (`core/plugin/registry.h`): plugins are queried in the configured order and the first
+one with any matching row supplies the op, so `--kernels gdn_query_reload,libr4d` is what puts this
+row ahead of libr4d's for this op and leaves every other op to libr4d. A non-empty `--kernels` is
+exclusive — kernel libraries it does not name are closed before registration
+(`core/plugin/loader.cpp`) — so `libref` is not loaded at all under these flags, not merely ranked
+below them.
+
+Loading the plugin is not opt-in once its file sits in an environment's `kernels/`: the complete set
+is checked for a schema per row (`Registry::check_complete`), a row whose op no loaded plugin declares
+returns `RAD_E_NOSCHEMA`, and `Engine::load_plugins` aborts on that status
+(`core/engine_bringup.cpp`). A home holding this `.so` and no libr4d therefore cannot start the
+engine at all — `rad-info --plugins` itself exits non-zero on it. With libr4d in the same home and
+both named, both load.
 
 ## Limits — what this row refuses
 
@@ -190,39 +201,56 @@ What follows is the **arithmetic contract this source states**, not a measuremen
   new numeric stage. An absent `o_q`/`o_scale` pair skips the quantiser entirely, which is what the
   target schema allows.
 
-`gate.json` declares `numerics: bitexact`. For the fp32-state / int8 form the source was written
-for, that is now **measured** against the frozen libr4d row on gfx1201 (see below). It does not
-extend to the f16 or fp8-e4m3 instantiations this port adds, which have never executed.
+`gate.json` declares `numerics: bitexact`. That is the contract above, not a result: **no run of this
+payload on a card exists in this tree**, so byte equality with the frozen libr4d row is unverified for
+every form, including the fp32-state / int8 one the source was written for, and a fortiori for the
+f16 and fp8-e4m3 instantiations, which have never executed anywhere. The harness that would decide it
+is built and ready; running it is the open measurement.
 
-### Measured against the frozen row (gfx1201, ABI 26)
+### The comparator: what it checks, and that it has not run here
 
 `gdn_query_reload_compare.cpp` dlopens the frozen `libr4d.so` and this plugin, finds both rows by
 name, and calls each `launch(const RadArgs*, RadStream)` on radiance's own stream. There is no
-describe path in ABI 26, so the comparison is of the real dispatches.
+describe path in ABI 26, so the comparison it performs is of the real dispatches.
 
-Result: **13 checks, 0 failures**, exit 0, on a card (AQL backend, `gfx1201`), under the queue lock.
+**It has not been run on a card in this tree.** No invocation, timestamp or log of it exists here, so
+this document states no result — not for byte equality, not for the poison/guard checks, not for the
+refusals. `grep -c 'ok(' gdn_query_reload_compare.cpp` reports 13 lines: the helper's definition plus
+twelve call sites, one of them inside the six-iteration refusal loop. That is what a complete run
+asserts, not a count it has returned. An earlier version of this file reported "13 checks, 0
+failures, on a card", which this port cannot substantiate: the statement came with the source
+candidate, has no log in this repository, and is not carried over here.
 
-Byte-identical across a six-step trajectory, at the allocation's full extent, for every plane:
-`o` (bf16), `o_q` (i8), `o_scale` (f32), the recurrent state/anchor/factor cache (f32) and the conv
-state cache (bf16). Each step's acceptance count is what the previous step actually wrote, and
-neither arm is reset to a snapshot, so every step reads what the step before it left.
+When it runs, it asserts byte equality over a six-step trajectory, at the allocation's full extent, on
+every plane: `o` (bf16), `o_q` (i8), `o_scale` (f32), the recurrent state/anchor/factor cache (f32)
+and the conv state cache (bf16), with each step's acceptance count being what the previous step
+actually wrote and neither arm reset to a snapshot, so every step reads what the step before left.
 
-The equality is guarded by controls that ran in the same invocation:
+The equality is guarded by controls inside the same invocation:
 
-- both frozen caches moved (a comparison over untouched buffers would be vacuous);
-- a one-bit input flip moved the frozen row's output, and the comparison rejected one changed
-  consumer byte (a negative control);
-- with `--poison-counters`, the candidate's scratch was filled with `0x5b` (guards `0xa7`) before
-  **every** launch, and after each launch all `N*Hg` counters were zero and both guards untouched —
-  the emitted 256-thread clear really ran and wrote exactly its own counters, on reused scratch;
-- the scratch hook answers a parameters-only declare with exactly `4096 * 4` bytes;
-- six refusals returned their declared codes: integer state cache (`RAD_E_DTYPE`), an `x` pitch
+- both frozen caches are checked to have moved (a comparison over untouched buffers would be
+  vacuous);
+- a one-bit input flip must move the frozen row's output, and the comparison must reject one changed
+  consumer byte (negative control);
+- with `--poison-counters`, the candidate's scratch is filled with `0x5b` (guards `0xa7`) before
+  **every** launch, and after each launch all `N*Hg` counters must be zero and both guards untouched
+  — the emitted 256-thread clear writing exactly its own counters on reused scratch;
+- the scratch hook must answer a parameters-only declare with exactly `4096 * 4` bytes;
+- six refusals must return their declared codes: integer state cache (`RAD_E_DTYPE`), an `x` pitch
   past int32 (`RAD_E_STRIDE`), scratch one byte short (`RAD_E_SCRATCH`), `q_len` 17
   (`RAD_E_SHAPE`), `state_form=per_candidate` (`RAD_E_UNSUPPORTED`), absent `num_accepted`
   (`RAD_E_INVAL`).
 
-What this does **not** cover: speed (no timing was taken), the f16 state cache, the fp8-e4m3 code
-path, the optional conv-bias operand, and any full-model step (`rad-kbench` was not run).
+That run does not cover speed (no timing is part of it), the f16 state cache, the fp8-e4m3 code path,
+the optional conv-bias operand, or any full-model step.
+
+The open measurement, for whoever has a card:
+
+```sh
+flock -n -x /tmp/radiance-tp2-bench.lock \
+  <build>/bin/gdn_query_reload_compare --frozen <home>/kernels/libr4d.so \
+    --candidate <home>/kernels/gdn_query_reload.so --steps 6 --poison-counters
+```
 
 ## Original evidence, and what it does and does not say about this target
 
@@ -239,16 +267,16 @@ Two distinct pieces of history must not be conflated:
 - The **older query-only prototype** had no clear at all and relied on caller zeroing. It is not
   the parent of this port.
 
-That history is now partly superseded: **in this tree the clear has run**, on a card, in the
-comparison recorded above — every one of the six trajectory launches had its payload poisoned to
-`0x5b` beforehand, and each
-leaving all `N*Hg` counters zero and both guards intact. What is still unmeasured is its **cost**:
-no timing was taken, so the second dispatch's price is unknown here.
+Nothing in this tree supersedes that: **the clear has not run here either.** Its correctness is
+exactly what the `--poison-counters` pass above would establish (guards intact, all `N*Hg` counters
+zero on reused scratch), and that pass is open. Its cost is unknown in any tree — no timing has been
+taken — so the second dispatch's price is not a number this port has.
 
 Three things in this port are **not** covered by the source's evidence at all:
 
-1. **The per-launch counter clear — cost only.** It ran (see above), so its correctness is measured;
-   its cost is not. Its ordering argument is stream order alone.
+1. **The per-launch counter clear — neither correctness nor cost.** It has not run here; the
+   poison/guard check is the one that would settle correctness, and no timing anywhere settles cost.
+   Its ordering argument is stream order alone.
 2. **The f16 state instantiation.** The source instantiated the fp32 state only. This row adds the
    f16 form because the target schema allows it and a refusal would abort a step the row was
    selected for. The arithmetic is `ru_state<1>`'s, unchanged from the source body, but it has
@@ -269,7 +297,8 @@ not run, and no speed number of any kind was taken on this payload.
 - `gdn_query_reload_compare.cpp` — the ABI 26 comparison harness: it dlopens the frozen `libr4d.so`
   and this plugin, drives both rows over a seeded multi-step trajectory and compares every output
   and state plane byte for byte, with the controls and refusals listed under "Numerics".
-- `CMakeLists.txt` — the out-of-tree build described above.
+- `CMakeLists.txt` — the plugin build (out-of-tree against a staged SDK prefix), and the comparator
+  target, which exists only when the directory is built inside the radiance tree.
 - `gate.json` — review metadata. Its `engine_env`/`engine_args` are the flags this engine accepts;
   the `optional_local_harness_profile` block records the source tree's own harness variables as
   history and is not read by this engine.
