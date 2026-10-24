@@ -497,7 +497,7 @@ void use_cost_policy(Fixture& f, Predictions& pred, const int32_t* tiers = nullp
         for (int i = 0; i < n_tiers; ++i) dp.policy.tiers[i] = tiers[i];
         dp.policy.n_tiers = n_tiers;
     }
-    dp.policy.hold     = 0;      /* a single-cycle test must not wait 8 cycles for a move */
+    dp.policy.hold     = 8;      /* the serving dwell: the switch is priced, never waited out */
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = DraftCostModel{ nullptr, price };
@@ -1571,7 +1571,7 @@ void downshift(Fixture& f, bool ahead, Coupled& c, int max_tokens = 64) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = log.model();
@@ -1669,7 +1669,7 @@ void upshift(Fixture& f, bool ahead, Coupled& c) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = log.model();
@@ -1766,7 +1766,7 @@ void budget_cut(Fixture& f, bool ahead, Coupled& c) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = log.model();
@@ -1926,7 +1926,7 @@ void failed_opens(Fixture& f, Coupled& c, const FailOpts& o) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = log.model();
@@ -2232,7 +2232,7 @@ TEST(a_shortened_publication_under_a_valid_plan_is_kept_unpriced) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &c.pred, predict };
     dp.costs     = log.model();
@@ -2343,7 +2343,7 @@ TEST(a_row_that_publishes_nothing_in_a_refused_cycle_comes_back_with_an_empty_wi
         dp.policy.tiers[1] = 2;
         dp.policy.tiers[2] = 3;
         dp.policy.n_tiers  = 3;
-        dp.policy.hold     = 0;
+        dp.policy.hold     = 8;
         dp.policy.hyst     = 0.0;
         dp.predictor = DraftPredictor{ &c.pred, predict };
         dp.costs     = log.model();
@@ -2437,7 +2437,7 @@ TEST(a_recycled_slot_does_not_inherit_the_frozen_window) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 3;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &c.pred, predict };
     dp.costs     = log.model();
@@ -2899,7 +2899,7 @@ TEST(the_priced_shape_carries_history_prefill_and_the_loaded_drafter) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 6;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = DraftCostModel{ &log, price_and_record };
@@ -3049,7 +3049,7 @@ TEST(the_real_profile_prices_the_cycle_the_runtime_evidences_its_replay) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 6;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = DraftCostModel{ &real, real_price };
@@ -3153,7 +3153,7 @@ TEST(an_unpriced_deepest_tier_still_chooses_the_priced_cheaper_tier) {
     dp.policy.tiers[2] = 6;
     dp.policy.n_tiers  = 3;
     dp.policy.fallback_k = 5;   /* distinguishable from every tier */
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = DraftCostModel{ &real, real_price };
@@ -3984,7 +3984,7 @@ TEST(the_next_cycle_declares_the_last_brackets_observed_replay) {
     dp.policy.tiers[1] = 2;
     dp.policy.tiers[2] = 6;
     dp.policy.n_tiers  = 3;
-    dp.policy.hold     = 0;
+    dp.policy.hold     = 8;
     dp.policy.hyst     = 0.0;
     dp.predictor = DraftPredictor{ &pred, predict };
     dp.costs     = DraftCostModel{ &log, price_and_record };

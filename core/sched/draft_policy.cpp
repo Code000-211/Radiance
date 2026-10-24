@@ -119,16 +119,16 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
     if (c_.hold_reductions && c_.max_seqs > 0 && held_k_.size() < (size_t)c_.max_seqs)
         held_k_.assign((size_t)c_.max_seqs, 0);
     if (c_.mode == DraftPolicyMode::Cost)
-        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), a raise needs %.0f%% and %d "
-                 "cycles%s", (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
-                 (int)c_.n_tiers, 100.0 * c_.hyst, (int)c_.hold,
-                 c_.hold_reductions ? ", and so does a reduction" : "");
+        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), a depth change is priced "
+                 "against the one cycle it costs over a %d-cycle dwell (%.0f%% net margin)%s",
+                 (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
+                 (int)c_.n_tiers, (int)c_.hold, 100.0 * c_.hyst,
+                 c_.hold_reductions ? ", and so is a reduction" : "");
     return RAD_OK;
 }
 
 void DraftPlanner::reset() {
     last_k_ = 0;
-    held_   = 0;
     chosen_ = false;
     gap_reported_ = false;
     gap_refused_  = false;
@@ -254,6 +254,23 @@ double DraftPlanner::expect(const DraftPredictions& pred, int32_t i, int32_t cap
         e += run;
     }
     return e;
+}
+
+bool DraftPlanner::switch_pays(const Priced& cand, const Priced& inc) const {
+    /* The dwell the new depth is assumed to run: `hold`, and at least two cycles -- the move's own
+     * cycle plus the one that first earns the new depth's yield. A shorter dwell has no steady
+     * cycle to gain in, so it would refuse every move. */
+    const double dwell = c_.hold > 2 ? (double)c_.hold : 2.0;
+    /* The move's own cycle is priced, not assumed free: this cycle pays the candidate shape's
+     * execution price (`ms`, the pass it will run) while the tokens it commits are the frozen
+     * window's, so the dwell's first cycle earns the incumbent's yield at the candidate's price and
+     * the rest earn the candidate's own. That one cycle is the switching cost; over the dwell it is
+     * what separates the switch from simply staying. */
+    const double tokens = inc.yield + (dwell - 1.0) * cand.yield;
+    const double ms     = cand.ms + (dwell - 1.0) * cand.hms;
+    /* Not a margin on either score: the net rate of the move against the rate of staying, the
+     * dwell's priced switch included. */
+    return tokens * inc.hms > (1.0 + c_.hyst) * ms * inc.yield;
 }
 
 int32_t DraftPlanner::total_k(const int32_t* k, int32_t n, int32_t* max_k) {
@@ -563,24 +580,18 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         if (!moved || evals >= search_limit) break;
     }
 
-    /* held_ counts the cycles since last_k_ last moved (a cycle only the rows' caps reduced
-     * counts too, it never left the incumbent); the plan issued here is not one of them
-     * yet, and a cycle with no rows is not a cycle at the depth. */
-    if (view.n_seq == 0) {
-        /* nothing ran: the depth did not hold, it had nothing to hold over */
-    } else if (chosen_) {
-        if (held_ < INT32_MAX) ++held_;
-    } else {
-        held_ = 0;
-    }
-
-    /* --draft-hysteresis both: the search's reduction waits for the hold and the margin, as a raise
-     * does below. Taken at once, every dip of the acceptance estimate pulled the depth down for
-     * at least `hold` cycles before a raise could undo it, so under a noisy estimate the plan sat
-     * below the depth its mean asks for. It is judged before the resource cut, which still
-     * applies at once, against the incumbent's own assignment: a row its cap holds under the
-     * incumbent is no policy reduction, and an incumbent with no price is no reason to stay.
-     * At most one incumbent is priced per cycle -- a held reduction never reaches the raise. */
+    /* --draft-hysteresis both: the search's reduction is judged by the priced switch rule, as a
+     * raise is below. Taken at once, every dip of the acceptance estimate pulled the depth down
+     * for at least `hold` cycles before a raise could undo it, so under a noisy estimate the plan
+     * sat below the depth its mean asks for. A reduction is not a loss of cheap time though: the
+     * dwell's first cycle still commits the deeper window's tokens at the shallower price, and the
+     * later ones run the shallower window's own rate, so the rule compares the two rates with that
+     * one cycle priced -- a reduction is refused only when the shallower window's throughput,
+     * credited with that cycle, does not cover what it stops producing.
+     * It is judged before the resource cut, which still applies at once, against the incumbent's
+     * own assignment: a row its cap holds under the incumbent is no policy reduction, and an
+     * incumbent with no price is no reason to stay. At most one incumbent is priced per cycle -- a
+     * held reduction never reaches the raise. */
     if (c_.hold_reductions && chosen_ && view.n_seq > 0) {
         int32_t search_top = 0;
         total_k(out->k, view.n_seq, &search_top);
@@ -597,9 +608,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
                 const int rc = price(view, pred, costs, held_k_.data(), -1, c_.max_evals, &evals,
                                      &incumbent);
                 if (rc < 0) return rc;
-                if (incumbent.valid && (held_ < c_.hold ||
-                    !(best_p.yield / best_p.hms >
-                      incumbent.yield / incumbent.hms * (1.0 + c_.hyst)))) {
+                if (incumbent.valid && !switch_pays(best_p, incumbent)) {
                     for (int32_t i = 0; i < view.n_seq; ++i) out->k[i] = held_k_[(size_t)i];
                     best_p = incumbent;
                 }
@@ -627,9 +636,14 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         if (p.valid) best_p = p;
     }
 
-    /* Hysteresis and hold: a raise waits; a reduction is immediate unless held above. A raise needs
-     * the hold and `hyst` more yield per horizon millisecond than the incumbent, both at their
-     * measured means; with no price for the incumbent it is refused. `unc` takes no part: it is the
+    /* The priced switch, both ways by the same rule. A depth change is taken when the yield it
+     * gains over the dwell pays for the one cycle the switch spends (switch_pays): the plan is
+     * frozen one cycle ahead, so the cycle after a move runs the new shape's price while the tokens
+     * it commits are the frozen window's -- it earns the incumbent's yield at the candidate's
+     * price, and only the cycles after it earn the candidate's own. A fixed percentage of the
+     * incumbent's score was the wrong threshold: it ignored what the move costs and blocked a rung
+     * of roughly 12% more time for eight cycles however large the yield gain was, so the run stayed
+     * a rung below its class's optimum after every category switch. `unc` takes no part: it is the
      * largest deviation any one sample showed (DraftCostTable::record), 0 at n=1 and only growing
      * with n, so as a penalty it blocked raises to the depths measured most and spared the ones
      * measured least. Added to the raise alone it made every reduction permanent -- with a
@@ -638,9 +652,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         Priced incumbent;
         const int rc = price(view, pred, costs, out->k, last_k_, c_.max_evals, &evals, &incumbent);
         if (rc < 0) return rc;
-        const double raised = issued_priced ? best_p.yield / best_p.hms : 0.0;
-        if (!issued_priced || held_ < c_.hold || !incumbent.valid ||
-            !(raised > incumbent.yield / incumbent.hms * (1.0 + c_.hyst))) {
+        if (!issued_priced || !incumbent.valid || !switch_pays(best_p, incumbent)) {
             for (int32_t i = 0; i < view.n_seq; ++i)
                 if (out->k[i] > last_k_) out->k[i] = last_k_;
             top = last_k_;
@@ -655,10 +667,7 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
         const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
         if (out->k[i] < (last_k_ < c ? last_k_ : c)) forced = false;
     }
-    if (!forced) {
-        if (top != last_k_) held_ = 0;   /* a new depth starts a new hold */
-        last_k_ = top;
-    }
+    if (!forced) last_k_ = top;
     chosen_ = true;
 
     /* The issued assignment's own estimate -- after the budget cut and the hysteresis, so it

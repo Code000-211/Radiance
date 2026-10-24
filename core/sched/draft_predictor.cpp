@@ -57,6 +57,13 @@ int DraftPredictModel::configure(const Params& p, DraftPredictState* states, int
     cap_ = cap;
     alpha_ = 1.0 - std::exp2(-1.0 / (double)p_.half_life);
     if (reset) {
+        /* The workload's estimate is part of what a reset means: a new table starts from the prior,
+         * so a slot entering it has nothing else to start from. */
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
+            pop_a_[j] = p_.prior;
+            pop_ess_[j] = p_.prior_weight;
+            pop_n_[j] = 0;
+        }
         for (int32_t i = 0; i < cap_; ++i) start(states_[i], 0, 0);
     }
     return RAD_OK;
@@ -76,10 +83,14 @@ int DraftPredictModel::grow(DraftPredictState* states, int32_t cap) {
 void DraftPredictModel::start(DraftPredictState& s, uint64_t req_id, uint32_t slot_gen) const {
     s.req_id = req_id;
     s.slot_gen = slot_gen;
+    /* A slot with no labels of its own starts where the workload was measured, not at the flat
+     * prior: acceptance is a property of what the request writes, and E(K) has no other way to see
+     * it before this request produced a label (the class visibility, see the header). With no
+     * workload evidence this is the prior unchanged, and its own labels move it from there. */
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) {
-        s.a[j] = p_.prior;
+        s.a[j] = pop_a_[j];
         s.n[j] = 0;
-        s.ess[j] = p_.prior_weight;
+        s.ess[j] = pop_ess_[j];
     }
 }
 
@@ -178,6 +189,12 @@ bool DraftPredictModel::learn(DraftPredictState& s, const DraftSeqObservation& o
         s.a[j] = (float)((double)s.a[j] + w * ((double)x - (double)s.a[j]));
         s.ess[j] = (float)settle_ess((double)s.ess[j], w);
         if (s.n[j] < UINT16_MAX) ++s.n[j];
+        /* The same label at the workload's level: the level a slot with no labels starts from. Its
+         * own n keeps this the workload's mean, not this request's. */
+        const double pw = settle_weight(pop_n_[j], (double)p_.prior_weight, alpha_);
+        pop_a_[j] = (float)((double)pop_a_[j] + pw * ((double)x - (double)pop_a_[j]));
+        pop_ess_[j] = (float)settle_ess((double)pop_ess_[j], pw);
+        if (pop_n_[j] < UINT16_MAX) ++pop_n_[j];
         applied = true;
     }
     /* Positions past the window the verify computed drift toward its deepest position, the same

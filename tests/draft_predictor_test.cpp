@@ -220,7 +220,8 @@ TEST(grow_keeps_every_learned_slot_and_refuses_a_smaller_table) {
     CHECK_NEAR(big[0].a[0], 0.84, 1e-6);   /* the learned slot carried over */
     CHECK_EQ(big[0].n[0], 1);
     CHECK_EQ(big[(size_t)kCap].req_id, 0u);
-    CHECK_EQ(big[(size_t)kCap].a[0], 0.8f);
+    /* A slot added to the table starts where the workload was measured, and with no labels. */
+    CHECK_NEAR(big[(size_t)kCap].a[0], 0.84, 1e-6);
     /* A slot past the old cap is predicted, not refused. */
     REQUIRE_EQ(predicted(r, 11, kCap).valid, 0u);
     CHECK_EQ(big[(size_t)kCap].req_id, 11u);
@@ -500,12 +501,13 @@ TEST(a_recycled_slot_starts_over_and_an_unchanged_identity_keeps_the_estimate) {
     CHECK_OK(r.predict());
     CHECK_NEAR(r.state[0].a[1], learned, 0.0);
 
-    /* The slot is recycled for another generation: the new request starts at the prior. */
+    /* The slot is recycled for another generation: the new request starts over -- with no labels
+     * of its own, at what the workload was measured at (0.84 here), not at the flat prior. */
     const DraftPrediction fresh = predicted(r, 11, 0, 2);
     CHECK_EQ(r.state[0].req_id, 11u);
     CHECK_EQ(r.state[0].slot_gen, 2u);
     CHECK_EQ(fresh.valid, 0u);
-    CHECK_EQ(fresh.a[0], 0.8f);
+    CHECK_NEAR(fresh.a[0], 0.84, 1e-6);
 
     /* A cycle of the old identity is still deliverable (the contract never consults the live
      * slot), but request 11 owns this table slot now: the old rows are skipped, never mixed into
@@ -513,12 +515,12 @@ TEST(a_recycled_slot_starts_over_and_an_unchanged_identity_keeps_the_estimate) {
     CHECK_OK(r.observe(10, 3, 3, DraftCensor::None, -1, -1, DraftDrafter::Serial, 0, 1));
     CHECK_EQ(r.state[0].req_id, 11u);
     CHECK_EQ(r.state[0].n[0], 0);
-    CHECK_EQ(r.state[0].a[0], 0.8f);
+    CHECK_NEAR(r.state[0].a[0], 0.84, 1e-6);   /* the workload's, not the old generation's */
 
     /* And the old request on another slot starts over too (the scheduler moves state itself). */
     r.add(0, 10, 1, 1);
     CHECK_OK(r.predict());
-    CHECK_EQ(r.pseq[0].a[0], 0.8f);
+    CHECK_NEAR(r.pseq[0].a[0], 0.84, 1e-6);
     CHECK_EQ(r.pseq[0].n[0], 0);
 
     /* Identity is the pair, not the request: a cycle of an older generation is deliverable after
@@ -533,6 +535,51 @@ TEST(a_recycled_slot_starts_over_and_an_unchanged_identity_keeps_the_estimate) {
     CHECK_EQ(p.state[0].slot_gen, 4u);
     CHECK_EQ(p.state[0].n[0], 0);
     CHECK_EQ(p.state[0].a[0], 0.8f);
+}
+
+/* The class visibility, on the yield side. A slot with no labels starts where the workload was
+ * measured -- code accepting at 6/6 lifts position 0, prose rejecting at 2 pulls position 2 back --
+ * so E(K) sees what kind of text this is without a classifier, without a per-token query and
+ * without a class column anywhere near the cost table. The same labels move the request's own
+ * estimate; the seeded slot keeps n = 0 and the workload's sample size, so nothing here claims a
+ * measurement of this request. */
+TEST(a_slot_with_no_labels_starts_where_the_workload_was_measured) {
+    Rig r(6);
+    r.add(0, 10, 0);
+    r.add(1, 11, 1);
+    CHECK_OK(r.predict());
+    CHECK_EQ(r.model.workload_a(0), 0.8f);   /* nothing measured yet: the prior */
+
+    /* Code first: every position accepts. */
+    CHECK_OK(r.observe(10, 6, 6));
+    CHECK(r.model.workload_a(0) > 0.8f);
+    const float code = r.model.workload_a(0);
+
+    /* Then prose, rejecting at position 2. */
+    CHECK_OK(r.observe(11, 6, 2, DraftCensor::None, -1, -1, DraftDrafter::Serial, 1));
+    CHECK(r.model.workload_a(2) < r.model.workload_a(1));   /* the rejection is visible */
+    CHECK(r.model.workload_a(0) >= code);                   /* two accepts: at least the code level */
+
+    /* A new request on a recycled slot starts there: no labels of its own, the workload's mean per
+     * position, and the workload's sample size behind unc. */
+    const DraftPrediction fresh = predicted(r, 12, 2, 7);
+    CHECK_EQ(fresh.valid, 0u);
+    for (int j = 0; j < 6; ++j) {
+        CHECK_EQ(fresh.a[j], r.model.workload_a(j));
+        CHECK_EQ(fresh.n[j], 0);
+        CHECK(fresh.unc[j] > 0.0f);
+    }
+    CHECK_EQ(r.state[2].a[2], r.model.workload_a(2));
+    CHECK_EQ(r.state[2].n[2], 0);
+
+    /* And its own labels move it from there, not from the prior: a rejection at position 0 pulls
+     * that position's estimate down, while the positions the window never checked stay seeded. */
+    const float seeded = r.state[2].a[0];
+    CHECK_OK(r.observe(12, 6, 0, DraftCensor::None, -1, -1, DraftDrafter::Serial, 2, 7));
+    CHECK(r.state[2].a[0] < seeded);
+    CHECK_EQ(r.state[2].n[0], 1);
+    CHECK_EQ(r.state[2].a[4], r.model.workload_a(4));
+    CHECK_EQ(r.state[2].n[4], 0);
 }
 
 TEST(uncertainty_is_computed_from_the_effective_sample_size) {
@@ -610,7 +657,7 @@ TEST(an_observation_must_name_a_complete_cycle_its_plan_and_a_known_slot) {
     CHECK_OK(r.model.observe(r.obs));   /* r.obs still names request 10 of generation 1 */
     CHECK_EQ(r.state[0].req_id, 11u);
     CHECK_EQ(r.state[0].n[0], 0);
-    CHECK_EQ(r.state[0].a[0], 0.8f);
+    CHECK_NEAR(r.state[0].a[0], 0.84, 1e-6);   /* the workload's, not the old generation's */
 }
 
 TEST(an_extrapolated_position_carries_no_evidence) {

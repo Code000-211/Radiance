@@ -95,18 +95,25 @@ struct DraftPolicyConfig {
     /* --draft-depth-tiers, ascending and unique, 0 first when K0 is a legal choice. */
     int32_t tiers[RAD_DRAFT_MAX_TIERS] = { 0, 2, 3, 4, 6 };
     int32_t n_tiers = 5;
-    /* A raise needs this much more yield and this many cycles since the last move. Reductions
-     * happen at once unless `hold_reductions`. Both are starting values (the issue's 2%/eight
-     * steps). The hold is on the incumbent depth (the deepest K the policy last chose, not one a
-     * row's own cap forced): a reallocation of drafts below it is judged by the model's price for
-     * the whole shape, and a per-request hold would need identity-keyed state in the policy. */
+    /* The switch rule's two inputs, not its justification. A depth change is taken when the move's
+     * own rate over `hold` cycles (at least two: the move's own cycle plus the first that earns the
+     * new depth's yield) -- the dwell the new depth is assumed to run -- beats staying:
+     * the first of those cycles is priced, not assumed free (it runs the candidate's shape while the
+     * tokens it commits are the frozen window's), the rest run at the candidate's own price and
+     * yield. `hyst` is the return that net rate must show over the rate of not moving. Neither is a
+     * threshold on its own: no fixed percentage of the incumbent's score and no separate hold
+     * counter. Both are starting values (the issue's 2% and eight cycles). The incumbent depth is
+     * the deepest K the policy last chose, not one a row's own cap forced: a reallocation below it
+     * is judged by the model's price for the whole shape, and a per-request dwell would need
+     * identity-keyed state. */
     double  hyst = 0.02;
     int32_t hold = 8;
-    /* --draft-hysteresis both: a reduction waits for the same hold and margin a raise does,
-     * against the incumbent's own assignment (every row at min(incumbent, its cap)), as the
-     * adaptive window does both ways. Not held up: a reduction the rows' own caps force, the
-     * resource cut, and a reduction from an incumbent with no price of its own. Off: reductions
-     * happen at once. */
+    /* --draft-hysteresis both: a reduction is judged by the same priced switch rule, against the
+     * incumbent's own assignment (every row at min(incumbent, its cap)), as the adaptive window
+     * does both ways. A reduction that pays for itself is still taken at once -- a shallow window
+     * whose throughput covers the yield it gives up saves more than one transition cycle costs. Not
+     * held up either way: a reduction the rows' own caps force, the resource cut, and a reduction
+     * from an incumbent with no price of its own. Off: reductions happen at once. */
     bool    hold_reductions = false;
     /* Deterministic coordinate passes over the requests, and the whole cycle's estimate call
      * budget. The budget bounds a large batch's per-cycle host time. The deepest gate may spend all
@@ -219,6 +226,9 @@ private:
     /* E(K) for request i: 1 + the sum of prefix survival probabilities, capped by its remaining
      * output. */
     static double expect(const DraftPredictions& pred, int32_t i, int32_t cap, int32_t k);
+    /* The priced switch rule: whether the yield `cand` gains over `hold` cycles pays for the one
+     * cycle the move spends (both `Priced`s are valid and price per-cycle stationary shapes). */
+    bool   switch_pays(const Priced& cand, const Priced& inc) const;
     /* Summed drafts of the plan, and its deepest K. */
     static int32_t total_k(const int32_t* k, int32_t n, int32_t* max_k);
     /* The plan's rows and validity; the failure is the caller's to act on. Remembers the issued
@@ -244,8 +254,7 @@ private:
     void    fit_frozen(const DraftBatchView& view);
 
     DraftPolicyConfig c_{};
-    int32_t last_k_ = 0;     /* the hysteresis incumbent; 0 until one was chosen */
-    int32_t held_   = 0;     /* cycles since it last moved */
+    int32_t last_k_ = 0;     /* the switch's incumbent; 0 until one was chosen */
     bool    chosen_ = false;
     /* The calibration sequence's position. It advances only on a cycle that has rows: an empty
      * view has no depth to measure, and stepping on it would put every later depth one place off

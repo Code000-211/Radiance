@@ -49,6 +49,21 @@
  * Sampling: the model has no sampling dimension. Labels from a request that changes class land in
  * the same EMA; a[] is a head estimate for the row it was predicted for and must not price a
  * lookup row, and no RNG or device property is claimed here.
+ *
+ * Class visibility, on the yield side: a request's acceptance differs with what it writes -- the
+ * measured 72% for json, 55% for code and 47% for prose at a similar K are the same head, the same
+ * window and the same row shape. That difference is a property of the text, not of the shape, so it
+ * has no place in the cost key (draft_cost.h prices a shape in milliseconds; a class-keyed row cost
+ * would mix a yield into a price). It enters the plan through E(K) instead: the model keeps the
+ * workload's own position-wise acceptance next to each request's, with the same EMA and the same
+ * prior weight, and a slot with no labels of its own starts from it rather than from the flat
+ * prior. So a cycle that opens a prose request begins at the acceptance prose was measured at, and
+ * a code request at its own -- no text classifier (nothing here reads the text) and no per-token
+ * query (one number per position per cycle, learned from labels the verify already produced).
+ * The workload estimate is not a prior over the class: it is evidence, so a recycled slot's a[] is
+ * the measured level of acceptance, and its own labels move it from there. Where the classes are
+ * interleaved the workload estimate is their running mix; a new request's first ~half-life of
+ * labels is then centred between them, which is the best a model without a class key can say.
  */
 #pragma once
 #include "draft_types.h"
@@ -91,11 +106,17 @@ public:
     int grow(DraftPredictState* states, int32_t cap);
     const Params& params() const { return p_; }
 
-    /* DraftPredictFn: fills out->seq[] in view order, starting a recycled slot at the prior, and
-     * stamps the view's cycle into the set: draft_predictions_current compares (cycle, version,
-     * rows), so a set computed for an earlier cycle is not current while its history still is.
+    /* DraftPredictFn: fills out->seq[] in view order, starting a recycled slot at the workload's
+     * measured acceptance (the prior while there is none), and stamps the view's cycle into the
+     * set: draft_predictions_current compares (cycle, version, rows), so a set computed for an
+     * earlier cycle is not current while its history still is.
      * Refuses a view of another policy version. */
     int predict(const DraftBatchView& view, DraftPredictions* out) const;
+
+    /* The workload's position-wise acceptance, [0..max_depth), for a diagnostic or a test: what a
+     * slot with no labels of its own starts from. */
+    float workload_a(int j) const { return j >= 0 && j < RAD_SCHED_MAX_SPEC ? pop_a_[j] : 0.0f; }
+
     /* The trampoline an integrator puts in DraftHooks::predictor. */
     static int predict_hook(void* self, const DraftBatchView& view, DraftPredictions* out);
 
@@ -131,6 +152,12 @@ private:
     DraftPredictState* states_ = nullptr;
     int32_t cap_ = 0;
     double  alpha_ = 0.0;   /* the EMA step at half_life */
+    /* The workload's position-wise acceptance: the same EMA over every labelled position of every
+     * request, used as the starting point of a slot with no labels of its own (class visibility on
+     * the yield side, see the header). Not per request and not a sample count of any one slot. */
+    mutable float    pop_a_[RAD_SCHED_MAX_SPEC] = {};
+    mutable float    pop_ess_[RAD_SCHED_MAX_SPEC] = {};
+    mutable uint16_t pop_n_[RAD_SCHED_MAX_SPEC] = {};
     mutable Counts counts_;
 };
 

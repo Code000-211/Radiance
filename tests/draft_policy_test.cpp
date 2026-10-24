@@ -398,7 +398,7 @@ TEST(a_cut_plan_its_own_shape_cannot_price_is_issued_unpriced) {
     CHECK_EQ(draft_plan_valid(c.f.plan), RAD_OK);
 }
 
-TEST(a_raise_waits_for_the_hold_and_a_reduction_does_not) {
+TEST(a_raise_and_a_reduction_are_both_priced_by_the_switch) {
     Cycle c;
     c.pred.a = 0.95f;
     c.add(0, 1);
@@ -416,14 +416,19 @@ TEST(a_raise_waits_for_the_hold_and_a_reduction_does_not) {
     const int32_t shallow = c.f.plan.k[0];
     CHECK(shallow < deep);
 
-    /* And back: the raise needs the hold as well as 2% more yield. Within the hold it is refused
-     * even though the deep window now prices better. */
+    /* And back: the raise is priced, not counted. The deep window's yield pays for the one cycle
+     * the switch spends before the dwell's worth of its gain has accrued, so it is taken on the
+     * very next cycle -- no hold to wait out. */
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = 0.95f;
     CHECK_EQ(c.choose(), RAD_OK);
-    CHECK_EQ(c.f.plan.k[0], shallow);
+    CHECK_EQ(c.f.plan.k[0], deep);
+    CHECK_EQ(c.planner.last_k(), deep);
 }
 
-TEST(a_raise_is_taken_once_the_hold_has_passed) {
+/* `hold` is the dwell the switch is priced over, not a counter that delays it: a short dwell makes
+ * the one transition cycle weigh more (it is 1 of 2 cycles instead of 1 of 8), it does not add a
+ * cycle of waiting. The raise below pays under either. */
+TEST(hold_prices_the_dwell_and_does_not_delay_the_switch) {
     DraftPolicyConfig cfg = cost_config();
     cfg.hold = 2;
     Cycle c(6, cfg);
@@ -437,12 +442,9 @@ TEST(a_raise_is_taken_once_the_hold_has_passed) {
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = 0.2f;
     CHECK_EQ(c.choose(), RAD_OK);
     CHECK(c.f.plan.k[0] < 6);
-    const int32_t shallow = c.f.plan.k[0];
 
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = 0.95f;
-    CHECK_EQ(c.choose(), RAD_OK);   /* first cycle of the hold: the raise is refused */
-    CHECK_EQ(c.f.plan.k[0], shallow);
-    CHECK_EQ(c.choose(), RAD_OK);   /* hold spent, the deep window pays again */
+    CHECK_EQ(c.choose(), RAD_OK);   /* the deep window pays its own transition cycle */
     CHECK_EQ(c.f.plan.k[0], 6);
 }
 
@@ -465,10 +467,11 @@ int reference_estimate(void*, const DraftVerifyShape& s, DraftCostEstimate* out)
 }  /* namespace */
 
 /* A reduction is not permanent. Prose-like acceptance takes the plan from K4 to K2 at once; when
- * code-like acceptance returns, K4 is back once the hold has passed. Scoring the raise on
- * `ms + unc` refused it forever: 3.935 / (34.376 + 8.914) is under K2's 2.654 / 25.713 * 1.02 at
- * any acceptance this text has, and that is how a BetterBench run stayed shallow after its first
- * category. Pipeline depth 0, so the executed and the stationary shape are the same (k,k). */
+ * code-like acceptance returns, the priced switch takes K4 back on the very next cycle. Scoring
+ * the raise on `ms + unc` refused it forever: 3.935 / (34.376 + 8.914) is under K2's
+ * 2.654 / 25.713 * 1.02 at any acceptance this text has, and that is how a BetterBench run stayed
+ * shallow after its first category. Pipeline depth 0, so the executed and the stationary shape are
+ * the same (k,k). */
 TEST(a_reduction_is_not_permanent_when_the_deeper_bucket_is_well_measured) {
     DraftPolicyConfig cfg = cost_config();
     for (int32_t t = 0; t <= 6; ++t) cfg.tiers[t] = t;
@@ -490,29 +493,55 @@ TEST(a_reduction_is_not_permanent_when_the_deeper_bucket_is_well_measured) {
     CHECK_EQ(c.f.plan.max_k, 2);   /* a reduction is immediate */
     CHECK(c.f.plan.source == DraftPlanSource::Cost);
 
-    /* Code-like again: the hold still applies, a raise waits for it ... */
+    /* Code-like again: the raise is priced and taken at once -- K4 yields 48% more tokens for 34%
+     * more milliseconds, which pays for the one cycle the switch spends at the deeper price. */
     accept(0.88f);
-    for (int32_t n = 1; n < cfg.hold; ++n) {
-        REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
-        CHECK_EQ(c.f.plan.max_k, 2);
-    }
-    /* ... and is then taken, although (4,4) carries 8.9 ms of `unc`. */
     REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
     CHECK_EQ(c.f.plan.max_k, 4);
     CHECK(c.f.plan.source == DraftPlanSource::Cost);
     CHECK_EQ(c.planner.last_k(), 4);
 
-    /* The margin still applies: at a = .93 K6 is the best depth, but only 1.3% over K4, so the
-     * plan stays at K4 however long it holds ... */
+    /* The switch has to pay, and at a = .93 it does not: K6 is the best depth by 1.3%, but its
+     * cycle costs 29% more than K4's, so the dwell's first cycle at (44.4 ms, K4's yield) eats the
+     * gain no matter how long the plan would stay. It stays at K4 ... */
     accept(0.93f);
     for (int n = 0; n < 3 * cfg.hold; ++n) {
         REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
         CHECK_EQ(c.f.plan.max_k, 4);
     }
-    /* ... and at a = .95 it is 3.2% over K4, past the margin, with the hold long spent. */
+    /* ... and at a = .95, where the deep rung is 3.2% ahead, it is still a wash: 44.4 ms for one
+     * cycle of K4's tokens against eight cycles 3.2% ahead. */
     accept(0.95f);
     REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
-    CHECK_EQ(c.f.plan.max_k, 6);
+    CHECK_EQ(c.f.plan.max_k, 4);
+}
+
+/* The other side of the same rule: the climb is one priced decision, not one rung per `hold`. From
+ * K2 the raise goes straight to K6 at a = .95 -- K6 yields 108% more tokens than K2 for 73% more
+ * milliseconds, which pays the dwell's one transition cycle -- and a plan already at K6 stays
+ * there. */
+TEST(a_priced_raise_climbs_in_one_cycle_and_not_a_rung_at_a_time) {
+    DraftPolicyConfig cfg = cost_config();
+    for (int32_t t = 0; t <= 6; ++t) cfg.tiers[t] = t;
+    cfg.n_tiers = 7;
+    cfg.fallback_k = 6;
+    Cycle c(6, cfg);
+    c.add(0, 1, 10000);
+    const DraftCostModel model{ nullptr, reference_estimate };
+    const auto accept = [&](float a) {
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[0].a[j] = a;
+    };
+
+    accept(0.68f);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 2);   /* the free first choice: 2.142 / 25.713 */
+
+    accept(0.95f);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);   /* one cycle, all four rungs, priced once */
+    CHECK_EQ(c.planner.last_k(), 6);
+    REQUIRE_EQ(c.planner.choose(c.f.view, c.f.pred, model, &c.f.plan), RAD_OK);
+    CHECK_EQ(c.f.plan.max_k, 6);   /* and the incumbent now holds the best rung */
 }
 
 /* The same reference, with one depth's buckets taken away on request. */
@@ -537,10 +566,10 @@ DraftPolicyConfig held_reductions_config() {
 }
 }  /* namespace */
 
-/* --draft-hysteresis both: a reduction waits for the hold and the margin a raise needs. A dip of
- * the estimate no longer takes the depth down at once, so it cannot hold the plan under the
- * depth its mean asks for while the raise back waits out its own hold. */
-TEST(with_held_reductions_a_reduction_waits_for_the_hold_and_the_margin) {
+/* --draft-hysteresis both: a reduction is judged by the same priced switch rule a raise is, so a
+ * dip of the estimate can no longer take the depth down at once without paying for it -- and one
+ * that pays is still taken at once, no hold to wait out. */
+TEST(with_held_reductions_a_reduction_is_taken_when_it_pays_and_refused_when_it_does_not) {
     const DraftPolicyConfig cfg = held_reductions_config();
     Cycle c(6, cfg);
     c.add(0, 1, 10000);
@@ -556,25 +585,24 @@ TEST(with_held_reductions_a_reduction_waits_for_the_hold_and_the_margin) {
     accept(0.88f);
     CHECK_EQ(choose(), 4);   /* the first choice is free */
 
-    /* Prose-like: K2 is 7.2% ahead of K4, and still waits out the hold. */
+    /* Prose-like: K2 is 7.2% ahead of K4 and 8.7 ms cheaper, so the dwell's first cycle still
+     * commits K4's tokens at that price -- the move pays at once. */
     accept(0.68f);
-    for (int32_t n = 1; n < cfg.hold; ++n) {
-        CHECK_EQ(choose(), 4);
-        CHECK(c.f.plan.source == DraftPlanSource::Cost);
-    }
     CHECK_EQ(choose(), 2);
     CHECK_EQ(c.planner.last_k(), 2);
 
-    /* The raise back waits the same way. */
+    /* The raise back is priced the same way and taken at once: 3.935 / 34.376 against
+     * 2.654 / 25.713, one transition cycle at K4's price included. */
     accept(0.88f);
-    for (int32_t n = 1; n < cfg.hold; ++n) CHECK_EQ(choose(), 2);
     CHECK_EQ(choose(), 4);
 
-    /* Under the margin a reduction is refused however long the hold: at a = .78 K3 is the best
-     * depth, 0.3% ahead of K4 (2.863 / 30.348 against 3.233 / 34.376). */
+    /* A reduction that does not pay is refused however long the plan would hold it: at a = .78 K3
+     * is the best depth, 0.3% ahead of K4 (2.863 / 30.348 against 3.233 / 34.376) -- under the
+     * rule's 2% return. */
     accept(0.78f);
     for (int n = 0; n < 3 * cfg.hold; ++n) CHECK_EQ(choose(), 4);
-    /* At a = .70 K2 is 5.6% ahead, and with the hold long spent it is taken at once. */
+    /* At a = .70 it pays (2.19 / 25.713 against 2.773 / 34.376, and the first cycle keeps the deep
+     * window's tokens), so it is taken. */
     accept(0.70f);
     CHECK_EQ(choose(), 2);
 }
@@ -723,6 +751,49 @@ TEST(the_choice_is_never_worse_than_the_best_homogeneous_baseline) {
         const int32_t k[3] = { tiers[t], tiers[t], tiers[t] };
         CHECK(got + 1e-9 >= score_of(k));
     }
+}
+
+/* The heuristic against the enumeration it stands in for, on the small batch the enumeration is
+ * affordable on (three requests, five tiers, 125 plans). The policy never runs this -- 7^B is not a
+ * hotpath -- but on a batch this size the coordinate passes must land on the enumerated optimum,
+ * not merely beat the homogeneous baselines. */
+TEST(the_coordinate_search_matches_the_enumeration_on_a_small_batch) {
+    Cycle c;
+    for (int i = 0; i < 3; ++i) c.add(i, (uint64_t)i + 1);
+    const float a[3] = { 0.9f, 0.6f, 0.3f };
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) c.f.pred.seq[i].a[j] = a[i];
+    c.measure(1.0, 0.2);
+    CHECK_EQ(c.choose(), RAD_OK);
+
+    /* The fake prices a plan by its deepest window, as the enumeration below does. */
+    const auto score_of = [&](const int32_t* k) {
+        double y = 0.0;
+        int32_t top = 0;
+        for (int i = 0; i < 3; ++i) {
+            double run = 1.0;
+            y += 1.0;
+            for (int d = 1; d <= k[i]; ++d) { run *= a[i]; y += run; }
+            if (k[i] > top) top = k[i];
+        }
+        return y / (1.0 + 0.2 * top);
+    };
+    const int32_t tiers[5] = { 0, 2, 3, 4, 6 };
+    double best = 0.0;
+    int32_t best_k[3] = { 0, 0, 0 };
+    for (int x = 0; x < 5; ++x)
+        for (int y = 0; y < 5; ++y)
+            for (int z = 0; z < 5; ++z) {
+                const int32_t k[3] = { tiers[x], tiers[y], tiers[z] };
+                const double v = score_of(k);
+                if (v > best) { best = v; for (int i = 0; i < 3; ++i) best_k[i] = k[i]; }
+            }
+
+    const double got = score_of(c.f.plan.k);
+    CHECK(got + 1e-9 >= best);
+    /* And it is a plan, not a lucky tie: the deep window goes to the request that keeps matching. */
+    CHECK_EQ(c.f.plan.k[0], best_k[0]);
+    CHECK_EQ(c.f.plan.k[2], best_k[2]);
 }
 
 TEST(the_cost_model_is_shown_the_shape_the_plan_verifies) {
