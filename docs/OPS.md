@@ -2344,6 +2344,14 @@ the cache rather than rebinding it. Hits and misses write the same bytes as the 
 `r4d_selftest`'s `ple_cache` (`r4d_selftest <libr4d.so> --case ple_cache`) holds both to a host
 gather cold, warm, colliding, under four concurrent streams whose launches are all enqueued before
 the first read-back, in a single set of four ways that every launch reclaims, and after a reset.
+Whether those streams land a reader inside that window is the card's, so that stage shows only
+that concurrent reclaim and rewrite wrote every byte as the table has it.
+The window is forced on its own: a reader parks in it (the `r4d_ple_probe` test hook, `r4d.h`),
+the same launch's other blocks reclaim the way it holds and publish a row that is no row's, so the
+parked reader loads that rewrite and has to reject it at the recheck that follows the load. The
+case fails unless the counters show both the park and the recheck that found the way rewritten, and
+the row that parked reader writes must still be the table's -- taking the generation check out puts
+the rewritten bytes in the output.
 What the hit rate is worth on a given workload is a measurement this option does not make for you.
 
 ### `ngram_ids`
