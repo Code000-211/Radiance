@@ -54,10 +54,13 @@ written:
   `scripts/gpu_job.py` (a GPU continuation). Foreign or differently-motivated rules are
   left untouched and a dedicated one-shot `at` continuation is created instead. No
   scheduler is added;
-- a wakeup the platform rejects (nonzero CLI exit) is reported and the next candidate is
-  tried, so one unusable candidate cannot stall the queue. An ambiguous write error
-  (timeout, unknown exit, unparsable response) stops the handover, because the rule may
-  already exist and a second dispatch could double-start the next run.
+- a nonzero exit of a `wakeup create` proves nothing on its own, so it is reconciled by
+  re-reading the candidate's rules: a stored own GPU rule means the write landed (stop, it
+  is dispatched), and only a provably absent rule counts as rejected — then the next
+  candidate is tried, so one unusable candidate cannot stall the queue. An unreadable rule
+  list, a timeout, an unparsable response, or any failed `wakeup trigger` stops the
+  handover: that write may already have queued a run, and a second dispatch could
+  double-start the next test.
 
 If the handover call fails it is reported on stderr and does not rewrite the finished
 test's exit code; use the existing Sweeper as backstop. A stale `testing` issue (owner
@@ -128,8 +131,9 @@ it starts), an executed continuation chain for success, failure to `blocked`, an
 manual start in the test body, after the finished issue's final status, and releases
 the lock again), exactly one successor dispatched after release for its own agent,
 skipping a blocked candidate and a parent with open child work, waking a squad
-leader, reuse of an own GPU rule and ignoring foreign/unrelated rules, a rejected dispatch that falls through to
-the next candidate, an ambiguous dispatch that stops instead of double-starting,
+leader, reuse of an own GPU rule and ignoring foreign/unrelated rules, a rejected create that falls through to the
+next candidate, and three no-double-start cases (a create whose response was lost after
+committing, a lost trigger response, an unparsable create response),
 blocked/stale issue refusal, failed initial/final status updates, command failure
 (no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both successful exit
 statuses, and successful execution without foreign process/FD inspection

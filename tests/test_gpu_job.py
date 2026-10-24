@@ -78,6 +78,8 @@ elif args[:2] == ["issue", "wakeup"] and args[2] == "trigger":
             f.write("reject " + name + "\\n")
         sys.exit(3)
     dispatch(name, "trigger")
+    if (root / ("lost-" + name)).exists():
+        sys.exit(1)  # committed, but the response was lost
     if (root / ("ambiguous-" + name)).exists():
         print("not json")
         sys.exit(0)
@@ -97,6 +99,8 @@ elif args[:2] == ["issue", "wakeup"] and args[2] == "create":
     with (root / "events").open("a") as f:
         f.write("agent " + name + " " + agent + "\\n")
     dispatch(name, "create")
+    if (root / ("lost-" + name)).exists():
+        sys.exit(1)  # committed, but the response was lost
     if (root / ("ambiguous-" + name)).exists():
         print("not json")
         sys.exit(0)
@@ -246,6 +250,26 @@ class GpuJobTests(unittest.TestCase):
         self.finish(self.start("pass"), 0)
         self.assertEqual(self.events("reject "), ["reject MAIN-2"])
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-3 create free"])
+
+    def test_handover_lost_create_response_is_reconciled(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "lost-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        # The stored rule proves the write committed: no second dispatch, no second start.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.assertEqual(json.loads((self.root / "wakeups-id-MAIN-2").read_text())[0]["agent_id"],
+                         "agent-MAIN-2")
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
+
+    def test_handover_lost_trigger_response_stops_dispatch(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "wakeups-id-MAIN-2").write_text(json.dumps([
+            {"id": "rule", "enabled": True, "agent_id": "agent-MAIN-2",
+             "instruction": "python3 scripts/gpu_job.py --issue MAIN-2 -- ./probe"}]))
+        (self.root / "lost-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 trigger free"])
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
 
     def test_handover_ambiguous_error_stops_dispatch(self):
         (self.root / "MAIN-3").write_text("ready_for_testing")

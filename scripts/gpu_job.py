@@ -68,26 +68,59 @@ def wake_target(candidate: dict[str, Any]) -> str | None:
     return None
 
 
+class DispatchRejected(Exception):
+    """The platform provably stored no wakeup; no run was queued."""
+
+
+class DispatchAmbiguous(Exception):
+    """A write failed without proof about whether the wakeup exists; never try a second one."""
+
+
 def gpu_continuation(rule: dict[str, Any], agent_id: str) -> bool:
     """An enabled rule that wakes this candidate's own agent with a GPU-runner instruction."""
     return (bool(rule.get("enabled")) and rule.get("agent_id") == agent_id
             and GPU_RULE_MARKER in (rule.get("instruction") or ""))
 
 
-def dispatch(candidate: dict[str, Any], target: str) -> None:
-    """Reuse the candidate's own GPU continuation rule, else create a dedicated one-shot rule.
+def own_rules(issue_id: str, target: str) -> list[dict[str, Any]]:
+    return [r for r in multica("issue", "wakeup", "list", issue_id) or []
+            if gpu_continuation(r, target)]
 
-    Raises CalledProcessError when the CLI rejected the write; other errors may be ambiguous.
+
+def dispatch(candidate: dict[str, Any], target: str) -> None:
+    """Wake one candidate through its own GPU continuation rule, else a dedicated one-shot rule.
+
+    A nonzero exit of a write proves nothing, so a failed create is reconciled by re-reading the
+    rules (a stored rule means it landed); without that proof, or for a failed trigger, the
+    handover stops instead of risking a second start.
     """
     name = candidate["identifier"]
-    rules = [r for r in multica("issue", "wakeup", "list", candidate["id"]) or []
-             if gpu_continuation(r, target)]
+    try:
+        rules = own_rules(candidate["id"], target)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        raise DispatchAmbiguous(f"cannot read rules: {exc}") from exc
     if rules:
-        multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
-    else:
+        try:
+            multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            # Fired or rejected is not observable here; a second dispatch could double-start.
+            raise DispatchAmbiguous(f"trigger failed: {exc}") from exc
+        return
+    try:
         multica("issue", "wakeup", "create", candidate["id"], "--kind", "at",
                 "--after", "1s", "--agent-id", target,
                 "--instruction", HANDOVER.format(issue=name))
+    except subprocess.CalledProcessError as exc:
+        # The CLI exited, so the write either committed or not; only a stored rule proves it did.
+        try:
+            landed = own_rules(candidate["id"], target)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as read_exc:
+            raise DispatchAmbiguous(f"create exit {exc.returncode}, rules unreadable: {read_exc}") from exc
+        if landed:
+            return
+        raise DispatchRejected(f"create exit {exc.returncode}, no rule stored") from exc
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        raise DispatchAmbiguous(f"create failed: {exc}") from exc
 
 
 def hand_over(finished: str) -> None:
@@ -103,21 +136,24 @@ def hand_over(finished: str) -> None:
             continue
         try:
             target = wake_target(candidate)
-            if not target:
-                print(f"handover: {name} has no wakable agent or squad leader; skipped", file=sys.stderr)
-                continue
             # A parent whose child work is still open must not duplicate the child's measurement.
-            if open_children(candidate["id"]):
-                print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
-                continue
-            dispatch(candidate, target)
-        except subprocess.CalledProcessError as exc:
-            # The platform rejected this candidate's wakeup; no run was queued, so try the next one.
-            print(f"handover: {name} dispatch rejected (exit {exc.returncode}); trying next candidate",
-                  file=sys.stderr)
-            continue
+            open_work = open_children(candidate["id"]) if target else []
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            # Could have been written before the error: stop instead of risking a second run.
+            # Nothing was written for this candidate; skipping it cannot double-start anything.
+            print(f"handover: cannot inspect {name}; skipped: {exc}", file=sys.stderr)
+            continue
+        if not target:
+            print(f"handover: {name} has no wakable agent or squad leader; skipped", file=sys.stderr)
+            continue
+        if open_work:
+            print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
+            continue
+        try:
+            dispatch(candidate, target)
+        except DispatchRejected as exc:
+            print(f"handover: {name} rejected ({exc}); trying next candidate", file=sys.stderr)
+            continue
+        except DispatchAmbiguous as exc:
             print(f"handover: ambiguous dispatch for {name}; not trying another candidate: {exc}",
                   file=sys.stderr)
             return
