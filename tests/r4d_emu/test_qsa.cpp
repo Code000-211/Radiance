@@ -24,7 +24,10 @@
  * (tile 1) and the tile's union (tile 16) give the same bytes for the same rows, and both are held
  * to libref's `attn_paged` -- the attention the architecture issues today, loaded from
  * $RADIANCE_HOME -- byte for byte as well, over 8K and 32K histories, draft depth 3 and 6, rows with
- * and without a partial page, ties at a coarse score grid and two prefill chunks. `parser_case` is the
+ * and without a partial page, ties at a coarse score grid and two prefill chunks. That comparison is
+ * required, not opportunistic: a build whose `$RADIANCE_HOME/kernels/libref.so` is missing, refuses
+ * to open, or declares no `attn_paged` fails the case with the reason, because a run without the
+ * opponent would be a green run of half the claim. `parser_case` is the
  * batch: two sequences in one step, a declared capacity of 256 sequences and a block table with the
  * batch's two rows, so the parser's row check is held to the live sequence count rather than to the
  * capacity, and the same rows as a chunk show that `row0` keeps them in their own sequence.
@@ -764,21 +767,30 @@ int read_table(const Fix& f, const SharedTab& t, int64_t hd, int64_t nh, int64_t
  * or null when $RADIANCE_HOME holds no libref (the case then reports that it covered only the
  * oracle). */
 typedef int (*AttnLaunch)(const RadArgs*, RadStream);
-AttnLaunch load_row_path() {
+/* The row path is the case's opponent, not an optional extra: `masked read:` claims the table's
+ * read *is* the attention the architecture issues today, and a build that cannot load that
+ * attention cannot make the claim. So the lookup reports why it failed and the case fails on it --
+ * a missing reference must not turn the required comparison into a green run. */
+AttnLaunch load_row_path(std::string* why) {
     const char* home = std::getenv("RADIANCE_HOME");
-    if (!home || !*home) return nullptr;
+    if (!home || !*home) { *why = "RADIANCE_HOME is not set"; return nullptr; }
     const std::string p = std::string(home) + "/kernels/libref.so";
     void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!h) return nullptr;
+    if (!h) {
+        const char* e = dlerror();                       /* cleared by the failed dlopen */
+        *why = std::string("cannot load ") + p + ": " + (e ? e : "unknown");
+        return nullptr;
+    }
     auto open = (int (*)(void))dlsym(h, "rad_plugin_open");      /* as the loader does */
-    if (open && open() < 0) return nullptr;
+    if (open && open() < 0) { *why = p + ": rad_plugin_open refused"; return nullptr; }
     auto cnt = (int (*)(void))dlsym(h, "rad_kernel_count");
     auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
-    if (!cnt || !at) return nullptr;
+    if (!cnt || !at) { *why = p + " has no rad_kernel_count/rad_kernel_at"; return nullptr; }
     for (int i = 0; i < cnt(); ++i) {
         const RadKernelInfo* k = at(i);
         if (k && k->op && !std::strcmp(k->op, "attn_paged")) return k->launch;
     }
+    *why = p + " declares no attn_paged";
     return nullptr;
 }
 
@@ -823,7 +835,14 @@ int masked_read_case() {
     };
     /* A small head so the f64 reference stays cheap: the op's arithmetic does not depend on its width. */
     const int64_t hd = 32, nh = 4, gqa = 1;
-    AttnLaunch rowp = load_row_path();
+    std::string why;
+    AttnLaunch rowp = load_row_path(&why);
+    if (!rowp) {
+        std::printf("FAIL masked read: the row path is unavailable: %s\n", why.c_str());
+        std::printf("FAIL masked read: build libref and set RADIANCE_HOME to its prefix "
+                    "($RADIANCE_HOME/kernels/libref.so); the byte claim needs it\n");
+        return 1;
+    }
     int fails = 0, partial_rows = 0;
     for (Fix& f : fx) {
         SelOut got;
@@ -869,7 +888,7 @@ int masked_read_case() {
         /* The measurement's claim: this read is the row path's read. `libref`'s `attn_paged` over the
          * same rows, in this build, byte for byte -- not a tolerance, because both walk the row's keys
          * in block order with the same expressions. */
-        if (rowp) {
+        {
             std::vector<uint16_t> path;
             rc = row_path_read(f, got, hd, nh, gqa, q, kv, npages, rowp, path);
             if (rc != RAD_OK) {
@@ -898,15 +917,15 @@ int masked_read_case() {
         for (int m = 0; m < M; ++m) listed += got.ns[(size_t)m];
         for (int64_t t = 0; t < shared.tiles; ++t) unioned += shared.tlen[(size_t)t];
         std::printf("  %-52s %d rows: %lld pages read -> %lld in %lld tile(s) (%.1fx fewer), "
-                    "%d partial-page row(s), byte-identical, %.1e from the oracle, %s\n",
+                    "%d partial-page row(s), byte-identical, %.1e from the oracle, "
+                    "byte-identical to the row path\n",
                     f.name.c_str(), M, (long long)listed, (long long)unioned,
                     (long long)shared.tiles, unioned ? (double)listed / (double)unioned : 0.0, partial,
-                    worst, rowp ? "byte-identical to the row path" : "row path not built");
+                    worst);
     }
-    std::printf("masked read: %zu fixtures, %d failure(s), %d partial-page row(s), row path: %s\n",
-                fx.size(), fails, partial_rows,
-                rowp ? "libref attn_paged, byte for byte"
-                     : "not covered ($RADIANCE_HOME has no libref; oracle only)");
+    std::printf("masked read: %zu fixtures, %d failure(s), %d partial-page row(s), "
+                "row path: libref attn_paged, byte for byte\n",
+                fx.size(), fails, partial_rows);
     return fails;
 }
 

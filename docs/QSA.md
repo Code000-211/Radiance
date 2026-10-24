@@ -182,8 +182,11 @@ table per row (tile 1) and through the tile's union and requires the two outputs
 byte, holds both to the op's f64 oracle within rounding, and holds the masked read to `libref`'s
 `attn_paged` -- the attention the architecture issues today, loaded from `$RADIANCE_HOME` -- byte for
 byte as well (`row path:`), over 8K and 32K histories, draft depth 3 and 6, rows with and without a
-partial page, ties at a coarse score grid and two prefill chunks. What the table saves there is what the
-measurement is for: 2.1x to 10x fewer entries for a tile of 4 to 32 rows.
+partial page, ties at a coarse score grid and two prefill chunks. That comparison is required, not
+opportunistic: a build whose `$RADIANCE_HOME/kernels/libref.so` is missing, refuses to open, or
+declares no `attn_paged` fails the case and names the reason, because a run without the opponent would
+be a green run of half the claim. What the table saves there is what the measurement is for: 2.1x to
+10x fewer entries for a tile of 4 to 32 rows.
 
 The sparse path in `arch/common/rad_block_attn_gated_fp8.h` now reads through them, behind
 `RADIANCE_QSA_TABLE=1` (read on every call, so a step is either fully on or fully off). With the

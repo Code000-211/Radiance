@@ -307,8 +307,10 @@ endif()
 
 # arch_test reads libref's vocabulary from $RADIANCE_HOME/kernels to check that each architecture
 # declares on it, and glm5next_test the loaded libraries' op schemas, so libref is built before
-# them.
-foreach(t arch_test glm5next_test)
+# them. r4d_emu_qsa holds the shared table's masked read to libref's `attn_paged` byte for byte, and
+# a build without it cannot make that claim, so the test fails rather than skipping the comparison --
+# the dependency keeps a plain build from failing it, not an excuse to let it pass.
+foreach(t arch_test glm5next_test r4d_emu_qsa r4d_emu_qsa_sweep)
   if(TARGET libref AND TARGET ${t})
     add_dependencies(${t} libref)
   endif()
@@ -536,7 +538,9 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_sweep PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 900)
   # QSA selection at serving sizes, seeded: about 15 s.
   add_test(NAME r4d_emu_qsa_sweep COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_qsa sweep 100)
-  set_tests_properties(r4d_emu_qsa_sweep PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 900)
+  # The sweep runs the masked read too, so it needs the same home and fails without it.
+  set_tests_properties(r4d_emu_qsa_sweep PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 900
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
 endif()
 
 # ================================================================== the document as a test
