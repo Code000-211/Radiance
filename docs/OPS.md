@@ -2321,18 +2321,28 @@ because `rad_gate_reference_kernels` refuses to serve on libref.
 heads that hash onto them, and with `--ngram-placement ram` a miss costs 320 bytes over the link
 plus a dequantise per rank. `RADIANCE_PLE_VRAM_CACHE_SETS=<n>` gives the gather a 4-way
 set-associative L1 of decoded rows on the card: `n` sets of four 320-byte bf16 rows with a tag, a
-state and a hit counter each, hashed `id * 2654435761 mod n`, a set's coldest way replaced and a
-new row starting warm. A hit reads the row from VRAM and touches neither the table nor the scale.
+generation and a hit counter each, hashed `id * 2654435761 mod n`, a set's coldest way replaced and
+a new row starting warm. A hit reads the row from VRAM and touches neither the table nor the scale.
+`n` is rounded down to a power of two and capped at 262144 sets, which is 1048576 rows: 320 MiB of
+payload and 12 MiB of tags, generations and counters, the log line at startup printing what it
+took. 65536 sets is a quarter of that.
+
+The generation is a seqlock, not a status word: 0 is empty, odd is one writer's, even is published.
+A reader keeps the generation it found and demands the same one after its payload load, so a way
+reclaimed and rewritten for the same id while it was reading reads as a miss -- the case a bare
+ready word cannot tell from a row that stayed put.
 
 It is off by default: with the variable unset or `0` the row is allocated nothing, no launch takes
 the cached path, and every gather is the one described above. It is allocated in the row's `init`,
 which runs inside `declare()`, so the VRAM budget reads it as `already held` (core/mem/vram_budget.h)
 and it comes out of what the weight and KV pools could otherwise claim. Its lifetime is that
 instance's: `fini` frees it, a reload starts empty, and an instance handed a second table bypasses
-the cache rather than rebinding it. Hits and misses write the same bytes as the uncached kernel --
-`r4d_selftest`'s `ple_cache` case holds both to a host gather, cold, warm, colliding, under four
-concurrent streams and after a reset. What the hit rate is worth on a given workload is a
-measurement this option does not make for you.
+the cache rather than rebinding it. Hits and misses write the same bytes as the uncached kernel:
+`r4d_selftest`'s `ple_cache` (inside the `embed_lookup_q_bf16` case, so
+`r4d_selftest <libr4d.so> --case embed_lookup_q_bf16`) holds both to a host gather cold, warm,
+colliding, under four concurrent streams, in a single set of four ways that every launch reclaims,
+and after a reset. What the hit rate is worth on a given workload is a measurement this option does
+not make for you.
 
 ### `ngram_ids`
 

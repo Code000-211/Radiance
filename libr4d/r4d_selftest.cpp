@@ -23482,6 +23482,39 @@ static void ple_cache_case(const Plugin& pl) {
     /* The default path, no instance, must agree with the cached one. */
     check("no cache", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, nullptr));
 
+    /* One set, four places, eight ids, four streams, sixteen shuffles: every launch reclaims ways
+     * the other streams are reading. That is the reclaim-and-rewrite (X, Y, X while a reader is
+     * between its payload load and its recheck) a bare status word cannot see and the generation
+     * can, so this is the stage the seqlock earns its keep on. */
+    setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "1", 1);
+    void* inst3 = nullptr;
+    if (r->init(nullptr, 0, 0, 1, &inst3) != RAD_OK || !inst3) {
+        bad += "a one-set init allocated nothing; ";
+    } else {
+        hipStream_t hs[4] = { nullptr, nullptr, nullptr, nullptr };
+        void* hx[4] = { dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)),
+                        dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)) };
+        bool hot_ok = true;
+        for (int s = 0; s < 4; ++s) hot_ok = hot_ok && hipStreamCreate(&hs[s]) == hipSuccess;
+        if (!hot_ok) {
+            bad += "hipStreamCreate failed (one set); ";
+        } else {
+            for (int round = 0; round < 16; ++round) {
+                std::vector<int32_t> ids((size_t)M);
+                for (int64_t m = 0; m < M; ++m) {
+                    rs = rs * 1664525u + 1013904223u;
+                    ids[(size_t)m] = (int32_t)((rs >> 9) % 8u);
+                }
+                for (int s = 0; s < 4; ++s)
+                    check(fmt("hot set %d/%d", round, s).c_str(), ids, table, hx[s],
+                          launch(ids, d_tab, hx[s], hs[s], inst3));
+            }
+            for (int s = 0; s < 4; ++s) st_stream_sync(hs[s]);
+            for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(hs[s]), "hipStreamDestroy", __LINE__);
+        }
+        r->fini(inst3);
+    }
+
     if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
     else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
     ok(what, bad.empty(), bad);
