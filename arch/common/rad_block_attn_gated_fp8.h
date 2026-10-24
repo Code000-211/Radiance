@@ -340,6 +340,9 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * a loaded library declares both ops; otherwise step() keeps the row path, and a fake builder
      * (tests/arch_fakes.h) whose vocabulary lacks them takes the row path too.
      *
+     * `M` is `max_tok` and not a chunk width: the ops run over the step's own rows, so `cu_seqlens`
+     * keeps the engine's row numbering and a row's sequence needs no rebasing (below).
+     *
      * `block_size` must equal the compress ratio: `selb` holds block-table entries and the table is
      * paged at the ratio, so a page holds exactly one block. Any other geometry keeps the row
      * path, which maps a block to its page like any other list. */
@@ -348,12 +351,12 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         qsa_umax > 0 && qsa_ratio > 0 && qsa_blocks > 0 && qsa_page == qsa_ratio &&
         rad_op_declared(b, "qsa_table") && rad_op_declared(b, "qsa_attn")) {
         op_tab = RAD_OP(b, "qsa_table",
-                        RAD_PARAMS(RAD_RANGE("M", 1, qsa_chunk()), RAD_INT("blocks", qsa_blocks),
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("blocks", qsa_blocks),
                                    RAD_INT("topk", qsa_topk), RAD_INT("tile", qsa_tile),
                                    RAD_INT("ratio", qsa_ratio), RAD_INT("u_max", qsa_umax)),
                         RAD_NOWEIGHTS);
         op_attn_tab = RAD_OP(b, "qsa_attn",
-                             RAD_PARAMS(RAD_RANGE("M", 1, qsa_chunk()),
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                         RAD_INT("n_head", g.n_head),
                                         RAD_INT("head_dim", g.head_dim),
                                         RAD_INT("gqa", g.gqa()), RAD_INT("block_size", qsa_page),
@@ -648,50 +651,39 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         }
     } else if (tabulated) {
         /* One union per tile of `qsa_tile` rows, then the attention reads it through each row's
-         * membership mask. A last chunk narrower than a tile runs on the row path below: the table
-         * needs one whole tile, and the two paths are byte-identical (tests/r4d_emu/test_qsa.cpp,
-         * "masked read"), so the arm a row lands in cannot move its numbers.
+         * membership mask. One launch over the step's `T` rows -- not a chunk apiece -- because the
+         * reader finds a row's sequence by binary search in `cu_seqlens`, and `cu_seqlens` is the
+         * batch's: a chunk that starts at row 256 would look up row 0 in the first sequence's range
+         * and read its pages. Slicing the planes would need a rebased `cu` no buffer here carries,
+         * and the table planes are already sized for `max_tok` rows, so the step is one launch.
+         * A tile of fewer rows than `qsa_tile` is a partial last tile, which qsa_table writes like
+         * any other (`tiles = ceil(M/tile)`), so no row falls back to the row path.
          *
          * `bt` is the sequence's own block table here, not the row's selection: the table holds
          * block indices and the reader maps them, in block order, to the pages the prefix cache
          * gave them. */
-        const int64_t chunk = qsa_chunk();
-        const int64_t qw = g.q_dim(), tile = qsa_tile;
+        const int64_t tile = qsa_tile;
         const int64_t btp = kvb ? kvb->block_table_pitch : 0;
-        for (int64_t off = 0; off < T; off += chunk) {
-            const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
-            if (rows < tile) {
-                RAD_ISSUE_N(c, op_attn, 1,
-                            brow_slice(w.q, off, rows, qw),
-                            kv_cache(kv, layer),
-                            brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                            brow_slice(qsa_sequ, off, rows, 1),
-                            RAD_NONE, RAD_NONE, RAD_NONE,
-                            brow_slice(w.attn.x, off, rows, qw));
-                continue;
-            }
-            const int64_t tiles = (rows + tile - 1) / tile;
-            const int64_t t0 = off / tile;
-            RAD_ISSUE_N(c, op_tab, rows,
-                        brow_slice(qsa_selb, off, rows, qsa_topk + 1),
-                        brow_slice(qsa_nsel, off, rows, 1),
-                        praw(batch->positions + off, RAD_I32, rows),
-                        brow_slice(qsa_tab, t0, tiles, qsa_umax),
-                        brow_slice(qsa_tlen, t0, tiles, 1),
-                        brow_slice(qsa_mask, off, rows, qsa_umax),
-                        brow_slice(qsa_roff, off, rows, 1));
-            RAD_ISSUE_N(c, op_attn_tab, 1,
-                        brow_slice(w.q, off, rows, qw),
-                        kv_cache(kv, layer),
-                        brow_slice(qsa_tab, t0, tiles, qsa_umax),
-                        brow_slice(qsa_tlen, t0, tiles, 1),
-                        brow_slice(qsa_mask, off, rows, qsa_umax),
-                        brow_slice(qsa_roff, off, rows, 1),
-                        praw(batch->positions + off, RAD_I32, rows),
-                        praw2(table, RAD_I32, batch->n_seq, btp),
-                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
-                        brow_slice(w.attn.x, off, rows, qw));
-        }
+        const int64_t tiles = (T + tile - 1) / tile;
+        RAD_ISSUE_N(c, op_tab, T,
+                    brows(qsa_selb, T),
+                    brows(qsa_nsel, T),
+                    praw(batch->positions, RAD_I32, T),
+                    brow_slice(qsa_tab, 0, tiles, qsa_umax),
+                    brow_slice(qsa_tlen, 0, tiles, 1),
+                    brow_slice(qsa_mask, 0, T, qsa_umax),
+                    brow_slice(qsa_roff, 0, T, 1));
+        RAD_ISSUE_N(c, op_attn_tab, 1,
+                    brows(w.q, T),
+                    kv_cache(kv, layer),
+                    brow_slice(qsa_tab, 0, tiles, qsa_umax),
+                    brow_slice(qsa_tlen, 0, tiles, 1),
+                    brow_slice(qsa_mask, 0, T, qsa_umax),
+                    brow_slice(qsa_roff, 0, T, 1),
+                    praw(batch->positions, RAD_I32, T),
+                    praw2(table, RAD_I32, batch->n_seq, btp),
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                    brows(w.attn.x, T));
     } else if (sparse) {
         const int64_t chunk = qsa_chunk();
         const int64_t qw = g.q_dim();

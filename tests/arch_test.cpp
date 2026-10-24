@@ -6964,8 +6964,8 @@ TEST(flashnext_sparse_attention_chunks_by_its_scratch_not_by_max_seqs) {
 }
 
 /* The shared-table read path, the prototype behind RADIANCE_QSA_TABLE=1: with the switch on, the
- * per-tile planes are declared and a sparse chunk issues `qsa_table` once per tile and `qsa_attn`
- * once for the chunk, and `qsa_select` grows the block-index operand the table is built from. With
+ * per-tile planes are declared and a sparse step issues `qsa_table` over its rows and `qsa_attn`
+ * once for the step, and `qsa_select` grows the block-index operand the table is built from. With
  * the switch unset, not one buffer or op of it is declared -- the control arm of the measurement is
  * the graph this branch shipped before, because both arms have to run in one build. */
 TEST(flashnext_reads_attention_through_the_shared_table_only_behind_its_switch) {
@@ -6982,19 +6982,30 @@ TEST(flashnext_reads_attention_through_the_shared_table_only_behind_its_switch) 
         const auto k = kit(b, {}, { 1024 }, 9000);
         const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() });
         CHECK_PASSES(b, v);
-        /* Two full-attention layers. With the switch on, 1024 rows go in chunks of 256 (max_seqs 4
-         * rounds up to a whole tile) as one table per chunk and one read per chunk; with it off, the
-         * control arm is what the branch already shipped: the fused gated op over the whole chunk. */
+        /* Two full-attention layers. With the switch on, the step's 1024 rows go through one table
+         * per tile of 16 rows -- 64 tiles, one launch -- and one read over all 1024 rows. Not a read
+         * per chunk: `cu_seqlens` is the batch's, so a chunk would look its first row up in the first
+         * sequence's range, and a declared op's parameters are baked at declare, so the chunk's
+         * offset cannot be one. With the switch off, the control arm is what the branch already
+         * shipped: the fused gated op over the whole step. */
         const auto tab = issues_of(b, *v[0], "qsa_table");
         const auto rd = issues_of(b, *v[0], "qsa_attn");
         const auto row = issues_of(b, *v[0], "attn_paged");
         const auto gq = issues_of(b, *v[0], "attn_paged_gate_quant");
-        CHECK_EQ(tab.size(), on ? (size_t)2 * 4 : (size_t)0);
-        CHECK_EQ(rd.size(), on ? (size_t)2 * 4 : (size_t)0);
+        CHECK_EQ(tab.size(), on ? (size_t)2 : (size_t)0);
+        CHECK_EQ(rd.size(), on ? (size_t)2 : (size_t)0);
         CHECK_EQ(row.size(), (size_t)0);
         CHECK_EQ(gq.size(), on ? (size_t)0 : (size_t)2);
-        for (const RecIssue* i : tab) CHECK_EQ(i->opd[0].rows, 256);   /* rows of one chunk */
-        for (const RecIssue* i : rd) CHECK_EQ(i->opd[0].rows, 256);    /* queries of one chunk */
+        for (const RecIssue* i : tab) {
+            CHECK_EQ(i->opd[0].rows, 1024);                  /* selection rows of the step */
+            CHECK_EQ(i->opd[3].rows, 1024 / 16);             /* one table row a tile of 16 */
+            CHECK_EQ(i->opd[6].rows, 1024);                  /* every row carries a row_off */
+        }
+        for (const RecIssue* i : rd) {
+            CHECK_EQ(i->opd[0].rows, 1024);                  /* queries of the step */
+            CHECK_EQ(i->opd[2].rows, 1024 / 16);             /* the whole tile plane, unsliced */
+            CHECK_EQ(i->opd[2].cols, i->opd[4].cols);        /* the mask's u_max is the table's */
+        }
         for (const RecIssue* i : gq) CHECK_EQ(i->opd[0].rows, 1024);
         /* The selection's operand list is positional, so the block indices are the ninth operand
          * whether or not the path is on: RAD_NONE keeps the count, and a dropped operand would be

@@ -25,6 +25,9 @@ const RadParamSpec kAttnParams[] = {
     { "blocks",     RAD_P_INT,   RAD_REQUIRED, 0 },
     { "max_seqs",   RAD_P_INT,   RAD_REQUIRED, 0 },
     { "u_max",      RAD_P_INT,   RAD_REQUIRED, 0 },
+    /* The chunk's first row in the batch's `cu_seqlens` numbering: a later chunk passes its offset
+     * so the row's sequence still comes from the batch, not from the chunk. */
+    { "row0",       RAD_P_INT,   0, 0 },
     { "scale",      RAD_P_F64,   0, 0 },
     { "q_dtype",    RAD_P_STR,   RAD_REQUIRED, 0 },
     { "kv_dtype",   RAD_P_STR,   RAD_REQUIRED, 0 },
@@ -47,7 +50,7 @@ const RadOperandSpec kAttnOperands[] = {
 };
 
 const RadOpSchema kSchemas[] = {
-    { "qsa_attn", kAttnParams, 14, kAttnOperands, 10,
+    { "qsa_attn", kAttnParams, 15, kAttnOperands, 10,
       "Paged attention over a table a query tile shares: the union's entries the row's membership "
       "mask holds, in block order, then the row's partial page. Same keys in the same order as the "
       "row path, so the same sum." },
@@ -80,7 +83,8 @@ int attn_geometry(const RadParam* p, int n, RadQsaAttnCall* c) {
     /* `tab` holds block-table entries and the table is paged at the compress ratio, so a cache page
      * has to be exactly one block: a wider page would make the partial page's token range wrong. */
     if (c->block_size != c->ratio) return RAD_E_UNSUPPORTED;
-    if (tile < 1 || tile > c->M || tile > 32) return RAD_E_UNSUPPORTED;
+    /* `tile > M` is a step shorter than a tile (`qsatable.cpp`, `table_geometry`): one short tile. */
+    if (tile < 1 || tile > 32) return RAD_E_UNSUPPORTED;
     c->kv_heads = c->n_head / c->gqa;
     c->tile     = tile;
     c->tiles    = (c->M + tile - 1) / tile;
@@ -89,6 +93,8 @@ int attn_geometry(const RadParam* p, int n, RadQsaAttnCall* c) {
      * for still fills that width. */
     c->u_max    = rad_param_geti(p, n, "u_max", 0);
     if (c->u_max < 1 || c->u_max > c->tile * c->topk) return RAD_E_UNSUPPORTED;
+    c->row0     = rad_param_geti(p, n, "row0", 0);
+    if (c->row0 < 0) return RAD_E_UNSUPPORTED;
     c->scale    = (float)rad_param_getf(p, n, "scale", 1.0 / std::sqrt((double)c->head_dim));
     return RAD_OK;
 }
@@ -157,13 +163,18 @@ int rad_qsa_attn_args(const RadArgs* a, RadQsaAttnCall* out) {
         if (a->t[i].rank != 1 || a->t[i].dtype != RAD_I32 || a->t[i].shape[0] < c.M)
             return RAD_E_SHAPE;
     if (a->t[7].rank != 2 || a->t[7].dtype != RAD_I32) return RAD_E_SHAPE;
-    if (a->t[7].shape[0] < rad_args_geti_or(a, "max_seqs", 1)) return RAD_E_SHAPE;
+    if (a->t[7].shape[1] < c.blocks) return RAD_E_SHAPE;
     /* `cu_seqlens`, one entry per sequence and one past the last, so its width is the sequence
-     * count plus one and never the row count. */
+     * count plus one and never the row count. `max_seqs` bounds that capacity; the row count below
+     * is the live one, which is what the block table has to cover. */
     if (a->t[8].rank != 1 || a->t[8].dtype != RAD_I32) return RAD_E_SHAPE;
     if (a->t[8].shape[0] < 2 || a->t[8].shape[0] > rad_args_geti_or(a, "max_seqs", 1) + 1)
         return RAD_E_SHAPE;
     c.seqs = a->t[8].shape[0] - 1;
+    /* The block table is `[n_seq][blocks]` for the batch's live sequences. `max_seqs` is the
+     * capacity the caller declared (the architecture declares the chunk's row count, far above
+     * the batch's sequence count), so it must not decide how many rows the table needs. */
+    if (a->t[7].shape[0] < c.seqs) return RAD_E_SHAPE;
     if (a->t[9].rank != 2 || a->t[9].shape[0] != c.M ||
         a->t[9].shape[1] != c.n_head * c.head_dim) return RAD_E_SHAPE;
     if (a->t[9].stride[0] < c.n_head * c.head_dim) return RAD_E_STRIDE;

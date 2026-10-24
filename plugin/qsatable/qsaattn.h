@@ -20,9 +20,20 @@
  * WHY THE SUM IS THE ROW PATH'S SUM. Softmax is summed in table order and float addition is not
  * associative, so the masked read reproduces a row's result only when the row's list is a
  * subsequence of the union -- which block order makes true by construction (docs/QSA.md, "Table
- * order"). The kernel accumulates in that order, one key at a time; `tests/r4d_emu/test_qsa.cpp`
- * (`masked read:`) runs the same rows through a per-row table (tile 1) and through the shared one and
- * requires the outputs to be equal **byte for byte**.
+ * order"). The kernel runs the row path's two passes over that key order -- the max, then the sum --
+ * in the row path's own expressions, so two tables that give a row the same keys in the same order
+ * give it the same bytes. `tests/r4d_emu/test_qsa.cpp` checks that
+ * in two steps: `masked read:` holds the shared table to a table per row (tile 1) **of this op**
+ * byte for byte, and `row path:` holds it to the attention the architecture issues today
+ * (`libref`'s `attn_paged`, loaded from the same build) key for key, entry for entry. The second
+ * one is the measurement's claim; the first is only the table's self-consistency.
+ *
+ * ONE LAUNCH IS THE STEP'S ROWS. `cu` is the batch's `cu_seqlens`, so the row numbering it answers
+ * to is the batch's; `arch/common/rad_block_attn_gated_fp8.h` therefore issues one launch over the
+ * step's `T` rows rather than a chunk apiece. A caller that chunks anyway slices q, positions and
+ * the table's row planes but not `cu`, and must pass its chunk's first row in the batch's numbering
+ * as `row0` -- otherwise the second chunk of a two-sequence batch looks its rows up in the first
+ * sequence's interval and reads that sequence's pages.
  *
  * PROTOTYPE. The device row is one workgroup of one lane per (row, kv head), so it is a statement of
  * the op, not a serving kernel: a real one keeps a row's union in LDS and processes the tile's rows
@@ -52,6 +63,8 @@ struct RadQsaAttnCall {
 
     int64_t M, n_head, kv_heads, gqa, head_dim, block_size, ratio;
     int64_t tile, u_max, tiles, topk, blocks, seqs;
+    int64_t row0;                   /* the chunk's first row in the batch's `cu` numbering; a chunk
+                                     * also rebases `row_off`, which counts offsets into `tab` */
     int64_t q_pitch, out_pitch, bt_pitch;              /* elements between rows */
     int64_t kv_sb, kv_sh, kv_so, kv_sd;                /* cache strides: block, head, slot, dim */
     float   scale;
@@ -82,10 +95,11 @@ int rad_ref_qsa_attn(const RadArgs*);
 #endif
 RAD_QSA_HD int64_t rad_qsa_attn_seq(const RadQsaAttnCall& c, int64_t row) {
     if (!c.cu) return 0;
-    int64_t lo = 0, hi = c.seqs;   /* cu[lo] <= row, and row < cu[hi] when hi < seqs */
+    const int64_t r = row + c.row0;   /* the batch's row, not the chunk's */
+    int64_t lo = 0, hi = c.seqs;   /* cu[lo] <= r, and r < cu[hi] when hi < seqs */
     while (lo + 1 < hi) {
         const int64_t mid = (lo + hi) / 2;
-        if (c.cu[mid] <= row) lo = mid; else hi = mid;
+        if (c.cu[mid] <= r) lo = mid; else hi = mid;
     }
     return lo;
 }
@@ -100,6 +114,8 @@ void rad_qsa_attn_keys(const RadQsaAttnCall& c, int64_t row, Visit visit) {
     const int64_t s = rad_qsa_attn_seq(c, row);
     const int64_t p = c.pos[row];
     const int64_t own = (p + 1) / c.ratio;
+    /* `row_off` is an offset into the `tab` plane the caller handed over: a caller that slices the
+     * plane rebases it (`qsa_attn`'s `row0`). */
     const int64_t tile = c.row_off[row] / c.u_max;
     const int32_t* tab = c.tab + c.row_off[row];
     const int32_t* mask = c.mask + (int64_t)row * c.u_max;
