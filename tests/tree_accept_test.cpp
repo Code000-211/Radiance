@@ -178,6 +178,96 @@ TEST(a_wrong_ancestor_mask_is_refused_not_scored) {
 
     /* Depth is derived from the parent, so a caller cannot hand in a depth that disagrees. */
     CHECK(t[6].depth == t[t[6].parent].depth + 1);
+
+    /* The root is the only depth-0 row; a mutated root depth is refused rather than shifting
+     * every position on the tree. */
+    CandidateTree bad_root;
+    CHECK(bad_root.build_linear(5, nullptr, 0));
+    CHECK(bad_root.masks_consistent());
+    bad_root[0].depth = -5;
+    CHECK(!bad_root.masks_consistent());
+    CHECK(!bad_root.fits(0, 64));
+
+    /* The sampler's entry point checks the tree it was handed, so a bad mask cannot reach the
+     * passes that read the accepted path. */
+    int32_t out[8], path[8], acc = -1;
+    std::vector<int32_t> pick(static_cast<size_t>(bad.size()), 1);
+    CHECK_EQ(accept_tree_greedy(bad, pick.data(), bad.size(), out, &acc, path), RAD_E_INVAL);
+}
+
+TEST(the_legacy_uint16_mask_is_refused_above_sixteen_rows) {
+    int32_t history[8][8];
+    for (int r = 0; r < 8; ++r)
+        for (int k = 0; k < 8; ++k) history[r][k] = 100 + r * 8 + k;
+
+    CandidateTree t;
+    CHECK(t.build_mtp_fixed(history, 8, kTreeMaxNodes, 7, 4096));
+    CHECK_EQ(t.size(), 65);
+
+    /* Rows below 16 keep their exact form. */
+    CHECK_EQ(tree_mask16(t[0].ancestors), 0x0001);
+    CHECK_EQ(tree_mask16(t[9].ancestors), 0x0201);   /* root + itself */
+    /* A row whose ancestor set reaches past bit 15 has no uint16 form: 0, never a truncated set
+     * that would condition the row on the wrong tokens. */
+    CHECK_EQ(tree_mask16(t[40].ancestors), 0x0000);
+    CHECK_EQ(tree_mask16(t[64].ancestors), 0x0000);
+}
+
+TEST(the_geometry_matches_the_archived_reference_at_5c3bb1d) {
+    /* Goldens dumped from the archived source
+     * (candidates/fulldrafter-abi16-review/source @5c3bb1d): arch/common/rad_tree_candidate.h
+     * builds the topologies, mine/ref_mtp_tree_accum.cpp packs the MTP tree. Values are literals
+     * on purpose -- an expected value computed by the code under test proves nothing. */
+    CandidateTree t;
+    uint32_t cand[15];
+    for (int i = 0; i < 15; ++i) cand[i] = 2000u + static_cast<uint32_t>(i);
+    CHECK(t.build_top4(500u, cand, 8));
+    const uint16_t top4[9] = {0x0001, 0x0003, 0x0005, 0x0009, 0x0011,
+                              0x0023, 0x0043, 0x0083, 0x0103};
+    CHECK_EQ(t.size(), 9);
+    for (int32_t i = 0; i < t.size(); ++i) CHECK_EQ(tree_mask16(t[i].ancestors), top4[i]);
+
+    /* The packed MTP tree the archived accumulator produced for three rounds of eight unique
+     * candidates at the legacy capacity: root, three spine rows, then twelve alternates. */
+    int32_t history[8][8];
+    for (int r = 0; r < 8; ++r)
+        for (int k = 0; k < 8; ++k) history[r][k] = -1;
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 8; ++k) history[r][k] = 100 + r * 8 + k;
+
+    const int32_t tokens3[16] = {7, 100, 108, 116, 101, 102, 103, 104,
+                                 105, 106, 107, 109, 110, 111, 112, 113};
+    const int32_t parents3[16] = {-1, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1};
+    const uint16_t masks3[16] = {0x0001, 0x0003, 0x0007, 0x000F, 0x0011, 0x0021, 0x0041, 0x0081,
+                                  0x0101, 0x0201, 0x0401, 0x0803, 0x1003, 0x2003, 0x4003, 0x8003};
+    CHECK(t.build_mtp_fixed(history, 3, 16, 7, 4096));
+    CHECK_EQ(t.size(), 16);
+    for (int32_t i = 0; i < 16; ++i) {
+        CHECK_EQ(static_cast<int32_t>(t[i].token), tokens3[i]);
+        CHECK_EQ(t[i].parent, parents3[i]);
+        CHECK_EQ(tree_mask16(t[i].ancestors), masks3[i]);
+    }
+
+    /* The full MTP8/64 shape: eight spine rows, then each round's seven alternates. */
+    for (int r = 0; r < 8; ++r)
+        for (int k = 0; k < 8; ++k) history[r][k] = 100 + r * 8 + k;
+    CHECK(t.build_mtp_fixed(history, 8, kTreeMaxNodes, 7, 4096));
+    CHECK_EQ(t.size(), 65);
+    const int32_t parents8[12] = {-1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(t[i].parent, parents8[i]);
+    /* Masks of root, the first alternate, and one alternate per round up to the last row. */
+    const int32_t probe[9] = {0, 9, 17, 25, 33, 41, 49, 57, 64};
+    const uint64_t probe_low[9] = {0x1ull, 0x201ull, 0x20003ull, 0x2000007ull, 0x20000000Full,
+                                   0x2000000001Full, 0x200000000003Full, 0x20000000000007Full,
+                                   0x00000000000000FFull};
+    const bool probe_high[9] = {false, false, false, false, false, false, false, false, true};
+    for (int i = 0; i < 9; ++i) {
+        uint64_t low = 0;
+        for (size_t b = 0; b < 64; ++b)
+            if (t[probe[i]].ancestors.test(b)) low |= 1ull << b;
+        CHECK_EQ(low, probe_low[i]);
+        CHECK_EQ(t[probe[i]].ancestors.test(64), probe_high[i]);
+    }
 }
 
 TEST(a_chain_tree_accepts_exactly_what_accept_greedy_accepts) {

@@ -45,10 +45,13 @@ inline constexpr int32_t kTreeRoundCandidates = 8;
 
 using TreeMask = std::bitset<static_cast<size_t>(kTreeMaxNodes)>;
 
-/* The legacy uint16 form. Exact for nodes below 16 -- every ancestor precedes its descendant --
- * and only publishable for trees no wider than that. */
+/* The legacy uint16 form. Exact for trees no wider than kTreeLegacyMaskNodes -- every ancestor
+ * precedes its descendant. A mask with a bit above that width has no uint16 form, so it returns 0
+ * instead of a silently truncated set: an ancestor set that lost its high bits conditions a row on
+ * a token that is not on its path. Callers that can see wider trees use the full TreeMask. */
 inline uint16_t tree_mask16(const TreeMask& m) {
-    return static_cast<uint16_t>((m & TreeMask(0xFFFFu)).to_ullong());
+    if ((m >> kTreeLegacyMaskNodes).any()) return 0;
+    return static_cast<uint16_t>(m.to_ullong());
 }
 
 struct TreeNode {
@@ -98,7 +101,8 @@ public:
     }
 
     /* A chain: node i's parent is i-1. The linear topology a serial drafter emits, so a tree
-     * batch and a chain batch have one construction path. */
+     * batch and a chain batch have one construction path. `n_draft` past the capacity is
+     * truncated to it (unlike build_mtp_fixed, which refuses a budget it cannot fill). */
     bool build_linear(uint32_t root, const uint32_t* draft, int32_t n_draft) {
         reset();
         if (!add(-1, root)) return false;
@@ -208,6 +212,7 @@ public:
         TreeMask expect;
         expect.set(0);
         if (nodes[0].ancestors != expect) return false;
+        if (nodes[0].depth != 0) return false;   /* the root is the only depth-0 row */
         for (int32_t i = 1; i < count; ++i) {
             const int32_t p = nodes[i].parent;
             if (p < 0 || p >= i) return false;
@@ -257,13 +262,15 @@ struct TreeWinner {
  *
  * `n_pick` must cover every row the walk can visit, which is the tree's node count: the bonus is
  * the pick at the last visited node, so a shorter buffer leaves the walk without the token the
- * step must emit. Returns RAD_OK and fills `*out`; RAD_E_INVAL on a malformed tree or a short
- * buffer; RAD_E_STATE when the walk ends without a bonus (a tree whose rows ran out before its
- * picks did, which no verifier may paper over with token 0). */
+ * step must emit. Returns RAD_OK and fills `*out`; RAD_E_INVAL on a malformed tree (bad masks or
+ * topology, short buffer); RAD_E_STATE never occurs as written -- `node` grows strictly and leaves
+ * have no children, so the walk always ends with a bonus -- and the clause is kept only so a future
+ * tree shape cannot emit token 0. */
 inline int verify_tree_greedy(const CandidateTree& tree, const int32_t* pick, int32_t n_pick,
                               TreeWinner* out) {
     if (!out || tree.count <= 0 || tree.count > kTreeMaxNodes) return RAD_E_INVAL;
     if (!pick || n_pick < tree.count) return RAD_E_INVAL;
+    if (!tree.masks_consistent()) return RAD_E_INVAL;
     const int32_t n = tree.count;
 
     int32_t node = 0, acc = 0;

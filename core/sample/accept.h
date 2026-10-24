@@ -55,8 +55,9 @@ class CandidateTree;
  * applies to the emitted tokens unchanged, so a stop token inside the tree ends the step where it
  * would end a chain.
  *
- * Returns RAD_E_INVAL for a malformed tree or a `pick` shorter than the tree (every visited row
- * needs its pick), and RAD_E_STATE when the walk ends without a bonus token. */
+ * Returns RAD_E_INVAL for a malformed tree -- masks that disagree with the topology, or a `pick`
+ * shorter than the tree (every visited row needs its pick) -- and RAD_E_STATE when the walk ends
+ * without a bonus token. */
 int accept_tree_greedy(const CandidateTree& tree, const int32_t* pick, int32_t n_pick,
                        int32_t* out, int32_t* n_accepted, int32_t* out_path);
 
