@@ -163,7 +163,7 @@ if(TARGET rad_core)
   target_link_libraries(gdn_query_reload_compare PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
   target_include_directories(gdn_query_reload_compare PRIVATE
-    ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/core)
+    ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/tools)
   # The harness writes the plugin path from its own arguments; the home only has to exist for the
   # engine's device layer to resolve its plugin scan roots.
   target_compile_definitions(gdn_query_reload_compare PRIVATE

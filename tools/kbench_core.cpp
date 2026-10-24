@@ -433,29 +433,6 @@ std::string phase_line(const Phases& ph, double wall_s) {
 }
 
 /* ================================================================== timing */
-TimeStats time_stats(std::vector<double> v) {
-    TimeStats s;
-    v.erase(std::remove_if(v.begin(), v.end(), [](double x) { return !std::isfinite(x); }),
-            v.end());
-    const int64_t n = (int64_t)v.size();
-    s.n = (int)n;
-    if (n == 0) return s;
-    std::sort(v.begin(), v.end());
-    s.min = v.front();
-    s.max = v.back();
-    s.median = n % 2 ? v[(size_t)(n / 2)] : 0.5 * (v[(size_t)(n / 2 - 1)] + v[(size_t)(n / 2)]);
-    /* ceil(0.9 n) in integers: 0.9 * 20 is 18.000000000000004 in doubles. */
-    s.p90 = v[(size_t)((9 * n + 9) / 10 - 1)];
-    if (n < 2) return s;
-    const double h = 0.98 * std::sqrt((double)n);
-    const int64_t lo = std::max<int64_t>(1, (int64_t)std::floor((double)n / 2.0 - h));
-    const int64_t hi = std::min<int64_t>(n, (int64_t)std::ceil((double)n / 2.0 + 1.0 + h));
-    s.ci_lo = v[(size_t)(lo - 1)];
-    s.ci_hi = v[(size_t)(hi - 1)];
-    if (s.median > 0) s.ci_pct = 100.0 * (s.ci_hi - s.ci_lo) / 2.0 / s.median;
-    return s;
-}
-
 bool timing_done(const std::vector<double>& v, int min_n, int max_n, double ci_pct) {
     const int n = (int)v.size();
     if (n >= max_n) return true;

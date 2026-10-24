@@ -17,8 +17,14 @@
 //   * the candidate's scratch is poisoned with 0x5b (guards 0xa7) before every launch, and after
 //     the launch the N*Hg counters must be zero and both guards untouched -- that is the emitted
 //     clear actually running, not a promise about a fresh allocation.
+//
+// AND, separately from every one of those checks, a timing block: the same two rows on one prepared
+// buffer pair, interleaved pair by pair, one device-layer event pair per dispatch. It reports numbers
+// and cannot fail the run -- a pass/fail line over a wall-clock difference would be a verdict, and
+// this harness has no basis for one.
 #include <hip/hip_runtime.h>
 
+#include "kbench_time_stats.h"
 #include "rad_abi.h"
 #include "rad_device.h"
 
@@ -523,6 +529,69 @@ void run_case(const Plugin& frozen, const Plugin& cand, Stream& stream, int step
     bf.free_all(); bc.free_all();
 }
 
+// ------------------------------------------------------------------ timing
+//
+// The two rows timed on the same prepared buffer pair, arms interleaved inside one loop (the drift
+// rule: a clock ramp or a thermal step hits both arms of a pair alike), one event pair around each
+// dispatch and one sync per pair so the host is not what is measured. The replicate count is a
+// constant fixed before the run -- choosing it after seeing the spread would be choosing the answer
+// -- and the warmup pairs are dropped, not reported.
+constexpr int kTimingReps = 21;
+constexpr int kTimingWarmup = 2;
+
+void run_timing(const Plugin& frozen, const Plugin& cand, Stream& stream) {
+    const RadKernelInfo* rf = find_row(frozen, "gdn_conv_recurrent_update_k128_v128_bf16");
+    const RadKernelInfo* rc = find_row(cand, "gdn_query_reload_conv_recurrent_k128_v128_bf16");
+    const Geo g;
+    Inputs in;
+    build_inputs(g, 0x51ed270bu, in);
+    Buffers bf, bc;
+    if (!rf || !rc || !bf.alloc(g) || !bc.alloc(g)) {
+        ok("timing: both rows run the timed loop", false, "allocation or row lookup");
+        bf.free_all(); bc.free_all(); return;
+    }
+    upload_inputs(g, in, bf);
+    upload_inputs(g, in, bc);
+    RadEvent f0 = nullptr, f1 = nullptr, c0 = nullptr, c1 = nullptr;
+    std::string why;
+    for (RadEvent* e : { &f0, &f1, &c0, &c1 })
+        if (why.empty() && rad_event_create(e) != RAD_OK) why = "event create";
+    std::vector<double> tf, tc;
+    for (int rep = -kTimingWarmup; rep < kTimingReps && why.empty(); ++rep) {
+        float msf = 0, msc = 0;
+        const bool good =
+            rad_event_record(f0, stream.value) == RAD_OK && run_row(rf, g, bf, stream) == RAD_OK &&
+            rad_event_record(f1, stream.value) == RAD_OK &&
+            rad_event_record(c0, stream.value) == RAD_OK && run_row(rc, g, bc, stream) == RAD_OK &&
+            rad_event_record(c1, stream.value) == RAD_OK && rad_event_sync(c1) == RAD_OK &&
+            rad_event_elapsed_ms(f0, f1, &msf) == RAD_OK &&
+            rad_event_elapsed_ms(c0, c1, &msc) == RAD_OK;
+        if (!good) { why = fmt("rep %d: event or launch refused", rep); break; }
+        if (rep < 0) continue;                       // warmup pair, dropped
+        tf.push_back((double)msf * 1000.0);          // microseconds per dispatch
+        tc.push_back((double)msc * 1000.0);
+    }
+    for (RadEvent* e : { &f0, &f1, &c0, &c1 }) if (*e) rad_event_destroy(*e);
+    ok("timing: both rows complete the timed loop", why.empty(), why);
+    if (why.empty()) {
+        const auto sf = rad::kb::time_stats(tf), sc = rad::kb::time_stats(tc);
+        // Beyond the spread only when the two medians' order-statistic intervals do not overlap --
+        // the same interval rad-kbench reports. No significance test is implied or performed.
+        const bool beyond = sf.ci_hi < sc.ci_lo || sc.ci_hi < sf.ci_lo;
+        const double d = sc.median - sf.median;
+        std::printf("timing  %d reps per arm, %d warmup pairs dropped, interleaved, one event pair "
+                    "per dispatch\n", sf.n, kTimingWarmup);
+        std::printf("  frozen     p50 %8.3f us  min %8.3f  max %8.3f  p90 %8.3f  ci95 [%.3f, %.3f]\n",
+                    sf.median, sf.min, sf.max, sf.p90, sf.ci_lo, sf.ci_hi);
+        std::printf("  candidate  p50 %8.3f us  min %8.3f  max %8.3f  p90 %8.3f  ci95 [%.3f, %.3f]\n",
+                    sc.median, sc.min, sc.max, sc.p90, sc.ci_lo, sc.ci_hi);
+        std::printf("  delta p50  %+.3f us (%+.1f%% of frozen); medians' intervals overlap: %s\n",
+                    d, sf.median > 0 ? 100.0 * d / sf.median : 0.0,
+                    beyond ? "no -- beyond the spread" : "yes -- inside the spread");
+    }
+    bf.free_all(); bc.free_all();
+}
+
 // The scratch hook is asked with parameters only, before any tensor address exists.
 void check_cold_scratch(const RadKernelInfo* row) {
     std::array<RadParam, 4> ps = {{
@@ -581,6 +650,7 @@ int main(int argc, char** argv) {
         if (!g_fail) check_moved(frozen, stream);
         if (!g_fail) check_sensitive(frozen, stream);
         if (!g_fail) run_case(frozen, cand, stream, steps);
+        if (!g_fail) run_timing(frozen, cand, stream);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
