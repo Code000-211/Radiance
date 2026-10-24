@@ -241,8 +241,30 @@ The equality is guarded by controls inside the same invocation:
   (`RAD_E_SHAPE`), `state_form=per_candidate` (`RAD_E_UNSUPPORTED`), absent `num_accepted`
   (`RAD_E_INVAL`).
 
-That run does not cover speed (no timing is part of it), the f16 state cache, the fp8-e4m3 code path,
-the optional conv-bias operand, or any full-model step.
+That run does not cover the f16 state cache, the fp8-e4m3 code path, the optional conv-bias operand,
+or any full-model step.
+
+### The timing block
+
+The same invocation ends with a timing block, and that block alone is what a "faster?" question can
+be answered from. It is deliberately not part of the correctness checks and it cannot fail the run:
+it prints numbers, and a pass/fail line over a wall-clock difference would be a verdict this harness
+has no basis for.
+
+- Both rows run on one prepared buffer pair, **interleaved inside one loop** (frozen, candidate,
+  repeat), so a clock ramp or a thermal step hits the two arms of a pair alike — the drift rule
+  radiance's measurement notes ask for. One device-layer event pair per dispatch
+  (`rad_event_record`/`rad_event_elapsed_ms`), one sync per pair, so the host is not what is timed.
+- The replicate count is a **constant in the source** — `kTimingReps = 21`, with `kTimingWarmup = 2`
+  dropped pairs — fixed before the run. A flag would let the count be chosen after seeing the
+  spread, which would be choosing the answer. 21 leaves 21 samples per arm while staying inside one
+  GPU window; that is enough for the order-statistic interval and not enough for a significance
+  test, which is why none is reported.
+- The spread is reported per arm (p50, min, max, p90, and the distribution-free 95% interval for the
+  median) and as a verdict: the candidate is **beyond the spread** only when the two medians'
+  intervals do not overlap, otherwise **inside the spread**. The arithmetic is `rad::kb::time_stats`,
+  shared with `rad-kbench`, so `tests/kbench_test.cpp` checks the evaluation path on a host
+  (`ctest -L fast -R kbench_test`) instead of only on a card.
 
 The open measurement, for whoever has a card:
 
@@ -251,6 +273,9 @@ flock -n -x /tmp/radiance-tp2-bench.lock \
   <build>/bin/gdn_query_reload_compare --frozen <home>/kernels/libr4d.so \
     --candidate <home>/kernels/gdn_query_reload.so --steps 6 --poison-counters
 ```
+
+A run that reports only correctness has not answered the cost question, and a difference inside the
+spread is "no established gain", not a loss and not a win.
 
 ## Original evidence, and what it does and does not say about this target
 

@@ -7,6 +7,7 @@
  * tests/kbench_mutant_test.cpp checks the wiring with known-bad kernels.
  */
 #pragma once
+#include "kbench_time_stats.h"
 #include "kfixture.h"
 #include "opshapes.h"
 
@@ -247,20 +248,8 @@ std::string phase_line(const Phases& ph, double wall_s);
  * telemetry's table, the calibration's plausibility check, and the inputs the timing pass draws
  * where the correctness draw is not what the engine sees. */
 
-/* Order statistics of per-launch times in microseconds, one per timed batch. */
-struct TimeStats {
-    int    n = 0;
-    double median = -1, min = -1, max = -1;
-    double p90 = -1;          /* nearest rank: the ceil(0.9 n)-th smallest */
-    /* A distribution-free confidence interval for the median: the order statistics of ranks
-     * floor(n/2 - 0.98 sqrt(n)) and ceil(n/2 + 1 + 0.98 sqrt(n)), clipped to the sample. Up to
-     * ten samples that is the whole range, which covers the median with probability
-     * 1 - 2^(1-n): 95% from six samples on, less below (94% at five, 50% at two). From eleven on,
-     * one outlier on either side leaves it unchanged. None (-1) for fewer than two samples. */
-    double ci_lo = -1, ci_hi = -1;
-    double ci_pct = -1;       /* half the interval's width, as a percent of the median */
-};
-TimeStats time_stats(std::vector<double> v);
+/* TimeStats and time_stats(): tools/kbench_time_stats.h, shared with a harness that is not
+ * rad-kbench (the GDN query-reload comparator). */
 
 /* Whether a case has been timed enough: `max_n` batches, or at least `min_n` whose median's
  * interval half-width is within `ci_pct` percent. */
