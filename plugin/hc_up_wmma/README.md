@@ -59,9 +59,16 @@ it is not even a candidate for them; there is no in-kernel fallback path and non
   `#pragma GCC visibility push(hidden)`, as do its own non-exported definitions -- the dispatch-log
   globals (`r4d_dispatch_log`, `r4d_dispatch_cap`, `r4d_dispatch_n`, `exports.cpp`) and the device
   half's row accessors. The project sets no `-fvisibility=hidden`, so those pragmas are what keep
-  it in; with them the only dynamic symbols, with or without a device build, are the six plugin
-  exports. `libr4d`'s `r4d_rad_*` entries are not among them; both libraries load and the base row
-  keeps working beside this one.
+  it in. A card-less build (`-DRAD_WITH_HIP=OFF`) defines six dynamic symbols -- the plugin exports
+  alone. The device build defines **18** (`nm -D --defined-only`): those six plus eleven
+  `hc_up_wmma::*` names (`up_mix`, its `__device_stub__`, `quant<true>`, `quant<false>` and their
+  stubs, `body`, `launch`, `row`, `scratch`, `dense`) and `__hip_cuid_*`. Cause: the `visibility
+  pop` on `hc_up_wmma.hip:20` closes the pragma before the namespace at `:26`, so only the
+  dispatch-log globals and the row accessors are pulled in; `__hip_cuid_*` is HIP's own. None of
+  those names is a libr4d name, so nothing here can interpose: `libr4d`'s `r4d_rad_*` entries are
+  not among them, both libraries load and the base row keeps working beside this one. Pulling the
+  pragma over the namespace is the fix for the eleven; it is not made here (documentation-only
+  run).
 - **No new architecture, default or option.** This is the row only.
 - **No numerics change in down/inject.** The `d` and scale buffers are the base row's, sized by the
   same arithmetic, so the up dot consumes exactly what libr4d's down kernel writes.
@@ -107,12 +114,23 @@ Without a device build the library still compiles and loads, declares `hc_read`'
 
 Verified here, no card involved:
 
-- it compiles and links for `gfx1201` in this tree and exports exactly the six plugin symbols;
+- it compiles and links for `gfx1201` in this tree; the six plugin exports are the only dynamic
+  symbols in a card-less build, and the device build adds eleven `hc_up_wmma::*` names plus
+  `__hip_cuid_*` (18 in total, `nm -D --defined-only`);
 - it is inert with the switch unset or `0`, and offers one device row with it set;
 - that row claims only `M=3..4, n=2560, hc=4, lowrank=320, inject=1, group=128, dtype=bf16,
   mix=e4m3`, and its scratch hook answers `M*(lowrank*2 + 8*4)` and refuses every other band;
 - its `hc_read` schema is libr4d's, field for field.
 
-**Not verified: the numbers on a card.** No GPU run, no benchmark and no C8 measurement was made
-for this port; that belongs to `Radiance Testing`. Until then the row's outputs have not been
-compared against libr4d's on real weights, and the switch should stay off in serving.
+**Measured on a card, and not taken over.** `Radiance Testing` measured this row at head `39a6ef3`
+over the base `b679448` on a physical R9700 (`gfx1201`, `HIP_VISIBLE_DEVICES=1`, serialized under
+the benchmark lock); `up_mix` and `quant` are identical between `59d2a1a` and `39a6ef3`, so the
+numbers hold for both. Numerics pass the tree's contract (`tools/kbench_core.cpp`): against `libref`
+at `hc_read`'s 3,0e-2 e4m3 tolerance the port reads 6,95e-03 (M=4, `rotate=0`) and 1,30e-02
+(M=4, `rotate=1`) -- at or below the base row's 7,76e-03 / 1,45e-02 on every seed, all six outputs
+covered, zero memory violations, zero skips. Performance **fails**: 29,23 us against the base
+row's 27,71 us at M=4 (+5,5 %, interleaved 3x) and 30,88 us against 27,69 us at M=3 (+11,6 %,
+separate runs with identical case inputs). Cause: three launches per `hc_read` (down, `up_mix`,
+`quant`) where the base row needs two, its up/mix/quant fused into one. Verdict: **no takeover** --
+`RADIANCE_HC_UP_WMMA` stays off in serving. No serving A/B was run (C8, decode, prefill, composite,
+TP2); the negative kernel delta could only be confirmed there, not reversed.

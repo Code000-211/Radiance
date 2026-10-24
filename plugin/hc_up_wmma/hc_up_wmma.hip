@@ -238,18 +238,20 @@ static bool hc_up_wmma_enabled() {
 }
 
 /* One line, once, when the row is first offered: the switch is the only thing standing between an
- * installed library and the unmeasured row, and it is otherwise invisible in operation. The
- * plugin ABI has no log hook -- RAD_INFO is core-internal (core/rad_internal.h) and a plugin links
- * only rad_abi -- so stderr is the channel a plugin has. */
-/* Hidden with the rest of this library's internals: only the six rad_* plugin exports are dynamic
- * (see exports.cpp and README.md, "What it does not change"). */
+ * installed library and the measured-and-rejected row, and it is otherwise invisible in
+ * operation. The plugin ABI has no log hook -- RAD_INFO is core-internal (core/rad_internal.h) and
+ * a plugin links only rad_abi -- so stderr is the channel a plugin has. */
+/* Hidden with the rest of this library's internals: only the six rad_* plugin exports are hidden
+ * here -- the namespace above it is not, so a device build also exports hc_up_wmma::* (18 dynamic
+ * symbols in total; see README.md, "What it does not change"). */
 #pragma GCC visibility push(hidden)
 extern "C" int rad_hc_up_wmma_row_count(void) {
     if (!hc_up_wmma_enabled()) return 0;
     static const bool announced = [] {
         std::fprintf(stderr,
                      "[hc_up_wmma] RADIANCE_HC_UP_WMMA=1: offering hc_read_up_wmma_m3_m4 "
-                     "(M=3..4, unmeasured on a card)\n");
+                     "(M=3..4; measured: numerics pass, 5.5-12 percent slower than libr4d, "
+                     "not recommended)\n");
         return true;
     }();
     (void)announced;
