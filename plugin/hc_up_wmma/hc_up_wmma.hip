@@ -19,6 +19,7 @@
 #include "../../libr4d/r4d_shapes.cpp"
 #pragma GCC visibility pop
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -212,7 +213,12 @@ const RadKernelInfo* row() {
         r.computes = "unchanged HC down/inject; unscaled BF16 WMMA up; stateless quantization";
         r.shape = "M=3..4, n=2560, hc=4, lowrank=320, inject=1, group=128; dense rows";
         r.dtypes = "bf16 activations; existing E4M3/F32 mixing rows; I8 or E4M3 quantized outputs";
-        r.domain = RAD_DOMAIN_DEVICE; r.priority = 100;
+        r.domain = RAD_DOMAIN_DEVICE;
+        /* Selection is by plugin hierarchy first (core/plugin/select.cpp): the scan stops at the
+         * first library with a matching row, so priority is only compared between rows of ONE
+         * plugin. 100 cannot outbid libr4d across the boundary; it is kept high so a future
+         * sibling row inside this library loses to this one. */
+        r.priority = 100;
         r.constraints = constraints; r.n_constraints = sizeof(constraints) / sizeof(constraints[0]);
         r.launch = launch; r.scratch = scratch;
         r.layout = r4d_rad_layout_hc_e4m3; r.relayout = r4d_rad_relayout_hc_e4m3;
@@ -224,14 +230,33 @@ const RadKernelInfo* row() {
 }  /* namespace hc_up_wmma */
 
 /* Off unless RADIANCE_HC_UP_WMMA=1, so a library on the search path changes nothing by itself.
- * With the switch set the row still loses to libr4d unless this library is listed first, which is
- * the documented way to override an op (docs/PLUGIN.md, the hierarchy). */
+ * With the switch set the row is offered, and by the default path order this library comes first
+ * (hc_up_wmma.so < libavx.so < libr4d.so), so the row is what `hc_read` resolves to. */
 static bool hc_up_wmma_enabled() {
     const char* v = std::getenv("RADIANCE_HC_UP_WMMA");
     return v && std::strcmp(v, "1") == 0;
 }
 
-extern "C" int rad_hc_up_wmma_row_count(void) { return hc_up_wmma_enabled() ? 1 : 0; }
+/* One line, once, when the row is first offered: the switch is the only thing standing between an
+ * installed library and the unmeasured row, and it is otherwise invisible in operation. The
+ * plugin ABI has no log hook -- RAD_INFO is core-internal (core/rad_internal.h) and a plugin links
+ * only rad_abi -- so stderr is the channel a plugin has. */
+/* Hidden with the rest of this library's internals: only the six rad_* plugin exports are dynamic
+ * (see exports.cpp and README.md, "What it does not change"). */
+#pragma GCC visibility push(hidden)
+extern "C" int rad_hc_up_wmma_row_count(void) {
+    if (!hc_up_wmma_enabled()) return 0;
+    static const bool announced = [] {
+        std::fprintf(stderr,
+                     "[hc_up_wmma] RADIANCE_HC_UP_WMMA=1: offering hc_read_up_wmma_m3_m4 "
+                     "(M=3..4, unmeasured on a card)\n");
+        return true;
+    }();
+    (void)announced;
+    return 1;
+}
+
 extern "C" const RadKernelInfo* rad_hc_up_wmma_row_at(int i) {
     return i == 0 && hc_up_wmma_enabled() ? hc_up_wmma::row() : nullptr;
 }
+#pragma GCC visibility pop

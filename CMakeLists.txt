@@ -310,9 +310,10 @@ add_subdirectory(arch)
 # enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
 add_subdirectory(plugin/spechub)
 # hc_up_wmma: an opt-in `hc_read` row for the M=3/4 band of Qwen Flash-Next's drafter, with the
-# up-dot reduction on WMMA (ported from the ABI16 archive, plugin/hc_up_wmma/README.md). Inert
-# without RADIANCE_HC_UP_WMMA=1 and listed nowhere it wins from: it overrides libr4d's row only
-# when an operator puts it first on RADIANCE_KERNELS.
+# up-dot reduction on WMMA (ported from the ABI16 archive, plugin/hc_up_wmma/README.md). Installed
+# but inert without RADIANCE_HC_UP_WMMA=1; with the switch set it wins the op by the default load
+# order, where its file (hc_up_wmma.so) sorts before libavx.so and libr4d.so. Listing it first on
+# RADIANCE_KERNELS pins that order; it is not needed for the default install.
 add_subdirectory(plugin/hc_up_wmma)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)

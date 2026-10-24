@@ -6,11 +6,17 @@
  *
  * WHY THE SCHEMA IS RESTATED. Op selection is by hierarchy, not by priority: the FIRST library on
  * the search path that carries any row for an op fixes that op's schema, and later libraries serve
- * the rows it leaves unserved (docs/PLUGIN.md). This row only ever wins the shapes libr4d cannot
- * take if this library comes first, so this library must declare `hc_read` itself. The declaration
+ * the rows it leaves unserved (docs/PLUGIN.md). This library only wins the M=3..4 band at all when
+ * it comes first, so it must declare `hc_read` itself. The declaration
  * must match libr4d's row for row -- tests/hc_up_wmma_wiring_test.cpp compares the two libraries'
- * schemas field for field, and a mismatch refuses this plugin at load, loudly, leaving the base
- * kernel serving.
+ * schemas field for field.
+ *
+ * A MISMATCH REFUSES THE LATER PLUGIN, WHICH IS libr4d. The loader compares schemas as it stages
+ * libraries in hierarchy order (core/plugin/loader.cpp) and drops the one that disagrees, naming
+ * both. With this library first -- the default path order, and the documented way to enable the
+ * row -- a drifted port therefore refuses libr4d and every device row with it. That is loud but it
+ * hits the wrong library, and it happens with or without RADIANCE_HC_UP_WMMA: the schema is
+ * declared either way.
  *
  * OFF BY DEFAULT. `rad_kernel_count` is 0 unless RADIANCE_HC_UP_WMMA=1, so installing the library
  * changes nothing about how `hc_read` resolves.
@@ -20,13 +26,19 @@
 /* The dispatch log is this DSO's own: the loader maps plugins RTLD_LOCAL, so libr4d's copy is not
  * importable and an unresolved symbol would refuse the library at load. Nothing here sets it.
  * Declared here rather than through libr4d/r4d_emit.h so this file needs no HIP header: it is also
- * the half a card-less tree compiles (plugin/hc_up_wmma/CMakeLists.txt). */
+ * the half a card-less tree compiles (plugin/hc_up_wmma/CMakeLists.txt).
+ *
+ * HIDDEN. These are libr4d's names, defined here so the include in hc_up_wmma.hip links; leaving
+ * them dynamic would let a loader that maps this library RTLD_GLOBAL interpose libr4d's copies.
+ * The project sets no -fvisibility=hidden, so the pragma is the only thing that keeps them in. */
+#pragma GCC visibility push(hidden)
 extern const void** r4d_dispatch_log;
 extern int          r4d_dispatch_cap;
 extern int          r4d_dispatch_n;
 const void** r4d_dispatch_log = nullptr;
 int          r4d_dispatch_cap = 0;
 int          r4d_dispatch_n   = 0;
+#pragma GCC visibility pop
 
 namespace {
 

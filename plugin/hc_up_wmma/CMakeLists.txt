@@ -6,9 +6,11 @@
 # cmake/RadAddPlugin.cmake, which is also where the HIP compiler has to be clang++ and not hipcc).
 #
 # It declares NO op of its own: it answers `hc_read`, which libr4d also answers, and it is inert
-# until RADIANCE_HC_UP_WMMA=1 AND this library precedes libr4d on the search path. Everything else
-# about the op -- the operand order, the mixing-weight rows, the layouts, the down+inject routine --
-# is libr4d's, included rather than restated (hc_up_wmma.hip).
+# until RADIANCE_HC_UP_WMMA=1. With the switch set it wins the op by the default load order -- its
+# file sorts before libr4d.so -- so the switch is the whole opt-in; naming it first on
+# RADIANCE_KERNELS only pins that order. Everything else about the op -- the operand order, the
+# mixing-weight rows, the layouts, the down+inject routine -- is libr4d's, included rather than
+# restated (hc_up_wmma.hip).
 if(NOT COMMAND rad_add_plugin)
   cmake_minimum_required(VERSION 3.21)
   project(hc_up_wmma LANGUAGES CXX)

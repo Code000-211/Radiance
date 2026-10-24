@@ -4,8 +4,11 @@ A kernel plugin that answers `hc_read` for one geometry: `n=2560, hc=4, lowrank=
 `inject=1`, `group=128` -- the decode band of Qwen Flash-Next's drafter, where the up-dot reduction
 dominates. It differs from libr4d's base row in **one** kernel: the up matvec runs as an unscaled
 BF16 WMMA dot per 80-column slice with the FP32 mixing scale applied after the dot, instead of the
-scalar reduction. Down, inject, the operand order, the mixing-weight rows, the fp8 layouts and the
-quantiser are libr4d's, included rather than restated.
+scalar reduction. Down, inject, the operand order, the mixing-weight rows and the fp8 layouts are
+libr4d's, included rather than restated. The quantiser at the end is **not** included: it is this
+library's own `quant` template (`hc_up_wmma.hip`), a different launch geometry from libr4d's
+`hc_quant_rows_kernel` (one wave per row, one block per 128-channel group) doing the same amax,
+scale and packing, so the codes it writes are the base row's.
 
 Ported from `candidates/fulldrafter-abi16-review/source/mine/hc_up_wmma.hip` on
 `pr/fulldrafter-source-review` (PR #1, `5c3bb1d`) to this tree's ABI (26). The archive is a snapshot
@@ -13,20 +16,38 @@ of ABI16 and is not merged wholesale; see "What changed in the port" below.
 
 ## Turning it on
 
-Nothing happens by installing it. Two switches, both required:
+Installing it changes nothing: `rad_kernel_count` is 0 unless `RADIANCE_HC_UP_WMMA=1` is set. On a
+default install that switch alone is enough, because it is the load order -- not an extra option --
+that puts this library first:
 
 ```sh
-RADIANCE_HC_UP_WMMA=1 RADIANCE_KERNELS=hc_up_wmma,libr4d radiance --model drafter.rad ...
+RADIANCE_HC_UP_WMMA=1 radiance --model drafter.rad ...
 ```
 
-1. `RADIANCE_HC_UP_WMMA=1` makes the library offer its row at all (`rad_kernel_count` is 0
-   otherwise). An operator who installs the plugin and forgets this gets exactly the base kernel.
-2. The library must come **before** libr4d in the kernel hierarchy. Op selection is by hierarchy,
-   not by priority: the first library that carries a row for an op fixes the op's schema, and a
-   later library only serves rows the earlier one leaves unserved. `hc_up_wmma` alone on the path
-   therefore never wins the op -- it also *declares* `hc_read`, so it can be listed first, and that
-   declaration is checked against libr4d's field for field (`tests/hc_up_wmma_wiring_test.cpp`); a
-   drifted copy is refused at load with both plugins named.
+With no `RADIANCE_KERNELS` every library in the plugin directory loads, sorted by path
+(`core/plugin/loader.cpp`): `hc_up_wmma.so` comes before `libavx.so` and `libr4d.so`. Selection is
+by that hierarchy and is absolute (`core/plugin/select.cpp`): the first library that carries a row
+for an op wins it, and a later library only serves rows the earlier one leaves unserved. The plugin
+is built and installed by default (`cmake/RadAddPlugin.cmake`), so it is on that path already; the
+`RADIANCE_HC_UP_WMMA=1` switch is the whole opt-in.
+
+Naming the hierarchy explicitly pins the same order -- and that list is exclusive, so it has to
+name every library, the host library (`libavx`, which serves every host-placed op, the tokeniser
+and the server included) and the reference along with it (`docs/PLUGIN.md`, `docs/GUIDE.md`):
+
+```sh
+RADIANCE_HC_UP_WMMA=1 RADIANCE_KERNELS=hc_up_wmma,libavx,libr4d radiance --model drafter.rad ...
+```
+
+`hc_up_wmma` declares `hc_read` itself, so it may be listed first; the declaration is checked
+against libr4d's field for field (`tests/hc_up_wmma_wiring_test.cpp`). A drifted copy is refused at
+load with both plugins named -- and it is the **later** library the loader refuses, so with this one
+first it is libr4d, plus every device row it carries, that disappears. That refusal is
+unconditional: the schema is declared whether or not `RADIANCE_HC_UP_WMMA` is set.
+
+When the row is offered, the library writes one line to stderr (`[hc_up_wmma] ...`). The engine's
+`RAD_INFO` is core-internal and the plugin ABI has no log hook, so stderr is the channel a plugin
+has; the line is written once, on the first `rad_kernel_count` call.
 
 Every other shape -- `M=1,2`, other widths, a different `hc`/`lowrank`, `inject=0`, another
 `dtype`/`mix` -- falls through to libr4d untouched. The row carries those limits as constraints, so
@@ -35,12 +56,24 @@ it is not even a candidate for them; there is no in-kernel fallback path and non
 ## What it does not change
 
 - **No symbol interposition.** Everything the port pulls in from libr4d sits behind
-  `#pragma GCC visibility push(hidden)`, so the only dynamic symbols this library exports are the
-  six plugin exports. `libr4d`'s `r4d_rad_*` entries are not among them; both libraries load and
-  the base row keeps working beside this one.
+  `#pragma GCC visibility push(hidden)`, as do its own non-exported definitions -- the dispatch-log
+  globals (`r4d_dispatch_log`, `r4d_dispatch_cap`, `r4d_dispatch_n`, `exports.cpp`) and the device
+  half's row accessors. The project sets no `-fvisibility=hidden`, so those pragmas are what keep
+  it in; with them the only dynamic symbols, with or without a device build, are the six plugin
+  exports. `libr4d`'s `r4d_rad_*` entries are not among them; both libraries load and the base row
+  keeps working beside this one.
 - **No new architecture, default or option.** This is the row only.
 - **No numerics change in down/inject.** The `d` and scale buffers are the base row's, sized by the
   same arithmetic, so the up dot consumes exactly what libr4d's down kernel writes.
+
+## Limits, beyond the shape constraints
+
+- **Dense operands, aligned.** `h`, `x` and `inj` must have exactly their logical row pitch (`HN`,
+  `n`, `hc`) and `h` must be 16-byte aligned; the base row accepts a padded pitch and needs no such
+  alignment on `h`. These are not row constraints, so a caller that hands a padded `h` selects this
+  row and gets `RAD_E_STRIDE` -- it does not fall back to libr4d.
+- **`group` is required to be 128 even without `q`.** The row's constraint makes `group` part of
+  selection; a call that leaves it unset (the parameter's default, 0) never reaches this row.
 
 ## What changed in the port
 

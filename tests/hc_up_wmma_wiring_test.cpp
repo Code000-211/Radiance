@@ -10,9 +10,10 @@
  *     every shape libr4d must keep serving;
  *   - its scratch hook answers the same arithmetic the base row does for the band it claims, and
  *     refuses the bands it does not;
- *   - its `hc_read` schema is libr4d's, field for field. This library has to be listed BEFORE
- *     libr4d to win the op, and the first library to declare an op fixes its schema, so a drifted
- *     copy here would re-shape an op the whole tree is using.
+ *   - its `hc_read` schema is libr4d's, field for field. The first library to declare an op fixes
+ *     its schema, and by the default path order this library is first (hc_up_wmma.so sorts before
+ *     libr4d.so), so its declaration is the one every caller is validated against -- and a drifted
+ *     copy makes the LOADER refuse libr4d, not this library.
  */
 #include "rad_test.h"
 
@@ -149,6 +150,17 @@ TEST(hc_up_wmma_row_only_claims_the_shape_it_was_ported_for) {
     CHECK(has_eq("lowrank", 320));
     CHECK(has_eq("inject", 1));
     CHECK(has_eq("group", 128));
+    /* The string axes too: without `dtype=bf16` and `mix=e4m3` the kernel would be offered an
+     * fp8 or f16 trunk its layouts do not read. */
+    auto has_in = [k](const char* key, const char* v) {
+        for (int i = 0; i < k->n_constraints; ++i)
+            if (std::strcmp(k->constraints[i].key, key) == 0)
+                return k->constraints[i].op == RAD_C_IN && k->constraints[i].sval &&
+                       std::strcmp(k->constraints[i].sval, v) == 0;
+        return false;
+    };
+    CHECK(has_in("dtype", "bf16"));
+    CHECK(has_in("mix", "e4m3"));
     bool m_ge = false, m_le = false;
     for (int i = 0; i < k->n_constraints; ++i) {
         const RadConstraint& c = k->constraints[i];
@@ -187,10 +199,11 @@ TEST(hc_up_wmma_scratch_is_the_base_rows_arithmetic_and_refuses_other_bands) {
     unsetenv("RADIANCE_HC_UP_WMMA");
 }
 
-/* The drift check. This library is useless unless it is listed before libr4d, and it is only
- * listed first because it declares `hc_read` itself; then its declaration is the one every caller
- * of `hc_read` is validated against. Same op, same parameters in the same order, same operand
- * slots -- or the engine would hand `x` a buffer meant for `q`. */
+/* The drift check. This library is first on the default path order, and it is first because it
+ * declares `hc_read` itself; then its declaration is the one every caller of `hc_read` is
+ * validated against. Same op, same parameters in the same order, same operand slots -- or the
+ * engine would hand `x` a buffer meant for `q`. The refusal is the loader's, and it drops the
+ * library that disagrees: with this one first, that is libr4d and all its device rows. */
 TEST(hc_up_wmma_declares_hc_read_exactly_as_libr4d_does) {
     Dso mine;
     if (!mine.open(RAD_HC_UP_WMMA_LIB)) SKIP("hc_up_wmma: " RAD_HC_UP_WMMA_LIB " not built");

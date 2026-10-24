@@ -13,9 +13,9 @@
 extern "C" {
 #endif
 
-/* The row: 0 rows unless RADIANCE_HC_UP_WMMA=1, and this library alone on the path never wins the
- * op anyway -- see exports.cpp. Defined in hc_up_wmma.hip, so only a build with a device half has
- * them. */
+/* The row: 0 rows unless RADIANCE_HC_UP_WMMA=1. With the switch set it is offered, and the default
+ * load order already puts this library before libr4d -- see exports.cpp and README.md. Defined in
+ * hc_up_wmma.hip, so only a build with a device half has them. */
 int                  rad_hc_up_wmma_row_count(void);
 const RadKernelInfo* rad_hc_up_wmma_row_at(int i);
 
