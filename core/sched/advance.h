@@ -51,8 +51,9 @@ enum AdvMode : int32_t {
 };
 
 /* The most nodes a tree verify can stage, so the deepest step emits this many tokens. Kept equal
- * to kTreeMaxNodes (arch/common/rad_tree_candidate.h) by a check in tests/tree_dispatch_test.cpp;
- * advance_impl.h cannot include the host model into the kernel. */
+ * to kTreeMaxNodes (arch/common/rad_tree_candidate.h) by the check at tests/advance_test.cpp:554;
+ * advance_impl.h cannot include the host model into the kernel. ADV_TREE_ACCEPT itself is prepared
+ * but not scheduled: no build stages a tree yet (see sched/tree_dispatch.h). */
 inline constexpr int32_t kAdvTreeMaxNodes = 65;
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,

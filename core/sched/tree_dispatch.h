@@ -202,9 +202,8 @@ inline int tree_dispatch_commit(const TreeStep& s, const int32_t* pick, int32_t 
     int32_t emitted[kTreeMaxNodes]{};
     for (int32_t j = 0; j < w.accepted; ++j) emitted[j] = static_cast<int32_t>(w.tokens[j]);
     emitted[w.accepted] = static_cast<int32_t>(w.bonus);
-    int32_t acc = w.accepted;
-    for (int32_t j = 0; j <= acc; ++j)
-        if (is_eog(emitted[j])) { acc = j; break; }
+    /* The same cut the chain applies, from the one place that defines it. */
+    const int32_t acc = accept_cut_at_eog(emitted, w.accepted, is_eog);
 
     /* The walk's own path must be a parent chain ending at the node whose pick is the bonus. A
      * path that is not one means the acceptance rule and the topology disagree, which no commit
@@ -225,9 +224,10 @@ inline int tree_dispatch_commit(const TreeStep& s, const int32_t* pick, int32_t 
     return RAD_OK;
 }
 
-/* The host's commit against the card's acceptance. The card walks the same tree in
- * advance_impl.h (ADV_TREE_ACCEPT) from the same staged parents and picks; a disagreement means
- * one of the two read different rows, and the step is refused rather than emitted. */
+/* The host's commit against the card's acceptance. The card's walk (advance_impl.h,
+ * ADV_TREE_ACCEPT) is prepared but not scheduled in this build: nothing sets spec_is_tree and
+ * d_parent is never filled, so this check has no production caller yet. It is the comparison the
+ * engine runs once the tree is wired, and a disagreement refuses the step rather than emitting it. */
 inline int tree_dispatch_confirm(const TreeCommit& c, int32_t card_accepted, int32_t card_token,
                                  std::string* why) {
     if (card_accepted != c.n_accepted || card_token != static_cast<int32_t>(c.bonus)) {

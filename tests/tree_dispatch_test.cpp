@@ -21,6 +21,7 @@
 
 #include "sched/tree_dispatch.h"
 
+#include <cstring>
 #include <string>
 
 using namespace rad;
@@ -30,6 +31,35 @@ namespace {
 static constexpr int32_t kVocab = 4096;
 
 bool is_eog(int32_t t) { return t == 2; }
+
+/* A step carrying a tree of its own that no call will admit, and sentinels in every field it could
+ * write, so a refusal that staged something shows up as a changed field rather than as a stale
+ * zero that also looks untouched. */
+TreeStep sentinel_step() {
+    TreeStep s;
+    for (int32_t j = 0; j < kTreeMaxNodes; ++j) {
+        s.parents[j]   = -7;
+        s.positions[j] = -7;
+        s.masks16[j]   = 0xaaaa;
+    }
+    s.n_nodes     = -7;
+    s.root_pos    = -7;
+    s.has_mask16  = true;
+    s.tree.add(-1, 1234);
+    return s;
+}
+
+/* Every staged field the admit/commit pair writes: a refusal must leave all of them alone. */
+bool staged_untouched(const TreeStep& now, const TreeStep& before) {
+    if (now.n_nodes != before.n_nodes || now.root_pos != before.root_pos ||
+        now.has_mask16 != before.has_mask16 || now.tree.node_count() != before.tree.node_count())
+        return false;
+    for (int32_t j = 0; j < kTreeMaxNodes; ++j)
+        if (now.parents[j] != before.parents[j] || now.positions[j] != before.positions[j] ||
+            now.masks16[j] != before.masks16[j])
+            return false;
+    return true;
+}
 
 /* A chain of `n_draft` drafts past the root, ids 0..n_draft, and a pick vector that accepts all of
  * them. */
@@ -45,22 +75,22 @@ TEST(the_switch_and_the_temperature_contract_refuse_before_anything_is_staged) {
     uint32_t draft[4] = {10, 11, 12, 13};
     CHECK(t.build_linear(9, draft, 4));
 
-    TreeStep step;
+    const TreeStep before = sentinel_step();
+    TreeStep step = before;
     std::string why;
 
-    /* The switch is off: refuse, and leave the step untouched so no tree is allocated. */
+    /* The switch is off: refuse, and leave every staged field alone so no tree is allocated. */
     CHECK_EQ(tree_dispatch_admit(t, 100, kVocab, 512, /*temp0=*/true, /*coupled=*/false, 0,
                                  &step, &why), RAD_E_STATE);
     CHECK(why.find("RADIANCE_MTP_COUPLED") != std::string::npos);
-    CHECK_EQ(step.n_nodes, 0);
-    CHECK(step.tree.empty());
+    CHECK(staged_untouched(step, before));
 
     /* The switch is on but the sampler is not greedy: the tree cannot reproduce it. */
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, 100, kVocab, 512, /*temp0=*/false, /*coupled=*/true, 0,
                                  &step, &why), RAD_E_UNSUPPORTED);
     CHECK(why.find("temperature 0") != std::string::npos);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
 
     /* The fixed profile takes the same gate, before it builds anything. */
     int32_t history[8][8];
@@ -69,16 +99,21 @@ TEST(the_switch_and_the_temperature_contract_refuse_before_anything_is_staged) {
     why.clear();
     CHECK_EQ(tree_dispatch_fixed(history, 8, 65, 9, kVocab, 100, 512, false, true, 0, &step, &why),
              RAD_E_UNSUPPORTED);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
     why.clear();
     CHECK_EQ(tree_dispatch_fixed(history, 8, 65, 9, kVocab, 100, 512, true, false, 0, &step, &why),
              RAD_E_STATE);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
 
-    /* And the admitted step of a good call does not carry a refused one's remains. */
+    /* An admitted step replaces all of it -- a sentinel left in place would be a half-staged tree. */
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, 100, kVocab, 512, true, true, 0, &step, &why), RAD_OK);
     CHECK_EQ(step.n_nodes, t.node_count());
+    for (int32_t j = 0; j < step.n_nodes; ++j) {
+        CHECK_EQ(step.parents[j], step.tree[j].parent);
+        CHECK_EQ(step.positions[j], 100 + step.tree[j].depth);
+    }
+    CHECK(!staged_untouched(step, before));
 }
 
 TEST(a_chain_tree_commits_token_for_token_what_the_serial_path_accepts) {
@@ -114,6 +149,23 @@ TEST(a_chain_tree_commits_token_for_token_what_the_serial_path_accepts) {
     for (int32_t j = 0; j <= commit.n_accepted; ++j) CHECK_EQ(commit.tokens[j], serial[j]);
     CHECK_EQ(commit.n_discarded, 6 - commit.n_accepted);
 
+    /* A stop token at the first draft ends the step with nothing accepted; one further in cuts
+     * the accepted prefix where the serial cut does. The chain test would not otherwise reach an
+     * end-of-generation cut at all -- its tokens are 11..16 and is_eog stops on 2. */
+    auto stop_first = [](int32_t tok) { return tok == 11; };
+    TreeCommit cut0;
+    CHECK_EQ(tree_dispatch_commit(step, pick, 7, stop_first, &cut0, &why), RAD_OK);
+    CHECK_EQ(cut0.n_accepted, 0);
+    CHECK_EQ((int32_t)cut0.bonus, 11);
+    CHECK_EQ(cut0.n_discarded, 6);
+
+    auto stop_second = [](int32_t tok) { return tok == 12; };   /* the first accepted draft */
+    TreeCommit cut1;
+    CHECK_EQ(tree_dispatch_commit(step, pick, 7, stop_second, &cut1, &why), RAD_OK);
+    CHECK_EQ(cut1.n_accepted, 1);
+    CHECK_EQ((int32_t)cut1.bonus, 12);
+    CHECK_EQ(cut1.n_discarded, 6 - 1);
+
     /* The card's acceptance, staged by advance_impl.h, must land on the same pair. */
     CHECK_EQ(tree_dispatch_confirm(commit, commit.n_accepted, (int32_t)commit.bonus, &why), RAD_OK);
     CHECK_EQ(tree_dispatch_confirm(commit, commit.n_accepted + 1, (int32_t)commit.bonus, &why),
@@ -132,7 +184,7 @@ TEST(the_fixed_mtp_profile_stages_its_parents_positions_and_masks) {
     CHECK_EQ(tree_dispatch_fixed(history, 8, kTreeMaxNodes, 5, kVocab, 64, 512, true, true, 0,
                                  &step, &why), RAD_OK);
     CHECK_EQ(step.n_nodes, step.tree.node_count());
-    CHECK(step.n_nodes > 16);
+    CHECK(step.n_nodes > kTreeLegacyMaskNodes);
     CHECK(!step.has_mask16);   /* node 16 and up have no exact uint16 ancestor set */
     CHECK_EQ(step.root_pos, 64);
     for (int32_t j = 0; j < step.n_nodes; ++j) {
@@ -155,8 +207,9 @@ TEST(a_budget_that_cuts_the_fixed_profile_short_is_refused) {
 
     TreeStep step;
     std::string why;
-    CHECK_EQ(tree_dispatch_fixed(history, 8, 16, 5, kVocab, 64, 512, true, true, 0, &step, &why),
-             RAD_E_INVAL);
+    /* kTreeLegacyMaskNodes rows is less than the profile's own node count. */
+    CHECK_EQ(tree_dispatch_fixed(history, 8, kTreeLegacyMaskNodes, 5, kVocab, 64, 512, true, true,
+                                 0, &step, &why), RAD_E_INVAL);
     CHECK(why.find("truncates") != std::string::npos);
     CHECK_EQ(step.n_nodes, 0);
 
@@ -284,9 +337,19 @@ TEST(a_short_pick_buffer_a_tampered_layout_and_a_short_tree_are_refused) {
     int32_t pick[8];
     chain_picks(t, pick);
 
+    /* A refused commit writes nothing into the step it would have committed. */
     TreeCommit commit;
+    for (int32_t j = 0; j < kTreeMaxNodes; ++j) {
+        commit.tokens[j] = -9;
+        commit.path[j]   = -9;
+    }
+    commit.n_accepted = -9;
+    commit.n_discarded = -9;
+    commit.bonus = 0xdeadbeefu;
+    const TreeCommit commit_before = commit;
     CHECK_EQ(tree_dispatch_commit(step, pick, step.n_nodes - 1, is_eog, &commit, &why), RAD_E_INVAL);
     CHECK(why.find("shorter") != std::string::npos);
+    CHECK_EQ(std::memcmp(&commit, &commit_before, sizeof commit), 0);
 
     pick[2] = -1;
     why.clear();

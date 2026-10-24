@@ -2481,12 +2481,13 @@ walk matches, and there is no approximate tree sampling -- such a call is refuse
 `RAD_E_UNSUPPORTED` and the serial path keeps running), refuses a tree whose ancestor set has no
 exact `tree_mask16` form when the consumer is 16-bit, refuses a budget that would cut the fixed
 MTP8 profile short, and produces the parents, positions and masks a batch stages plus the commit
-(winner path, accepted count, discarded branches, end-of-generation cut). The card walks the same
-tree from the same staged parents (`ADV_TREE_ACCEPT`) and the engine compares its answer with the
-host's before a step is emitted. What is missing is the attention operand: no kernel in this tree
-takes an ancestor mask, `attn_paged` is causal over positions, so a tree row would attend to its
-siblings; and no GDN/QSA/PLE update can discard a losing branch, since the linear state absorbs
-every verified row in row order. `core/sched/batch.cpp` therefore still refuses `spec_is_tree`,
+(winner path, accepted count, discarded branches, end-of-generation cut). The card side of the same
+walk exists as `ADV_TREE_ACCEPT`, and `tree_dispatch_confirm` is the comparison the engine will run
+before a step is emitted. Both are prepared, not wired: nothing produces a tree step, `spec_is_tree`
+has no producer, `d_parent` is never filled, and no architecture is marked tree-capable. What is
+missing is the attention operand: no kernel in this tree takes an ancestor mask, `attn_paged` is
+causal over positions, so a tree row would attend to its siblings; and no GDN/QSA/PLE update can
+discard a losing branch, since the linear state absorbs every verified row in row order. `core/sched/batch.cpp` therefore still refuses `spec_is_tree`,
 with that reason, and enabling a tree needs those two kernels (and their op schemas) first.
 
 `mtp_couple_propose` runs on a draft round's

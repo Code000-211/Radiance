@@ -101,14 +101,16 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_TREE_ACCEPT: {
         /* verify_tree_greedy's walk over the row's nodes, then collect_step's end-of-generation
-         * cut. Node 0 is the root at the row's first position; a node is accepted when a lower-id
+         * cut (accept_cut_at_eog's rule). Node 0 is the root at the row's first position; a node is accepted when a lower-id
          * child of the current node carries the target's pick at the current node, lowest id
          * first, and the first node without such a child contributes the step's own token. The
          * row's tokens are the nodes' tokens in id order, its parents at parent_off.
          *
+         * Prepared, not wired: nothing in this build issues ADV_TREE_ACCEPT, because the batch
+         * cannot stage a tree without an ancestor-mask attention operand (sched/tree_dispatch.h).
          * A node without a pick, a tree with no node or one past the row's capacity is not a tree
-         * the host admitted: acc = -1 is what the host's cross-check (tree_dispatch_confirm)
-         * refuses the step on, and the other fields keep the position the slot was staged at. */
+         * the host admitted: acc = -1 is what the host's cross-check (tree_dispatch_confirm) will
+         * refuse the step on, and the other fields keep the position the slot was staged at. */
         if (n <= 0 || n > kAdvTreeMaxNodes) {
             S.acc = -1;
             S.n_acc = 0;
