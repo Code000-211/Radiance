@@ -7108,9 +7108,11 @@ Sel qsa_select_run(const std::vector<float>& score, int64_t nb, const std::vecto
 }
 }  /* namespace */
 
-/* qsa_select takes the blocks above the topk-th score in block order, then ties at it in block
- * order (lower index first), never a dead page, then the partial page when the query is not on a
- * block's last token; -1 pads to topk + 1, and seqused is the attention length over the table. */
+/* qsa_select takes the top-k by score -- the blocks above the topk-th score and the ties at it,
+ * lower index first -- and emits them in BLOCK order, never a dead page, then the partial page when
+ * the query is not on a block's last token; -1 pads to topk + 1, and seqused is the attention length
+ * over the table. Block order is what lets a tile of rows share one table: a row's list is then a
+ * subsequence of the union, so a masked read sums the same keys in the same order. */
 TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     const float ninf = -INFINITY;
     /* Scores 3 6 5 1 5 and a dead block; topk 2: block 2 (6), then the first tie at 5 (block 1). */
@@ -7118,7 +7120,7 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     const std::vector<int64_t> bt = { 10, 11, 12, 13, 14, -1, 16 };
     Sel r = qsa_select_run(s1, 7, bt, 6, { 25 }, 2, 4);
     REQUIRE_EQ(r.sel.size(), (size_t)3);
-    CHECK_EQ(r.sel[0], 12LL); CHECK_EQ(r.sel[1], 11LL);
+    CHECK_EQ(r.sel[0], 11LL); CHECK_EQ(r.sel[1], 12LL);   /* block 1's tie before block 2 */
     CHECK_EQ(r.sel[2], 16LL);                        /* partial page: (25 + 1) % 4 != 0 */
     CHECK_EQ(r.nsel[0], 3LL);
     CHECK_EQ(r.su[0], 2LL * 4 + 25 % 4 + 1);

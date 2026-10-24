@@ -1176,8 +1176,10 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
     };
-    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x98ba2952bb37b075ull },
-                           { 8, 0x8204e073efdeee0cull, 0x1279aecfe4e32d9aull } };
+    /* The step hashes moved once when `qsa_select` grew its ninth operand (`selb`, issued RAD_NONE
+     * by the DSA indexer); the graph is unchanged. */
+    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0xb1c07ecf787e0fb5ull },
+                           { 8, 0x8204e073efdeee0cull, 0x9576fc1f22894272ull } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
