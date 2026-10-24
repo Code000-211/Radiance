@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -444,8 +445,105 @@ int parse_bucket(const json& b, int32_t idx, DraftCostBucket* out, std::string* 
 
 }  /* namespace */
 
+namespace {
+
+/* One rank's resolved placement, as Engine::draft_cost_runtime formats it:
+ * "<strategy> vram=<bytes> host=<bytes> file=<bytes> dyn=<0|1> res=<16 hex>". Parsed so the
+ * identity can be compared field by field: `vram` is the budget measured when the profile was
+ * written, not a decision the plan made. */
+struct PlacementRank {
+    std::string strategy;
+    int64_t     vram = 0, host = 0, file = 0;
+    int32_t     dyn = 0;
+    uint64_t    res = 0;
+};
+
+bool placement_rank_parse(const std::string& s, PlacementRank* out) {
+    char strategy[32] = { 0 };
+    long long vram = 0, host = 0, file = 0;
+    int dyn = 0;
+    unsigned long long res = 0;
+    char tail = 0;
+    /* Six assignments, then nothing after the digest (sscanf returns 6 when %c finds no input). */
+    if (std::sscanf(s.c_str(), "%31s vram=%lld host=%lld file=%lld dyn=%d res=%16llx%c", strategy,
+                    &vram, &host, &file, &dyn, &res, &tail) != 6)
+        return false;
+    out->strategy = strategy;
+    out->vram = (int64_t)vram;
+    out->host = (int64_t)host;
+    out->file = (int64_t)file;
+    out->dyn  = (int32_t)dyn;
+    out->res  = (uint64_t)res;
+    return true;
+}
+
+std::vector<std::string> placement_split(const std::string& s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    for (;;) {
+        const size_t j = s.find(';', i);
+        out.push_back(s.substr(i, j == std::string::npos ? std::string::npos : j - i));
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+    return out;
+}
+
+/* The placement fields, rank by rank. A rank whose `vram` is the only difference is not an
+ * identity change: the plan resolved the same strategy, host/file split, dynamic flag and
+ * residency against a budget measured on a differently loaded card, so the difference is reported
+ * as `drift` for a warning instead of refusing the profile. Any other field, a different rank
+ * count, or a string this build cannot parse is a real placement change and names the field.
+ * A larger budget is treated exactly like a smaller one: only a different plan is a reason to
+ * refuse. */
+bool placement_same(const std::string& a, const std::string& b, std::string* first,
+                    DraftCostPlacementDrift* drift) {
+    if (a == b) return true;
+    auto whole = [&]() {
+        if (first) *first = "placement profile=\"" + a + "\" runtime=\"" + b + "\"";
+        return false;
+    };
+    const std::vector<std::string> pa = placement_split(a);
+    const std::vector<std::string> pb = placement_split(b);
+    if (pa.size() != pb.size()) return whole();
+
+    std::string budget;
+    for (size_t i = 0; i < pa.size(); ++i) {
+        if (pa[i] == pb[i]) continue;
+        PlacementRank x, y;
+        if (!placement_rank_parse(pa[i], &x) || !placement_rank_parse(pb[i], &y)) return whole();
+        auto field = [&](const char* name, const std::string& pv, const std::string& rv) {
+            if (pv == rv) return false;
+            if (first)
+                *first = fmt("placement[%zu].%s profile=\"%s\" runtime=\"%s\" -- a resolved-plan "
+                             "change, not a start-budget effect", i, name, pv.c_str(), rv.c_str());
+            return true;
+        };
+        if (field("strategy", x.strategy, y.strategy)) return false;
+        if (field("host", std::to_string(x.host), std::to_string(y.host))) return false;
+        if (field("file", std::to_string(x.file), std::to_string(y.file))) return false;
+        if (field("dynamic", std::to_string(x.dyn), std::to_string(y.dyn))) return false;
+        if (field("residency", fmt("%016llx", (unsigned long long)x.res),
+                  fmt("%016llx", (unsigned long long)y.res))) return false;
+        /* Everything the plan resolved agrees; only the measured start budget differs. */
+        if (x.vram != y.vram) {
+            const long long d = (long long)y.vram - (long long)x.vram;   /* runtime - profile */
+            budget += fmt("%srank %zu: start VRAM budget profile=%lld runtime=%lld (%s %s)",
+                          budget.empty() ? "" : "; ", i, (long long)x.vram, (long long)y.vram,
+                          humanb(d < 0 ? -d : d).c_str(), d < 0 ? "smaller" : "larger");
+        }
+    }
+    if (!budget.empty() && drift) {
+        drift->budget_changed = true;
+        drift->budget = budget;
+    }
+    return true;
+}
+
+}  /* namespace */
+
 bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostFingerprint& b,
-                                 std::string* first) {
+                                 std::string* first, DraftCostPlacementDrift* drift) {
     auto str = [&](const char* name, const std::string& x, const std::string& y) {
         if (x == y) return true;
         if (first) *first = std::string(name) + " profile=\"" + x + "\" runtime=\"" + y + "\"";
@@ -461,12 +559,17 @@ bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostF
      * must load on a serving run that lends, so its basis is not compared against the runtime's.
      * The live loan is compared only for a live profile; for a reference it is ignored. */
     const bool live = a.basis == DraftCostBasis::Live;
-    return str("model", a.model, b.model) && str("quant", a.quant, b.quant) &&
-           num("tp", a.tp, b.tp) && str("tp_wire", a.tp_wire, b.tp_wire) &&
-           str("gpus", a.gpus, b.gpus) && str("kernels", a.kernels, b.kernels) &&
-           str("kv_format", a.kv_format, b.kv_format) && str("placement", a.placement, b.placement) &&
-           str("arena", a.arena, b.arena) &&
-           (!live || str("live_loan", a.live_loan, b.live_loan));
+    DraftCostPlacementDrift local;
+    const bool same = str("model", a.model, b.model) && str("quant", a.quant, b.quant) &&
+                      num("tp", a.tp, b.tp) && str("tp_wire", a.tp_wire, b.tp_wire) &&
+                      str("gpus", a.gpus, b.gpus) && str("kernels", a.kernels, b.kernels) &&
+                      str("kv_format", a.kv_format, b.kv_format) &&
+                      placement_same(a.placement, b.placement, first, &local) &&
+                      str("arena", a.arena, b.arena) &&
+                      (!live || str("live_loan", a.live_loan, b.live_loan));
+    /* Reported only for a full match: a refused profile has no budget to warn about. */
+    if (same && drift) *drift = local;
+    return same;
 }
 
 std::string draft_cost_gpus(const std::vector<std::string>& names) {
@@ -812,6 +915,7 @@ void DraftCostTable::clear() {
     dropped_ = 0;
     ignored_ = 0;
     reference_skipped_ = 0;
+    budget_drift_.clear();
     capacity_ = 0;
     active_ = false;
     fallback_admitted_ = false;
@@ -826,10 +930,14 @@ int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRu
     if (capacity <= 0) return RAD_E_INVAL;
 
     std::string diff;
-    if (!draft_cost_fingerprint_same(profile.fingerprint, runtime.fingerprint, &diff)) {
+    DraftCostPlacementDrift drift;
+    if (!draft_cost_fingerprint_same(profile.fingerprint, runtime.fingerprint, &diff, &drift)) {
         reason_ = "profile fingerprint differs: " + diff;
         return RAD_OK;   /* a visible fallback, not a parse error */
     }
+    /* Same resolved plan, different measured start budget: the profile binds (a shared card would
+     * otherwise never load one) and the caller warns with both budgets. */
+    budget_drift_ = drift.budget;
     if (profile.execution != runtime.execution) {
         reason_ = profile.execution == DraftCostExecution::Shrinking
                       ? "execution: profile is for shrinking rounds, this runtime runs rectangular"

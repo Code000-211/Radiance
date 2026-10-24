@@ -1234,6 +1234,91 @@ TEST(the_documented_c8_gradient_is_reproduced_without_a_new_measurement) {
     CHECK(a.ms < b.ms);   /* the policy's comparison: K3 wins */
 }
 
+/* The start budget is measured on arrival, not resolved: a card that held a foreign context when
+ * the profile was written (or holds one now) resolves the same plan against a smaller budget. That
+ * alone is not an identity change -- refusing it made the cost path unusable on any shared card --
+ * so it binds and reports both values and the difference for the warning. */
+TEST(a_smaller_start_budget_alone_is_not_a_placement_change) {
+    const std::string same = " host=0 file=2147483648 dyn=1 res=9f2c41ab7e0d3355";
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "expert_tiered vram=16865296384" + same;   /* 300 MiB less */
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(first.empty());
+    CHECK(drift.budget_changed);
+    CHECK(has(drift.budget, "rank 0"));
+    CHECK(has(drift.budget, "profile=17179869184"));
+    CHECK(has(drift.budget, "runtime=16865296384"));
+    CHECK(has(drift.budget, "300.00 MiB smaller"));
+
+    /* A larger budget is the same case: uninteresting while the plan is the same. */
+    std::swap(a.placement, b.placement);
+    std::string grew;
+    DraftCostPlacementDrift up;
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(has(up.budget, "300.00 MiB larger"));
+
+    /* Multiple ranks name the rank whose budget moved. */
+    a.placement = "all_vram vram=17179869184" + same + ";" + "layer_offload vram=8589934592" + same;
+    b.placement = "all_vram vram=17179869184" + same + ";" + "layer_offload vram=16528539648" + same;
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(has(up.budget, "rank 1"));
+    CHECK(!has(up.budget, "rank 0"));
+
+    /* An older, unfingerprinted placement string still compares as a whole. */
+    a.placement = b.placement = "all_vram";
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(up.budget.empty());
+}
+
+/* A different plan behind a different budget is a different placement: the reason names the field
+ * and says the budget was not the cause, and no tolerated drift is reported for a refused file. */
+TEST(a_budget_that_resolves_another_plan_is_refused_by_field) {
+    const std::string same = " host=0 file=0 dyn=1 res=9f2c41ab7e0d3355";
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "all_vram vram=16865296384" + same;
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement[0].strategy"));
+    CHECK(has(first, "profile=\"expert_tiered\""));
+    CHECK(has(first, "runtime=\"all_vram\""));
+    CHECK(has(first, "resolved-plan change"));
+    CHECK(!drift.budget_changed);
+
+    /* Same strategy and budget, different residency: a placement change on its own. */
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "expert_tiered vram=17179869184 host=0 file=0 dyn=1 res=0000000000000001";
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement[0].residency"));
+}
+
+/* What configure() does with that verdict: bind and report, or stay inactive and name the field. */
+TEST(the_table_binds_a_drifted_start_budget_and_names_it) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.fingerprint.placement = "all_vram vram=17179869184 host=0 file=0 dyn=1 res=00000000000000ff";
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    rt.fingerprint.placement = "all_vram vram=16865296384 host=0 file=0 dyn=1 res=00000000000000ff";
+
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, rt), RAD_OK);
+    CHECK(t.active());
+    CHECK(t.reason().empty());
+    CHECK(has(t.budget_drift(), "300.00 MiB smaller"));
+
+    rt.fingerprint.placement = "expert_tiered vram=16865296384 host=0 file=0 dyn=1 res=00000000000000ff";
+    CHECK_EQ(t.configure(p, rt), RAD_OK);
+    CHECK(!t.active());
+    CHECK(has(t.reason(), "placement[0].strategy"));
+    CHECK(has(t.reason(), "resolved-plan change"));
+    CHECK(t.budget_drift().empty());   /* clear() does not carry the earlier run's warning */
+}
+
 /* The fingerprint's gpus field is derived from the ranks' device names, not typed by the user:
  * identical cards keep the documented "Nx NAME" form, a mixed set stays comma-separated in rank
  * order so the string still names the deployment. */

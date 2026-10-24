@@ -750,6 +750,20 @@ are regenerated, never rescaled.
   reader derives it and the `--draft-profile-out` writer derives it from the same function, so
   read and write cannot drift. A `rectangular`-stamped profile for a serial deployment is refused
   by name and must be recalibrated, not restamped.
+- **The start budget is measured, the plan is the identity.** `vram` in `placement` is the budget the
+  card offered when the profile was written, so it moves with whatever else was resident: a foreign
+  context holding ~0.3 GiB is enough to make a recorded and a current budget differ. That alone does
+  not name a different deployment. `configure()` compares `placement` rank by rank and compares
+  only `strategy`, `host`, `file`, `dyn` and `res`: when those agree, a smaller or larger `vram`
+  binds the profile and is reported as a warning with both budgets and the difference (a start
+  refuses only on a different plan). Any other difference is still a placement change, refused by
+  name with the field, e.g. `placement[0].strategy profile="expert_tiered"
+  runtime="all_vram" -- a resolved-plan change, not a start-budget effect`; `res` is not compared
+  across budgets for this (it digests tier/site per weight, not the budget), so a budget change
+  that moves residency fails on `res`, not on the budget. A `placement` string this build cannot
+  parse -- an older file, or a hand-edited one -- is compared whole, as before. The budget is not
+  part of the file's meaning, so the format version is unchanged: only the binding moves, not what
+  the numbers say.
 - **Basis, arena and loan are separate fields.** `basis` is how the numbers were measured:
   `live` (the deployment's own lending as it runs) or `no-loan` (the reference calibration: both
   lenders off, the plan's start placement without borrowed copies). The basis belongs to the file,

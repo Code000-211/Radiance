@@ -123,7 +123,9 @@ struct Fixture {
 /* `wide` adds a second, usable bucket keyed `n_rows = 8` whose verify window is not the one an
  * eight-row decoding cycle runs, so the row count alone does not make a batch priceable. */
 void activate_costs(Fixture& f, bool priced = false,
-                    DraftCostBasis basis = DraftCostBasis::Live, bool wide = false) {
+                    DraftCostBasis basis = DraftCostBasis::Live, bool wide = false,
+                    const char* placement = "all_vram",
+                    const char* runtime_placement = nullptr) {
     DraftCostProfile p;
     p.fingerprint.model     = "test";
     p.fingerprint.quant     = "q";
@@ -131,7 +133,7 @@ void activate_costs(Fixture& f, bool priced = false,
     p.fingerprint.gpus      = "g";
     p.fingerprint.kernels   = "k";
     p.fingerprint.kv_format = "bf16";
-    p.fingerprint.placement = "all_vram";
+    p.fingerprint.placement = placement;
     p.fingerprint.tp        = 1;
     p.fingerprint.basis     = basis;
     p.fingerprint.arena     = "none";
@@ -170,6 +172,7 @@ void activate_costs(Fixture& f, bool priced = false,
     }
     DraftCostRuntime rt;
     rt.fingerprint = p.fingerprint;
+    if (runtime_placement) rt.fingerprint.placement = runtime_placement;
     CHECK_OK(f.sch.draft_costs().configure(p, rt));
     REQUIRE(f.sch.draft_costs().active());
     /* Matching is not admission: an empty profile has no price for any shape, so the deployment
@@ -3754,6 +3757,54 @@ TEST(the_cost_policy_is_refused_by_name_on_a_deployment_it_cannot_price) {
 
     activate_costs(f);
     CHECK_OK(f.start());
+}
+
+/* The start that used to be refused: the profile was measured while a foreign context held ~300
+ * MiB of the card, so its recorded start budget is larger than this run's. Same strategy, same
+ * host/file split, same residency -- the plan is identical, and the baseline lock reads active(),
+ * which now binds it. */
+TEST(a_profile_measured_on_a_larger_start_budget_still_starts_a_cost_run) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    activate_costs(f, /*priced=*/true, DraftCostBasis::Live, /*wide=*/false,
+                   "all_vram vram=17179869184 host=0 file=0 dyn=1 res=00000000000000ff",
+                   "all_vram vram=16865296384 host=0 file=0 dyn=1 res=00000000000000ff");
+    CHECK(!f.sch.draft_costs().budget_drift().empty());
+    CHECK_OK(f.start());
+}
+
+/* A budget that resolves another plan is not the same deployment, and Cost still refuses it by
+ * name: the field and the cause are in the reason the lock prints. */
+TEST(a_profile_for_another_placement_is_still_refused_at_start) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 6;
+    f.cfg.draft_policy = DraftPolicyKind::Cost;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 6;
+    DraftCostProfile p;
+    p.fingerprint.model     = "test";
+    p.fingerprint.quant     = "q";
+    p.fingerprint.tp_wire   = "w";
+    p.fingerprint.gpus      = "g";
+    p.fingerprint.kernels   = "k";
+    p.fingerprint.kv_format = "bf16";
+    p.fingerprint.placement = "all_vram vram=17179869184 host=0 file=0 dyn=1 res=00000000000000ff";
+    p.fingerprint.tp        = 1;
+    p.fingerprint.arena     = "none";
+    p.fingerprint.live_loan = "flex=0 lend=0";
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    rt.fingerprint.placement = "expert_tiered vram=17179869184 host=0 file=0 dyn=1 res=00000000000000ff";
+    CHECK_OK(f.sch.draft_costs().configure(p, rt));
+    REQUIRE(!f.sch.draft_costs().active());
+    const std::string refused = stderr_of([&] { CHECK_EQ(f.start(), RAD_E_UNSUPPORTED); });
+    CHECK(has(refused, "placement[0].strategy"));
+    CHECK(has(refused, "resolved-plan change"));
 }
 
 /* An explicit ladder below the executable depth is a valid reload when the profile prices its
