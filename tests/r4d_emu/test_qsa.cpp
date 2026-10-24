@@ -95,10 +95,14 @@ void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns
             for (int64_t b : live) ord.push_back(val[(size_t)b]);
             std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
             const float thr = ord[(size_t)(topk - 1)];
-            for (int64_t b : live)
+            /* The selection in block order, above the threshold and the ties alike: the ties are
+             * the ones the top-k leaves slots for. */
+            int64_t above = 0;
+            for (int64_t b : live) above += val[(size_t)b] > thr;
+            for (int64_t need = topk - above; int64_t b : live) {
                 if (val[(size_t)b] > thr) take.push_back(b);
-            for (int64_t b : live)
-                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+                else if (need > 0 && val[(size_t)b] == thr) { take.push_back(b); --need; }
+            }
         }
         int32_t* row = &se[(size_t)(m * (topk + 1))];
         int64_t out = 0;

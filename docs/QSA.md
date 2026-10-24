@@ -154,6 +154,20 @@ nothing is allocated past the sequence, so `bt[n] >= 0` would work there. Mid-ch
 query finds a later token's live page in `bt[n]`, which `seqused` would then cover. The partial
 page is appended only when `(pos + 1) % ratio != 0`.
 
+## Table order
+
+**The table is the selection in block order**, ties taken by the lowest block index first; the
+partial page follows, decided by position, then `-1` to `topk + 1`. Order is not cosmetic: the
+attention sums its softmax over pages in table order and float addition is not associative, so two
+forms of the selection agree only if they write the same sequence.
+
+Block order is what a table **shared by a query tile** can reproduce. A tile's queries select from
+one history, so their sets overlap heavily; their union, taken in block order, holds every row's
+table as a subsequence, and a row read off the union with its own membership mask is that row's
+table, byte for byte, rather than merely the same set of pages. Any other emit order (score
+descending, as a sort would give) makes the union's order right for at most one row, and forces a
+per-row compaction whose sums can drift from the row path's.
+
 ## Cost
 
 The indexer is the only part of a decode step that grows with context: `qsa_score` and

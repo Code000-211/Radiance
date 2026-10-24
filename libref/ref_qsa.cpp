@@ -103,9 +103,11 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
  * by max(score, 0); with `signed` 1 the live ones are those with a finite score, ranked by it (so
- * -0 ties +0). At most `topk` are taken: all of them when that many or fewer are live, else
- * every block above the topk-th largest value in block order, then the blocks equal to it in block
- * order until topk are taken. The partial page bt[n] follows when (pos + 1) % ratio != 0 and
+ * -0 ties +0). At most `topk` are taken, in block order: all of them when that many or fewer are
+ * live, else every block above the topk-th largest value and the blocks equal to it (lowest block
+ * index first) until topk are taken. The order is the contract: the attention sums the pages in
+ * table order, and a table shared by a query tile is their union in the same order (docs/QSA.md).
+ * The partial page bt[n] follows when (pos + 1) % ratio != 0 and
  * n < width, and -1 pads the row to topk + 1. nsel counts the entries, seqused is
  * (nsel - 1) * ratio + pos % ratio + 1 (0 for an empty table). A row no sequence holds reads
  * sequence 0, as libr4d's does. */
@@ -153,10 +155,16 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
             for (int64_t b : live) ord.push_back(val[(size_t)b]);
             std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
             const float thr = ord[(size_t)(topk - 1)];
-            for (int64_t b : live)
+            /* The selection in block order, above the threshold and the ties alike: the order is
+             * part of the contract, since the attention sums a query's pages in table order and a
+             * table shared by a query tile is the union in block order (docs/QSA.md). */
+            int64_t above = 0;
+            for (int64_t b : live) above += val[(size_t)b] > thr;
+            int64_t need = topk - above, ties = 0;
+            for (int64_t b : live) {
                 if (val[(size_t)b] > thr) take.push_back(b);
-            for (int64_t b : live)
-                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+                else if (ties < need && val[(size_t)b] == thr) { take.push_back(b); ++ties; }
+            }
         }
         int64_t out = 0;
         for (int64_t b : take) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs,
