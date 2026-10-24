@@ -2071,6 +2071,61 @@ TEST(ngram_window_follows_the_committed_history) {
     }
 }
 
+/* The one row a decode step's gather could take ahead (MAIN-11, arm b): the verify ends, the
+ * sampler keeps k of its 1 + n_spec rows and draws one more token, and the NEXT step's row 0 is
+ * that bonus token over the two tokens before it. Both halves of the contract the ahead path needs
+ * are checked here, because they decide whether the prefetch is worth an op at all:
+ *
+ *   - derivable: the row is a function of the last three tokens alone, so the host can hash it as
+ *     soon as the sample lands -- no launch, no draft, no second pass over the step;
+ *   - fresh: it equals no row of the step whose sampler produced it, for every k. Row `k` of that
+ *     step is the same position hashed over the draft it proposed there, and that draft was
+ *     rejected -- so the running gather does not already hold this row, and the prefetch reads
+ *     rows nothing else has warmed. A step's other rows need the next step's drafts, unavailable
+ *     until the drafter returns; this one does not.
+ */
+TEST(ngram_ahead_at_decode_is_the_bonus_row) {
+    const NgK K;
+    const int64_t W = NgK::kCtx + kNspec;
+    const std::vector<int64_t> hist{ 1, 2, 3 };        /* the committed history, in a warm window */
+    const std::vector<int64_t> tok{ 4, 100, 200, 300 }; /* the bonus, then three drafts */
+
+    for (int64_t k = 0; k <= kNspec; ++k) {
+        /* The verify: 1 + n_spec rows over the history, one row kept beyond the bonus. */
+        T s1(RAD_I32, {1, W}), i1(RAD_I32, {3, NgK::kHeads}), ids(RAD_I32, {4, NgK::kHeads});
+        CHECK_OK(ng_launch(K, { hist }, s1, { 0 }, { 0 }, nullptr, i1));
+        const std::vector<int64_t> one{ 1 };
+        CHECK_OK(ng_launch(K, { tok }, s1, { 0 }, { 1 }, &one, ids));
+
+        /* What the sampler can hand over while the drafter runs: the k kept tokens and the bonus
+         * drawn after them. Distinct from every draft, so a row cannot coincide by token. */
+        const std::vector<int64_t> bonus{ 900 + k };
+        std::vector<int64_t> upto = hist;
+        upto.insert(upto.end(), tok.begin(), tok.begin() + k + 1);
+        std::vector<int64_t> three = last_n<int64_t>(upto, NgK::kCtx, NgK::kEos);
+        three.push_back(bonus[0]);
+
+        /* Derivable: three tokens on the host give the row, with no state window to read. */
+        const std::vector<int64_t> ahead = ng_fresh(K, three);
+
+        /* ... and it is the row the next step really computes, at its row 0. */
+        T s2(RAD_I32, {1, W}), ip(RAD_I32, { (int64_t)upto.size(), NgK::kHeads });
+        CHECK_OK(ng_launch(K, { upto }, s2, { 0 }, { 0 }, nullptr, ip));
+        /* A one-row decode reads the window at offset zero, as a step after a prefill chunk does:
+         * the slack the verify leaves is indexed by ITS num_accepted, which this window no longer
+         * is. */
+        const std::vector<int64_t> nacc{ 1 };
+        T ids2(RAD_I32, {1, NgK::kHeads});
+        CHECK_OK(ng_launch(K, { bonus }, s2, { 0 }, { 1 }, &nacc, ids2));
+        CHECK(ng_row(ids2, 0) == ahead);
+
+        /* Fresh: no row of the step that just ran is this row -- row k has the same position but
+         * the rejected draft as its token (for k = 0, the bonus the step was handed, not the one
+         * it drew). So taking it ahead buys a row the gather has not read. */
+        for (int64_t t = 0; t <= kNspec; ++t) CHECK(ng_row(ids, t) != ahead);
+    }
+}
+
 namespace {
 
 /* ple_conv at width 3 and dilation 2 (history 4) over two channels, f32 throughout so the
