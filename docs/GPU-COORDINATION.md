@@ -99,9 +99,14 @@ entry points, not silently edited while another agent's measurements are running
 
 The existing `/home/orca/multica-tools/dispatch-sweep.py` nudges only exact `todo`
 and `in_progress` states; it already ignores `ready_for_testing` and `testing`.
-Do not add a second scheduler. Its autopilot also contains prose-driven triage
-and blocked-work restarts: that configuration needs explicit GPU-state exceptions.
-No agent/autopilot configuration was changed without approval.
+Do not add a second scheduler. On 2026-10-24 code211 confirmed the proposed
+configuration change. The GPU-window contract was appended to Radiance Testing,
+Code 1–4, Implementation 1–4, Review 1–4, and Rescue (14 agents), preserving their
+existing instructions, roles, runtime, model, permissions, and concurrency limits.
+The existing Sweeper autopilot now has priority guards for waiters, active GPU
+windows, and blocked prerequisites. Each write was read back and verified; its
+schedule, assignee, mode, and active state were preserved. These are instructions,
+not a device sandbox or retroactive protection for already-claimed agent runs.
 
 A direct read-only call to the production `gpu_holders()` preflight in this runtime
 failed with `PermissionError: /proc/1/fd`. The runner therefore correctly refuses
@@ -118,12 +123,13 @@ repository serving/conversion/diagnostic scripts (including `fnserve`, `mcserve`
 Some existing scripts stop servers globally; do not run these against foreign
 processes just because an outer lock was acquired.
 
-Rollout requires confirmation of this concrete configuration change: GPU-capable
-agents must use this runner for every GPU phase, maintain `ready_for_testing`
-between phases, and use persisted wakeups instead of retry loops; the existing
-Sweeper must never nudge waiters, rewrite active `testing`, or release blocked
-GPU work without checking its blockers. Migrate the owning agents' local harnesses
-at a safe boundary after the active measurement, not by terminating it.
+The approved configuration is applied, but rollout remains blocked on complete
+read-only process visibility and legacy harness migration. The confirmation did
+not identify such an execution context or authorize a particular permissions
+change; no permissions were widened. Migrate the owning agents' local harnesses
+at a safe boundary after the active measurement, not by terminating it. New agent
+claims receive the mandatory runner/waiter contract; already-claimed legacy runs
+are not silently assumed to have received it.
 
 ## CPU-only verification
 
