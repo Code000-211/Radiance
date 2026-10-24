@@ -146,7 +146,7 @@ inline int tree_dispatch_fixed(const int32_t (*history)[kTreeRoundCandidates], i
         return refuse(RAD_E_UNSUPPORTED,
                       "tree dispatch: the tree accepts at temperature 0 only; sampling a tree is "
                       "not implemented and the serial path must run unchanged");
-    const int32_t budget = rounds == 3 ? 16 : kTreeMaxNodes;
+    const int32_t budget = rounds == 3 ? kTreeLegacyMaskNodes : kTreeMaxNodes;
     CandidateTree tree;
     if (!tree.build_mtp_fixed(history, rounds, capacity, root, vocab))
         return refuse(RAD_E_INVAL,

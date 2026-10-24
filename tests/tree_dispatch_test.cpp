@@ -49,10 +49,21 @@ TreeStep sentinel_step() {
     return s;
 }
 
+/* The tree itself: a refusal must not rewrite a node either. A token, parent, depth or ancestor
+ * set the tree did not carry before is a half-staged tree that node_count() alone cannot show. */
+bool tree_untouched(const CandidateTree& now, const CandidateTree& before) {
+    if (now.node_count() != before.node_count()) return false;
+    for (int32_t j = 0; j < before.node_count(); ++j)
+        if (now[j].token != before[j].token || now[j].parent != before[j].parent ||
+            now[j].depth != before[j].depth || now[j].ancestors != before[j].ancestors)
+            return false;
+    return true;
+}
+
 /* Every staged field the admit/commit pair writes: a refusal must leave all of them alone. */
 bool staged_untouched(const TreeStep& now, const TreeStep& before) {
     if (now.n_nodes != before.n_nodes || now.root_pos != before.root_pos ||
-        now.has_mask16 != before.has_mask16 || now.tree.node_count() != before.tree.node_count())
+        now.has_mask16 != before.has_mask16 || !tree_untouched(now.tree, before.tree))
         return false;
     for (int32_t j = 0; j < kTreeMaxNodes; ++j)
         if (now.parents[j] != before.parents[j] || now.positions[j] != before.positions[j] ||
@@ -205,18 +216,20 @@ TEST(a_budget_that_cuts_the_fixed_profile_short_is_refused) {
     for (int r = 0; r < 8; ++r)
         for (int c = 0; c < 8; ++c) history[r][c] = c < 2 ? 300 + 10 * r + c : -1;
 
-    TreeStep step;
+    const TreeStep before = sentinel_step();
+    TreeStep step = before;
     std::string why;
     /* kTreeLegacyMaskNodes rows is less than the profile's own node count. */
     CHECK_EQ(tree_dispatch_fixed(history, 8, kTreeLegacyMaskNodes, 5, kVocab, 64, 512, true, true,
                                  0, &step, &why), RAD_E_INVAL);
     CHECK(why.find("truncates") != std::string::npos);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
 
     /* And a rounds/capacity pair the profile does not offer is refused by the profile itself. */
     why.clear();
     CHECK_EQ(tree_dispatch_fixed(history, 3, kTreeMaxNodes, 5, kVocab, 64, 512, true, true, 0,
                                  &step, &why), RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
 }
 
 TEST(a_wide_tree_is_refused_for_a_sixteen_bit_mask_consumer_not_truncated) {
@@ -224,12 +237,13 @@ TEST(a_wide_tree_is_refused_for_a_sixteen_bit_mask_consumer_not_truncated) {
     for (int r = 0; r < 8; ++r)
         for (int c = 0; c < 8; ++c) history[r][c] = c < 3 ? 400 + 10 * r + c : -1;
 
-    TreeStep step;
+    const TreeStep before = sentinel_step();
+    TreeStep step = before;
     std::string why;
     CHECK_EQ(tree_dispatch_fixed(history, 8, kTreeMaxNodes, 5, kVocab, 64, 512, true, true, 16,
                                  &step, &why), RAD_E_UNSUPPORTED);
     CHECK(why.find("uint16") != std::string::npos);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
 
     /* A 16-row tree does have the legacy form and is admitted for that consumer. */
     uint32_t cand[14];
@@ -245,7 +259,8 @@ TEST(a_wide_tree_is_refused_for_a_sixteen_bit_mask_consumer_not_truncated) {
 
 TEST(a_mutated_mask_an_out_of_span_depth_and_a_bad_vocabulary_are_refused) {
     uint32_t draft[3] = {21, 22, 23};
-    TreeStep step;
+    const TreeStep before = sentinel_step();
+    TreeStep step = before;
     std::string why;
 
     CandidateTree bad_mask;
@@ -253,26 +268,31 @@ TEST(a_mutated_mask_an_out_of_span_depth_and_a_bad_vocabulary_are_refused) {
     bad_mask[2].ancestors.reset(1);   /* node 2 no longer attends to node 1 */
     CHECK_EQ(tree_dispatch_admit(bad_mask, 7, kVocab, 512, true, true, 0, &step, &why), RAD_E_INVAL);
     CHECK(why.find("ancestor") != std::string::npos);
-    CHECK_EQ(step.n_nodes, 0);
+    CHECK(staged_untouched(step, before));
 
     CandidateTree t;
     CHECK(t.build_linear(20, draft, 3));
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, 7, kVocab, /*token_span=*/3, true, true, 0, &step, &why),
              RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, 7, /*vocab=*/22, 512, true, true, 0, &step, &why), RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, -1, kVocab, 512, true, true, 0, &step, &why), RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
     why.clear();
     CHECK_EQ(tree_dispatch_admit(t, 7, kVocab, 512, true, true, /*mask_bits=*/32, &step, &why),
              RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
 
     /* A tree of the root alone verifies nothing. */
     CandidateTree root_only;
     CHECK(root_only.build_linear(20, nullptr, 0));
     why.clear();
     CHECK_EQ(tree_dispatch_admit(root_only, 0, kVocab, 512, true, true, 0, &step, &why), RAD_E_INVAL);
+    CHECK(staged_untouched(step, before));
 }
 
 TEST(the_commit_drops_every_branch_off_the_winner_and_cuts_at_the_stop_token) {
@@ -354,6 +374,7 @@ TEST(a_short_pick_buffer_a_tampered_layout_and_a_short_tree_are_refused) {
     pick[2] = -1;
     why.clear();
     CHECK_EQ(tree_dispatch_commit(step, pick, step.n_nodes, is_eog, &commit, &why), RAD_E_INVAL);
+    CHECK_EQ(std::memcmp(&commit, &commit_before, sizeof commit), 0);
     chain_picks(t, pick);
 
     /* A staged parent that disagrees with the tree would make the card's walk take another edge. */
@@ -363,16 +384,19 @@ TEST(a_short_pick_buffer_a_tampered_layout_and_a_short_tree_are_refused) {
     CHECK_EQ(tree_dispatch_commit(tampered, pick, tampered.n_nodes, is_eog, &commit, &why),
              RAD_E_INVAL);
     CHECK(why.find("staged layout") != std::string::npos);
+    CHECK_EQ(std::memcmp(&commit, &commit_before, sizeof commit), 0);
 
     /* A step whose node count and tree disagree is refused before the walk. */
     TreeStep short_step = step;
     short_step.n_nodes = 2;
     why.clear();
     CHECK_EQ(tree_dispatch_commit(short_step, pick, 8, is_eog, &commit, &why), RAD_E_INVAL);
+    CHECK_EQ(std::memcmp(&commit, &commit_before, sizeof commit), 0);
 
     /* And a tree of the root alone cannot be committed either. */
     TreeStep empty_step;
     CHECK_EQ(tree_dispatch_commit(empty_step, pick, 8, is_eog, &commit, &why), RAD_E_INVAL);
+    CHECK_EQ(std::memcmp(&commit, &commit_before, sizeof commit), 0);
 }
 
 RAD_TEST_MAIN()
