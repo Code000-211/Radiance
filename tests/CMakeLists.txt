@@ -240,6 +240,24 @@ if(RAD_HIP_FOUND)
   endforeach()
 endif()
 
+# hc_up_wmma_wiring_test dlopens the ported opt-in row's plugin: inert until its switch is set,
+# claiming only M=3..4 at n=2560/hc=4/lowrank=320, and declaring `hc_read` field for field as
+# libr4d does (it has to be listed first to win the op, and then its schema is the one callers are
+# validated against). Skips the row's cases when the tree has no device half.
+if(TARGET hc_up_wmma)
+  target_link_libraries(hc_up_wmma_wiring_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(hc_up_wmma_wiring_test PRIVATE
+    RAD_HC_UP_WMMA_LIB="${RAD_PLUGIN_OUT}/kernels/hc_up_wmma.so"
+    RAD_R4D_LIB="${RAD_PLUGIN_OUT}/kernels/libr4d.so")
+  add_dependencies(hc_up_wmma_wiring_test hc_up_wmma)
+  if(RAD_HIP_FOUND)
+    target_compile_definitions(hc_up_wmma_wiring_test PRIVATE RAD_HC_UP_WMMA_WITH_DEVICE=1)
+    if(TARGET libr4d)
+      add_dependencies(hc_up_wmma_wiring_test libr4d)
+    endif()
+  endif()
+endif()
+
 # spechub_wiring_test dlopens the built spechub plugin and checks how its rows are classified: the
 # device rows must be production kernels and the host oracle rows must stay reference. It needs the
 # library path and the same RAD_SPECHUB_WITH_DEVICE answer the plugin was built with.
@@ -512,6 +530,11 @@ endif()
 set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
 if(TARGET spechub)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/spechub.so)
+endif()
+# hc_up_wmma restates `hc_read`'s schema (it has to be listed before libr4d to win the op), so the
+# document is checked against that copy too.
+if(TARGET hc_up_wmma)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/hc_up_wmma.so)
 endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)

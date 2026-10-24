@@ -309,6 +309,11 @@ add_subdirectory(arch)
 # the experimental line owns. Built by default so the flag's kernels exist in the same tree that
 # enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
 add_subdirectory(plugin/spechub)
+# hc_up_wmma: an opt-in `hc_read` row for the M=3/4 band of Qwen Flash-Next's drafter, with the
+# up-dot reduction on WMMA (ported from the ABI16 archive, plugin/hc_up_wmma/README.md). Inert
+# without RADIANCE_HC_UP_WMMA=1 and listed nowhere it wins from: it overrides libr4d's row only
+# when an operator puts it first on RADIANCE_KERNELS.
+add_subdirectory(plugin/hc_up_wmma)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()
