@@ -129,8 +129,6 @@ the cards the engine runs on.
 | `flashnext.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | Qwen3.8-Flash-Next, 4-bit codebook experts and an int8 trunk; MTP depth 3; finished conversations kept in host memory (`--prefix-cache-mib`) |
 | `flashnext-tp1.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | The same on one card: a 42 GiB pinned host pool for the experts that do not fit, 4096-token prefill steps, 4 sequences |
 | `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
-
-All three Flash-Next files serve `qwen-fixed-chat-template.jinja` (froggeric/Qwen-Fixed-Chat-Templates v22.5, Apache-2.0) through `--override-chat-template`, in place of the template the container carries. Drop the flag and the `volumes` entry to go back to the container's own.
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
 | `ornith-1.5-35b-a3b.yaml` | `ornith-1.5-35b-a3b-fp8.rad` | Ornith-1.5-35B-A3B, FP8, MTP, vision |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
@@ -156,6 +154,8 @@ All three Flash-Next files serve `qwen-fixed-chat-template.jinja` (froggeric/Qwe
 | `ltx-2.5.yaml` | `ltx-2.5-distilled-fp8.rad` | LTX-2.5 distilled as block fp8: video with its stereo soundtrack on `/v1/videos`, one card (`RADIANCE_GPU`), the text encoder in pinned host memory; the base container serves the same way |
 | `minimax-music3.yaml` | `minimax-music3-bf16.rad` | MiniMax-Music3 in bf16: songs from lyrics and a description on `/v1/audio/speech` |
 | `breeze-tts2.yaml` | `breeze-tts2-bf16.rad` | Breeze-TTS-2 in bf16: speech on `/v1/audio/speech` and live over `/v1/audio/speech/stream`, on one card (`RADIANCE_GPU`) |
+
+All three Flash-Next files serve `qwen-fixed-chat-template.jinja` (froggeric/Qwen-Fixed-Chat-Templates v22.5, Apache-2.0) through `--override-chat-template`, in place of the template the container carries. Drop the flag and the `volumes` entry to go back to the container's own.
 
 The container names are the files the README's model table downloads or converts.
 
