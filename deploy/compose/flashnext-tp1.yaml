@@ -13,7 +13,10 @@ services:
   radiance:
     extends: { file: common.yaml, service: radiance }
     container_name: radiance-flashnext-tp1
+    volumes:
+      - ./qwen-fixed-chat-template.jinja:/templates/qwen-fixed-chat-template.jinja:ro
     command: >
+      --override-chat-template /templates/qwen-fixed-chat-template.jinja
       --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
       --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
       --tp 1 --max-num-seqs 4 --max-model-len 200000
