@@ -69,7 +69,10 @@ namespace rad {
  * on the free VRAM at start, so the flag value would let two differently placed deployments share
  * a profile. It carries, per rank in rank order, the strategy, the resolved budgets and a digest
  * of the plan's tier/site per weight -- the expert residency a strategy name alone does not name.
- * The engine refuses to derive a runtime from a plan that is still `auto`.
+ * Its `vram` is the one field that is a measurement rather than a decision: the budget the card
+ * offered at that start, so a foreign context moves it without moving the plan. It is compared
+ * apart (DraftCostPlacementDrift): same plan, different budget binds and warns. The engine refuses
+ * to derive a runtime from a plan that is still `auto`.
  *
  * `basis` says how the numbers were measured and selects the comparison rule: a `NoLoan`
  * reference compares the plan, the budgets and the arena levels and ignores `live_loan`; a `Live`
@@ -93,9 +96,26 @@ struct DraftCostFingerprint {
     int32_t     tp = 0;
 };
 
-/* Compares two fingerprints; `first` names the first differing field, for the log and the plan. */
+/* The start's measured VRAM budget, when it is the only thing the profile and this run disagree
+ * on. `vram` in `placement` is measured on arrival, so it is the one field of that string that is
+ * not the plan's identity: a card that held a foreign context when the profile was written (or
+ * holds one now) resolves the same strategy, host/file split, dynamic flag and residency against a
+ * smaller budget. Such a run binds the profile anyway -- refusing would make the cost path
+ * unusable on any shared card -- and this names both budgets and their difference so the caller
+ * can warn. A profile whose plan differs (strategy, host, file, dynamic, residency digest) is
+ * still a different placement and is refused.
+ *
+ * `budget` is empty unless the plans are identical and the budgets are not. */
+struct DraftCostPlacementDrift {
+    bool        budget_changed = false;
+    std::string budget;   /* "rank <i>: start VRAM budget profile= runtime= (delta smaller)" */
+};
+
+/* Compares two fingerprints; `first` names the first differing field, for the log and the plan.
+ * `drift`, when given, receives the budget-only difference a match tolerated (see above). */
 bool draft_cost_fingerprint_same(const DraftCostFingerprint& a, const DraftCostFingerprint& b,
-                                 std::string* first);
+                                 std::string* first,
+                                 DraftCostPlacementDrift* drift = nullptr);
 
 /* The backend's round model -- how the active drafter issues draft work, not how one cycle's K
  * happened to fall. Shrinking is a serial head that runs one round per row, so N_j falls with j
@@ -312,6 +332,10 @@ public:
 
     bool active() const { return active_; }
     const std::string& reason() const { return reason_; }
+    /* The start budget the profile recorded differs from this run's while the resolved plan does
+     * not (DraftCostPlacementDrift): the profile is bound and this names both budgets and their
+     * difference, for the warning the caller prints. Empty when they agree or the plan differs. */
+    const std::string& budget_drift() const { return budget_drift_; }
     /* Stops pricing and learning, naming why, while keeping the loaded buckets visible: the run's
      * residency diverged from the fingerprint's start placement, so the profile is no longer a
      * measurement of this deployment. Not admit_fallback(): drift is not an admission to price
@@ -368,6 +392,7 @@ public:
 private:
     std::vector<DraftCostBucket> buckets_;
     std::string reason_;
+    std::string budget_drift_;
     int32_t capacity_ = 0;
     int64_t dropped_ = 0;
     int64_t ignored_ = 0;

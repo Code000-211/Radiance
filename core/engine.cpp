@@ -1924,6 +1924,13 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
 
     RAD_TRY(sched_.draft_costs().configure(profile, runtime));
 
+    /* The plan and this run agree, the card did not: a foreign context held part of the budget at
+     * one of the two starts, so the resolved plan is the same and only its headroom differs. Bind
+     * the profile and say so -- both budgets and the difference are in the text. */
+    if (sched_.draft_costs().active() && !sched_.draft_costs().budget_drift().empty())
+        RAD_WARN("--draft-profile '%s': %s; the resolved plan is unchanged, so the profile binds",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().budget_drift().c_str());
+
     if (!sched_.draft_costs().active())
         RAD_WARN("--draft-profile '%s' is not used for this deployment: %s",
                  cfg_.draft_profile.c_str(), sched_.draft_costs().reason().c_str());

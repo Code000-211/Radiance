@@ -108,6 +108,41 @@ TEST(a_fingerprint_mismatch_leaves_the_table_inactive_and_names_the_field) {
     CHECK(EngineTestPeer::sched(e).draft_costs().reason().find("placement") != std::string::npos);
 }
 
+/* The plan is the identity; the measured start budget is not. A profile written while another
+ * process held ~300 MiB of the card binds here, and the start says so -- a refusal would make Cost
+ * unusable on every shared card. */
+TEST(a_drifted_start_budget_binds_the_profile_and_warns_with_both_values) {
+    Config cfg;
+    cfg.draft_profile = write_case_file("engine_profile_drifted.json", kProfile);
+    Engine e(std::move(cfg));
+    DraftCostRuntime r = matching_runtime();
+    r.fingerprint.placement = "all_vram vram=314572800 host=0 file=0 dyn=1 res=0000000000000000";
+    int rc = RAD_E_STATE;
+    const std::string log = stderr_of([&] { rc = EngineTestPeer::load_profile(e, r); });
+    CHECK_EQ(rc, RAD_OK);
+    CHECK(EngineTestPeer::sched(e).draft_costs().active());
+    CHECK(has(log, "start VRAM budget profile=0 runtime=314572800"));
+    CHECK(has(log, "300.00 MiB larger"));
+    CHECK(has(log, "the resolved plan is unchanged"));
+}
+
+/* A budget that resolves a different plan is still a different placement: the start is refused by
+ * the scheduler's baseline lock, and the reason names the field and that the budget was not the
+ * cause. This is the fingerprint's purpose -- a cost table must not be bound to another layout. */
+TEST(a_placement_change_is_refused_with_the_field_and_the_cause) {
+    Config cfg;
+    cfg.draft_profile = write_case_file("engine_profile_replaced.json", kProfile);
+    Engine e(std::move(cfg));
+    DraftCostRuntime r = matching_runtime();
+    r.fingerprint.placement = "expert_tiered vram=314572800 host=0 file=0 dyn=1 res=0000000000000000";
+    int rc = RAD_E_STATE;
+    const std::string log = stderr_of([&] { rc = EngineTestPeer::load_profile(e, r); });
+    CHECK_EQ(rc, RAD_OK);
+    CHECK(!EngineTestPeer::sched(e).draft_costs().active());
+    CHECK(has(EngineTestPeer::sched(e).draft_costs().reason(), "placement[0].strategy"));
+    CHECK(has(log, "a resolved-plan change, not a start-budget effect"));
+}
+
 TEST(a_matching_profile_is_admitted_before_the_scheduler_starts) {
     Config cfg;
     cfg.draft_profile = write_case_file("engine_profile_ok.json", kProfile);

@@ -1234,6 +1234,159 @@ TEST(the_documented_c8_gradient_is_reproduced_without_a_new_measurement) {
     CHECK(a.ms < b.ms);   /* the policy's comparison: K3 wins */
 }
 
+/* The start budget is measured on arrival, not resolved: a card that held a foreign context when
+ * the profile was written (or holds one now) resolves the same plan against a smaller budget. That
+ * alone is not an identity change -- refusing it made the cost path unusable on any shared card --
+ * so it binds and reports both values and the difference for the warning. */
+TEST(a_smaller_start_budget_alone_is_not_a_placement_change) {
+    const std::string same = " host=0 file=2147483648 dyn=1 res=9f2c41ab7e0d3355";
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "expert_tiered vram=16865296384" + same;   /* 300 MiB less */
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(first.empty());
+    CHECK(drift.budget_changed);
+    CHECK(has(drift.budget, "rank 0"));
+    CHECK(has(drift.budget, "profile=17179869184"));
+    CHECK(has(drift.budget, "runtime=16865296384"));
+    CHECK(has(drift.budget, "300.00 MiB smaller"));
+
+    /* A larger budget is the same case: uninteresting while the plan is the same. */
+    std::swap(a.placement, b.placement);
+    std::string grew;
+    DraftCostPlacementDrift up;
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(has(up.budget, "300.00 MiB larger"));
+
+    /* Multiple ranks name the rank whose budget moved. */
+    a.placement = "all_vram vram=17179869184" + same + ";" + "layer_offload vram=8589934592" + same;
+    b.placement = "all_vram vram=17179869184" + same + ";" + "layer_offload vram=16528539648" + same;
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(has(up.budget, "rank 1"));
+    CHECK(!has(up.budget, "rank 0"));
+
+    /* An older, unfingerprinted placement string still compares as a whole. */
+    a.placement = b.placement = "all_vram";
+    CHECK(draft_cost_fingerprint_same(a, b, &grew, &up));
+    CHECK(up.budget.empty());
+}
+
+/* A different plan behind a different budget is a different placement: the reason names the field
+ * and says the budget was not the cause, and no tolerated drift is reported for a refused file. */
+TEST(a_budget_that_resolves_another_plan_is_refused_by_field) {
+    const std::string same = " host=0 file=0 dyn=1 res=9f2c41ab7e0d3355";
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "all_vram vram=16865296384" + same;
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement[0].strategy"));
+    CHECK(has(first, "profile=\"expert_tiered\""));
+    CHECK(has(first, "runtime=\"all_vram\""));
+    CHECK(has(first, "resolved-plan change"));
+    CHECK(!drift.budget_changed);
+
+    /* Same strategy and budget, different residency: a placement change on its own. */
+    a.placement = "expert_tiered vram=17179869184" + same;
+    b.placement = "expert_tiered vram=17179869184 host=0 file=0 dyn=1 res=0000000000000001";
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement[0].residency"));
+}
+
+/* The placement string is a contract, not a heuristic: a rank that does not have the exact shape
+ * the engine writes is compared as a whole string. Anything else would bind a costs table to a
+ * placement nobody described -- the numbers are read as bytes, `dyn` as a flag and `res` as the
+ * sixteen-digit digest, and a value outside those bounds is not a budget that moved. */
+TEST(a_malformed_placement_rank_is_not_a_tolerated_budget) {
+    const std::string ok = "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff";
+    const char* bad[] = {
+        "all_vram vram=-1 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=9999999999999999999999999999999 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 dyn=4294967297 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=ff",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000fff",
+        "all_vram vram=100 host=0 file=0 dyn=2 res=00000000000000ff",
+        "all_vram vram=0100 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 res=00000000000000ff dyn=1",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff tail",
+        "all_vram vram=100 host=0 file=0 dyn=1",
+        "all_vram vram=100 host=-1 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=+100 host=0 file=0 dyn=1 res=00000000000000ff",
+    };
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    std::string first;
+    DraftCostPlacementDrift drift;
+    for (const char* s : bad) {
+        /* Invalid on the runtime side: the profile is the well-formed one. */
+        a.placement = ok;
+        b.placement = s;
+        drift.budget = "sentinel";
+        CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+        CHECK(has(first, "placement profile=\"" + ok + "\""));
+        CHECK(!drift.budget_changed);
+
+        /* And with the sides swapped, so the profile is the invalid string. */
+        std::swap(a.placement, b.placement);
+        CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+        CHECK(has(first, "placement profile=\"" + std::string(s) + "\""));
+    }
+
+    /* A digest the engine never wrote is not equal to the same value written as sixteen digits. */
+    a.placement = ok;
+    b.placement = "all_vram vram=100 host=0 file=0 dyn=1 res=0000000000000ff";
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+}
+
+/* Both sides are validated in full before any rank may be tolerated: identical legacy ranks must
+ * not let a mixed old/new pair pass as a budget drift, because the second rank's shape is not one
+ * this build reads and its "vram" is not known to be the only difference. */
+TEST(a_mixed_legacy_and_current_placement_is_compared_whole) {
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "legacy;all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    b.placement = "legacy;all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff";
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement profile=\"legacy;all_vram vram=200"));
+    CHECK(!drift.budget_changed);
+
+    /* A fully current, fully parseable pair still binds on a budget-only difference. */
+    a.placement = "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff;"
+                  "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    b.placement = "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff;"
+                  "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    CHECK(draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(drift.budget_changed);
+    CHECK(has(drift.budget, "rank 0"));
+    CHECK(!has(drift.budget, "rank 1"));
+}
+
+/* What configure() does with that verdict: bind and report, or stay inactive and name the field. */
+TEST(the_table_binds_a_drifted_start_budget_and_names_it) {
+    DraftCostProfile p;
+    p.fingerprint = runtime_fingerprint();
+    p.fingerprint.placement = "all_vram vram=17179869184 host=0 file=0 dyn=1 res=00000000000000ff";
+    DraftCostRuntime rt;
+    rt.fingerprint = p.fingerprint;
+    rt.fingerprint.placement = "all_vram vram=16865296384 host=0 file=0 dyn=1 res=00000000000000ff";
+
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, rt), RAD_OK);
+    CHECK(t.active());
+    CHECK(t.reason().empty());
+    CHECK(has(t.budget_drift(), "300.00 MiB smaller"));
+
+    rt.fingerprint.placement = "expert_tiered vram=16865296384 host=0 file=0 dyn=1 res=00000000000000ff";
+    CHECK_EQ(t.configure(p, rt), RAD_OK);
+    CHECK(!t.active());
+    CHECK(has(t.reason(), "placement[0].strategy"));
+    CHECK(has(t.reason(), "resolved-plan change"));
+    CHECK(t.budget_drift().empty());   /* clear() does not carry the earlier run's warning */
+}
+
 /* The fingerprint's gpus field is derived from the ranks' device names, not typed by the user:
  * identical cards keep the documented "Nx NAME" form, a mixed set stays comma-separated in rank
  * order so the string still names the deployment. */
