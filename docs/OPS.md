@@ -2317,6 +2317,23 @@ The table must be a weight operand for the host site to be reachable at all: `ga
 plain input and would never be placed there. The host kernel lives in a production plugin (libavx)
 because `rad_gate_reference_kernels` refuses to serve on libref.
 
+**The optional row cache.** The rows a prompt's n-grams name recur, across turns and across the
+heads that hash onto them, and with `--ngram-placement ram` a miss costs 320 bytes over the link
+plus a dequantise per rank. `RADIANCE_PLE_VRAM_CACHE_SETS=<n>` gives the gather a 4-way
+set-associative L1 of decoded rows on the card: `n` sets of four 320-byte bf16 rows with a tag, a
+state and a hit counter each, hashed `id * 2654435761 mod n`, a set's coldest way replaced and a
+new row starting warm. A hit reads the row from VRAM and touches neither the table nor the scale.
+
+It is off by default: with the variable unset or `0` the row is allocated nothing, no launch takes
+the cached path, and every gather is the one described above. It is allocated in the row's `init`,
+which runs inside `declare()`, so the VRAM budget reads it as `already held` (core/mem/vram_budget.h)
+and it comes out of what the weight and KV pools could otherwise claim. Its lifetime is that
+instance's: `fini` frees it, a reload starts empty, and an instance handed a second table bypasses
+the cache rather than rebinding it. Hits and misses write the same bytes as the uncached kernel --
+`r4d_selftest`'s `ple_cache` case holds both to a host gather, cold, warm, colliding, under four
+concurrent streams and after a reset. What the hit rate is worth on a given workload is a
+measurement this option does not make for you.
+
 ### `ngram_ids`
 
 Qwen4-Exp's Per-Layer Embedding gives one layer a second embedding table addressed by a hash of the

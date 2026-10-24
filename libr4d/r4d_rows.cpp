@@ -5071,7 +5071,8 @@ static const RadKernelInfo kKernels[] = {
   "i32 tokens, an E4M3 table with a bf16 or f32 scale or a plain bf16 one, bf16 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
-  nullptr, nullptr, r4d_rad_embed_lookup_q, nullptr, r4d_rad_layout_embed_q, nullptr,
+  r4d_rad_embed_lookup_q_init, r4d_rad_embed_lookup_q_fini, r4d_rad_embed_lookup_q,
+  nullptr, r4d_rad_layout_embed_q, nullptr,
   r4d_shape_embed_lookup_q },
 
 { "ple_gate_bf16", "ple_gate", "norm",

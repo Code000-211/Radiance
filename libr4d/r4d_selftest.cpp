@@ -23306,6 +23306,187 @@ static void embed_lookup_q_case(const Plugin& pl) {
     ok(what, bad.empty(), bad);
 }
 
+/* ------------------------------------------------------------------ the PLE row cache */
+/* embed_lookup_q's optional VRAM L1 (r4d_model_bf16.hip, RADIANCE_PLE_VRAM_CACHE_SETS). Every launch
+ * is held to the same host gather embed_lookup_q_case uses, because a cache that changed one byte
+ * would make the n-gram embedding depend on the hit rate:
+ *
+ *   1. cold: every id a miss, so every row is read from the table, stored and returned;
+ *   2. warm: the same ids twice more, served from the ways the first launch filled;
+ *   3. collisions: 4 sets and 16 places against 64 ids, eight shuffles, so rows evict each other
+ *      and the LOADING/READY handshake runs under continuous replacement;
+ *   4. a second table through the same instance, which must bypass the cache -- a hit there would
+ *      return the first table's bytes;
+ *   5. four streams at once, the same ids, so one launch's misses race the next one's hits.
+ *
+ * Then the instance is freed and re-initialised, which must start cold, and a launch with no
+ * instance (the default, no cache) must write the same bytes as the cached one. */
+static void ple_cache_case(const Plugin& pl) {
+    if (!sel("embed_lookup_q_bf16")) return;
+    const char* what = "PLE row cache vs a host gather, to the bit";
+    const RadKernelInfo* r = find(pl, "embed_lookup_q_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!r->init || !r->fini) { ok(what, false, "the row has no init/fini"); return; }
+
+    const int64_t NV = 64, M = 37, NE = 160;
+    const uint32_t sets = 4;                    /* 16 places: 64 ids must evict */
+    const float scale = rad_bf16_to_f32(rad_f32_to_bf16(1.99317932e-4f));
+    std::string bad;
+
+    /* Every code but the two NaN encodings, as in the case above. */
+    auto make_table = [&](uint32_t seed) {
+        std::vector<uint8_t> t((size_t)(NV * NE));
+        uint32_t rs = seed;
+        for (size_t i = 0; i < t.size(); ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            uint8_t c = (uint8_t)((i * 167 + (rs >> 24)) & 0xFF);
+            if ((c & 0x7F) == 0x7F) c ^= 0x01;
+            t[i] = c;
+        }
+        return t;
+    };
+    const std::vector<uint8_t> table = make_table(0x9e3779b9u);
+    const std::vector<uint8_t> table2 = make_table(0x1234567u);
+    auto want_row = [&](const std::vector<uint8_t>& t, int32_t id, std::vector<uint16_t>& out) {
+        out.assign((size_t)NE, 0);                 /* off the table: a zero row */
+        if (id < 0 || id >= NV) return;
+        for (int64_t i = 0; i < NE; ++i)
+            out[(size_t)i] =
+                rad_f32_to_bf16(rad_fp8e4m3_to_f32(t[(size_t)(id * NE + i)]) * scale);
+    };
+
+    auto dev = [&](const void* h, size_t b) {
+        void* d = dalloc(b);
+        st_memcpy(d, h, b, hipMemcpyHostToDevice);
+        return d;
+    };
+    const uint16_t sc_bits = rad_f32_to_bf16(scale);
+    void* d_tab  = dev(table.data(), table.size());
+    void* d_tab2 = dev(table2.data(), table2.size());
+    void* d_sc   = dev(&sc_bits, 2);
+    void* d_tok  = dalloc((size_t)M * 4);
+    void* d_x    = dalloc((size_t)(M * NE * 2));
+
+    std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }), T(d_tab, RAD_F8E4M3, { NV, NE }),
+                                 T(d_sc, RAD_BF16, { 1 }), T(d_x, RAD_BF16, { M, NE }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n_embd", NE), PI("n_vocab", NV),
+                                PS("dtype", "bf16") };
+
+    auto launch = [&](const std::vector<int32_t>& ids, void* tab, void* x, hipStream_t st,
+                      void* inst) {
+        st_memcpy(d_tok, ids.data(), ids.size() * 4, hipMemcpyHostToDevice);
+        ts[1].data = tab;
+        ts[3].data = x;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        a.instance = inst;
+        return r->launch(&a, (RadStream)st);
+    };
+    auto check = [&](const char* stage, const std::vector<int32_t>& ids,
+                     const std::vector<uint8_t>& t, void* x, int rc) {
+        if (rc != RAD_OK) { bad += fmt("%s: rc=%d; ", stage, rc); return; }
+        std::vector<uint16_t> got((size_t)(M * NE));
+        st_memcpy(got.data(), x, got.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<uint16_t> want;
+        int64_t wrong = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            want_row(t, ids[(size_t)m], want);
+            for (int64_t i = 0; i < NE; ++i)
+                wrong += got[(size_t)(m * NE + i)] != want[(size_t)i];
+        }
+        if (wrong)
+            bad += fmt("%s: %lld of %lld entries differ; ", stage, (long long)wrong,
+                       (long long)(M * NE));
+    };
+
+    /* 16 ids, four to a set by the cache's own hash, so the second launch is warm across every
+     * way. Padding and an id past the table are in the mix from the collision stage on. */
+    std::vector<int32_t> by_set[4];
+    for (int32_t id = 0; id < NV; ++id)
+        by_set[((uint32_t)id * 2654435761u) & (sets - 1u)].push_back(id);
+    std::vector<int32_t> ids_fit((size_t)M);
+    for (int64_t m = 0; m < M; ++m)
+        ids_fit[(size_t)m] = by_set[m % 4][(size_t)((m / 4) % 4)];
+    std::vector<int32_t> ids_hit = ids_fit;
+    for (int64_t m = 16; m < M; ++m) ids_hit[(size_t)m] = ids_fit[(size_t)(m - 16)];
+
+    const char* prev = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    const bool had = prev != nullptr;
+    const std::string saved = had ? prev : "";
+    setenv("RADIANCE_PLE_VRAM_CACHE_SETS", std::to_string(sets).c_str(), 1);
+
+    void* inst = nullptr;
+    const int irc = r->init(nullptr, 0, 0, 1, &inst);
+    if (irc != RAD_OK || !inst) {
+        if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
+        else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        ok(what, false, "init allocated no cache: rc=" + std::to_string(irc));
+        return;
+    }
+
+    check("cold", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst));
+    check("warm", ids_hit, table, d_x, launch(ids_hit, d_tab, d_x, nullptr, inst));
+    check("warm again", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst));
+
+    /* 64 ids into 16 places, in eight different orders: every launch evicts. */
+    uint32_t rs = 0x51ed2701u;
+    for (int round = 0; round < 8; ++round) {
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) {
+            rs = rs * 1664525u + 1013904223u;
+            ids[(size_t)m] = (int32_t)((rs >> 8) % (uint32_t)NV);
+        }
+        ids[3] = -1;
+        ids[7] = (int32_t)NV;
+        ids[11] = -2;
+        check(fmt("collisions %d", round).c_str(), ids, table, d_x,
+              launch(ids, d_tab, d_x, nullptr, inst));
+    }
+
+    check("a second table", ids_fit, table2, d_x, launch(ids_fit, d_tab2, d_x, nullptr, inst));
+    check("back to the first table", ids_fit, table, d_x,
+          launch(ids_fit, d_tab, d_x, nullptr, inst));
+
+    /* Four streams, eight rounds: the same ids, so each stream's rows are the others' hits. */
+    hipStream_t st[4] = { nullptr, nullptr, nullptr, nullptr };
+    void* sx[4] = { dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)),
+                    dalloc((size_t)(M * NE * 2)), dalloc((size_t)(M * NE * 2)) };
+    bool streams_ok = true;
+    for (int s = 0; s < 4; ++s)
+        streams_ok = streams_ok && hipStreamCreate(&st[s]) == hipSuccess;
+    if (!streams_ok) {
+        bad += "hipStreamCreate failed; ";
+    } else {
+        for (int round = 0; round < 8; ++round) {
+            for (int s = 0; s < 4; ++s)
+                check(fmt("streams %d/%d", round, s).c_str(), ids_fit, table, sx[s],
+                      launch(ids_fit, d_tab, sx[s], st[s], inst));
+        }
+        for (int s = 0; s < 4; ++s) st_stream_sync(st[s]);
+        for (int s = 0; s < 4; ++s) hip_ck(hipStreamDestroy(st[s]), "hipStreamDestroy", __LINE__);
+    }
+
+    /* Freed and re-initialised: a cold cache again, on the same instance pointer or another. */
+    r->fini(inst);
+    void* inst2 = nullptr;
+    const int irc2 = r->init(nullptr, 0, 0, 1, &inst2);
+    if (irc2 != RAD_OK || !inst2) bad += "re-init allocated nothing; ";
+    else {
+        check("after a reset", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, inst2));
+        r->fini(inst2);
+    }
+
+    /* The default path, no instance, must agree with the cached one. */
+    check("no cache", ids_fit, table, d_x, launch(ids_fit, d_tab, d_x, nullptr, nullptr));
+
+    if (had) setenv("RADIANCE_PLE_VRAM_CACHE_SETS", saved.c_str(), 1);
+    else unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    ok(what, bad.empty(), bad);
+}
+
 /* ngram_ids' `ahead_ids`: the prompt following the step, hashed in the same launch. Step one runs
  * [5, 6] and [11, 42], with three more tokens of the last sequence, [7, 8, 9], in `tok` behind
  * them. Their ids must equal what step two computes for [7, 8, 9] against the window step one
@@ -23952,6 +24133,7 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     embed_lookup_q_case(pl);
+    ple_cache_case(pl);
     lora_case(pl);
 
     /* --- the paged cache's write side --- */

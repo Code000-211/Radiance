@@ -30,9 +30,12 @@
 #include "r4d_fp8_wmma.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace {
 
@@ -131,6 +134,149 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     } else {
         dst[0] = f32_to_bf16(v[0] * s);
     }
+}
+
+// ------------------------------------------------------------------ the PLE row cache
+//
+// The n-gram table (arch/common/rad_block_ple.h) is 51.2 GB of E4M3 rows, and with
+// --ngram-placement ram it lives in pinned host memory: every PLE gather then crosses the link and
+// decodes. Its rows recur -- a prompt's n-gram ids repeat across turns, and within one request
+// across the heads whose hashes collide -- so this keeps the decoded rows on the card, four ways a
+// set, and a hit neither crosses the link nor dequantises. The host side below says when it runs.
+//
+// One wave a row: a lane carries eight of the row's 160 entries, so the payload is one 16-byte
+// vector a lane and the tag check is one thread's work. The row width is the model's
+// (rad_block_ple.h) and the entry refuses other widths.
+constexpr uint32_t kPleRow = 160, kPleLanes = kPleRow / 8, kPleWays = 4;
+constexpr uint32_t kPleCacheThreads = 32;
+constexpr uint32_t kPleEmpty = 0u, kPleLoading = 1u, kPleReady = 2u;
+
+__device__ __forceinline__ uint32_t ple_set(int32_t id, uint32_t mask) {
+    return ((uint32_t)id * 2654435761u) & mask;
+}
+
+__device__ __forceinline__ uint32_t ple_pack2(float a, float b) {
+    return (uint32_t)f32_to_bf16(a) | ((uint32_t)f32_to_bf16(b) << 16);
+}
+
+/* The slot holding `id`, or -1. The loads are scoped atomics, so they read L2 and not the CU's own
+ * (non-coherent) L1, and each one invalidates that L1 for the payload reads that follow. */
+__device__ __forceinline__ int32_t ple_lookup(const int32_t* __restrict__ tags,
+                                              uint32_t* __restrict__ state, int32_t id,
+                                              uint32_t base) {
+    for (uint32_t w = 0; w < kPleWays; ++w) {
+        if (__hip_atomic_load(state + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) !=
+            kPleReady)
+            continue;
+        if (__hip_atomic_load(tags + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id)
+            return (int32_t)(base + w);
+    }
+    return -1;
+}
+
+/* Claims a way for `id`: an empty one, else the coldest of the four, so a row that keeps recurring
+ * outlives the rows around it. A way another writer holds (LOADING) is not a candidate, and a lost
+ * compare-and-swap means the choice went stale, so the scan repeats. Lane 0 only. */
+__device__ __forceinline__ int32_t ple_claim(int32_t* __restrict__ tags,
+                                             uint32_t* __restrict__ state,
+                                             uint32_t* __restrict__ heat, int32_t id,
+                                             uint32_t num_sets) {
+    const uint32_t base = ple_set(id, num_sets - 1u) * kPleWays;
+    for (uint32_t attempt = 0; attempt < kPleWays; ++attempt) {
+        uint32_t pick = kPleWays, coldest = 0xFFFFFFFFu;
+        for (uint32_t w = 0; w < kPleWays; ++w) {
+            const uint32_t st =
+                __hip_atomic_load(state + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (st == kPleEmpty) { pick = w; break; }
+            if (st != kPleReady) continue;
+            const uint32_t h =
+                __hip_atomic_load(heat + base + w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (pick == kPleWays || h < coldest) { pick = w; coldest = h; }
+        }
+        if (pick == kPleWays) continue;                 /* every way is being written */
+        const uint32_t want =
+            __hip_atomic_load(state + base + pick, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) ==
+                    kPleEmpty
+                ? kPleEmpty
+                : kPleReady;
+        if (atomicCAS((int*)(state + base + pick), (int)want, (int)kPleLoading) != (int)want)
+            continue;                                   /* another writer took it: choose again */
+        tags[base + pick] = id;
+        atomicExch(heat + base + pick, 4u);              /* a new row starts warm */
+        return (int32_t)(base + pick);
+    }
+    return -1;                                          /* four live writers: skip the insert */
+}
+
+/* One row a block. `state[slot]` is EMPTY, LOADING or READY, and `tags[slot]` is the row id, good
+ * only while READY. A writer claims a way by compare-and-swap (EMPTY or READY -> LOADING, so one
+ * writer owns a slot), writes the tag and the payload, fences, then publishes READY. A reader loads
+ * the payload, fences, and reads state and tag again: a slot claimed since the payload load reads
+ * as LOADING or carries another id, and a slot republished for the same id carries the same bytes.
+ * The fence matters -- an acquire fence alone lets a compiler sink the payload load past the check
+ * (measured), where a full one keeps it below. */
+__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags,
+    uint32_t* __restrict__ state, uint32_t* __restrict__ heat, uint8_t* __restrict__ data,
+    uint32_t num_sets) {
+    const uint32_t lane = threadIdx.x, m = blockIdx.x;
+    const int32_t id = tok[m] - vocab_off;
+    const bool keep = id >= 0 && id < n_vocab;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld;
+
+    int32_t slot = -1;
+    if (keep && lane == 0)
+        slot = ple_lookup(tags, state, id, ple_set(id, num_sets - 1u) * kPleWays);
+    slot = __shfl(slot, 0);
+
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (slot >= 0) {
+        if (lane < kPleLanes)
+            v = *(const uint4*)(data + (size_t)slot * (kPleRow * 2u) + (size_t)lane * 16u);
+        __threadfence();                   /* every lane's payload load is done before the recheck */
+        __syncwarp();
+        bool hit = false;
+        if (lane == 0)
+            hit = __hip_atomic_load(state + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) ==
+                      kPleReady &&
+                  __hip_atomic_load(tags + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id;
+        hit = __shfl((int)hit, 0) != 0;
+        if (hit) {
+            if (lane < kPleLanes) *(uint4*)(dst + (size_t)lane * 8u) = v;
+            if (lane == 0) atomicAdd(heat + slot, 1u);
+            return;
+        }
+    }
+
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    if (!keep) {
+        if (lane < kPleLanes) *(uint4*)(dst + (size_t)lane * 8u) = zero;
+        return;
+    }
+
+    /* Miss: decode the eight codes this lane carries, in the generic kernel's order and rounding. */
+    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    if (lane < kPleLanes) {
+        const uint2 q = *(const uint2*)(wte + (size_t)id * kPleRow + (size_t)lane * 8u);
+        const v2f a = r4d_fp8::e4m3_pk<false>(q.x), b = r4d_fp8::e4m3_pk<true>(q.x);
+        const v2f c = r4d_fp8::e4m3_pk<false>(q.y), d = r4d_fp8::e4m3_pk<true>(q.y);
+        v = make_uint4(ple_pack2(a.x * s, a.y * s), ple_pack2(b.x * s, b.y * s),
+                       ple_pack2(c.x * s, c.y * s), ple_pack2(d.x * s, d.y * s));
+        *(uint4*)(dst + (size_t)lane * 8u) = v;
+    }
+
+    int32_t islot = -1;
+    if (lane == 0) islot = ple_claim(tags, state, heat, id, num_sets);
+    islot = __shfl(islot, 0);
+    if (islot < 0) return;
+    if (lane < kPleLanes)
+        *(uint4*)(data + (size_t)islot * (kPleRow * 2u) + (size_t)lane * 16u) = v;
+    __threadfence();                       /* every lane's payload reaches L2 ... */
+    __syncthreads();                       /* ... before lane 0 publishes */
+    if (lane == 0)
+        __hip_atomic_store(state + islot, kPleReady, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -728,6 +874,125 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     return rc == RAD_OK ? 0 : -4;
 }
 
+/* ------------------------------------------------------------------ the PLE VRAM row cache
+ *
+ * Opt-in, off by default: RADIANCE_PLE_VRAM_CACHE_SETS names the set count (rounded down to a power
+ * of two, capped at kPleCacheMaxSets); 0 or absent allocates nothing and every gather runs the
+ * generic kernel above, unchanged. 65536 sets is 262144 rows of 320 B, 80 MiB of payload plus 2 MiB
+ * of tags, state and heat counters, and the init prints what it took.
+ *
+ * Why it can pay: with --ngram-placement ram the table is pinned host memory, so the gather reads
+ * 320 B a row over the link and dequantises it, per row and per rank. A row that recurs (a prompt
+ * re-read across turns, a head whose hash collides) is then free. Whether a workload's hit rate
+ * repays the insert traffic is a measurement this change does not make; there is no default on and
+ * no speed claim here (archive PR #2's 16x is an unverified ABI-16 number).
+ *
+ * Lifetime, identity, budget:
+ *   - one per resolved instance, from init() to fini() (rad_abi.h), which is one per PLE gather in
+ *     the program and one model load: a reload re-inits and starts empty, with no table to
+ *     identify.
+ *   - the table a launch passes is bound on the first launch. A launch handing a different table
+ *     bypasses the cache rather than rebinding, so one table's rows can never answer for another
+ *     and no launch has to clear 82 MiB. A cache whose instance outlives its table leaks nothing,
+ *     since the payload is never dereferenced again.
+ *   - the allocation happens in init, which runs before the VRAM budget reads the card, so it is
+ *     part of that budget's "already held" (core/mem/vram_budget.h) and not an unaccounted claim
+ *     on a pool; a failed allocation only leaves the cache off.
+ *
+ * The mechanism is the device kernel above (ple_embed_lookup_q_kernel). Its hit and miss paths
+ * write the same bytes as embed_lookup_q_kernel, which r4d_selftest's ple_cache case checks against
+ * a host gather at every stage: cold, warm, colliding, after a table change, and from four
+ * concurrent streams.
+ */
+struct PleVramCache {
+    int32_t*  tags  = nullptr;   /* row id per way, valid while state says READY */
+    uint32_t* state = nullptr;   /* EMPTY, LOADING or READY per way */
+    uint32_t* heat  = nullptr;   /* hit counter per way: the replacement policy's age */
+    uint8_t*  data  = nullptr;   /* kPleCacheRowBytes rows, decoded bf16 */
+    uint32_t  sets  = 0;
+    int       device = -1;
+    std::atomic<const void*> table{nullptr};
+};
+
+static void ple_cache_free(PleVramCache* c) {
+    if (!c) return;
+    (void)hipFree(c->data);
+    (void)hipFree(c->heat);
+    (void)hipFree(c->state);
+    (void)hipFree(c->tags);
+    delete c;
+}
+
+constexpr uint32_t kPleCacheWays     = 4;
+constexpr uint32_t kPleCacheRowBytes = 320;          /* 160 bf16, kPleRow above */
+constexpr uint32_t kPleCacheMaxSets  = 1u << 18;     /* 1,048,576 rows: 320 MiB of payload */
+
+static uint32_t ple_cache_sets_from_env() {
+    const char* e = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+    if (!e || !*e) return 0;
+    char* end = nullptr;
+    const long want = std::strtol(e, &end, 10);
+    if (end == e) return 0;
+    if (want <= 0) return 0;
+    long sets = 1;
+    while (sets * 2 <= want && (uint32_t)(sets * 2) <= kPleCacheMaxSets) sets *= 2;
+    return (uint32_t)sets;
+}
+
+extern "C" int r4d_rad_embed_lookup_q_init(const RadParam* p, int n_p, int rank, int world,
+                                           void** out) {
+    (void)p; (void)n_p; (void)rank; (void)world;
+    if (out) *out = nullptr;
+    const uint32_t sets = ple_cache_sets_from_env();
+    if (!sets) return RAD_OK;
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess) return RAD_OK;
+    PleVramCache* c = new (std::nothrow) PleVramCache();
+    if (!c) return RAD_OK;
+    c->sets = sets;
+    c->device = dev;
+    const size_t ways = (size_t)sets * kPleCacheWays;
+    const bool got = hipMalloc((void**)&c->tags, ways * sizeof(int32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->state, ways * sizeof(uint32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->heat, ways * sizeof(uint32_t)) == hipSuccess &&
+                     hipMalloc((void**)&c->data, ways * kPleCacheRowBytes) == hipSuccess;
+    if (!got || hipMemset(c->state, 0, ways * sizeof(uint32_t)) != hipSuccess) {
+        ple_cache_free(c);
+        std::fprintf(stderr, "[r4d] ple cache: device %d could not allocate %u sets; the gathers "
+                             "read the table as before\n", dev, sets);
+        return RAD_OK;
+    }
+    std::fprintf(stderr, "[r4d] ple cache: device %d holds %u sets x %u ways, %.1f MiB "
+                         "(%zu rows)\n", dev, sets, kPleCacheWays,
+                 (double)(ways * (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0), ways);
+    if (out) *out = c;
+    return RAD_OK;
+}
+
+extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
+    ple_cache_free((PleVramCache*)instance);
+}
+
+/* True when this launch may use `c` for `table`: the first table seen binds the instance, and any
+ * other leaves the cache alone. */
+static bool ple_cache_binds(PleVramCache* c, const void* table) {
+    const void* bound = c->table.load(std::memory_order_acquire);
+    if (!bound &&
+        c->table.compare_exchange_strong(bound, table, std::memory_order_acq_rel))
+        return true;
+    return bound == table;
+}
+
+static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, const void* sc,
+                                      bool sc_f32, uint16_t* x, long long M, int32_t n_vocab,
+                                      int32_t vocab_off, long long x_ld, PleVramCache* c,
+                                      RadStream stream) {
+    return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
+                    dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
+                    (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->state, c->heat, c->data,
+                    c->sets) == RAD_OK ? 0 : -4;
+}
+
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
                                            int n_vocab, int vocab_off, int x_ld, float scale,
                                            long stream) {
@@ -1234,6 +1499,18 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
     if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
+
+    /* The cached path needs the model's row width and a 16-byte row start; anything else (and the
+     * default, where no cache was allocated) takes the generic kernel above. */
+    PleVramCache* cache = (PleVramCache*)a->instance;
+    if (cache && cache->sets && q && n_embd == (long long)kPleRow && x_ld >= (long long)kPleRow &&
+        x_ld % 8 == 0 && M <= 0x7fffffffLL && r4d_aligned(x->data, 16) &&
+        r4d_aligned(wte->data, 4) && ple_cache_binds(cache, wte->data))
+        return embed_lookup_q_cached_emit((const int32_t*)r4d_addr(tok), (const uint8_t*)r4d_addr(wte),
+                                          sc ? (const void*)r4d_addr(sc) : nullptr,
+                                          sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
+                                          (int)n_vocab, (int)voff, x_ld, cache, stream) == 0
+                   ? RAD_OK : RAD_E_DEVICE;
 
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
                                sc ? (const void*)r4d_addr(sc) : nullptr,
