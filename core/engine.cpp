@@ -1601,11 +1601,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
-    if (cfg_.kld()) {
+    if (cfg_.kld() || cfg_.diagnose_mode()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.diagnose_mode() ? run_diagnose() : cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -1878,6 +1878,11 @@ std::string request_overrides(const Config& c) {
     return out;
 }
 }  /* namespace */
+
+SamplingParams Engine::sampling_defaults() const {
+    return resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
+}
+
 /* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
  * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
  * embedding program, and so do image, video and audio content parts unless the program declared an

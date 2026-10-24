@@ -356,6 +356,7 @@ became text." Never compare the two across that boundary.
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | installing, converting, serving, the HTTP API, operating a server |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | every flag of every tool, and the recipe syntax |
+| [`docs/DIAGNOSE.md`](docs/DIAGNOSE.md) | `--diagnose`: the engine measures itself, and what makes a run a measurement |
 | [`docs/DOCKER.md`](docs/DOCKER.md) | the image and the compose files |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | writing a kernel library, architecture or quantiser plugin, including one for another AMD card |
 | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | the supported model families and their geometry |

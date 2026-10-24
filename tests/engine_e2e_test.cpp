@@ -664,6 +664,111 @@ TEST(qwen35_preemption_by_recompute_changes_no_logit) {
  * the pool can hold, so it would wait at the head of the queue forever. The run is refused before
  * anything is scored, naming the document's length and the pool's. Bounded by a timeout, so the
  * wedge it guards against fails the case instead of hanging it. */
+/* The diagnose mode end to end: the real binary starts as a serve would, runs its own workload
+ * through the scheduler, and writes a report whose sections are the ones the report format
+ * declares. Its arithmetic is tests/diagnose_test.cpp's; this is that the driver runs at all, that
+ * every prompt was salted and the cache emptied (no request reports a cached token), and that a
+ * second run on the same build reproduces every request's tokens, which is what --diagnose-baseline
+ * compares. The numbers themselves are a card's measurement, not this test's.
+ *
+ * The model, the corpus and the baseline all live under a directory named after a marker: the
+ * report is pasted into issues, so no path of the machine may reach it, and a variable whose name
+ * is an allowed prefix plus a secret suffix must not be reported at all. */
+TEST(the_diagnose_mode_measures_itself_and_reproduces_its_tokens) {
+    World& w = world();
+    tiny::TempDir d("diagnose");
+    REQUIRE(d.ok());
+    const std::string private_dir = d / "MARKER-private-home";
+    REQUIRE_EQ(mkdir(private_dir.c_str(), 0755), 0);
+    const std::string model = private_dir + "/model.rad";
+    REQUIRE_EQ(symlink(w.llama_rad.c_str(), model.c_str()), 0);
+    const std::string corpus = private_dir + "/corpus.jsonl";
+    std::string body;
+    for (int i = 0; i < 3; ++i) {
+        tiny::Rng r(40 + i);
+        body += json{ { "category", "prose" }, { "prompt", words(r, 120) }, { "max_tokens", 8 } }
+                        .dump() + "\n";
+    }
+    REQUIRE(tiny::write_text(corpus, body));
+    /* One point of each sweep, one measured run: the driver's whole shape, quickly. */
+    const std::vector<std::string> shared = {
+        "--diagnose-corpus", corpus, "--diagnose-tokens", "8", "--diagnose-runs", "1",
+        "--diagnose-concurrency", "1", "--diagnose-prefill", "512",
+        "--max-model-len", "1024", "--max-num-seqs", "2", "--max-num-batched-tokens", "256" };
+    std::vector<std::string> a = { "--diagnose", d / "first" };
+    a.insert(a.end(), shared.begin(), shared.end());
+    const Ran r = radiance(model, a, { "RADIANCE_API_KEY_SYNTHETIC_SECRET_IN_NAME=x" }, 600);
+    REQUIRE_RAN(r);
+
+    std::string text;
+    {
+        const std::string path = d.path + "/first/diagnose.json";
+        FILE* f = std::fopen(path.c_str(), "rb");
+        REQUIRE(f != nullptr);
+        char buf[4096];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+    }
+    const json rep = json::parse(text, nullptr, false);
+    REQUIRE(rep.is_object());
+    for (const char* k : { "engine", "workload", "categories", "concurrency", "prefill",
+                           "interference", "environment", "not_measured", "verdict", "problems",
+                           "warnings" })
+        CHECK(rep.contains(k));
+    CHECK_EQ(rep["verdict"].get<std::string>(), std::string("valid"));
+    CHECK_EQ(rep["problems"].size(), (size_t)0);
+    /* Every point of the workload ran: three prose prompts once each, one stream, one 512-token
+     * prefill, and a prompt arriving into a running stream. A point the engine could not run is
+     * named in the report, never left as a zero. */
+    REQUIRE_EQ(rep["categories"].size(), (size_t)1);
+    const json& cat = rep["categories"][0];
+    CHECK_EQ(cat["prompts"].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(cat["runs"].size(), (size_t)3);
+    CHECK_EQ(rep["concurrency"].size(), (size_t)1);
+    CHECK_EQ(rep["concurrency"][0]["streams"].get<int64_t>(), (int64_t)1);
+    REQUIRE_EQ(rep["prefill"].size(), (size_t)1);
+    CHECK_EQ(rep["prefill"][0]["prompt_tokens"].get<int64_t>(), (int64_t)512);
+    CHECK(rep["interference"]["runs"][0]["arrival_ttft_ms"].get<double>() > 0);
+    CHECK(rep["interference"]["runs"][0]["interference"]["stall_ratio"].get<double>() > 0);
+
+    /* Salted and uncached, and the step ring lost nothing: the workload's own statement of its
+     * validity, checked afterwards from what each run recorded. */
+    int64_t cached = 0, lost = 0;
+    for (const json& run : cat["runs"]) {
+        cached += run["requests"]["cached_prompt_tokens"].get<int64_t>();
+        lost += run["steps"]["lost"].get<int64_t>();
+        CHECK(run["steps"]["recorded"].get<int64_t>() > 0);
+        CHECK(run["requests"]["outputs"][0].size() > 0);
+    }
+    CHECK_EQ(cached, (int64_t)0);
+    CHECK_EQ(lost, (int64_t)0);
+    /* Names, not values: the report is pasted into issues. */
+    for (const json& n : rep["environment"]["variables"])
+        CHECK(n.get<std::string>().find('=') == std::string::npos);
+    /* No path and no secret-suffixed name in either artifact of either run. */
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(text.find(marker) == std::string::npos);
+        CHECK(tiny::read_text(d.path + "/first/diagnose.md").find(marker) == std::string::npos);
+    }
+
+    /* The same build, the same workload: identical tokens, which is what the baseline compares. */
+    const std::string baseline = private_dir + "/baseline.json";
+    REQUIRE(tiny::write_text(baseline, text));
+    std::vector<std::string> b = { "--diagnose", d / "second", "--diagnose-baseline", baseline };
+    b.insert(b.end(), shared.begin(), shared.end());
+    const Ran r2 = radiance(model, b, {}, 600);
+    REQUIRE_RAN(r2);
+    const std::string json2 = tiny::read_text(d.path + "/second/diagnose.json");
+    const std::string md = tiny::read_text(d.path + "/second/diagnose.md");
+    CHECK(md.find("# Diagnosis") == 0);
+    CHECK(md.find("**Verdict: valid**") != std::string::npos);
+    CHECK(md.find("## Parity") != std::string::npos);
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(json2.find(marker) == std::string::npos);
+        CHECK(md.find(marker) == std::string::npos);
+    }
+}
+
 TEST(a_kl_document_longer_than_the_kv_pool_is_refused_up_front) {
     World& w = world();
     REQUIRE(w.ok);

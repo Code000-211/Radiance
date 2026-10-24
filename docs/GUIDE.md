@@ -1699,6 +1699,18 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `--kld-lora NAME` | run the documents through the `--lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
 | `--kld-lora-sources PREFIX` | with `--kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
 
+**Self-measurement**, instead of serving: a fixed workload, a report, an exit code; see [DIAGNOSE.md](DIAGNOSE.md)
+
+| flag | default | |
+|---|---|---|
+| `--diagnose DIR` | — | run a fixed workload instead of serving and write `DIR/diagnose.json` and `DIR/diagnose.md`: step times, tokens a step, draft acceptance, TTFT, emission intervals, jitter, by prompt category, concurrency and prefill depth |
+| `--diagnose-tokens N` | 256 | tokens a decode stream generates |
+| `--diagnose-runs N` | 3 | measured runs of each point, after one unmeasured |
+| `--diagnose-concurrency LIST` | 1,2,4,8 | stream counts of the concurrency sweep |
+| `--diagnose-prefill LIST` | 1024,4096,16384,65536 | prompt lengths of the prefill sweep |
+| `--diagnose-corpus FILE` | built-in | JSONL of category prompts |
+| `--diagnose-baseline FILE` | — | an earlier `diagnose.json`: compare every request's tokens with it |
+
 **Diagnostics**
 
 | flag | |

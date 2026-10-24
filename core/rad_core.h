@@ -894,6 +894,22 @@ struct Config {
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
 
+    /* ---------------- DIAGNOSIS (core/diag/diagnose.h, core/engine_diagnose.cpp) ----------------
+     *
+     * A mode, like the KL mode: the engine starts as it would to serve, then runs a fixed workload
+     * on itself -- decode by prompt category, a concurrency sweep, a prefill sweep with decode at
+     * each depth, a prompt arriving into running streams -- and writes DIR/diagnose.json and
+     * DIR/diagnose.md instead of listening. Every point is run once unmeasured and then
+     * `diagnose_runs` times. */
+    std::string diagnose;               /* --diagnose DIR */
+    int diagnose_tokens = 256;          /* --diagnose-tokens N: tokens a decode stream generates */
+    int diagnose_runs = 3;              /* --diagnose-runs N: measured runs a point */
+    std::vector<int> diagnose_concurrency = { 1, 2, 4, 8 };          /* --diagnose-concurrency */
+    std::vector<int> diagnose_prefill = { 1024, 4096, 16384, 65536 }; /* --diagnose-prefill */
+    std::string diagnose_corpus;        /* --diagnose-corpus FILE; empty is the built-in one */
+    std::string diagnose_baseline;      /* --diagnose-baseline FILE: an earlier diagnose.json to compare outputs with */
+    bool diagnose_mode() const { return !diagnose.empty(); }
+
     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
      * (one image is one pass) and sizes the encoder's activations. -1 is `auto`: the default below
      * when the container carries a vision tower and 0 when it does not. 0 serves text only and

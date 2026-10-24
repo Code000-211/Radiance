@@ -282,6 +282,29 @@ TEST(the_device_fakes_are_the_ones_linked) {
     rad_dev_free(p, RAD_MEM_DEVICE);
 }
 
+/* THE STEP RECORD EXISTS ONLY FOR --diagnose. Sizing the ring at every init put 2.5 MiB and a
+ * record a step on the serving path for a report nobody asked for. Off: no ring, no record. On:
+ * the ring and one record each of the three steps. */
+TEST(the_step_record_exists_only_with_diagnose) {
+    for (const bool on : { false, true }) {
+        Fixture f;
+        f.build();
+        if (on) f.cfg.diagnose = "/tmp/radiance-diagnose-not-written";   /* Scheduler only reads it */
+        CHECK_OK(f.start());
+        CHECK_EQ(f.sch.step_record_capacity(), on ? (size_t)(1u << 16) : (size_t)0);
+        f.submit(64, 8);
+        for (int i = 0; i < 3; ++i) {
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain();
+            f.sch.step_finished();
+        }
+        CHECK_EQ(f.sch.step_record_count(), on ? (uint64_t)3 : (uint64_t)0);
+        std::vector<rad::diag::StepRecord> out;
+        CHECK_EQ(f.sch.step_records(0, &out), (uint64_t)0);
+        CHECK_EQ(out.size(), on ? (size_t)3 : (size_t)0);
+    }
+}
+
 /* ================================================================== geometry + chunking */
 TEST(chunk_geometry_is_computed_not_configured) {
     Fixture f;

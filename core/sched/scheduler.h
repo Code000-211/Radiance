@@ -15,6 +15,7 @@
 #include "batch.h"
 #include "draft.h"
 #include "metrics.h"
+#include "diag/diagnose.h"
 
 #include <chrono>
 #include <memory>
@@ -184,6 +185,17 @@ public:
      * capacities, so steady state allocates nothing. */
     void     take_completed(std::vector<uint64_t>* out);
     int      reap(uint64_t id);
+
+    /* ---------------------------------------------------------- the step record (--diagnose)
+     *
+     * One diag::StepRecord per committed step, in a ring sized at init and only with --diagnose: a
+     * serving process keeps no ring and records nothing. A reader takes every step a phase ran --
+     * its shape and its time -- without a second clock. Both calls take the lock; `step_records`
+     * appends what came after `from` and returns how many of those the ring overwrote before they
+     * were read (diag/diagnose.h). */
+    uint64_t step_record_count() const;
+    size_t   step_record_capacity() const;   /* 0 without --diagnose */
+    uint64_t step_records(uint64_t from, std::vector<diag::StepRecord>* out) const;
 
     /* ---------------------------------------------------------- the lock, for the engine
      *
@@ -622,6 +634,13 @@ private:
      * throughput window; metrics() decays what it reports by this. */
     std::chrono::steady_clock::time_point last_step_at_ = std::chrono::steady_clock::now();
     int64_t step_prefill_tok_ = 0, step_decode_tok_ = 0;
+    /* The step record, picked once at init: with --diagnose the ring is sized and record_step is
+     * written into it, without it step_finished calls a no-op. One indirect call a step, no test
+     * of the mode and no ring on the serving path. Callers of step_finished hold mu_. */
+    void record_step(int64_t ns, int64_t end_ns);
+    void record_no_step(int64_t, int64_t) {}
+    void (Scheduler::*record_step_)(int64_t, int64_t) = &Scheduler::record_no_step;
+    diag::StepRing step_ring_;
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
      * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
