@@ -115,7 +115,7 @@ Times are wall clock on a 16-core (32-thread) host build with other work running
 | `e2e` | `engine_e2e_test`: the `radiance` binary serving tiny synthetic checkpoints on the host backend |
 | `kbench` | `kbench`, `kbench_moe` and `kbench_ref`, the kernel replays (below) |
 | `slow` | `kbench_ref`, `r4d_selftest` and `r4d_emu_attn_sweep` |
-| `gpu` | `device_test_card`, `mem_test_card`, `place_test_card`, `runtime_test_card`, `device_test_nosvm`, `r4d_selftest`, and `kbench`/`kbench_moe` when libr4d is built; one at a time, and a server must not hold the card |
+| `gpu` | `device_test_card`, `mem_test_card`, `place_test_card`, `runtime_test_card`, `device_test_nosvm`, `r4d_selftest`, and `kbench`/`kbench_moe` when libr4d is built; one at a time, and a server must not hold the card. Each takes `/tmp/radiance-tp2-bench.lock` exclusively (`RAD_GPU_LOCK`, `RAD_GPU_LOCK_WAIT`), the lock the measurement harnesses and the GPU job runner take: a pair already in use fails the entry instead of running beside it |
 | `oot` | `oot_plugins`: every bundled plugin rebuilt out of tree against an install |
 | `r4d_emu` | libr4d kernel sources run on the host by a SIMT emulator; registered where a clang++ is found |
 
@@ -160,7 +160,8 @@ The tests that check kernels:
   answers are cached under `$RADIANCE_HOME/cache/kbench` by `libref`'s build, so an unchanged
   `libref` replays in seconds.
 - `r4d_selftest` (labels `slow`, `gpu`) checks libr4d's fusions by `memcmp` against the unfused
-  kernels they replace.
+  kernels they replace. It forks a child per row and each child inherits the pair lock's file
+  descriptor, so the card stays held until the last row ends.
 - `avx_check` (fast) compares libavx with libref op by op at every ISA level the CPU supports.
 - `r4d_emu_*` (fast, `r4d_emu_attn_sweep` slow) run libr4d's kernels on the host: those with no
   libref oracle (the windowed attention, the sandwich-norm joins, expert_scale, pair_argmax), and

@@ -109,6 +109,22 @@ set(RAD_TEST_CARD_ENV "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home" ${RAD_TE
                       ${RAD_TEST_SAN_ENV})
 set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
+# The GPU pair's exclusive lock: the file the measurement harnesses and the GPU job runner take.
+# RESOURCE_LOCK below only serialises within one ctest invocation, so without this a selftest or a
+# replay opens the cards beside another agent's measurement and invalidates both. A busy pair fails
+# the entry at once rather than queueing behind it; raise RAD_GPU_LOCK_WAIT to wait instead.
+find_program(RAD_FLOCK flock)
+set(RAD_GPU_LOCK "/tmp/radiance-tp2-bench.lock" CACHE FILEPATH
+    "Exclusive lock every gpu-labelled test takes, shared with the GPU job runner")
+set(RAD_GPU_LOCK_WAIT 0 CACHE STRING
+    "Seconds a gpu-labelled test waits for the pair lock; 0 fails at once")
+if(RAD_FLOCK)
+  set(RAD_GPU_LAUNCHER ${RAD_FLOCK} --exclusive --wait ${RAD_GPU_LOCK_WAIT} ${RAD_GPU_LOCK})
+elseif(RAD_HIP_FOUND)
+  message(WARNING "no flock(1): gpu-labelled tests cannot take ${RAD_GPU_LOCK}, so they run beside "
+                  "other GPU users")
+endif()
+
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
@@ -231,7 +247,7 @@ set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
 # that commits device memory fails beside another holding it, or beside a server.
 if(RAD_HIP_FOUND)
   foreach(n device_test mem_test place_test runtime_test)
-    add_test(NAME ${n}_card COMMAND ${n} -perf_)
+    add_test(NAME ${n}_card COMMAND ${RAD_GPU_LAUNCHER} ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu
       SKIP_RETURN_CODE 77
@@ -324,7 +340,7 @@ endif()
 # the default `ctest` still runs it.
 if(RAD_HIP_FOUND AND TARGET r4d_selftest)
   add_test(NAME r4d_selftest
-           COMMAND r4d_selftest ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+           COMMAND ${RAD_GPU_LAUNCHER} r4d_selftest ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
   set_tests_properties(r4d_selftest PROPERTIES
     LABELS "slow;gpu"
     TIMEOUT 900
@@ -338,7 +354,7 @@ endif()
 # instead (core/device/aql.cpp, "pinned host memory, in pieces"). HSA_USE_SVM=0 forces that path, so
 # device_test runs a second time on the card under it.
 if(RAD_HIP_FOUND AND TARGET device_test)
-  add_test(NAME device_test_nosvm COMMAND device_test -perf_)
+  add_test(NAME device_test_nosvm COMMAND ${RAD_GPU_LAUNCHER} device_test -perf_)
   set_tests_properties(device_test_nosvm PROPERTIES
     LABELS gpu
     SKIP_RETURN_CODE 77
@@ -588,14 +604,16 @@ set_tests_properties(oot_plugins PROPERTIES
 # depth sweep's cases differ in their operand shapes and all run. OpenMP waits passively: the host
 # libraries' teams would otherwise spin between launches and starve what ctest -j runs beside them.
 set(RAD_KBENCH_LABELS "kbench")
+set(RAD_KBENCH_LAUNCHER "")
 if(RAD_HIP_FOUND AND TARGET libr4d)
   set(RAD_KBENCH_LABELS "kbench;gpu")
+  set(RAD_KBENCH_LAUNCHER ${RAD_GPU_LAUNCHER})
 endif()
 set(RAD_KBENCH_ROWS ${CMAKE_SOURCE_DIR}/data/kbench_rows)
 if(TARGET rad-kbench AND EXISTS ${CMAKE_SOURCE_DIR}/data/kernels.rkb)
   add_test(NAME kbench
-           COMMAND rad-kbench --home ${RAD_PLUGIN_OUT} --max-cases 1 --no-ref --strict
-                   --coverage ${RAD_KBENCH_ROWS})
+           COMMAND ${RAD_KBENCH_LAUNCHER} rad-kbench --home ${RAD_PLUGIN_OUT} --max-cases 1
+                   --no-ref --strict --coverage ${RAD_KBENCH_ROWS})
   # RESOURCE_LOCK: each replay budgets a fraction of the memory available when it starts, so two
   # at once would together exceed it. They would also share the last-level cache and skew --bench.
   set_tests_properties(kbench PROPERTIES
@@ -611,8 +629,8 @@ endif()
 # container it came from.
 if(TARGET rad-kbench AND EXISTS ${CMAKE_SOURCE_DIR}/data/kernels_moe.rkb)
   add_test(NAME kbench_moe
-           COMMAND rad-kbench --home ${RAD_PLUGIN_OUT} --max-cases 1 --no-ref --strict
-                   --coverage ${RAD_KBENCH_ROWS}
+           COMMAND ${RAD_KBENCH_LAUNCHER} rad-kbench --home ${RAD_PLUGIN_OUT} --max-cases 1
+                   --no-ref --strict --coverage ${RAD_KBENCH_ROWS}
                    --fixture ${RAD_PLUGIN_OUT}/kernels_moe.rkb)
   set_tests_properties(kbench_moe PROPERTIES
     LABELS "${RAD_KBENCH_LABELS}"
