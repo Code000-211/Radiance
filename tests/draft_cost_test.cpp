@@ -1296,6 +1296,74 @@ TEST(a_budget_that_resolves_another_plan_is_refused_by_field) {
     CHECK(has(first, "placement[0].residency"));
 }
 
+/* The placement string is a contract, not a heuristic: a rank that does not have the exact shape
+ * the engine writes is compared as a whole string. Anything else would bind a costs table to a
+ * placement nobody described -- the numbers are read as bytes, `dyn` as a flag and `res` as the
+ * sixteen-digit digest, and a value outside those bounds is not a budget that moved. */
+TEST(a_malformed_placement_rank_is_not_a_tolerated_budget) {
+    const std::string ok = "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff";
+    const char* bad[] = {
+        "all_vram vram=-1 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=9999999999999999999999999999999 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 dyn=4294967297 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=ff",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000fff",
+        "all_vram vram=100 host=0 file=0 dyn=2 res=00000000000000ff",
+        "all_vram vram=0100 host=0 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=100 host=0 file=0 res=00000000000000ff dyn=1",
+        "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff tail",
+        "all_vram vram=100 host=0 file=0 dyn=1",
+        "all_vram vram=100 host=-1 file=0 dyn=1 res=00000000000000ff",
+        "all_vram vram=+100 host=0 file=0 dyn=1 res=00000000000000ff",
+    };
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    std::string first;
+    DraftCostPlacementDrift drift;
+    for (const char* s : bad) {
+        /* Invalid on the runtime side: the profile is the well-formed one. */
+        a.placement = ok;
+        b.placement = s;
+        drift.budget = "sentinel";
+        CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+        CHECK(has(first, "placement profile=\"" + ok + "\""));
+        CHECK(!drift.budget_changed);
+
+        /* And with the sides swapped, so the profile is the invalid string. */
+        std::swap(a.placement, b.placement);
+        CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+        CHECK(has(first, "placement profile=\"" + std::string(s) + "\""));
+    }
+
+    /* A digest the engine never wrote is not equal to the same value written as sixteen digits. */
+    a.placement = ok;
+    b.placement = "all_vram vram=100 host=0 file=0 dyn=1 res=0000000000000ff";
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+}
+
+/* Both sides are validated in full before any rank may be tolerated: identical legacy ranks must
+ * not let a mixed old/new pair pass as a budget drift, because the second rank's shape is not one
+ * this build reads and its "vram" is not known to be the only difference. */
+TEST(a_mixed_legacy_and_current_placement_is_compared_whole) {
+    DraftCostFingerprint a = runtime_fingerprint(), b = a;
+    a.placement = "legacy;all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    b.placement = "legacy;all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff";
+    std::string first;
+    DraftCostPlacementDrift drift;
+    CHECK(!draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(has(first, "placement profile=\"legacy;all_vram vram=200"));
+    CHECK(!drift.budget_changed);
+
+    /* A fully current, fully parseable pair still binds on a budget-only difference. */
+    a.placement = "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff;"
+                  "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    b.placement = "all_vram vram=100 host=0 file=0 dyn=1 res=00000000000000ff;"
+                  "all_vram vram=200 host=0 file=0 dyn=1 res=00000000000000ff";
+    CHECK(draft_cost_fingerprint_same(a, b, &first, &drift));
+    CHECK(drift.budget_changed);
+    CHECK(has(drift.budget, "rank 0"));
+    CHECK(!has(drift.budget, "rank 1"));
+}
+
 /* What configure() does with that verdict: bind and report, or stay inactive and name the field. */
 TEST(the_table_binds_a_drifted_start_budget_and_names_it) {
     DraftCostProfile p;

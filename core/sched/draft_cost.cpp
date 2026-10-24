@@ -23,11 +23,11 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace rad {
 namespace {
@@ -458,23 +458,71 @@ struct PlacementRank {
     uint64_t    res = 0;
 };
 
-bool placement_rank_parse(const std::string& s, PlacementRank* out) {
-    char strategy[32] = { 0 };
-    long long vram = 0, host = 0, file = 0;
-    int dyn = 0;
-    unsigned long long res = 0;
-    char tail = 0;
-    /* Six assignments, then nothing after the digest (sscanf returns 6 when %c finds no input). */
-    if (std::sscanf(s.c_str(), "%31s vram=%lld host=%lld file=%lld dyn=%d res=%16llx%c", strategy,
-                    &vram, &host, &file, &dyn, &res, &tail) != 6)
-        return false;
-    out->strategy = strategy;
-    out->vram = (int64_t)vram;
-    out->host = (int64_t)host;
-    out->file = (int64_t)file;
-    out->dyn  = (int32_t)dyn;
-    out->res  = (uint64_t)res;
+bool take_prefix(std::string_view& s, std::string_view lit) {
+    if (s.size() < lit.size() || s.compare(0, lit.size(), lit) != 0) return false;
+    s.remove_prefix(lit.size());
     return true;
+}
+
+/* Decimal bytes as the engine writes them: no sign, no leading zero, and it has to fit an int64,
+ * so the drift difference below can never overflow. */
+bool take_bytes(std::string_view& s, int64_t* out) {
+    size_t n = 0;
+    while (n < s.size() && s[n] >= '0' && s[n] <= '9') ++n;
+    if (n == 0 || n > 19) return false;      /* 19 digits is INT64_MAX's width */
+    if (n > 1 && s[0] == '0') return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t d = (uint64_t)(s[i] - '0');
+        if (v > ((uint64_t)INT64_MAX - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    *out = (int64_t)v;
+    s.remove_prefix(n);
+    return true;
+}
+
+/* `%016llx`: exactly sixteen hex digits, nothing less (a short digest is not the plan's hash). */
+bool take_digest(std::string_view& s, uint64_t* out) {
+    if (s.size() < 16) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        const char c = s[i];
+        int d = 0;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | (uint64_t)d;
+    }
+    *out = v;
+    s.remove_prefix(16);
+    return true;
+}
+
+/* Fully consuming: the whole rank string must be that shape. A partial match is not a placement,
+ * and a fingerprint this build cannot read is compared as a whole string, never tolerated. */
+bool placement_rank_parse(const std::string& s, PlacementRank* out) {
+    std::string_view rest(s);
+    const size_t sp = rest.find(' ');
+    if (sp == std::string_view::npos || sp == 0) return false;
+    for (size_t i = 0; i < sp; ++i) {
+        const char c = rest[i];
+        const bool word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_';
+        if (!word) return false;
+    }
+    out->strategy.assign(rest.substr(0, sp));
+    rest.remove_prefix(sp);
+    if (!take_prefix(rest, " vram=") || !take_bytes(rest, &out->vram)) return false;
+    if (!take_prefix(rest, " host=") || !take_bytes(rest, &out->host)) return false;
+    if (!take_prefix(rest, " file=") || !take_bytes(rest, &out->file)) return false;
+    if (!take_prefix(rest, " dyn=") || rest.empty() || (rest[0] != '0' && rest[0] != '1'))
+        return false;
+    out->dyn = (int32_t)(rest[0] - '0');
+    rest.remove_prefix(1);
+    if (!take_prefix(rest, " res=") || !take_digest(rest, &out->res)) return false;
+    return rest.empty();
 }
 
 std::vector<std::string> placement_split(const std::string& s) {
@@ -495,7 +543,11 @@ std::vector<std::string> placement_split(const std::string& s) {
  * as `drift` for a warning instead of refusing the profile. Any other field, a different rank
  * count, or a string this build cannot parse is a real placement change and names the field.
  * A larger budget is treated exactly like a smaller one: only a different plan is a reason to
- * refuse. */
+ * refuse.
+ *
+ * Both sides are validated in full before any rank is tolerated, identical ranks included: a
+ * string that mixes an old (unparseable) rank with a new one must fail whole, or an identical
+ * legacy rank would let that mixed pair through as a budget drift. */
 bool placement_same(const std::string& a, const std::string& b, std::string* first,
                     DraftCostPlacementDrift* drift) {
     if (a == b) return true;
@@ -507,11 +559,16 @@ bool placement_same(const std::string& a, const std::string& b, std::string* fir
     const std::vector<std::string> pb = placement_split(b);
     if (pa.size() != pb.size()) return whole();
 
+    std::vector<PlacementRank> ra(pa.size()), rb(pb.size());
+    for (size_t i = 0; i < pa.size(); ++i)
+        if (!placement_rank_parse(pa[i], &ra[i]) || !placement_rank_parse(pb[i], &rb[i]))
+            return whole();
+
     std::string budget;
     for (size_t i = 0; i < pa.size(); ++i) {
         if (pa[i] == pb[i]) continue;
-        PlacementRank x, y;
-        if (!placement_rank_parse(pa[i], &x) || !placement_rank_parse(pb[i], &y)) return whole();
+        const PlacementRank& x = ra[i];
+        const PlacementRank& y = rb[i];
         auto field = [&](const char* name, const std::string& pv, const std::string& rv) {
             if (pv == rv) return false;
             if (first)
@@ -525,12 +582,16 @@ bool placement_same(const std::string& a, const std::string& b, std::string* fir
         if (field("dynamic", std::to_string(x.dyn), std::to_string(y.dyn))) return false;
         if (field("residency", fmt("%016llx", (unsigned long long)x.res),
                   fmt("%016llx", (unsigned long long)y.res))) return false;
-        /* Everything the plan resolved agrees; only the measured start budget differs. */
+        /* Everything the plan resolved agrees; only the measured start budget differs. Both
+         * values are non-negative int64, so the difference is taken unsigned: no overflow, and
+         * no negation of a signed minimum. */
         if (x.vram != y.vram) {
-            const long long d = (long long)y.vram - (long long)x.vram;   /* runtime - profile */
+            const uint64_t lo = (uint64_t)(x.vram < y.vram ? x.vram : y.vram);
+            const uint64_t hi = (uint64_t)(x.vram < y.vram ? y.vram : x.vram);
             budget += fmt("%srank %zu: start VRAM budget profile=%lld runtime=%lld (%s %s)",
                           budget.empty() ? "" : "; ", i, (long long)x.vram, (long long)y.vram,
-                          humanb(d < 0 ? -d : d).c_str(), d < 0 ? "smaller" : "larger");
+                          humanb((int64_t)(hi - lo)).c_str(),
+                          y.vram < x.vram ? "smaller" : "larger");
         }
     }
     if (!budget.empty() && drift) {
