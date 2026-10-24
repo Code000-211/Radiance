@@ -235,6 +235,13 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         o["steps_held"]      = m.steps_held;
+        /* What the mixed steps are made of, for a chunked-prefill A/B: `steps_mixed` alone says
+         * only that a step carried both kinds (docs/PREFILL-OVERLAP.md). */
+        o["steps_multi_prefill"]   = m.steps_multi_prefill;
+        o["decode_rows_mixed"]     = m.decode_rows_mixed;
+        o["prefill_rows_mixed"]    = m.prefill_rows_mixed;
+        o["prefill_tok_mixed"]     = m.prefill_tok_mixed;
+        o["prefill_rows_unstaged"] = m.prefill_rows_unstaged;
         /* Time inside steps. The one rate the page cannot derive: wall clock between polls also
          * covers idle time (see SchedMetrics::step_ns). */
         o["step_ns"]         = m.step_ns;

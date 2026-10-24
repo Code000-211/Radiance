@@ -89,6 +89,36 @@ struct StepPlan {
     int32_t max_q_len = 0;
     int32_t max_ctx_len = 0;
 
+    /* Whether the entries agree with the split: sequences [0, n_seq_decode) are the decode rows
+     * and the rest prefill chunks.
+     *
+     * This is the ordering that makes a mixed step's recurrent state correct rather than merely
+     * concurrent. Every block that treats the two kinds differently issues over each half as its
+     * own contiguous run (RadBatch::n_seq_decode), and the half a sequence lands in is what writes
+     * its state: the recurrent path, which rolls a rejected draft back, or the chunked scan, which
+     * has no rollback operand at all. A decode row left in the prefill half keeps its rejected
+     * drafts folded into the state and the conv window and verifies one token instead of several;
+     * a chunk moved into the decode half is stepped as a single token. Neither shows in the
+     * batch's shape afterwards.
+     *
+     * Scheduler::step sorts every plan this way (its `part_` partition). This is the same rule
+     * read back, which is what BatchBuilder::build checks before it turns a plan into device
+     * arrays. Only a MIXED plan carries a split at all: for a pure plan the phase decides which
+     * half every sequence is in (rad::batch_split), so a draft pass -- all decode rows, and
+     * n_seq_decode left zero by reset() -- answers true.
+     *
+     * `bad`, when given, gets the first entry that disagrees with the split, which is what the
+     * builder's refusal names. */
+    bool split_ordered(int64_t* bad = nullptr) const {
+        if (phase != RAD_PHASE_MIXED) return true;
+        for (size_t i = 0; i < e.size(); ++i)
+            if ((int64_t)i < n_seq_decode ? e[i].is_prefill : !e[i].is_prefill) {
+                if (bad) *bad = (int64_t)i;
+                return false;
+            }
+        return true;
+    }
+
     void reset() {
         e.clear();
         n_tok = 0; phase = RAD_PHASE_DECODE; draft_pass = 0; tok_shift = 0; n_spec = 0;

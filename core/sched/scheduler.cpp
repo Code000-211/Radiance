@@ -1529,11 +1529,25 @@ const RadBatch* Scheduler::step() {
     /* Phase from what was scheduled; the run phase indexes bucket tables by it. A step with one
      * prefill chunk is MIXED, not DECODE, or it would pick the skinny-GEMM band for a large
      * GEMM. */
-    bool any_pf = false; int64_t n_dec = 0;
-    for (const StepEntry& e : plan_.e) { if (e.is_prefill) any_pf = true; else ++n_dec; }
+    bool any_pf = false; int64_t n_dec = 0, n_pf = 0;
+    for (const StepEntry& e : plan_.e) { if (e.is_prefill) { any_pf = true; ++n_pf; } else ++n_dec; }
     plan_.phase = any_pf && n_dec ? RAD_PHASE_MIXED
                 : any_pf         ? RAD_PHASE_PREFILL
                                  : RAD_PHASE_DECODE;
+
+    /* What this step's shape is made of, for the mixed-step A/B (docs/PREFILL-OVERLAP.md). The
+     * counts say who rode with whom; `prefill_rows_unstaged` is the one that says whether the
+     * step was worth staging for -- the prefill stager arms on the pass's whole row count
+     * (PrefillStager::begin_pass), so a shared step held under its smallest pass reads every
+     * routed layer's pooled experts across the link inside the GEMMs, which is how sharing can
+     * cost the prefill more than it saves the decode. */
+    if (n_pf > 1) ++m_.steps_multi_prefill;
+    if (plan_.phase == RAD_PHASE_MIXED) {
+        m_.decode_rows_mixed += n_dec;
+        m_.prefill_rows_mixed += n_pf;
+    }
+    if (stage_rows_ > 0 && plan_.n_tok < stage_rows_)
+        m_.prefill_rows_unstaged += n_pf;
 
     /* Step-shape counters. `steps_mixed` / `steps` shows how often a step carries both kinds of
      * row. `decode_rows_unspeculated` counts every decode row that took no draft, whatever the
@@ -1870,6 +1884,11 @@ int Scheduler::commit(const StepResult& res) {
              * not at this sequence's next ensure(), which may be steps away. */
             kv_->trim_window(r.id, r.n_computed);
             step_prefill_tok_ += e.n_tokens;
+            /* Of the prefill, how much was computed in a step that also carried decode rows: the
+             * share of prefill throughput a mixed-step A/B attributes to sharing
+             * (docs/PREFILL-OVERLAP.md). Charged here, with the tokens that ran, not the ones the
+             * plan aimed at, so a step that failed to build charges nothing. */
+            if (plan_.phase == RAD_PHASE_MIXED) m_.prefill_tok_mixed += e.n_tokens;
             server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
                                          r.n_cached);
             /* Once, when the prompt is fully placed: the usage block's admission accounting.

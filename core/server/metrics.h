@@ -143,6 +143,11 @@ private:
      * rate over a window rather than an average dominated by startup. */
     Counter c_steps_prefill_, c_steps_mixed_, c_steps_decode_, c_rows_unspec_, c_steps_ahead_;
     Counter c_prefill_capped_, c_steps_held_;
+    /* What the mixed steps are made of (docs/PREFILL-OVERLAP.md): who rode with whom, how much of
+     * the prefill ran beside decode rows, and how many chunks rode in a step the prefill stager
+     * left unarmed. */
+    Counter c_steps_multi_pf_, c_rows_dec_mixed_, c_rows_pf_mixed_, c_tok_pf_mixed_,
+            c_rows_pf_unstaged_;
     /* Seconds inside a step, all shapes and decode-only. Wall clock over a step count is not a
      * step time (see SchedMetrics::step_ns). */
     Counter c_step_secs_, c_step_secs_decode_;

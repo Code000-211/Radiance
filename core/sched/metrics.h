@@ -44,6 +44,29 @@ struct SchedMetrics {
      * step (--busy-prefill-chunk). Zero under `off`. */
     int64_t prefill_chunks_capped = 0;
 
+    /* What the mixed steps are made of, for the A/B a chunk-against-chunk or chunk-against-decode
+     * change has to answer (docs/PREFILL-OVERLAP.md). `steps_mixed` alone says only that a step
+     * carried both kinds; these say how much of each, and whether the step was worth staging for.
+     *
+     *   steps_multi_prefill    steps carrying two or more prefill chunks, whether or not a decode
+     *                          row rode with them: prefill against prefill, the concurrency the
+     *                          question is about.
+     *   decode_rows_mixed      decode rows that rode in a mixed step, i.e. the rows sharing was
+     *                          meant to serve.
+     *   prefill_rows_mixed     prefill chunks that rode in a mixed step.
+     *   prefill_tok_mixed      prompt tokens computed inside a mixed step (charged when the step
+     *                          commits), against `prefill_tokens`: the throughput a shared step is
+     *                          charged with.
+     *   prefill_rows_unstaged  prefill chunks carried by a step too small for the prefill stager
+     *                          to arm (its rows are under its smallest pass), so every routed
+     *                          layer read its pooled experts synchronously. Zero with no stager.
+     */
+    int64_t steps_multi_prefill = 0;
+    int64_t decode_rows_mixed = 0;
+    int64_t prefill_rows_mixed = 0;
+    int64_t prefill_tok_mixed = 0;
+    int64_t prefill_rows_unstaged = 0;
+
     /* Cumulative nanoseconds spent inside steps, total and for decode steps only. Wall time over
      * a step count is not a step time: it charges idle gaps between requests to steps and mixes
      * prefill with decode. `step_ns_decode / steps_decode` is the decode step time. Measured from

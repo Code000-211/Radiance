@@ -811,6 +811,23 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         RAD_ERR("tree-layout speculation was requested but is not implemented in this build");
         return nullptr;
     }
+    /* A mixed step issues its recurrent state over its decode rows and its chunked scan over its
+     * prefill chunks, each half as a contiguous run, so the split is what decides which path a
+     * sequence's state is written by. StepPlan::split_ordered() is that rule read back; a plan
+     * that breaks it puts a row on the wrong path, which is wrong in a way no later stage can see
+     * (a rejected draft left folded into the state, or a chunk stepped as one token), so refuse
+     * the build instead of issuing it. Checked here rather than in the scheduler because this is
+     * where the split becomes device arrays a kernel cannot undo. */
+    int64_t bad = 0;
+    if (!plan.split_ordered(&bad)) {
+        RAD_ERR("mixed step plan entry %lld is a %s on the %s side of a split at %lld: every "
+                "sequence before the split must be a decode row and every one after it a prefill "
+                "chunk (Scheduler::step's sort)",
+                (long long)bad, plan.e[(size_t)bad].is_prefill ? "chunk" : "decode row",
+                bad < (int64_t)plan.n_seq_decode ? "decode" : "prefill",
+                (long long)plan.n_seq_decode);
+        return nullptr;
+    }
 
     Set& s = set_;
     const int64_t n_seq = (int64_t)plan.e.size();

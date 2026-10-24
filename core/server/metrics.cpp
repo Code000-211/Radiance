@@ -174,6 +174,11 @@ void Metrics::sample(const SchedMetrics& m) {
     c_prefill_capped_.advance_to(m.prefill_chunks_capped);
     c_steps_held_.advance_to(m.steps_held);
     c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
+    c_steps_multi_pf_.advance_to(m.steps_multi_prefill);
+    c_rows_dec_mixed_.advance_to(m.decode_rows_mixed);
+    c_rows_pf_mixed_.advance_to(m.prefill_rows_mixed);
+    c_tok_pf_mixed_.advance_to(m.prefill_tok_mixed);
+    c_rows_pf_unstaged_.advance_to(m.prefill_rows_unstaged);
     c_step_secs_.advance_to((double)m.step_ns * 1e-9);
     c_step_secs_decode_.advance_to((double)m.step_ns_decode * 1e-9);
     c_prefill_tokens_.advance_to(m.prefill_tokens);
@@ -373,6 +378,25 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_held_total",
               "Decode-only steps run after a prefill chunk while other sequences decode "
               "(--prefill-interleave).", L, c_steps_held_.get());
+    /* What the mixed steps are made of, for a chunked-prefill A/B (docs/PREFILL-OVERLAP.md):
+     * `steps_mixed` alone says only that a step carried both kinds. */
+    w.counter("radiance:engine_steps_multi_prefill_total",
+              "Scheduler steps carrying two or more prefill chunks, with or without decode rows.",
+              L, c_steps_multi_pf_.get());
+    w.counter("radiance:engine_decode_rows_mixed_total",
+              "Decode rows carried by a step that also carried a prefill chunk.",
+              L, c_rows_dec_mixed_.get());
+    w.counter("radiance:engine_prefill_rows_mixed_total",
+              "Prefill chunks carried by a step that also carried decode rows.",
+              L, c_rows_pf_mixed_.get());
+    w.counter("radiance:engine_prefill_tokens_mixed_total",
+              "Prompt tokens computed inside a step that also carried decode rows. Against "
+              "prefill_tokens_total it is the share of prefill a shared step is charged with.",
+              L, c_tok_pf_mixed_.get());
+    w.counter("radiance:engine_prefill_rows_unstaged_total",
+              "Prefill chunks carried by a step too small for the prefill stager to arm, so every "
+              "routed layer read its pooled experts synchronously.",
+              L, c_rows_pf_unstaged_.get());
     w.counter("radiance:decode_rows_unspeculated_total",
               "Decode rows that took no draft, for any reason.",
               L, c_rows_unspec_.get());
