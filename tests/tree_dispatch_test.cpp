@@ -15,7 +15,9 @@
  *     refused, so no row is ever conditioned on a token that is not on its path;
  *   - the commit names the winner path, counts the discarded branches and cuts at a stop token;
  *   - a commit the card's acceptance does not reproduce, a short pick buffer and a tampered staged
- *     layout are refused rather than emitted.
+ *     layout are refused rather than emitted;
+ *   - the untouched checks cover the tree's unused slots as well, which the whole-object
+ *     assignment writes, so a refusal that staged a tree cannot read as untouched.
  */
 #include "rad_test.h"
 
@@ -46,14 +48,25 @@ TreeStep sentinel_step() {
     s.root_pos    = -7;
     s.has_mask16  = true;
     s.tree.add(-1, 1234);
+    /* The tree's unused slots are part of the object `out->tree = tree` copies (all kTreeMaxNodes
+     * of them), so they are sentinelled too -- otherwise a write past node_count() compares
+     * equal to a stale zero and node_count() alone cannot show it. */
+    for (int32_t j = s.tree.node_count(); j < kTreeMaxNodes; ++j) {
+        s.tree[j].parent = -7;
+        s.tree[j].depth  = -7;
+        s.tree[j].token  = 0xdead0000u + static_cast<uint32_t>(j);
+        s.tree[j].ancestors.set();
+    }
     return s;
 }
 
 /* The tree itself: a refusal must not rewrite a node either. A token, parent, depth or ancestor
- * set the tree did not carry before is a half-staged tree that node_count() alone cannot show. */
+ * set the tree did not carry before is a half-staged tree that node_count() alone cannot show.
+ * Every kTreeMaxNodes slot is compared, not only the occupied ones: the regular whole-object
+ * assignment writes the unused slots as well. */
 bool tree_untouched(const CandidateTree& now, const CandidateTree& before) {
     if (now.node_count() != before.node_count()) return false;
-    for (int32_t j = 0; j < before.node_count(); ++j)
+    for (int32_t j = 0; j < kTreeMaxNodes; ++j)
         if (now[j].token != before[j].token || now[j].parent != before[j].parent ||
             now[j].depth != before[j].depth || now[j].ancestors != before[j].ancestors)
             return false;
@@ -125,6 +138,42 @@ TEST(the_switch_and_the_temperature_contract_refuse_before_anything_is_staged) {
         CHECK_EQ(step.positions[j], 100 + step.tree[j].depth);
     }
     CHECK(!staged_untouched(step, before));
+}
+
+/* The guard behind every refusal check above: the tree's unused slots belong to the object the
+ * admit path assigns whole (`out->tree = tree`), so a write past node_count() has to show. Without
+ * this, a refusal that staged a full tree would still read as untouched. */
+TEST(a_write_into_an_unused_tree_slot_shows_as_a_staged_change) {
+    const TreeStep before = sentinel_step();
+    TreeStep step = before;
+    CHECK_EQ(before.tree.node_count(), 1);
+    CHECK(staged_untouched(step, before));
+
+    step.tree[1].token = 4321;
+    CHECK(!staged_untouched(step, before));
+    step = before;
+    step.tree[1].parent = 0;
+    CHECK(!staged_untouched(step, before));
+    step = before;
+    step.tree[1].depth = 3;
+    CHECK(!staged_untouched(step, before));
+    step = before;
+    step.tree[kTreeMaxNodes - 1].token = 4321;
+    CHECK(!staged_untouched(step, before));
+    step = before;
+    step.tree[kTreeMaxNodes - 1].ancestors.reset();
+    CHECK(!staged_untouched(step, before));
+    step = before;
+    CHECK(staged_untouched(step, before));
+
+    /* A refusal on this step still leaves every slot, used or not, alone. */
+    uint32_t draft[2] = {51, 52};
+    CandidateTree t;
+    CHECK(t.build_linear(50, draft, 2));
+    std::string why;
+    CHECK_EQ(tree_dispatch_admit(t, 3, kVocab, 512, /*temp0=*/true, /*coupled=*/false, 0, &step,
+                                 &why), RAD_E_STATE);
+    CHECK(staged_untouched(step, before));
 }
 
 TEST(a_chain_tree_commits_token_for_token_what_the_serial_path_accepts) {
