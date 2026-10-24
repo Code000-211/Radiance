@@ -2173,6 +2173,14 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     d2.observe(2, 5);                 /* accepted past the draft is clamped, not counted */
     CHECK_EQ(d2.accepted(), 2);
     CHECK_EQ(d2.drafted(), 802);
+    /* The raw tally is cumulative over the whole sequence: the 100 probes contribute 0 (raw
+     * defaults to the committed prefix, and none were committed), the clamp probe contributes its
+     * clamped 2, this call its 2 compared -- 4 in total, and still >= accepted() (3), because the
+     * end-of-generation cut shortens the commitment, not the tally. */
+    d2.observe(2, 1, 2);
+    CHECK_EQ(d2.accepted(), 3);
+    CHECK_EQ(d2.raw_matches(), 4);
+    CHECK(d2.raw_matches() >= d2.accepted());
 
     /* Depth 0 is speculation off, and it configures. */
     DraftController d3;
@@ -3242,6 +3250,50 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
     CHECK_OK(f.kv.ensure(3, 80));
     build({ 1, 3 });      /* 3 staged in row 1, its marks taken there */
     build({ 1, 2, 3 });   /* and back in row 2, which still holds its old blocks */
+    bb.fini();
+}
+
+/* The bench's one-shot build failure (tests/sched_fakes.h): a build that has work to do fails
+ * exactly once, an empty plan does not spend the shot, and the next real build recovers. This is
+ * the seam the C/E regressions drive -- the builder's own refusal path, so no fault-injection
+ * switch has to exist in production. */
+TEST(a_failing_build_is_one_shot_and_spares_an_empty_plan) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 80));
+    StepPlan p;
+    auto plan_one = [&] {
+        p.reset();
+        StepEntry e;
+        e.seq = 1;
+        e.card = 0;
+        e.n_tokens = 1;
+        e.ctx_len = (int32_t)f.kv.seqs[1].n - 1;
+        p.e.push_back(e);
+        p.n_tok = 1;
+    };
+
+    plan_one();
+    CHECK(bb.build(p, f.kv, 0) != nullptr);   /* unarmed: the real builder accepts it */
+    sched_fail_next_build();
+    p.reset();
+    CHECK(bb.build(p, f.kv, 0) == nullptr);    /* an empty plan is not work; the shot survives */
+    plan_one();
+    CHECK(bb.build(p, f.kv, 0) == nullptr);    /* the owed build fails, once */
+    CHECK(bb.build(p, f.kv, 0) != nullptr);    /* and the next one recovers */
     bb.fini();
 }
 

@@ -135,6 +135,22 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* The cost policy's delivery ledger, cumulative. `RAD_OK` from the predictor is not evidence
+     * that a cycle taught anything: every row can be skipped by a recycled (req_id, slot_gen) and
+     * the call still succeeds -- and a cycle that never completed is never delivered at all. So
+     * the three row outcomes are counted apart, plus the cycles that were dropped instead of
+     * delivered (incomplete, evicted, or refused by the predictor). All zero while Cost is off. */
+    int64_t draft_obs_attempted = 0;   /* request/sequence rows of deliverable cycles offered to
+                                        * the predictor: one per row, not per token position */
+    int64_t draft_obs_applied = 0;     /* rows that applied a learning update (at least one
+                                        * position's state moved; not a promise the estimate
+                                        * changed numerically) */
+    int64_t draft_obs_skipped = 0;     /* rows that taught nothing */
+    int64_t draft_obs_discarded = 0;   /* cycles not delivered: incomplete or refused */
+    /* Valid observations handed to an inactive cost table: the deployment is observing, not
+     * learning. Zero while a profile is installed, so "nothing was absorbed" and "nothing was
+     * offered" cannot be read as the same fact. */
+    int64_t draft_obs_inactive = 0;
 };
 
 

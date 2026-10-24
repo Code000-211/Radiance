@@ -476,6 +476,11 @@ public:
     /* retire() then balance() for an idle rank, so a loan made while idle is filled before the
      * next request. Call only while the rank thread is parked. */
     int idle_tick(HeatEngine* heat);
+    /* Whether the start placement is materialised: the fill has run once since the loan and had
+     * nothing left to issue, and no copy it issued is still landing. A plan that never fills
+     * (static, or no lent slot) is settled from the start. Until this holds, a cycle measured is
+     * not a measurement of the start placement (Engine::start_placement_settled). */
+    bool fill_settled() const;
     /* Whether idle ticks keep the turnover slots filled; the engine holds them through a prompt
      * and the few steps after it (Engine::tiering_dispatch). */
     void hold_turnover(bool held) { hold_turnover_ = held; }
@@ -567,11 +572,17 @@ private:
         int64_t  pool_slot = -1;
         int64_t  to_slot = -1;
         RadEvent ev = nullptr;
+        /* A promotion the fill issued into a free slot, not a swap's decision. */
+        bool     fill = false;
+        /* ... and one issued before the first observation: the plan's own free slots, filled by
+         * layer because every heat was zero (HeatStats::initial_fill_promotions). */
+        bool     initial = false;
 
         void clear() {
             state = State::Free;
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
+            fill = initial = false;
         }
         /* Whether the move hands `slab_slot` back once its quarantine clears. */
         bool frees_slab() const { return kind != Kind::Promote && kind != Kind::Stage; }
@@ -655,6 +666,12 @@ private:
     /* balance()'s drop candidates, (heat, unit), kept between calls so a step allocates nothing. */
     std::vector<std::pair<float, int32_t>> drop_cand_;
     bool hold_turnover_ = false;
+    /* balance()'s own bookkeeping for fill_settled(): whether a fill has run since the mover was
+     * built, whether every class then had nothing left to issue, and whether the last fill()
+     * stopped for want of a move record (it resumes after the next retire). */
+    bool balanced_ = false;
+    bool fill_idle_ = true;
+    bool fill_more_ = false;
     /* donor_slot()'s candidates per class, by layer, each layer sorted coldest first (hottest at
      * the back). Ranked once per dispatch; `at` is that dispatch. */
     struct DonorRank { int at = -1; std::vector<std::vector<std::pair<float, int32_t>>> by_layer; };
@@ -721,8 +738,10 @@ private:
     int64_t donor_slot(size_t klass, int32_t layer, HeatEngine* heat);
     /* A donor out of a lent slot into a free budgeted one, if one is free: false when none is. */
     bool migrate(int32_t unit, HeatEngine* heat);
-    /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. */
-    int  promote_to(int32_t unit, int64_t slot);
+    /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. `fill`
+     * marks one the fill issued rather than a swap; `initial` one issued with no observation yet
+     * (HeatStats::fill_promotions / initial_fill_promotions). */
+    int  promote_to(int32_t unit, int64_t slot, bool fill = false, bool initial = false);
     /* Promote the hottest pooled units of one class into up to `room` free slots. */
     int  fill(size_t klass, int64_t room, HeatEngine* heat);
     void count_flex();

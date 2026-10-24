@@ -14,6 +14,8 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "draft_cost.h"
+#include "draft_predictor.h"
 #include "metrics.h"
 
 #include <chrono>
@@ -29,6 +31,10 @@ struct SchedReq {
     std::unique_ptr<Request> req;
     uint64_t arrival = 0;        /* monotonic; the tiebreak below priority. A preempted request
                                   * keeps it, so it re-enters ahead of later arrivals */
+    /* The slot's generation: bumped every time this SchedReq is handed to another request. A
+     * cost plan names (req_id, slot, gen) so a recycled slot is never read as the request the
+     * plan was written for (core/sched/draft_types.h). */
+    uint32_t gen = 0;
     int32_t  slot = -1;
     /* The card's index for this sequence: the StepSlot the advance reads and writes (advance.h),
      * and the sequence identity a batch carries. Not `slot`, which is taken on arrival and can
@@ -117,6 +123,31 @@ struct SchedReq {
     }
 };
 
+/* What the executing path did inside one step's cycle bracket. The engine sees the tape and the
+ * placement engines; the scheduler does not. `replay_known` stays false unless a caller that
+ * actually knows reports, so a state nobody established is Unknown rather than a measured None
+ * (draft_cost.h: the replay state is part of a sample's key). The engine freezes each field on the
+ * rank thread as the step's own pass returns (Engine::step_evidence), because the next step's ahead
+ * pass is released before this step is collected: a counter delta read here would describe that
+ * pass. */
+struct DraftStepEvidence {
+    bool        replay_known = false;
+    DraftReplay replay       = DraftReplay::Unknown;
+    bool        staged       = false;  /* the trunk pass armed the pooled experts through the ring */
+    bool        moved        = false;  /* the placement engine promoted or demoted */
+    /* Placement moves on every rank since the cost profile was bound, cumulative. The per-step
+     * `moved` above only covers the bracket it names: the scheduler's tier and arena ticks run
+     * after step_finished, so a move between two brackets would otherwise never be stamped on the
+     * bracket measured after it. > 0 means this run's residency is no longer the one the
+     * fingerprint names. */
+    int64_t     moves_since_bind = 0;
+    /* The start placement is not materialised yet: the plan's lent slots are still being filled
+     * (Engine::start_placement_settled). A bracket that ran while that fill was in flight measured
+     * a residency no profile names, even when nothing retired inside it -- the mover's own
+     * evidence only covers the bracket, and the fill's copies retire over many. */
+    bool        placement_unresolved = false;
+};
+
 class Scheduler {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
@@ -124,6 +155,7 @@ public:
     struct StepResult {
         int             n_seq = 0;
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
+        const int32_t*  n_raw = nullptr;       /* [n_seq] matches before the EOG cut, >= n_accepted */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
         /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its
@@ -144,10 +176,12 @@ public:
 
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
      * PrefixCache::configure runs first and needs its checkpoint interval; pass nullptr to
-     * resolve one here. */
+     * resolve one here. `pass_replay` is the state every pass of this deployment runs under, when
+     * the caller can evidence it (`None` for a runtime that cannot record); `Unknown` otherwise. */
     int  init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
               const std::vector<BatchBuilder::RankIO>& ranks,
-              const ChunkGeometry* geo = nullptr);
+              const ChunkGeometry* geo = nullptr,
+              DraftReplay pass_replay = DraftReplay::Unknown);
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
@@ -170,6 +204,10 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* The serial head's valid-history end for a sequence (`SchedReq::draft_filled`), or -1 when the
+     * id is not live. The watermark is otherwise only visible through the next history pass, which
+     * for a history-only row starts where the watermark already is. */
+    int64_t  draft_watermark(uint64_t id) const;
     /* Whether the request is still admitted and Running, read under the lock. For an evidence
      * line written after a step's wait, where the staging that named it is older than the wait. */
     bool     running(uint64_t id) const;
@@ -301,9 +339,9 @@ public:
     int             commit(const StepResult& r);
     /* Ends the step for timing; call once per loop iteration that ran a step, after the drafter,
      * so the draft rounds are charged to the step (see the definition). Without it the counters
-     * stay correct but there is no timing. */
-    void            step_finished();
-
+     * stay correct but there is no timing. `ev` is what only the caller can see: the replay state
+     * the tape ran in and whether placement changed inside the bracket. */
+    void            step_finished(const DraftStepEvidence& ev = DraftStepEvidence{});
     /* ---------------------------------------------------- the serial drafter (spec §10)
      *
      * A serial draft head (RAD_DRAFT_SERIAL) runs as extra steps after the trunk step that fed it,
@@ -312,12 +350,18 @@ public:
      *
      *   serial_begin   before commit(), right after the step is issued, while plan() describes it.
      *               Says which sequences may draft, reserves lookahead KV up to the furthest
-     *               position acceptance could reach, and clamps `rounds` to the current depth.
+     *               position acceptance could reach, and clamps `rounds` to the current depth and
+     *               then to the deepest row that still drafts. What it writes is the whole set of
+     *               passes to run: a round past it has no row, and none may be asked for.
      *   serial_batch   one batch per pass: 0 is the history, which also carries round 1 for the
-     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. Rows continuing
-     *               a sampled verify are device rows (advance.h): the card fills their positions
-     *               and tokens, so no pass waits on the host.
-     *   serial_end     after commit(), with the rounds that ran: moves the history watermark.
+     *               drafting rows (RadBatch::draft_out_ids), then rounds from 2. A round runs only
+     *               the rows whose frozen K reaches it, deepest first, so every round's rows are a
+     *               prefix of the snapshot and a row's depth is the last round it was in. Rows
+     *               continuing a sampled verify are device rows (advance.h): the card fills their
+     *               positions and tokens, so no pass waits on the host. A null return alone does not
+     *               say why; read serial_batch_failed() with it.
+     *   serial_end     after commit(), with the rounds that ran and whether the history pass did:
+     *               moves the history watermark.
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
      *               keeps n_draft 0 and the n-gram drafter fills in.
      */
@@ -329,8 +373,23 @@ public:
     int serial_begin(int* rounds, SerialRow* out, int max);
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
-     * round 0 carries it. Call serial_end() once the step has committed. */
-    void serial_end(int rounds_done);
+     * round 0 carries it. Call serial_end() once the step has committed.
+     *
+     * `history_ran` is the driver's word that the round-0 pass it built actually executed: a built
+     * batch is not a run pass (the cycle may be rejected, the build may come back null, the host
+     * pass may fail), and only the driver sees which. It defaults to false so a caller that cannot
+     * report the outcome repeats the history pass instead of claiming a watermark it did not earn. */
+    void serial_end(int rounds_done, bool history_ran = false);
+
+    /* Did the last serial_batch() fail to build a pass it owed? A null return alone conflates that
+     * with "nothing owed" (empty snapshot, round 1, a round no row reaches), and with a round-0
+     * history pass that no drafting row survives into. Not derivable from `n == 0`: the history a
+     * K0-only snapshot still owes is exactly what a row count cannot see. Set only where a pass
+     * was owed and no batch came back, so the driver can fail the cycle instead of reading the
+     * error as idleness. Cleared by serial_begin() and at every serial_batch() entry, so it speaks
+     * for the last call only. Orthogonal to `history_ran`: this is "could it be built", that is
+     * "did it run". */
+    bool serial_batch_failed() const;
 
     /* ----------------------------------------------------- the block drafter (spec §10)
      *
@@ -375,6 +434,37 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    /* The observation path's counters, and one request's learned state: what a test (or a
+     * deployment's diagnostics) reads to see the hooks are called, not merely configured. The
+     * state is meaningful only while the slot holds that (req_id, slot_gen). */
+    int64_t draft_cycles_done() const { return draft_cycles_done_; }
+    int64_t draft_cycles_dropped() const { return draft_cycles_dropped_; }
+    /* A's cost table -- what the cycle samples measured -- and how many samples its observe()
+     * refused. Read-only use is the step path's; a deployment (or a test) may configure the
+     * profile through the mutable form. */
+    const DraftCostTable& draft_costs() const { return draft_costs_; }
+    DraftCostTable&       draft_costs() { return draft_costs_; }
+    /* Delivers every cycle record that is already fully measured into the cost table -- the same
+     * close the shutdown path performs -- so a profile exported from a running engine is not
+     * missing the cycles still held in the observation ring. A pending row is closed as dropped,
+     * so this is exactly what shutdown would have recorded, only earlier. */
+    void flush_draft_observations();
+    int64_t               draft_cost_refused() const { return draft_cost_refused_; }
+    /* The engine's cumulative residency evidence since the profile was bound, handed in before it
+     * opens the next cycle. Same sticky rule step_finished applies inside a bracket: a move the
+     * scheduler's own ticks publish between two brackets leaves no per-step stamp, and a cycle
+     * priced after it would be priced on a placement the run has left. */
+    void                  draft_residency(int64_t moves_since_bind);
+    /* Set when a cost cycle was refused because no plan can price the run: the residency drifted
+     * from the profile, or the ladder's coverage gap makes the offered top unpriced where the named
+     * baseline would run deeper. Either way the run has no profile it can price with, and the
+     * engine ends it on its error path rather than drafting at the ceiling. Not a fallback
+     * admission; the table stays inactive. */
+    bool                  draft_cost_aborted() const { return draft_cost_aborted_; }
+    const DraftPredictState* draft_predict_state(int32_t slot) const {
+        if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;
+        return &draft_predict_state_[(size_t)slot];
+    }
     SchedMetrics         metrics() const;
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
@@ -467,11 +557,40 @@ private:
     }
 
     /* The window a sequence may draft into: the configured depth, or under the adaptive window
-     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use).
-     * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
-     * rounds in serial_begin(). With the policy off it is next_depth(). */
+     * min(D, its stop) (DraftController::window_for, which starts the estimate on first use), or
+     * under the cost policy what this cycle's frozen plan assigns it. Every site that caps a
+     * proposal applies it: step(), set_draft(), expect_draft() and the rounds in serial_begin().
+     * With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
+        if (draft_.cost_policy()) {
+            const int k = planned_k(s);
+            if (k >= 0) return k;
+            /* A plan is in force but does not name this row: it was admitted after the cycle
+             * opened and was not priced, so it drafts nothing this cycle. Only a cycle whose
+             * plan failed outright runs legacy. */
+            return draft_.plan() ? 0 : draft_.next_depth();
+        }
         return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+    }
+
+    /* Whether the plan bars the n-gram fallback from this row (draft_plan_bars_fill). A row the
+     * plan does not name is barred too while a plan is in force: k[] is the budget for every
+     * drafter, and an unpriced row has none. */
+    bool bars_fill(const SchedReq& s) const {
+        const DraftPlan* p = draft_.plan();
+        if (!p) return false;
+        if (!s.req) return true;
+        for (int32_t i = 0; i < p->n_seq; ++i)
+            if (p->req_id[i] == s.req->id && p->slot[i] == s.slot && p->slot_gen[i] == s.gen)
+                return draft_plan_bars_fill(*p, i);
+        return true;
+    }
+
+    /* This cycle's planned K for the request, or -1 when the cost policy is off or its plan
+     * does not name it. A planned 0 is a decision: the n-gram fallback must not fill it. */
+    int planned_k(const SchedReq& s) const {
+        if (!draft_.cost_policy() || !s.req) return -1;
+        return draft_.planned_k(s.req->id, s.slot, s.gen);
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
@@ -484,6 +603,131 @@ private:
      * allocate. */
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
+
+    /* The calibration recording (--draft-profile-out): the same decode rows and the same
+     * observation ring as the cost policy, opened under the legacy/adaptive decision instead.
+     * Recording never touches the controller's plan, so draft_cap()/bars_fill() and the Cost
+     * lock are exactly what they are without it: the ring's record is the only output, and the
+     * engine exports it after the run. Armed at init from Config::draft_profile_out. */
+    void    draft_record_cycle();
+    /* One view per decode row at this cycle's open; the cost policy's cycle and the recording
+     * read the same rows. Caller holds mu_. */
+    int32_t draft_fill_view();
+    bool    draft_record_ = false;
+    /* The serial head's executed depth: min(--num-speculative-tokens, the drafter's own). The
+     * recording synthesises each cycle's plan at this bound, because that is the deepest round
+     * the head can publish. */
+    int32_t draft_head_depth_ = 0;
+    /* The depth the previous recording cycle drafted, -1 before the first: the paired step verifies
+     * that window, which is what the record's plan carries as history rows. */
+    int32_t draft_record_prev_k_ = -1;
+    /* A cycle wider than the format's widest window was dropped; said once, counted after. */
+    bool    draft_record_over_rows_warned_ = false;
+
+    /* What every pass of this deployment does at the tape, from runtime evidence: `None` when the
+     * backend cannot record (every pass runs unkeyed), `Unknown` when a pass may play, record or
+     * audit. Copied into each cost cycle's view; see DraftBatchView::replay. */
+    DraftReplay draft_pass_replay_ = DraftReplay::Unknown;
+
+    /* The cost policy's cycle: fill a DraftBatchView from the decode rows, let the controller
+     * predict and choose, and keep the plan the rest of the cycle reads. Reserved at init, so
+     * the step path does not allocate. */
+    void    draft_cost_cycle();
+    std::vector<DraftSeqView>    draft_view_seq_;
+    std::vector<DraftPrediction> draft_pred_seq_;
+    std::vector<uint64_t>        draft_pred_id_;
+    DraftBatchView               draft_view_;
+    DraftPredictions             draft_preds_;
+    uint64_t                     draft_cycle_id_ = 0;
+    uint32_t                     slot_gen_ = 0;
+    bool                         draft_cost_failed_ = false;
+
+    /* The cost policy's two hooks, owned here: A's table and B's per-request predictor. The
+     * predictor keeps one state per request slot; `slot` is the request's for its whole life
+     * (preemption keeps it, only a new request bumps the generation), so an estimate survives a
+     * preempt/resume without the scheduler copying anything.
+     *
+     * A's table starts empty: no profile is loaded yet, so every estimate is invalid and the
+     * policy issues its named fallback. The sample that feeds it is the cycle ring's own record:
+     * step_finished() stamps the step bracket -- total_ms and the executed replay state the engine
+     * reports -- onto the open record, and draft_ring_close() hands that record to
+     * DraftCostTable::observe. The planner cannot time its own cycle, so the plan it produced
+     * says timing_valid = false; the ring's copy is the one the bracket makes valid. */
+    DraftCostTable                 draft_costs_;
+    DraftPredictModel              draft_predict_;
+    std::vector<DraftPredictState> draft_predict_state_;
+
+    /* The cycle ring: a plan stays alive from the cycle that issued it until the step that
+     * verifies its drafts has committed, so the observation names the same plan its rows came
+     * from. Fixed capacity, storage reserved at init: the step path allocates nothing. A record
+     * whose slot is reused is dropped and counted -- a cycle that never completed is not
+     * evidence (draft_observation_deliverable), so it is discarded rather than delivered. */
+    struct DraftCycleRecord {
+        DraftPlan plan;                          /* the copy the observer is handed */
+        std::vector<uint64_t>     id;
+        std::vector<int32_t>      slot;
+        std::vector<uint32_t>     gen;
+        std::vector<int32_t>      k;
+        std::vector<DraftDrafter> fill;
+        std::vector<int32_t>      ctx_class;
+        std::vector<int32_t>      history_tokens;
+        std::vector<DraftSeqObservation> seq;    /* one per plan row, accumulated */
+        std::vector<uint8_t>      sampled;       /* row i: its cycle sampled, not the argmax */
+        std::vector<uint8_t>      state;         /* row i: 0 pending, 1 reported, 2 dropped */
+        int32_t rows[RAD_SCHED_MAX_SPEC + 1] = {};
+        /* The step bracket, filled by step_finished(). `timed` is the honest gate: a step that
+         * was never bracketed has no total_ms and cannot be a measurement. */
+        double   total_ms = 0.0;
+        int32_t  prefill_tokens = 0;             /* prefill tokens that shared the step */
+        int64_t  admitted0 = 0;                  /* m_.admitted at open, for the admission flag */
+        DraftReplay replay = DraftReplay::Unknown;
+        uint8_t  placed = 0;                     /* placement changed inside the bracket */
+        bool     timed = false;
+        int32_t  n_seq = 0;
+        uint64_t cycle_id = 0;
+        bool     active = false;
+    };
+    /* Capacity in cycles, not in steps: a record is delivered at the next cycle's open, so one is
+     * in flight; the rest is a backstop for a cycle that never got another open. */
+    enum { kDraftRing = 4 };
+    DraftCycleRecord draft_ring_[kDraftRing];
+    /* The record this cycle's verify and publications belong to, 0 when the open failed. */
+    uint64_t         draft_ring_cur_ = 0;
+    int64_t          draft_cycles_done_ = 0;      /* observations the predictor accepted */
+    int64_t          draft_cycles_dropped_ = 0;   /* incomplete, evicted or refused */
+    bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
+    int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
+    bool             draft_cost_warned_ = false;
+    /* The run's residency diverged from the one the profile's fingerprint names (sticky): the
+     * scheduler's own ticks move units between brackets, where no per-step evidence reaches. Every
+     * record opened after the divergence is marked placed, so no cycle measured on the drifted
+     * placement can be priced or exported. */
+    bool             draft_drift_ = false;
+    /* A cost cycle was refused after the drift: the run cannot price and must not fall back to the
+     * ceiling, so the next planning site reports it and the engine stops. One-way. */
+    bool             draft_cost_aborted_ = false;
+
+    /* The one sticky drift decision, shared by step_finished (the bracket that just closed) and
+     * draft_residency (before the next cycle opens). Requires mu_. */
+    void draft_drift_note(int64_t moves_since_bind);
+
+    /* The row's label provenance (whose window the verify measured) is stamped at report time;
+     * see draft_ring_report(). */
+    void draft_ring_open(const DraftPlan& plan);
+    DraftCycleRecord* draft_ring_cycle(uint64_t cycle_id);
+    void draft_ring_publish(const SchedReq& s, int32_t generated, int32_t published,
+                            DraftOrigin origin);
+    void draft_ring_report(const SchedReq& s, const StepEntry& e, int32_t accepted,
+                           uint64_t raw_match);
+    void draft_ring_drop_row(uint64_t req_id, int32_t slot, uint32_t gen);
+    void draft_ring_close(uint64_t cycle_id);
+    /* Close every record still open, delivering the ones already fully measured and counting the
+     * rest as dropped. Idempotent; the scheduler calls it at shutdown and at fini, so the last
+     * completed cycle reaches the predictor before its request identities are released. */
+    void draft_ring_flush();
+    /* Hand one resolved record to A: the executed distribution, the verify window that ran, the
+     * step bracket and the evidence step_finished() stamped on it. */
+    void draft_cost_observe(DraftCycleRecord& r);
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
@@ -573,6 +817,9 @@ private:
         /* Its index among the drafting rows, or -1 for a row that only owes history (e.g. a
          * sequence mid-prompt, with hidden states but no token to draft from). */
         int32_t        draft_idx = -1;
+        /* The depth this cycle gave the row, fixed at serial_begin: draft round r > 1 runs only
+         * the rows with k >= r, and the driver freezes each row's depth from the rounds it saw. */
+        int32_t        k = 0;
         /* No Request* here, as for BlockSeq: serial_batch reads serial_ after the lock was
          * released and retaken. */
         /* The furthest position round 1 can write at: the verify step's last position, reached
@@ -581,6 +828,8 @@ private:
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
+    /* The last serial_batch() owed a pass and built none; see serial_batch_failed(). */
+    bool                serial_failed_ = false;
 
     /* The block drafter's rows, valid between block_begin() and block_end(): one per entry of the
      * trunk step just run, in order, with `ctx_len`/`n_tokens` mirroring it. The drafter reads

@@ -1146,7 +1146,7 @@ bool Mover::migrate(int32_t unit, HeatEngine* heat) {
     return true;
 }
 
-int Mover::promote_to(int32_t unit, int64_t slot) {
+int Mover::promote_to(int32_t unit, int64_t slot, bool fill, bool initial) {
     UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
     const int rec = free_move_record();
@@ -1166,13 +1166,23 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
+    m.fill = fill;
+    m.initial = initial;
     ++copying_[(size_t)unit];
     stats_.h2d_bytes += (uint64_t)us.bytes;
     return RAD_OK;
 }
 
 int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
+    fill_more_ = false;
     if (room <= 0) return RAD_OK;
+    /* Before the first observation every heat is zero, so this fill's units are the plan's own
+     * free lent slots, taken by layer. The start loan is settled before serving (Engine::serve),
+     * so at zero dispatches this call can only be that first fill, under that loan: its unit set
+     * and amount are a function of the plan and the lent slots, both in the fingerprint. After
+     * one observation it is a heat decision, and the placement it resolves is not the plan's
+     * (HeatStats). */
+    const bool initial = !heat || heat->stats().dispatches == 0;
     struct Cand { float h; int32_t layer; int32_t unit; };
     std::vector<Cand> cand;
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
@@ -1213,9 +1223,10 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
             const int64_t slot = pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
             if (slot < 0) return RAD_OK;
             if (heat) heat->set_busy(u, true);
-            if (promote_to(u, slot) < 0) {                   /* no record left: next time */
+            if (promote_to(u, slot, /*fill=*/true, initial) < 0) {   /* no record left: next time */
                 pools_[klass].slab.add_free(slot);
                 if (heat) heat->set_busy(u, false);
+                fill_more_ = true;
                 return RAD_OK;
             }
             ++issued;
@@ -1230,6 +1241,7 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
 int Mover::balance(HeatEngine* heat, bool turnover) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
+    bool idle = true;   /* no class had anything left to fill once this call was done */
     for (size_t c = 0; c < pools_.size(); ++c) {
         ClassPools& cp = pools_[c];
         if (cp.flex_ptr.empty()) continue;
@@ -1333,14 +1345,39 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             }
         }
         /* A drain and a fill in the same call fight: the fill would take the slots the drain is
-         * trying to hand back. */
-        if (drained) continue;
+         * trying to hand back. The class is not settled either -- the next call fills what the
+         * drain frees. */
+        if (drained) {
+            idle = false;
+            continue;
+        }
 
         /* ---- Then fill every free slot past the working reserve and the turnover slots. */
         RAD_TRY(fill(c, cp.slab.n_free() - cp.n_work - turn, heat));
+        if (fill_more_) idle = false;
     }
+    fill_idle_ = idle;
+    balanced_   = true;
     count_flex();
     return flush_moves();
+}
+
+bool Mover::fill_settled() const {
+    if (!plan_ || !plan_->dynamic || flex_capacity() <= 0) return true;
+    if (!balanced_ || !fill_idle_) return false;
+    /* A copy the fill issued would still change the tier map after this answer. Once it has
+     * published it has set the tier; the quarantine that follows guards issued kernels only. */
+    for (const Move& m : moves_)
+        if (m.state == Move::State::Copying && m.fill) return false;
+    /* The turnover slots are part of the start placement, and the idle balance keeps them free.
+     * Answering "materialised" with covered lent slots empty is what made
+     * Engine::start_placement_settled() resolve there and freeze the drift exemption before the
+     * reserve was filled: the first step's fill then read as moves. Complete_start_fill holds
+     * turnover to fill them; only a class whose free covered slots are down to its working
+     * reserve is settled. */
+    for (const ClassPools& cp : pools_)
+        if (cp.slab.n_free() > cp.n_work) return false;
+    return true;
 }
 
 int Mover::idle_tick(HeatEngine* heat) {
@@ -1511,7 +1548,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.tier = Tier::VRAM;
                 us.site = Site::Device;
                 ++stats_.promotions;
-                if (heat) heat->set_tier(m.unit, Tier::VRAM);
+                if (heat) heat->set_tier(m.unit, Tier::VRAM, m.fill, m.initial);
                 break;
             case Move::Kind::Demote:
                 /* Out of a lent slot, the unit was a donor (donor_slot): any other unit there is

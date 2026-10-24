@@ -19,6 +19,12 @@
 #include <thread>
 #include <vector>
 
+/* The transport's last moment before httplib's accept loop: the socket is bound and the routes are
+ * registered, but is_running_ is not set yet. A stop requested here has no listener to close; the
+ * listener must consume it when it starts. The default is the production no-op; a test binary
+ * links a strong definition that stops exactly here. */
+extern "C" __attribute__((weak)) void rad_test_before_listen() {}
+
 namespace rad {
 namespace server {
 
@@ -382,10 +388,13 @@ struct HttpTransport::Impl {
 HttpTransport::HttpTransport() : impl_(new Impl) {}
 HttpTransport::~HttpTransport() { stop(); }
 
-void HttpTransport::stop() { if (impl_) impl_->svr.stop(); }
+void HttpTransport::stop() {
+    if (!impl_) return;
+    impl_->svr.stop();
+}
 
-/* 0 until the accept loop runs: before that httplib's stop() is a no-op, and a caller that
- * stopped a server it believed up would wait forever. */
+/* 0 until the accept loop runs: a caller that stopped a server it believed up would otherwise
+ * wait on a port nothing is listening on. */
 int HttpTransport::port() const {
     return impl_ && impl_->svr.is_running() ? impl_->port.load() : 0;
 }
@@ -743,7 +752,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     });
 
     /* Bind once: binding a named port and then any port would leave the first socket bound and
-     * unused. */
+     * unused. A stop that arrived before this point is remembered by the listener and consumed
+     * when it starts (httplib's stop_requested_), so nothing here has to look for it. */
     const int port = o.port == 0 ? svr.bind_to_any_port(o.host.c_str())
                      : svr.bind_to_port(o.host.c_str(), o.port) ? o.port : -1;
     if (port <= 0) {
@@ -753,7 +763,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     impl_->port.store(port);
     RAD_INFO("server: listening on http://%s:%d (%d threads, up to %zu)", o.host.c_str(), port,
              nt, most);
-    return svr.listen_after_bind() ? RAD_OK : RAD_E_IO;
+    rad_test_before_listen();
+    const bool ok = svr.listen_after_bind();
+    return ok ? RAD_OK : RAD_E_IO;
 }
 
 }  /* namespace server */

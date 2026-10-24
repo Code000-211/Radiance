@@ -15,6 +15,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
+
 /* A loopback connection that gives up on a read after `timeout_s`, or -1. */
 static int dial(int port, int timeout_s) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -97,6 +102,92 @@ struct LiveServer {
         return send_all(fd, send) ? fd : -1;
     }
 };
+
+/* A stop requested before the listener runs is not lost.
+ *
+ * The engine stops the server from its watcher, which may run while the transport is still
+ * registering its routes; httplib's stop() only closes a listening socket and is a no-op before
+ * its accept loop. A transport that is asked to stop first (the same call, before run()) must
+ * return instead of serving a listener nothing can stop. Nothing here is timed: a stop that is
+ * dropped leaves run() blocked in the accept loop forever, and the bounded wait below is only
+ * how that failure is reported. */
+TEST(a_stop_before_the_listener_runs_is_remembered) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.host = "127.0.0.1";
+    o.port = 0;
+    o.n_threads = 2;
+    o.max_seqs = 2;
+    o.default_max_tokens = 32;
+    Server srv(d, o);
+
+    srv.stop();
+    std::promise<int> ran;
+    std::future<int> done = ran.get_future();
+    std::thread run([&] { ran.set_value(srv.run()); });
+    if (done.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        std::fprintf(stderr, "transport_test: run() did not return after a stop requested before "
+                             "the listener ran: the stop was dropped and the accept loop is "
+                             "waiting for one\n");
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    run.join();
+    CHECK_EQ(done.get(), RAD_OK);
+}
+
+/* The transport calls this on the serve thread after binding and registering the routes, and
+ * before httplib's accept loop sets is_running_. The case below arms it once, so it stops exactly
+ * in that window; every other serve in this binary sees null. */
+static Server* g_stop_before_listen = nullptr;
+extern "C" void rad_test_before_listen() {
+    if (Server* s = g_stop_before_listen) {
+        g_stop_before_listen = nullptr;
+        s->stop();
+    }
+}
+
+/* A stop that arrives after the routes are registered and the socket is bound, but before httplib
+ * marks the listener running, is delivered rather than dropped.
+ *
+ * This is the window the engine's watcher races: the socket is bound, the routes are registered,
+ * and httplib's stop() still sees is_running_ == false, so it closes nothing. The seam above stops
+ * exactly there, once, on the serve thread. A stop that only reaches a listener already marked
+ * running leaves run() blocked in the accept loop; the bounded wait below reports that as the
+ * failure it is. */
+TEST(a_stop_before_the_accept_loop_starts_is_delivered) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.host = "127.0.0.1";
+    o.port = 0;
+    o.n_threads = 2;
+    o.max_seqs = 2;
+    o.default_max_tokens = 32;
+    Server srv(d, o);
+
+    g_stop_before_listen = &srv;
+    std::promise<int> ran;
+    std::future<int> done = ran.get_future();
+    std::thread run([&] { ran.set_value(srv.run()); });
+    if (done.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        std::fprintf(stderr, "transport_test: run() did not return after a stop requested between "
+                             "the bind and the accept loop: the stop was dropped and the listener "
+                             "is waiting for another one\n");
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    run.join();
+    g_stop_before_listen = nullptr;  /* the hook has run; never arm a later case */
+    CHECK_EQ(done.get(), RAD_OK);
+}
 
 /* The pool outgrows the admission ceiling. A generation holds its connection's worker while it
  * runs, so a pool no larger than the ceiling fills before admission refuses anyone: the 429 never

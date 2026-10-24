@@ -25,6 +25,7 @@
 #include "util/stallwatch.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -37,7 +38,79 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef RAD_TEST_HOOKS
+/* Test-build-only seam: tests/CMakeLists.txt compiles the engine units a second time, for one test
+ * binary alone, with RAD_TEST_HOOKS. The loop calls this once per step, at the point where the
+ * step is issued and its completion flag reset but the wait has not run -- the one place where a
+ * driver outside the loop can see what the previous step left, what the reset left, and the history
+ * watermark before the finish moves it, and where it can withhold the step's completion proof.
+ * tests/engine_loop_test.cpp defines it strongly. rad_core is never compiled with RAD_TEST_HOOKS,
+ * so the production library carries neither this definition nor the call in any configuration. */
+extern "C" __attribute__((weak)) void rad_test_step_point(int step, int rows, bool prior_complete,
+                                                          bool complete) {
+    (void)step; (void)rows; (void)prior_complete; (void)complete;
+}
+
+/* The same test copy's second seam: called once in serve(), after the scheduler is initialised and
+ * before any rank or the stepper runs, so a driver can put one request in while there is no
+ * concurrent access. tests/engine_loop_test.cpp defines it strongly; the weak definition keeps
+ * every other test build that compiles these units linkable. */
+extern "C" __attribute__((weak)) void rad_test_serving() {}
+
+/* The same test copy's third seam: the evidence handed to Scheduler::step_finished, after the
+ * step's join and before the scheduler stamps it. A driver checks that what a step's cycle is keyed
+ * by is that step's own -- the ahead pass has run by now -- rather than reading the same fields off
+ * the engine, which would restate the call. tests/engine_loop_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) void rad_test_step_evidence(int step, int replay_known, int replay,
+                                                            int staged, int moved) {
+    (void)step; (void)replay_known; (void)replay; (void)staged; (void)moved;
+}
+
+/* A placement move a fixture triggers in the release it names: the rank loop adds the value to the
+ * heat counters tiering_dispatch reads, so a host run without a tiered plan can still be the
+ * mover. `what` is the release (kIssueAll/kIssueModel/kIssueSampler). tests/engine_loop_move_test.cpp
+ * defines it strongly. */
+extern "C" __attribute__((weak)) int64_t rad_test_tiering_moves(int rank, int32_t step, int what) {
+    (void)rank; (void)step; (void)what;
+    return 0;
+}
+
+/* The third seam: the server's running state, reported from run_server()'s watcher once
+ * Server::port() turns nonzero. That is the first moment a stop is one the transport accepts --
+ * before it, httplib's stop() closes nothing and the signal is dropped (core/server/http.cpp). A
+ * driver binds its one stop to this rather than to the signal handler's disposition, which is
+ * installed before run() and so says nothing about whether a stop would survive. */
+extern "C" __attribute__((weak)) void rad_test_serving_ready(int port) { (void)port; }
+
+/* A placement move a fixture publishes while the engine idles, where no rank thread runs and no
+ * host plan can raise the heat counters: the engine's cumulative count adds it, so the move
+ * between two brackets can be replayed. tests/engine_cost_drift_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int64_t rad_test_residency_moves() { return 0; }
+
+/* The start placement's resolve, forced by a fixture whose rank has no mover to fill: 0 leaves
+ * Engine::start_placement_settled() alone, > 0 keeps it unresolved. tests/engine_cost_drift_test.cpp
+ * defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_placement_unresolved() { return 0; }
+
+/* A start fill that fails, injected by a fixture whose real mover cannot be made to fail on the
+ * host: < 0 makes Engine::complete_start_fill return it before the first wave. 0 leaves the fill
+ * alone. tests/engine_start_fill_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_start_fill_error() { return RAD_OK; }
+
+/* The startup loan tick's failure, injected for the same reason: the fixture has no cache plan a
+ * refused offer could come from. < 0 makes Engine::loan_tick return it before it moves anything;
+ * 0 leaves the tick alone. tests/engine_start_fill_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) int rad_test_loan_tick_error() { return RAD_OK; }
+
+/* The destructor's drain seam, called twice: stage 0 after the compute streams are drained and
+ * before the buffers a pass may still read are freed, stage 1 after those frees. A driver asks
+ * the device allocator whether each allocation is still live at both points, so the case observes
+ * the order itself instead of restating it. tests/engine_dtor_order_test.cpp defines it strongly. */
+extern "C" __attribute__((weak)) void rad_test_dtor_stage(int stage) { (void)stage; }
+#endif
 
 namespace rad {
 
@@ -58,24 +131,9 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
-     * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
-     * allocator is per device. */
-    for (const auto& r : ranks_) {
-        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
-        const float* d = cvec_views_[(size_t) r->index].dir;
-        if (!d) continue;
-        if (rad_dev_set(r->device) < 0) continue;
-        rad_dev_free((void*) d, RAD_MEM_DEVICE);
-        cvec_views_[(size_t) r->index].dir = nullptr;
-    }
-    cvec_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
-    for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
-    if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
-    for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
     /* The tiering summary, here for the same reason, and only for a dynamic plan. Its per-layer
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */
@@ -96,6 +154,33 @@ Engine::~Engine() {
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
+#ifdef RAD_TEST_HOOKS
+    rad_test_dtor_stage(0);
+#endif
+    /* Only now, after the drain, free what a pass may still be reading. The control vector's
+     * per-rank direction copies are kernel operands uploaded at declare, outside any arena, so
+     * nothing else frees them; each is freed with its rank's device bound, since the allocator
+     * is per device. The pinned host targets are copy destinations of the compute streams.
+     * Ctx::shutdown waits on both streams (and destroys the ones it owns) before returning, so
+     * the frees are ordered behind the wait; freed before it, a step aborted between an async
+     * copy and its sync unpinned memory the card was still writing. The sync's result is still
+     * dropped, as it was before: a failed drain is reported and then stepped over, so a failed
+     * wait still reaches these frees. That gap is unchanged here. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
+        const float* d = cvec_views_[(size_t) r->index].dir;
+        if (!d) continue;
+        if (rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        cvec_views_[(size_t) r->index].dir = nullptr;
+    }
+    cvec_views_.clear();
+    for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
+    for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
+#ifdef RAD_TEST_HOOKS
+    rad_test_dtor_stage(1);
+#endif
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
@@ -273,6 +358,14 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     (void)r.mover.balance(&r.heat, !hold);
 }
 /* ------------------------------------------------------------------ the rank thread */
+#ifdef RAD_TEST_HOOKS
+void Engine::test_set_stager(OpStager* s) {
+    /* Every rank, as bringup does (engine_bringup.cpp): a pass and its evidence are per rank, and
+     * a stager attached to one only would leave the others answering for a pass it never armed. */
+    for (auto& r : ranks_) r->ctx.set_stager(s);
+}
+#endif
+
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
     if (r.ctx.bind_thread() < 0) {
@@ -297,6 +390,7 @@ void Engine::rank_loop(int index) {
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
+            const int64_t moves_before = r.ev_moves_before;
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -325,13 +419,193 @@ void Engine::rank_loop(int index) {
             /* Behind the pass, once a step: see tiering_dispatch. */
             if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
 
+            /* Freeze what this step's passes did, keyed by the step that ran them. Read here, on
+             * the thread and right after the passes: the next step's ahead pass is released before
+             * this one is collected, so a delta read at collect time would report it. The stager
+             * is per pass, which is why the trunk pass's Ctx record is what carries it; the tape
+             * is merged over every pass of the step (Ctx::last_pass_tape), and `moved` spans from
+             * the counters prepare_release snapshotted to here, the step's own window including
+             * its tiering dispatch.
+             *
+             * A sampler-only release runs the tiering dispatch of a step issued ahead and notes
+             * too, while the record still names that step: without it, a step with no draft pass
+             * (a shared-KV head whose plan drew K=0) would lose its move -- the next release's
+             * base is already the ahead step's. The merge is idempotent, so the repeat of the
+             * trunk pass's own facts costs nothing. */
+            int64_t injected = 0;
+#ifdef RAD_TEST_HOOKS
+            if (s >= 0) injected = rad_test_tiering_moves(index, b->step, what);
+#endif
+            const Ctx::StepEvidence rec = r.ctx.last_step_evidence();
+            if (s >= 0 && (what != kIssueSampler || rec.step == b->step)) {
+                const HeatStats hs = r.heat.stats();
+                /* The same count prepare_release snapshots: a bracket in which the initial fill
+                 * retires is the start placement being materialised, not left, so it is not
+                 * stamped `moved` either (HeatStats::moves, Engine::rank_fill_exempt). */
+                int64_t moves = hs.moves(rank_fill_exempt(r, hs.initial_fill_promotions)) + injected;
+                r.note_evidence(rec, r.ctx.last_pass_tape(), moves > moves_before);
+            }
+
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
     }
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
+bool Engine::step_evidence(int32_t step, DraftStepEvidence* out) const {
+    if (!out) return false;
+    bool known = false;
+    for (const auto& r : ranks_) {
+        const Rank::StepSnap& s = r->ev[(uint32_t)step & 3u];
+        if (s.step != step) continue;   /* this rank never ran the step: not evidence of None */
+        known = true;
+        out->staged = out->staged || s.staged;
+        out->moved  = out->moved  || s.moved;
+        if (s.tape == Ctx::kStepTapeRecord) out->replay = DraftReplay::Record;
+        else if (s.tape == Ctx::kStepTapeAudit && out->replay != DraftReplay::Record)
+            out->replay = DraftReplay::Audit;
+        else if (s.tape == Ctx::kStepTapePlay &&
+                 (out->replay == DraftReplay::Unknown || out->replay == DraftReplay::None))
+            out->replay = DraftReplay::Play;
+        else if (s.tape == Ctx::kStepTapeNone && out->replay == DraftReplay::Unknown)
+            out->replay = DraftReplay::None;
+    }
+    out->replay_known = known;
+    return known;
+}
+
+int64_t Engine::rank_fill_exempt(const Rank& r, uint64_t initial) const {
+    /* A fill before the first observation is the plan's own free lent slots -- zero heat, so by
+     * layer -- being materialised into memory the plan left free: the start placement being
+     * reached, not left. Once the resolve closes, each rank's count is frozen there
+     * (settle_start_placement), so a fill issued later is a move. Nothing is re-baselined: a move
+     * before the resolve keeps counting. */
+    return draft_placement_resolved_.load(std::memory_order_relaxed)
+               ? r.fill_exempt.load(std::memory_order_relaxed)
+               : (int64_t)initial;
+}
+
+int64_t Engine::residency_moves() const {
+    int64_t moves = 0;
+    for (const auto& r : ranks_) {
+        const HeatStats hs = r->heat.stats();
+        moves += hs.moves(rank_fill_exempt(*r, hs.initial_fill_promotions));
+    }
+#ifdef RAD_TEST_HOOKS
+    moves += rad_test_residency_moves();
+#endif
+    return moves;
+}
+
+bool Engine::start_placement_settled() const {
+#ifdef RAD_TEST_HOOKS
+    if (rad_test_placement_unresolved() > 0) return false;
+#endif
+    for (const auto& r : ranks_)
+        if (!r->mover.fill_settled()) return false;
+    return true;
+}
+
+void Engine::settle_start_placement() {
+    draft_placement_resolved_.store(true, std::memory_order_relaxed);
+    for (const auto& r : ranks_)
+        r->fill_exempt.store((int64_t)r->heat.stats().initial_fill_promotions,
+                             std::memory_order_relaxed);
+    /* The loaded profile is a measurement of the residency that is now in place; from here on a
+     * cycle may be priced by it. Nothing was priced before. */
+    const auto lk = sched_.hold();
+    sched_.draft_costs().hold_prices(false);
+}
+
+int Engine::complete_start_fill() {
+    /* One idle tick is one wave. The idle balance keeps the turnover slots free (hold_turnover_
+     * false), so only a balance that holds turnover fills them; held, the same call fills the
+     * reserve. A wave a drain cut short, or one whose records moves in flight still hold, repeats.
+     * Serve completes that here, at zero dispatches and before the first observation, so every
+     * promotion is the plan's own lent slot (HeatStats::initial_fill_promotions) and the residency
+     * the profile is bound to is the materialised one. Left for a later step the reserve would be a
+     * heat decision and read as a move (Mover::balance).
+     *
+     * The first wave runs whatever fill_settled() answers: a mover with nothing lent yet answers
+     * settled without a balance that held the reserve. Completion is only proven after one, and a
+     * fill that cannot settle within the wave bound is an error -- serve reports it instead of
+     * measuring a placement it never reached. */
+    constexpr int kWaves = 256;
+#ifdef RAD_TEST_HOOKS
+    if (const int injected = rad_test_start_fill_error(); injected < 0) return injected;
+#endif
+    for (auto& r : ranks_) {
+        const int ds = rad_dev_set(r->device);
+        if (ds < 0) return ds;
+        r->mover.hold_turnover(true);
+        int st = RAD_OK;
+        for (int wave = 0; wave < kWaves; ++wave) {
+            if (RadStream ts = r->mover.transfer_stream()) {
+                st = rad_stream_sync(ts);
+                if (st < 0) return st;
+            }
+            st = r->mover.idle_tick(&r->heat);
+            if (st < 0) return st;
+            if (r->mover.fill_settled()) break;
+        }
+        if (!r->mover.fill_settled()) {
+            RAD_ERR("rank %d: the start placement's fill did not settle in %d waves", r->index,
+                    kWaves);
+            return RAD_E_FULL;
+        }
+    }
+    if (!ranks_.empty()) (void)rad_dev_set(ranks_[0]->device);
+    return RAD_OK;
+}
+
+int Engine::prepare_serving() {
+    /* The start placement's loan, before anything is measured. With no request yet, the cache's
+     * spare is its whole carve minus one prefill chunk, so this offer is a function of the plan,
+     * the KV carve and max_tok -- not of request timing. Settling it now is what makes the fill
+     * that follows the plan's own free lent slots: it is issued here, before the first
+     * observation, so it orders by layer at zero heat instead of by what the run has routed. A
+     * first fill issued only after the first step would be a heat decision and never the start
+     * placement (Mover::fill, HeatStats::initial_fill_promotions), and the fingerprint below
+     * names this loan and the slots it covers -- the two facts that make the fill a function of
+     * the identity. */
+    const bool identity_bound = cfg_.draft_policy == DraftPolicyKind::Cost ||
+                                !cfg_.draft_profile.empty() || !cfg_.draft_profile_out.empty();
+    const int loan_st = loan_tick(/*idle=*/true);
+    if (identity_bound && loan_st < 0) {
+        RAD_ERR("serve: the start loan did not move: %s", rad_strerror(loan_st));
+        return loan_st;
+    }
+    /* Complete the fill before anything is measured. The identity derived below and the profile
+     * read against it name the residency this materialises; a wave left for later would land at
+     * heat, after the first observation, and be a move away from that identity. Only an
+     * identity-bound run takes that stake: a legacy run without a profile runs no completion and
+     * keeps its startup tick, so nothing is priced or profiled for it. The predicate it shares
+     * (`Mover::fill_settled`) is reserve-aware for every dynamic plan, and its idle balance keeps
+     * the reserve free, so it does not resolve before the first step: only a post-step balance that
+     * holds turnover fills the reserve.
+     *
+     * The fill's own error is serve's: a start placement that did not materialise must not fall
+     * through to a fingerprint, a profile or a price. */
+    if (identity_bound) {
+        const int st = complete_start_fill();
+        if (st < 0) {
+            RAD_ERR("serve: the start placement's fill did not complete: %s", rad_strerror(st));
+            return st;
+        }
+    }
+    /* Validated before any path starts serving: a calibration run that cannot export must say so
+     * now, not after a complete run. */
+    return begin_draft_calibration();
+}
+
 int Engine::prepare_release(const RadBatch* b) {
+    /* The placement counters when this step's window opens, before the arena level's recall can
+     * move a unit: the rank thread reports `moved` for the step from here (Rank::ev_moves_before),
+     * so a later step's reclaim cannot stand in for this one. */
+    for (auto& rk : ranks_) {
+        const HeatStats hs = rk->heat.stats();
+        rk->ev_moves_before = hs.moves(rank_fill_exempt(*rk, hs.initial_fill_promotions));
+    }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -401,6 +675,20 @@ int Engine::step_loop() {
      * device; the backend's current device is thread-local and starts at device 0. */
     if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("step loop: could not bind rank 0's device");
+    /* The cost profile's fingerprint names the residency at start. Every cycle's move evidence is
+     * reported against this count, so a move between two brackets still invalidates what follows
+     * it (Scheduler::step_finished). The start placement's own fill is not part of the count
+     * (residency_moves), so it may retire after this baseline without reading as a move. A plan
+     * that fills nothing is settled here; one that does stays unresolved -- and unpriced -- until
+     * its fill has landed (settle_start_placement). */
+    draft_placement_resolved_.store(start_placement_settled(), std::memory_order_relaxed);
+    if (draft_placement_resolved_.load(std::memory_order_relaxed)) {
+        settle_start_placement();
+    } else {
+        const auto lk = sched_.hold();
+        sched_.draft_costs().hold_prices(true);
+    }
+    draft_moves_baseline_ = residency_moves();
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
@@ -419,6 +707,11 @@ int Engine::step_loop() {
     while (!stopping_.load(std::memory_order_acquire)) {
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
+        /* The profile is bound to the residency the run started on. Read the cumulative evidence
+         * here -- the rank threads are parked at the barrier, so no rank writes -- and before the
+         * cycle below opens: the mover's idle tick publishes its move after step_finished, and a
+         * cycle priced before this read would be priced on the placement the run has left. */
+        sched_.draft_residency(residency_moves() - draft_moves_baseline_);
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
          * step ahead while a request waits, and a request with unencoded media waits. */
         if (!ahead && sched_.encodes_pending()) {
@@ -429,6 +722,15 @@ int Engine::step_loop() {
         ahead = nullptr;
         if (issued) sched_.promote_next();
         else        b = sched_.step();
+        /* A cycle whose policy ended on a refused plan -- a residency drift, or a shape the
+         * ladder cannot price -- is refused above; the run stops here, on the engine's existing
+         * error path, instead of drafting the rest of it at the ceiling. */
+        if (sched_.draft_cost_aborted()) {
+            RAD_ERR("draft cost: no cycle can be priced on this run (the residency does not match "
+                    "the profile, or the ladder cannot price this shape); stopping instead of "
+                    "drafting at the ceiling");
+            return fail_loop(RAD_E_STATE);
+        }
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
@@ -448,7 +750,14 @@ int Engine::step_loop() {
             }
             tier_tick();
             expire_tick(rad_mono_ns());
-            loan_tick(/*idle=*/true);
+            (void)loan_tick(/*idle=*/true);
+            /* The start placement is materialised once the fill has nothing left to issue and
+             * every copy it issued has retired. Only here, where no bracket is open: a resolve
+             * that flipped inside a bracket would stamp that bracket with a placement it ran
+             * without, and the evidence is consumed brackets later. */
+            if (!draft_placement_resolved_.load(std::memory_order_relaxed) &&
+                start_placement_settled())
+                settle_start_placement();
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -491,6 +800,14 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+#ifdef RAD_TEST_HOOKS
+        /* What the previous step left, read before the reset below. The step point in front of
+         * collect_step reports it beside the value the reset leaves. */
+        const bool rad_test_prior_complete = so.complete;
+#endif
+        /* StepOut outlives the step (it is the loop's), so last step's completion must not be
+         * readable as this one's before any wait has run. */
+        so.complete = false;
         if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
@@ -714,6 +1031,9 @@ int Engine::step_loop() {
          * commit. The card runs straight on while the host waits, commits and stages. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+#ifdef RAD_TEST_HOOKS
+        rad_test_step_point(b->step, (int)so.n_rows, rad_test_prior_complete, so.complete);
+#endif
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
@@ -762,6 +1082,7 @@ int Engine::step_loop() {
         Scheduler::StepResult res{};
         res.n_seq      = (int)plan.e.size();
         res.n_accepted = so.accepted.data();
+        res.n_raw      = so.raw_match.data();
         res.token      = so.token.data();
         res.eos        = so.eos.data();
         if (!so.lp.empty()) {
@@ -781,15 +1102,40 @@ int Engine::step_loop() {
                                               : run_block_drafter(b->step);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
-         * (Scheduler::step_finished). */
-        sched_.step_finished();
+         * (Scheduler::step_finished). What the tape and the placement engines did inside that
+         * bracket goes with it: the scheduler cannot see either, and a state nobody established
+         * must reach A as Unknown, not as a measured None. The evidence is the one the rank
+         * threads froze for this exact step (note_evidence), not a counter delta read now -- the
+         * next step's ahead pass has been released since. A step no rank reported is Unknown. */
+        DraftStepEvidence ev;
+        /* No rank ran a pass for this step (a sampler-only release with nothing issued ahead):
+         * Unknown, so A excludes the sample instead of pricing it as undisturbed. */
+        if (!step_evidence(b->step, &ev)) ev = DraftStepEvidence{};
+        /* The per-step fields above describe this bracket; the residency is cumulative, so a move
+         * the scheduler's own ticks made between two brackets still reaches the bracket measured
+         * after it. Fills are not moves (residency_moves). */
+        ev.moves_since_bind = residency_moves() - draft_moves_baseline_;
+        ev.placement_unresolved = !draft_placement_resolved_.load(std::memory_order_relaxed);
+#ifdef RAD_TEST_HOOKS
+        rad_test_step_evidence(b->step, (int)ev.replay_known, (int)ev.replay, (int)ev.staged,
+                               (int)ev.moved);
+#endif
+        sched_.step_finished(ev);
         tier_tick();
-        loan_tick(/*idle=*/false);
+        (void)loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
         drain_completed();
         sched_.publish(/*idle=*/false);
+        /* A run under continuous load may never reach the idle branch above, so the resolve is
+         * read here too: this bracket is closed (step_finished consumed its evidence) and the
+         * rank threads are parked, so the next one opens on the placement the resolve names.
+         * Without this, a fill that landed under load would keep the prices held for as long as
+         * requests kept arriving. */
+        if (!draft_placement_resolved_.load(std::memory_order_relaxed) &&
+            start_placement_settled())
+            settle_start_placement();
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
          * shows up in `collect`, the step's only host synchronisation. */
@@ -847,7 +1193,23 @@ int Engine::collect_issue(StepOut& so) {
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
     else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(so));
-    return rad_event_record(step_end_, ranks_[0]->ctx.stream());
+    RAD_TRY(rad_event_record(step_end_, ranks_[0]->ctx.stream()));
+    /* Each other rank's own end, recorded here rather than in the rank thread: the join barrier
+     * above already proves every rank has enqueued this step, so a record enqueued now on its
+     * stream covers all of its work and none of the step issued ahead below. */
+    for (size_t i = 1; i < ranks_.size(); ++i)
+        RAD_TRY(rad_event_record(rank_end_[i], ranks_[i]->ctx.stream()));
+    return RAD_OK;
+}
+
+/* The step's completion, on every rank. step_end_ is card-local and the rank barrier joins
+ * enqueues, so it alone would let the host commit -- and advance a history water level -- while
+ * another rank's stream is still running. The extra waits cost nothing in the common case: the
+ * ranks were released together, so theirs are done when rank 0's fires. */
+int Engine::await_step_end() {
+    RAD_TRY(rad_event_sync(step_end_));
+    for (size_t i = 1; i < ranks_.size(); ++i) RAD_TRY(rad_event_sync(rank_end_[i]));
+    return RAD_OK;
 }
 
 /* Issue the copy of an embedding step's pooled rows (the first n_seq) into pinned memory on rank
@@ -871,9 +1233,11 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
+    so.raw_match.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 1);
     if (plan.e.empty()) return RAD_OK;
-    RAD_TRY(rad_event_sync(step_end_));
+    RAD_TRY(await_step_end());
+    so.complete = true;
     if ((int64_t)plan.e.size() != (int64_t)b->n_seq) {
         RAD_ERR("an embedding step planned %zu sequences and its batch carries %lld",
                 plan.e.size(), (long long)b->n_seq);
@@ -979,13 +1343,25 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
+    so.raw_match.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
-    if (so.n_rows <= 0) return RAD_OK;
+    /* A step with no sampled rows has nothing to read back, so the host does not wait for a readback
+     * here and can run ahead. That is not completion evidence, and a history-only or mid-prompt
+     * pass still has to be proven before anything advances on it -- so wait when the step actually
+     * issued one, and only then. A pure prefill step issues no draft pass and keeps running ahead.
+     * Either way the fact is `so.complete`, never the row count or the batch pointer. */
+    if (so.n_rows <= 0) {
+        if (!serial_hist_issued_) return RAD_OK;
+        RAD_TRY(await_step_end());
+        so.complete = true;
+        return RAD_OK;
+    }
 
     so.rows.resize((size_t)so.n_rows);
-    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
-    RAD_TRY(rad_event_sync(step_end_));
+    /* Wait on the step-end events, not the streams: a step issued ahead is queued behind them. */
+    RAD_TRY(await_step_end());
+    so.complete = true;
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());
@@ -1031,6 +1407,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
             RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            /* The uncensored tally, taken before the cut below: a match is a comparison the target
+             * made, whether or not the step went on to commit it. */
+            so.raw_match[i] = acc;
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
@@ -1105,10 +1484,13 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
  *
  * A request that cannot wait for a shrink takes the blocks at once through a callback into every
  * slab (KVManager::set_reclaim, installed in start()). */
-void Engine::loan_tick(bool idle) {
-    if (!lending_) return;
+int Engine::loan_tick(bool idle) {
+#ifdef RAD_TEST_HOOKS
+    if (const int injected = rad_test_loan_tick_error(); injected < 0) return injected;
+#endif
+    if (!lending_) return RAD_OK;
     const uint64_t now = rad_mono_ns();
-    if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */
+    if (now - loan_last_ns_ < 100000000ull) return RAD_OK;    /* 100 ms */
     loan_last_ns_ = now;
 
     /* Under the scheduler's lock: the loan moves rank 0's live mark and free count, which an HTTP
@@ -1130,23 +1512,32 @@ void Engine::loan_tick(bool idle) {
 
     /* The cache moves first when the loan grows, the slabs first when it shrinks, so no block is
      * ever both a cache block and a slab slot. */
-    if (lead.kv.set_loan(std::max(offer, held)) < 0) {
+    if (const int st = lead.kv.set_loan(std::max(offer, held)); st < 0) {
         RAD_ERR("kv loan: the cache refused a loan of %lld tokens it said it could spare; lending "
                 "stops", (long long)std::max(offer, held));
         lending_ = false;
-        return;
+        return st;
     }
+    int first = RAD_OK;
     for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.follow(lead.kv);
     for (auto& r : ranks_) {
-        if (rad_dev_set(r->device) < 0) continue;
-        (void)r->mover.set_loan(Mover::kLendKV, offer);
+        if (const int st = rad_dev_set(r->device); st < 0) {
+            if (first == RAD_OK) first = st;
+            continue;
+        }
+        if (const int st = r->mover.set_loan(Mover::kLendKV, offer); st < 0 && first == RAD_OK)
+            first = st;
         if (idle) {
             const int st = r->mover.idle_tick(&r->heat);
-            if (st < 0) RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
-                                 rad_strerror(st));
+            if (st < 0) {
+                RAD_WARN("rank %d: filling the lent slots while idle: %s", r->index,
+                         rad_strerror(st));
+                if (first == RAD_OK) first = st;
+            }
         }
     }
     (void)rad_dev_set(ranks_[0]->device);
+    return first;
 }
 
 /* ------------------------------------------------------------------ the arena's level */
@@ -1210,6 +1601,9 @@ int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_
  * step's size. */
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
+    /* The reference calibration keeps both lenders at zero for the whole run: the levels are its
+     * identity, not a loan it may take. */
+    if (cfg_.draft_reference) return;
     if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
@@ -1361,6 +1755,341 @@ void Engine::drain_completed() {
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
+namespace {
+/* FNV-1a over the plan's tier/site per weight: two runs that resolved the same strategy and the
+ * same budgets but keep a different set of experts resident are different deployments, and the
+ * strategy name alone would not tell them apart. Index 0 is the sentinel. */
+uint64_t plan_residency_digest(const Plan& p) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 1; i < p.weight.size(); ++i) {
+        const uint8_t b[2] = { (uint8_t)p.weight[i].tier, (uint8_t)p.weight[i].site };
+        for (uint8_t x : b) {
+            h ^= x;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+}  /* namespace */
+
+int Engine::draft_cost_runtime(DraftCostRuntime* out) const {
+    if (!out) return RAD_E_INVAL;
+    if (ranks_.empty()) {
+        RAD_ERR("draft cost runtime: no rank has been planned, so this deployment has no "
+                "identity a cost profile could be bound to");
+        return RAD_E_STATE;
+    }
+    DraftCostFingerprint& fp = out->fingerprint;
+    /* Every field is what this deployment is, not what a flag asked for: the profile is refused
+     * on any difference (DraftCostTable::configure names the first). The gpus string is the
+     * ranks' devices in order -- product name, arch and the equipment a same-named SKU can
+     * differ in; kernels is the loaded libraries, the arch plugin and the device arch; the model
+     * name falls back to the container's arch id where a container carries no model_name (the
+     * checkpoint path already does the same). */
+    fp.model   = meta_.name ? meta_.name : "";
+    if (fp.model.empty() && meta_.arch_id) fp.model = meta_.arch_id;
+    fp.quant   = meta_.quant && *meta_.quant ? meta_.quant : "bf16";
+    fp.tp      = (int32_t)ranks_.size();
+    /* The same string engine_info() reports, "n/a" at TP1 included, so a record is reproducible
+     * from the info output. */
+    fp.tp_wire = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";
+    std::vector<std::string> gpus;
+    std::string arch;
+    for (const auto& rk : ranks_) {
+        RadDeviceProps p{};
+        if (const int prc = rad_dev_props(rk->device, &p); prc != RAD_OK) {
+            RAD_ERR("draft cost runtime: device %d: %s", rk->device, rad_dev_last_error());
+            return prc;
+        }
+        /* The product name alone collides across SKUs and steppings; the arch id and the
+         * equipment do not (rad_device.h names the name field "for logs and the tuning cache"). */
+        std::string g = p.name;
+        if (p.arch[0]) { g += " ("; g += p.arch; g += ")"; }
+        g += fmt(" dev=%d cu=%d vram=%lld", p.device_id, p.n_cu, (long long)p.vram_bytes);
+        gpus.push_back(std::move(g));
+        if (arch.empty()) arch = p.arch[0] ? p.arch : "";
+    }
+    fp.gpus      = draft_cost_gpus(gpus);
+    /* The arch plugin is part of the kernel identity: two plugins over the same kernel libraries
+     * are still two different selectors (build/startup.h keeps the two lists apart). */
+    fp.kernels   = plugins_.libraries();
+    if (!plugins_.arch_plugin.empty()) {
+        if (!fp.kernels.empty()) fp.kernels += ' ';
+        fp.kernels += plugins_.arch_plugin + "@" +
+                      (plugins_.arch_version.empty() ? "0" : plugins_.arch_version);
+    }
+    if (!arch.empty()) fp.kernels += " " + arch;
+    fp.kv_format = cfg_.kv_cache_dtype;
+
+    /* `placement` is the resolved plan, not the flag: `auto` resolves against a budget that
+     * depends on the free VRAM at this start (place/planner.cpp, mem/vram_budget.cpp), so two
+     * runs asking for `auto` can land on different strategies and different expert residency.
+     * Each rank contributes its strategy, its resolved budgets and a digest of its residency. A
+     * rank whose plan is still `auto` -- or has no weights -- makes the identity unknowable; the
+     * profile is refused then rather than matched against a guess.
+     *
+     * What the plan does not name is where the expert slab's memory comes from over the run: the
+     * arena's level rows (which step sizes lend part of the slab), and, for a live profile, the
+     * loan the KV cache held at start. Those are fields of their own: a no-loan reference has no
+     * live loan to compare, and the arena levels are what make two otherwise identical plans
+     * different placements. The loan is set before this is derived (serve's start loan), so it is
+     * not a snapshot of something still moving. */
+    fp.basis = cfg_.draft_reference ? DraftCostBasis::NoLoan : DraftCostBasis::Live;
+    std::string placement;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        const Plan& pl = ranks_[i]->plan;
+        if (pl.strategy == Strategy::Auto || pl.weight.size() <= 1) {
+            RAD_ERR("draft cost runtime: rank %zu has no resolved placement plan, so a cost "
+                    "profile cannot be bound to it", i);
+            return RAD_E_STATE;
+        }
+        if (!placement.empty()) placement += ';';
+        placement += fmt("%s vram=%lld host=%lld file=%lld dyn=%d res=%016llx",
+                         strategy_name(pl.strategy), (long long)pl.vram_budget,
+                         (long long)pl.host_budget, (long long)pl.file_stage_reserve,
+                         pl.dynamic ? 1 : 0, (unsigned long long)plan_residency_digest(pl));
+    }
+    fp.placement = std::move(placement);
+
+    /* The arena's identity is the level rows the arena motion actually uses -- the top level
+     * (max_tok) and the smaller steps below it (Engine::arena_rows_, built in start()), not the
+     * plan's depth: a level is the step size up to which the arena past the level's end is lent,
+     * so two runs with different levels lend at different points on the same plan. No level (no
+     * heat, nothing lent) is named "none", not left empty. */
+    std::string arena;
+    for (size_t i = 0; i < arena_rows_.size(); ++i)
+        arena += fmt("%s%lld", i ? "," : "", (long long)arena_rows_[i]);
+    fp.arena = arena.empty() ? "none" : std::move(arena);
+    /* The live loan is part of a live profile's identity only: two runs that lend different
+     * amounts fill different start placements. A no-loan reference measured with both lenders off
+     * has none, and the reader compares it under the no-loan rule. */
+    if (fp.basis == DraftCostBasis::Live) {
+        std::string loan;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            if (!loan.empty()) loan += ';';
+            loan += fmt("flex=%lld lend=%lld",
+                        (long long)ranks_[i]->mover.flex_offered_bytes(),
+                        (long long)ranks_[i]->kv.loan_tokens());
+        }
+        fp.live_loan = std::move(loan);
+    }
+
+    /* The backend's round model, not this cycle's distribution: the serial head runs one round per
+     * row, so it is shrinking even when a cycle's K are uniform. A block drafter, no drafter, or
+     * drafting switched off (n_spec == 0, already resolved from auto in declare()) has no rounds.
+     * The distribution keeps its identity in the bucket key. */
+    out->execution = draft_cost_execution(serial_drafting(), cfg_.n_spec);
+    return RAD_OK;
+}
+
+int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
+    if (cfg_.draft_profile.empty()) return RAD_OK;
+    DraftCostProfile profile;
+    std::string err;
+    const int rc = draft_cost_profile_read(cfg_.draft_profile, &profile, &err);
+    if (rc != RAD_OK) {
+        RAD_ERR("--draft-profile '%s': %s", cfg_.draft_profile.c_str(),
+                err.empty() ? rad_strerror(rc) : err.c_str());
+        return rc;
+    }
+
+    RAD_TRY(sched_.draft_costs().configure(profile, runtime));
+
+    if (!sched_.draft_costs().active())
+        RAD_WARN("--draft-profile '%s' is not used for this deployment: %s",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().reason().c_str());
+    else if (sched_.draft_costs().reference())
+        RAD_INFO("--draft-profile '%s': %zu buckets, basis no-loan -- an optimisation basis for "
+                 "the plan's start placement without borrowed copies, not a latency bound; it is "
+                 "kept immutable and only exact measured buckets price",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
+    else
+        RAD_INFO("--draft-profile '%s': %zu buckets match this deployment",
+                 cfg_.draft_profile.c_str(), sched_.draft_costs().buckets().size());
+    return RAD_OK;
+}
+
+/* --draft-profile-out: the calibration mode. Refused, not ignored, when it cannot produce an
+ * honest profile: the two flags together would read and write the same identity, an existing path
+ * would be replaced, and only the serial head can be recorded. All of them are checked here, at
+ * startup, so a run that cannot export says so before serving instead of after.
+ *
+ * Both policies calibrate. Under legacy the run never verifies a window it did not just draft, so
+ * the shape a cost deployment prices first -- a cycle whose paired step verified nothing, before
+ * any plan published -- cannot arise. A cost run executes exactly that start cycle, and the table
+ * is put in record-only mode for it: the run measures the fallback baseline it really runs and
+ * prices nothing from the buckets it is still filling. */
+int Engine::begin_draft_calibration() {
+    if (cfg_.draft_profile_out.empty()) {
+        if (cfg_.draft_reference) {
+            RAD_ERR("--draft-reference runs a calibration and needs --draft-profile-out: a serving "
+                    "run keeps its loans dynamic and does not measure a reference");
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    if (cfg_.draft_reference && cfg_.draft_policy != DraftPolicyKind::Cost) {
+        /* The reference is the cost planner's price basis. A legacy calibration would measure the
+         * fixed window, a plan the cost policy never asks for. */
+        RAD_ERR("--draft-reference needs --draft-policy cost: the reference prices the cost "
+                "planner's plans, not a fixed window");
+        return RAD_E_INVAL;
+    }
+    if (!cfg_.draft_profile.empty()) {
+        RAD_ERR("--draft-profile-out with --draft-profile: a calibration run measures its own "
+                "profile and does not read one; pass only one of the two");
+        return RAD_E_INVAL;
+    }
+    const bool cost = cfg_.draft_policy == DraftPolicyKind::Cost;
+    if (cfg_.kld()) {
+        RAD_ERR("--draft-profile-out: the KL mode scores the trunk and drafts nothing, so it "
+                "measures no draft cycle to export");
+        return RAD_E_INVAL;
+    }
+    /* The file's drafter dimension can only name the serial head: the block drafter proposes a
+     * whole block in one pass and the lookup drafter's rounds are the trunk's own, so neither has
+     * a per-row K this format could record. A run without the head would export a profile that
+     * misnames what produced it. */
+    if (!serial_drafting() || cfg_.n_spec <= 0) {
+        RAD_ERR("--draft-profile-out: needs a serial draft head and a positive ceiling (drafter "
+                "kind %d, depth %d, ceiling %d), because the profile names its rounds per row",
+                (int)drafter_.kind, (int)drafter_.depth, cfg_.n_spec);
+        return RAD_E_INVAL;
+    }
+    /* The writer links into place as the real gate (EEXIST); this only turns the common case into
+     * a startup error. Anything else -- a missing directory, no permission -- is not "free". */
+    struct stat st;
+    if (::stat(cfg_.draft_profile_out.c_str(), &st) == 0) {
+        RAD_ERR("--draft-profile-out '%s' already exists; a calibration run does not overwrite a "
+                "profile -- move it or choose another path", cfg_.draft_profile_out.c_str());
+        return RAD_E_INVAL;
+    }
+    if (errno != ENOENT) {
+        RAD_ERR("--draft-profile-out '%s': %s", cfg_.draft_profile_out.c_str(),
+                std::strerror(errno));
+        return RAD_E_IO;
+    }
+    /* The identity is derived here, before the scheduler starts: an incomplete one must fail
+     * before the run, not at export, and the profile is then written with the fingerprint this run
+     * was bound to. The table is the recording's target with no buckets of its own: under legacy
+     * nothing can be priced from it, and a cost calibration admits the fallback baseline it
+     * measures and never prices at all (record_only). */
+    RAD_TRY(draft_cost_runtime(&draft_calib_runtime_));
+    /* The calibration's own table carries the file's basis (a no-loan fingerprint when
+     * --draft-reference), but it is the writer, not a loaded reference: it must stay mutable so
+     * buckets can be recorded into it. */
+    draft_calib_runtime_.recording = true;
+    DraftCostProfile empty;
+    empty.fingerprint = draft_calib_runtime_.fingerprint;
+    empty.execution   = draft_calib_runtime_.execution;
+    RAD_TRY(sched_.draft_costs().configure(empty, draft_calib_runtime_));
+    if (!sched_.draft_costs().active()) {
+        RAD_ERR("--draft-profile-out: the recording table refused this runtime: %s",
+                sched_.draft_costs().reason().c_str());
+        return RAD_E_STATE;
+    }
+    if (cost) {
+        /* The run executes the named baseline until a cycle is measured, and it is that baseline
+         * -- including the start cycle nothing precedes -- that the file records. */
+        sched_.draft_costs().admit_fallback();
+        sched_.draft_costs().record_only();
+    }
+    draft_calibrating_ = true;
+    return RAD_OK;
+}
+
+int Engine::export_draft_cost_profile() {
+    if (!draft_calibrating_) return RAD_OK;
+    /* A no-loan reference was measured with both lenders off, and the file says so. The carve and
+     * the loans are checked where they really are -- what the mover holds, not the target it was
+     * given: set_loan writes its target even where no strip is registered, and reclaim() returns
+     * at once when loan_held is 0, so `loan` would prove nothing. A run that lent anything is not
+     * a reference and must not write a file that claims it was. */
+    if (cfg_.draft_reference) {
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const auto& r = *ranks_[i];
+            if (r.mover.flex_capacity() != 0 || r.mover.flex_used_bytes() != 0 ||
+                r.kv.loan_tokens() != 0 || r.mover.loan_held(Mover::kLendKV) != 0 ||
+                r.mover.loan_held(Mover::kLendArena) != 0) {
+                RAD_ERR("--draft-reference: rank %zu lent memory (flex capacity %lld, in use %lld, "
+                        "kv loan %lld, held kv %lld, held arena %lld), so this run did not measure "
+                        "the plan's start placement without borrowed copies and no file is written",
+                        i, (long long)r.mover.flex_capacity(),
+                        (long long)r.mover.flex_used_bytes(), (long long)r.kv.loan_tokens(),
+                        (long long)r.mover.loan_held(Mover::kLendKV),
+                        (long long)r.mover.loan_held(Mover::kLendArena));
+                return RAD_E_STATE;
+            }
+        }
+    }
+    /* Everything the step loop measured has to reach the table before the table is read. */
+    sched_.flush_draft_observations();
+
+    DraftCostProfile p;
+    p.fingerprint = draft_calib_runtime_.fingerprint;
+    p.execution   = draft_calib_runtime_.execution;
+    /* The fingerprint names the plan resolved at start. A bucket carrying kDraftSamplePlacement
+     * was measured while the mover was moving a unit (Scheduler::step_finished takes that from the
+     * rank's own move evidence), so its time is the cost of a residency this header does not
+     * name. The file has no field that could name the drifted residency, so those observations are
+     * left out -- only the affected ones: a clean cycle before the first move still measured the
+     * start plan and stays. */
+    int32_t placement = 0;
+    int32_t usable = 0;
+    for (const DraftCostBucket& b : sched_.draft_costs().buckets()) {
+        if (b.flags & kDraftSamplePlacement) { ++placement; continue; }
+        if (draft_bucket_usable(b)) ++usable;
+        p.buckets.push_back(b);
+    }
+    /* A run that measured no cycle (no request served, no serial round executed) -- or one whose
+     * every cycle was placement-affected -- must not leave a file a reader would take as a
+     * baseline: the writer refuses the empty one too, but the reason belongs in the log rather than
+     * in a generic parse error. */
+    if (p.buckets.empty()) {
+        if (placement > 0)
+            RAD_ERR("--draft-profile-out '%s': all %d measured bucket(s) were placement-affected, "
+                    "so none describes the start residency the fingerprint names; a calibration "
+                    "needs cycles the mover did not disturb", cfg_.draft_profile_out.c_str(),
+                    (int)placement);
+        else
+            RAD_ERR("--draft-profile-out '%s': no bucket was measured; the run recorded no draft "
+                    "cycle, which is not a calibration", cfg_.draft_profile_out.c_str());
+        return RAD_E_INVAL;
+    }
+    /* Every remaining bucket is a diagnostic the table never prices from -- a shortened run, an
+     * unpriced truncation, a warmup/record/audit/admission bracket. Writing those would report a
+     * calibration whose file can price nothing, so the export fails here instead. */
+    if (usable == 0) {
+        RAD_ERR("--draft-profile-out '%s': none of the %d kept bucket(s) is priceable (%d "
+                "placement-affected, the rest diagnostic only); a file of diagnostics is not a "
+                "calibration", cfg_.draft_profile_out.c_str(), (int)p.buckets.size(),
+                (int)placement);
+        return RAD_E_INVAL;
+    }
+
+    int32_t skipped = 0;
+    std::string err;
+    const int rc = draft_cost_profile_write_file(cfg_.draft_profile_out, p, &skipped, &err);
+    if (rc != RAD_OK) {
+        RAD_ERR("--draft-profile-out '%s': %s", cfg_.draft_profile_out.c_str(),
+                err.empty() ? rad_strerror(rc) : err.c_str());
+        return rc;
+    }
+    if (skipped > 0)
+        RAD_WARN("--draft-profile-out: %d diagnostic bucket(s) left out (the file has no name for "
+                 "their flag)", skipped);
+    if (placement > 0)
+        RAD_WARN("--draft-profile-out: %d placement-affected bucket(s) left out (a mover change "
+                 "inside the bracket; the fingerprint names the plan, not the drifted residency)",
+                 (int)placement);
+    RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
+             cfg_.draft_profile_out.c_str(), p.buckets.size(),
+             draft_calib_runtime_.fingerprint.model.c_str(),
+             draft_calib_runtime_.execution == DraftCostExecution::Shrinking ? "shrinking"
+                                                                            : "rectangular");
+    return RAD_OK;
+}
+
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
@@ -1371,6 +2100,18 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
+    /* The profile flags configure speculative decoding's cost table. A generator or an embedding
+     * model never initialises the scheduler that owns it, so both flags would be read by nobody.
+     * Refused here, where every path still returns before serving: silently ignoring a flag that
+     * asks for a calibration file or a cost baseline is worse than not starting. */
+    if ((generator || embedding_) &&
+        (!cfg_.draft_profile.empty() || !cfg_.draft_profile_out.empty())) {
+        RAD_ERR("--draft-profile/--draft-profile-out configure speculative decoding, but the '%s' "
+                "plugin makes %s: the scheduler is never initialised there, so the flag would be "
+                "ignored", plugins_.arch_plugin.c_str(),
+                generator ? "a generator" : "an embedding model");
+        return RAD_E_UNSUPPORTED;
+    }
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
@@ -1540,6 +2281,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    /* The start placement's loan, the fill that materialises it, and the calibration check that
+     * must refuse before a run rather than after one. Any error there is serve's: nothing below
+     * may measure, price or profile a placement that did not complete. */
+    RAD_TRY(prepare_serving());
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
@@ -1568,8 +2313,31 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         img_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
-    } else
-    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    } else {
+        /* The runtime is derived before the read: when the deployment's identity cannot be
+         * established, a profile is refused at this one race-free point instead of being loaded
+         * and left inactive with a warning. No profile, no derivation. */
+        if (!cfg_.draft_profile.empty()) {
+            DraftCostRuntime runtime;
+            RAD_TRY(draft_cost_runtime(&runtime));
+            RAD_TRY(load_draft_cost_profile(runtime));
+        }
+        /* A runtime that cannot record a pass runs every one of them live and unkeyed, which is a
+         * fact about the deployment the cost view can carry -- but only when every rank proves it:
+         * the pass spans them, so one rank that may record (or no rank asked at all) leaves the
+         * cycle's state Unknown. A recording runtime may play, record or audit, and which one a
+         * pass does exists only once it runs -- after its plan is issued -- so its cycles stay
+         * unpriced rather than declare a state they cannot know. */
+        int32_t n_recording = 0;
+        for (auto& rk : ranks_) n_recording += rk->ctx.records_passes() ? 1 : 0;
+        RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_,
+                            draft_replay_evidence((int32_t)ranks_.size(), n_recording)));
+#ifdef RAD_TEST_HOOKS
+        /* The one point where a submission is race-free: the scheduler holds its KV and limits,
+         * and neither the rank threads nor the stepper exist yet. */
+        rad_test_serving();
+#endif
+    }
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over
@@ -1615,9 +2383,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
-    /* A step-loop error takes precedence over the transport's status. */
+    /* A calibration export is part of the run's result, not a courtesy: its failure is the
+     * engine's status. A run the step loop aborted measured nothing a profile could stand on, so
+     * it writes no file. The step-loop error still wins when both are non-zero. */
     const int ls = loop_status_.load(std::memory_order_acquire);
-    return ls < 0 ? ls : s;
+    const int xrc = ls < 0 ? RAD_OK : export_draft_cost_profile();
+    if (ls < 0) return ls;
+    if (xrc != RAD_OK) return xrc;
+    return s;
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from
@@ -1886,6 +2659,10 @@ std::string request_overrides(const Config& c) {
  * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
  * IChatTemplate::apply. */
 int Engine::run_server() {
+    /* A stop that arrived between the previous serve and this one is this run's to act on: the
+     * watcher below consumes g_signalled at the moment it stops the transport, and nothing here
+     * clears it. Clearing at entry would swallow a signal raised after the previous run's stop
+     * and leave this listener with no consumer. */
     /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
      * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
      * hold the session table the sessions view reads. */
@@ -2741,9 +3518,25 @@ int Engine::run_server() {
     sigaction(SIGTERM, &sa, nullptr);
 
     std::atomic<bool> watching{true};
+#ifdef RAD_TEST_HOOKS
+    /* Once, and from the state itself: Server::port() is 0 until the transport is inside its
+     * accept loop, which is where httplib's stop() starts closing the listening socket instead of
+     * dropping the stop. The loop test's stop is bound to this report. */
+    bool serving_reported = false;
+#endif
     std::thread watcher([&] {
         while (watching.load(std::memory_order_relaxed)) {
-            if (g_signalled.load(std::memory_order_relaxed)) {
+#ifdef RAD_TEST_HOOKS
+            if (!serving_reported) {
+                if (const int port = srv.port(); port != 0) {
+                    serving_reported = true;
+                    rad_test_serving_ready(port);
+                }
+            }
+#endif
+            /* This exchange is the flag's one reset point: the signal is cleared where it is
+             * acted on, so one raised between two serve runs reaches the next run's watcher. */
+            if (g_signalled.exchange(false, std::memory_order_acq_rel)) {
                 RAD_INFO("stopping: draining in-flight requests");
                 srv.stop();
                 return;

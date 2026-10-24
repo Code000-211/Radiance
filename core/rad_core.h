@@ -148,6 +148,24 @@ constexpr DraftWindow kDraftWindowDefault = DraftWindow::Fixed;
 inline const char* draft_window_name(DraftWindow w) {
     return w == DraftWindow::Adaptive ? "adaptive" : "fixed";
 }
+
+/* --draft-policy: what decides each cycle's draft window.
+ *   Legacy  the fixed depth above, or --draft-window adaptive's per-sequence stop.
+ *   Cost    the adaptive-MTP cost policy (core/sched/draft_policy.h): B's predictor supplies
+ *           each request's per-position acceptance, A's cost model prices the batch shape, and
+ *           the plan it chooses is what every proposal site reads for the cycle. Without a
+ *           measured profile the model has no anchor, so the policy issues its named fallback at
+ *           the configured depth rather than inventing a price.
+ * The default is kDraftPolicyDefault, read by the help text and the startup line.
+ * `Kind`, not `DraftPolicy`: that name is the seam's choose hook (core/sched/draft_types.h). */
+enum class DraftPolicyKind { Legacy = 0, Cost = 1 };
+constexpr DraftPolicyKind kDraftPolicyDefault = DraftPolicyKind::Legacy;
+inline const char* draft_policy_name(DraftPolicyKind p) {
+    return p == DraftPolicyKind::Cost ? "cost" : "legacy";
+}
+/* The most K values --draft-depth-tiers carries; sizes Config::draft_tiers and the planner's
+ * ladder (RAD_DRAFT_MAX_TIERS, core/sched/draft_policy.h). */
+constexpr int kDraftMaxTiers = 8;
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
@@ -878,6 +896,35 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
+    /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
+     * The default is the ladder the policy was tuned with. An explicit tier above the executable
+     * head depth is refused by Scheduler::init, which is where that depth is known (auto resolves
+     * it). A top below it is left as given: a profile that prices that top is a valid reload, so
+     * the list is not refused at init. Only a cycle whose top is unpriced while the named
+     * baseline would run deeper is refused, by the policy that can see the shape; nothing is
+     * learnt into a depth the ladder never offers (docs/ADAPTIVE-MTP.md). The default ladder is
+     * trimmed to the depth instead, so a valid deployment is not refused for its deeper end. */
+    int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
+    int     draft_n_tiers = 5;
+    bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */
+    /* --draft-reference: this run calibrates the no-loan reference. Both lenders stay off for the
+     * whole run, so the buckets are the plan's start placement without borrowed copies; the file
+     * is stamped with that basis and a serving run may load it while its own loans stay dynamic.
+     * Not a switch a serving run sets, and not a bound: see docs/ADAPTIVE-MTP.md. */
+    bool    draft_reference = false;
+    /* --draft-profile: a rad-draft-profile/4 file measured on this deployment. Read once before
+     * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
+     * inactive and names the difference, and Cost is then refused by Scheduler::init. An older
+     * format is refused by name: it cannot be bound to this deployment. */
+    std::string draft_profile;
+    /* --draft-profile-out: where a calibration run writes the cost profile it measured, with the
+     * same fingerprint and execution the reader derives at startup. The observation ring records
+     * under legacy/adaptive; written once at the end of serve(), after the ring is flushed, and
+     * only when the run measured at least one bucket; never over an existing file. Under cost the
+     * table is record-only: the run issues the admitted fallback at its ceiling -- the start cycle
+     * included, which legacy drafting never executes -- and prices nothing from what it records. */
+    std::string draft_profile_out;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

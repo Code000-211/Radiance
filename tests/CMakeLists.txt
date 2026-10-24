@@ -58,7 +58,66 @@ set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
 # shared library's imports too: ROCm 10.1's libamdhip64 imports std::string::reserve, which g++-14
 # emits weak in rad_graph.cpp.o, and that object pulls in dispatch.cpp.o, whose strong device calls
 # silently replace the weak fakes sched_test, ref_test and runtime_test rely on.
-set(RAD_TEST_CORE stdc++ rad_core)
+#
+# rad_test_hooks is core/sched/batch.cpp compiled a second time, for tests only, with
+# RAD_TEST_HOOKS. rad_core itself is never compiled with it: the production library carries neither
+# the hook call nor the weak default, whether or not the test suite is configured. The copy sits
+# before rad_core and is linked whole, so BatchBuilder resolves to it even in a test that never
+# names the class -- otherwise the linker would take rad_core's object and the hook would silently
+# be absent.
+add_library(rad_test_hooks STATIC ${CMAKE_SOURCE_DIR}/core/sched/batch.cpp)
+target_compile_definitions(rad_test_hooks PRIVATE RAD_TEST_HOOKS=1 RAD_VERSION="${PROJECT_VERSION}")
+target_include_directories(rad_test_hooks PRIVATE
+  ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/vendor
+  ${CMAKE_BINARY_DIR}/rad_include)
+target_link_libraries(rad_test_hooks PRIVATE rad_abi Threads::Threads)
+
+set(RAD_TEST_CORE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_hooks>" rad_core)
+
+# The engine's completion cases reach collect_step through the EngineTestPeer friend, which
+# core/engine.h declares only under RAD_TEST_HOOKS. A friend is part of the class definition, so
+# every unit of a link that includes core/engine.h has to be compiled with the macro together --
+# that is why these units are built a second time here instead of defining it on the test alone.
+# The set of such units is exactly this list: engine.h is included by engine_priv.h (included by
+# these nine engine units, and by tests/engine_test_peer.h for Engine::Rank), by core/main.cpp (the
+# radiance binary, which never links this archive) and by the ten tests in RAD_TESTS_WITH_ENGINE --
+# engine_step_test.cpp, engine_loop_test.cpp, engine_loop_move_test.cpp, engine_history_test.cpp,
+# engine_profile_test.cpp, engine_cost_drift_test.cpp, engine_couple_short_row_test.cpp,
+# engine_start_fill_test.cpp, engine_dtor_order_test.cpp and engine_reference_basis_test.cpp, each
+# of them directly (the move, profile, cost-drift, coupled-short-row, start-fill, dtor-order and
+# reference tests include engine_test_peer.h as well). All ten are compiled with the macro. A
+# unit that starts including
+# engine.h must join this list, or one program would hold both definitions. Re-check with
+#   grep -rn '#include[[:space:]]*"\(core/\)\?engine\.h"' --include=*.cpp --include=*.h core tests
+# rad_core keeps its own, hook-free copies and is never asked for them: this archive goes in whole
+# and before it. Only the tests in RAD_TESTS_WITH_ENGINE link it, so no other test pays for the
+# engine.
+set(RAD_ENGINE_SRC
+  ${CMAKE_SOURCE_DIR}/core/engine.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_bringup.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_diag.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_draft.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_gen.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_kld.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_lora.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_mm.cpp
+  ${CMAKE_SOURCE_DIR}/core/engine_probe.cpp)
+add_library(rad_test_engine STATIC ${RAD_ENGINE_SRC})
+# rad_core's PUBLIC usage requirements (include paths, RAD_VERSION, RAD_HAVE_HIP) are what these
+# units are compiled against in the library, so they must be the same here.
+target_link_libraries(rad_test_engine PRIVATE rad_core)
+target_compile_definitions(rad_test_engine PRIVATE RAD_TEST_HOOKS=1)
+if(RAD_FFMPEG_FOUND)
+  # PRIVATE on rad_core, so not inherited, and the engine units must not be built without it
+  # where the library was built with it.
+  target_compile_definitions(rad_test_engine PRIVATE RAD_HAVE_FFMPEG=1)
+  target_link_libraries(rad_test_engine PRIVATE PkgConfig::RAD_FFMPEG)
+endif()
+
+set(RAD_TESTS_WITH_ENGINE engine_step_test engine_loop_test engine_loop_move_test
+                            engine_history_test engine_profile_test engine_cost_drift_test
+                            engine_couple_short_row_test engine_start_fill_test
+                            engine_dtor_order_test engine_reference_basis_test)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
@@ -113,6 +172,8 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_engine_loop_test 60)  # one engine start and a handful of tiny decode steps
+set(RAD_TEST_CPU_BUDGET_engine_loop_move_test 30)  # its own process, one engine, three decode steps
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
@@ -177,6 +238,11 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
+  elseif(n IN_LIST RAD_TESTS_WITH_ENGINE)
+    add_executable(${n} ${t})
+    target_compile_definitions(${n} PRIVATE RAD_TEST_HOOKS=1)
+    target_link_libraries(${n} PRIVATE stdc++ "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_test_engine>"
+                                     ${RAD_TEST_CORE})
   elseif(n IN_LIST RAD_TESTS_WITH_GBNF_ORACLE)
     add_executable(${n} ${t} ${CMAKE_CURRENT_SOURCE_DIR}/gbnf_oracle.cpp)
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
@@ -261,9 +327,10 @@ endif()
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on
 # the host backend; convert_test runs rad-convert on the same checkpoints. Both start the built
 # binaries as children, so they depend on them and on every plugin the checkpoints select
-# (llama_fp8 for convert_test's --set of an fp8 quantization_config).
-set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 lfm2_bf16 gemma4 llama_dense_fp8
-                 llama_fp8 qwenimage21)
+# (llama_fp8 for convert_test's --set of an fp8 quantization_config; qwen35moe_fp8 for the routed
+# checkpoint the loan and reference cases build, which qwen35_bf16 refuses).
+set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 qwen35moe_fp8 lfm2_bf16 gemma4
+                 gemma4_bf16 llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
@@ -279,6 +346,27 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+
+# engine_loop_test starts one engine of its own over a checkpoint with an assistant head: it needs
+# the plugin that serves the head (gemma4_bf16, selected by the fixture's quantization_config) and
+# libref's reference kernels. Like engine_e2e_test it pays a real startup, so it is `e2e` too.
+if(TARGET engine_loop_test)
+  add_dependencies(engine_loop_test gemma4_bf16 libref)
+  # The case starts a real engine, and its architecture plugin resolves the core's symbols from
+  # the executable at dlopen, as bin/radiance does. Without ENABLE_EXPORTS they are not in the
+  # dynamic symbol table and every plugin fails to load.
+  set_target_properties(engine_loop_test PROPERTIES ENABLE_EXPORTS ON)
+  set_tests_properties(engine_loop_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+
+# engine_loop_move_test starts its own engine the same way (a headless checkpoint, so the dense
+# gemma4 plugin and libref). Same export requirement: the plugin binds the core's C ABI back to
+# this executable at dlopen.
+if(TARGET engine_loop_move_test)
+  add_dependencies(engine_loop_move_test gemma4 libref)
+  set_target_properties(engine_loop_move_test PROPERTIES ENABLE_EXPORTS ON)
+  set_tests_properties(engine_loop_move_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

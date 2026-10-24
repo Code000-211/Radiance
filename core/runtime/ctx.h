@@ -324,6 +324,36 @@ public:
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
         return c;
     }
+
+    /* ---- one trunk step's evidence ----------------------------------------------------------
+     *
+     * Which path the step's own pass took, and whether the stager armed for it. Frozen by
+     * run_step() on this rank's step thread for a trunk pass (`draft_pass == 0`), so a reader
+     * after the step's ranks join sees that step's pass and not a later one: the next step's
+     * ahead pass is issued before this step is collected, and a cumulative counter delta read on
+     * the step thread would fold it in.
+     *
+     * A draft pass shares the step number and leaves the record alone: only the trunk pass is the
+     * step the scheduler brackets. `step` stays -1 until a trunk pass records one; a reader that
+     * asks for another step must treat the answer as unknown, not as measured None. */
+    enum StepTape : uint8_t { kStepTapeNone = 0, kStepTapePlay, kStepTapeRecord, kStepTapeAudit };
+    struct StepEvidence {
+        int32_t step   = -1;
+        uint8_t tape   = kStepTapeNone;   /* StepTape */
+        bool    staged = false;           /* the stager armed for this pass */
+    };
+    StepEvidence last_step_evidence() const { return last_ev_; }
+    /* The class the last pass took, whichever pass it was (the trunk record above is the bracket's
+     * and a draft pass leaves it alone): a step's bracket holds its draft passes, so the engine
+     * merges this in with Rank::note_evidence. */
+    uint8_t     last_pass_tape() const { return last_pass_tape_; }
+    /* The strongest class of the two: Record > Audit > Play > None. */
+    static uint8_t merge_tape(uint8_t have, uint8_t add) {
+        if (add == kStepTapeRecord || have == kStepTapeNone ||
+            (add == kStepTapeAudit && have == kStepTapePlay))
+            return add;
+        return have;
+    }
     void*       arena_base()   const { return arena_.base(); }
     void*       scratch()      const { return arena_.scratch(); }
 
@@ -587,6 +617,9 @@ private:
     ResidencyTable* residency_ = nullptr;
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */
+    StepEvidence    last_ev_;             /* the last trunk pass's evidence (run_step) */
+    uint8_t         last_pass_tape_ = kStepTapeNone;  /* the last pass's, draft included */
+    uint8_t         tape_path_ = kStepTapeNone;   /* the branch run_pass took */
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;
 

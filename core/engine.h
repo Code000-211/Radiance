@@ -47,6 +47,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
+class OpStager;   /* runtime/stager.h; test_set_stager only */
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
@@ -109,6 +110,19 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
+#ifdef RAD_TEST_HOOKS
+    /* Test-build-only: engine_step_test drives collect_step's completion branch on a
+     * default-constructed Engine, which needs no model and no started scheduler. The macro is
+     * defined for the test copies of the engine units and for the test unit itself
+     * (tests/CMakeLists.txt), which is every unit of that link that includes this header. The only
+     * other one, core/main.cpp, belongs to the radiance binary and never links those copies, so no
+     * program holds both definitions of the class. */
+    friend struct EngineTestPeer;
+    /* Test-build-only: attaches a stager to every rank's Ctx, as bringup does for a deployment
+     * whose budget left room for one. A test that checks the step's own placement evidence needs a
+     * stager that arms for a step it knows, which a tiny fixture never stages. */
+    void test_set_stager(OpStager* s);
+#endif
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -154,6 +168,29 @@ private:
 
     int load_plugins();
     int read_metadata();
+    /* --draft-profile: read once before the scheduler initialises and configure the cost table
+     * against `runtime`, this deployment's identity. A mismatch is not an error here (the table
+     * stays inactive and names it); an unreadable or malformed file is. The runtime is passed in
+     * rather than derived here so the caller has to produce it before the read -- and so a test
+     * can reach the mismatch branch without a started engine. */
+    int load_draft_cost_profile(const DraftCostRuntime& runtime);
+    /* The one derivation of "what this deployment is" for a cost profile -- fingerprint, basis and
+     * execution. Read by load_draft_cost_profile() and by the --draft-profile-out export, so the
+     * reader and the writer cannot drift. The basis is NoLoan under --draft-reference and Live
+     * otherwise; a no-loan runtime names the arena levels and no live loan. The execution is the
+     * backend's round model: the serial head runs one round per row (shrinking), even in a cycle
+     * whose K are uniform; a block drafter or no drafter at all is rectangular, as is disabled
+     * drafting. RAD_E_INVAL when a device property cannot be read; RAD_E_STATE when a rank carries
+     * no resolved placement plan, because a profile bound to "auto" would match a deployment that
+     * resolved differently. */
+    int draft_cost_runtime(DraftCostRuntime* out) const;
+    /* --draft-profile-out: validates once at startup (output path free, no --draft-profile) and
+     * names the mode. --draft-reference is a calibration flag and needs both an output path and
+     * --draft-policy cost. */
+    int begin_draft_calibration();
+    /* Flushes the observation ring and writes the profile. Called by serve() after the step and
+     * rank threads are joined; a failure is logged and returned, never swallowed. */
+    int export_draft_cost_profile();
     int read_checkpoint_metadata();
     /* --rope-scaling over the free-form keys, then the startup line and the context checks;
      * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */
@@ -246,11 +283,21 @@ private:
         /* Leading logits rows the sampler reads. RadBatch::n_out also counts the KL mode's scored
          * rows after them (Request::score). */
         int32_t               n_rows = 0;
+        /* This step's work on every rank has provably finished: the host waited on all of this
+         * step's end events. Set only after that wait, cleared when the next step is prepared, so
+         * a step issued ahead reads false while its wait is still pending. A failed wait returns
+         * the error and never sets it. It is the only completion fact the step carries; a non-null
+         * batch, a positive n_rows or a single rank are not substitutes, because a pass with no
+         * sampled row is enqueued but never waited on by collect_step's readback path. */
+        bool                  complete = false;
         std::vector<int32_t>  rows;       /* [n_out] the device's answer, copied back */
         int32_t*              rb = nullptr;   /* the pinned readback collect_issue filled */
         std::vector<float>    lg;         /* the first row's logits, at -vv */
         std::vector<int32_t>  token;      /* [n_seq] */
         std::vector<int32_t>  accepted;   /* [n_seq] */
+        /* [n_seq] accept_greedy's tally before accept_cut_at_eog: the end-of-generation cut
+         * shortens what is committed, not what was compared. The observation's raw_match. */
+        std::vector<int32_t>  raw_match;
         std::vector<uint8_t>  eos;        /* [n_seq] */
         /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
          * empty on a step with none. */
@@ -323,6 +370,47 @@ private:
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
+    /* The evidence the step `step` itself left (DraftStepEvidence): tape path and stager answer
+     * frozen on the rank threads as that step ran, and placement activity inside its window. False
+     * when no rank ran a pass for it, which the caller must treat as Unknown, not as a measured
+     * None -- a step issued ahead is collected after its pass, so a miss means no pass at all. */
+    bool step_evidence(int32_t step, DraftStepEvidence* out) const;
+    /* Placement moves (swap promotions + demotions) over every rank, cumulative, leaving out the
+     * fill's initial promotions: a fill before the first observation materialises the plan's own
+     * free lent slots (zero heat, by layer) into memory the plan left free, so it is the start
+     * placement being reached, not left. Any fill after the start placement is resolved, and
+     * every fill after an observation, counts. Cumulative on purpose: the per-step evidence
+     * covers one bracket, but the scheduler's tier and arena ticks move units after
+     * step_finished, so a move between two brackets would otherwise never reach the bracket
+     * measured after it. Compared against draft_moves_baseline_. */
+    int64_t residency_moves() const;
+    /* The promotions of one rank's snapshot `initial` that the move count leaves out as its share
+     * of the start placement's fill: the live initial fill promotions while the resolve is open,
+     * and the count frozen at settle_start_placement after it. One rule for residency_moves, the
+     * step's snapshot and the bracket's own count, so a fill that lands after the resolve is a move
+     * in all three. */
+    int64_t rank_fill_exempt(const Rank& r, uint64_t initial) const;
+    /* Whether every rank's fill has nothing left to issue and no copy still landing -- the start
+     * placement is materialised. True from the start for a plan that never fills. */
+    bool start_placement_settled() const;
+    /* Latches start_placement_settled() and freezes the exemption at the promotions that reached
+     * it. Not a baseline reset: the non-fill moves stay counted, and a drift already noted stays
+     * noted (Scheduler::draft_drift_note). */
+    void settle_start_placement();
+    /* Complete the start loan's fill before anything is measured: the idle balance keeps the
+     * turnover slots free, and fill_settled() does not call the loan settled while they are empty,
+     * so only a balance that holds turnover fills them -- the wave this call runs. A wave cut short
+     * (a drain before the fill, records still held by moves in flight) repeats. Every wave lands at
+     * zero dispatches, where each promotion is the plan's own lent slot, not a later heat decision.
+     * The first wave runs even when fill_settled() reads true, so the reserve is proven by a
+     * balance that held it; RAD_E_FULL when it cannot settle in the wave bound, and the first
+     * device, stream or mover error otherwise. See prepare_serving(). */
+    int  complete_start_fill();
+    /* serve()'s startup before anything is measured: the start loan, the fill that materialises
+     * it, and the calibration check that must refuse before a run rather than after one. Returns
+     * the first error, and serve stops there -- no fingerprint, profile or price follows a start
+     * placement that did not complete. */
+    int  prepare_serving();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */
@@ -334,6 +422,12 @@ private:
      * next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
+    /* One end event per rank, index 0 unused (step_end_ is rank 0's). The rank handoff is a host
+     * barrier, which joins the ranks' enqueues, not their execution, and step_end_ is card-local:
+     * without these, a rank's stream may still be running when the host reads the step. Recorded
+     * by the scheduler at the same point as step_end_ and waited on in await_step_end(). */
+    std::vector<RadEvent> rank_end_;
+    int  await_step_end();
 
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the
@@ -378,6 +472,7 @@ private:
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
+    int  publish_draft(uint64_t seq, const int32_t* tok, int n);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
@@ -386,11 +481,32 @@ private:
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter and the host's block driver both read the committed sequence). */
     bool pipelining_ = false;
+    /* --draft-profile-out was validated at startup and this run exports on exit. The runtime is
+     * derived there -- before the scheduler starts -- so a deployment whose identity cannot be
+     * established refuses the calibration up front and the exported header is the identity the run
+     * was actually bound to. */
+    bool draft_calibrating_ = false;
+    DraftCostRuntime draft_calib_runtime_;
+    /* residency_moves() when the run started: the profile's fingerprint names the residency at
+     * that point, so every later bracket is measured against it (DraftStepEvidence). */
+    int64_t draft_moves_baseline_ = 0;
+    /* The start placement's resolve (one-way). Before it every initial fill promotion is exempt;
+     * after it each rank's count is frozen (Rank::fill_exempt), so a fill issued later is a move.
+     * Atomic: the step loop settles it while a rank thread may still be noting its own step. */
+    std::atomic<bool> draft_placement_resolved_{true};
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
-     * asked for, and the rounds that ran. */
+     * asked for, and the rounds that ran. `serial_k_` is the frozen per-row depth: the last round
+     * each row was still in the batch, read off the passes that were actually issued, so the
+     * finish can compare the card's StepSlot::gen against the plan rather than the cycle's depth. */
     std::vector<Scheduler::SerialRow> serial_row_;
+    std::vector<int32_t> serial_k_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
+    /* A history pass (serial round 0) was built and enqueued for the current step. It is the
+     * engine's own record of what it issued, not a claim that anything ran: the pass proves itself
+     * only through StepOut::complete. Cleared at every issue_serial_drafter, so a previous step's
+     * history pass cannot be read as this one's. */
+    bool serial_hist_issued_ = false;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
     int  step_state_init();
@@ -461,8 +577,12 @@ private:
      * cache already owns (KVManager, the loan block). Lives here, not in the scheduler, because
      * rank 0's cache sets the amount while every rank's mover fills or empties slots, and a mover
      * may only be driven while its rank thread is parked, which this thread knows. `idle` also
-     * runs each mover's own fill, which a busy engine gets from the step. */
-    void loan_tick(bool idle);
+     * runs each mover's own fill, which a busy engine gets from the step. Returns the first error
+     * (the cache refusing the offer, a device that cannot be selected, a mover that rejects its
+     * loan or a failed idle fill); the runtime callers ignore the result -- the paths that already
+     * ignored one (`rad_dev_set`, `Mover::set_loan`) stay unlogged -- and only serve's
+     * identity-bound start path turns it into an abort. */
+    int loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx

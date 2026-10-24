@@ -128,6 +128,13 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     for (size_t d = 0;
          d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
+    /* The observation ledger: three row counts, one cycle count and one cost-observation count,
+     * renamed to keep the unit in the name. */
+    o.draft_obs_rows_attempted   = m.draft_obs_attempted;
+    o.draft_obs_rows_applied     = m.draft_obs_applied;
+    o.draft_obs_rows_skipped     = m.draft_obs_skipped;
+    o.draft_obs_cycles_discarded = m.draft_obs_discarded;
+    o.draft_cost_observations_inactive = m.draft_obs_inactive;
     o.preemptions = m.preemptions;
     o.total_requests = m.admitted;
     o.steps = m.steps;

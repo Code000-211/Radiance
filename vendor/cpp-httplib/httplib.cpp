@@ -7320,11 +7320,16 @@ void Server::wait_until_ready() const {
 }
 
 void Server::stop() noexcept {
+  /* Remember the request even when the listener is not up yet: listen_internal() consumes it as
+   * soon as it marks itself running, so a stop in that window is not dropped. */
+  stop_requested_ = true;
   if (is_running_) {
-    assert(svr_sock_ != INVALID_SOCKET);
-    std::atomic<socket_t> sock(svr_sock_.exchange(INVALID_SOCKET));
-    detail::shutdown_socket(sock);
-    detail::close_socket(sock);
+    /* One caller takes the socket; a concurrent stop must not close it twice or assert. */
+    const socket_t sock = svr_sock_.exchange(INVALID_SOCKET);
+    if (sock != INVALID_SOCKET) {
+      detail::shutdown_socket(sock);
+      detail::close_socket(sock);
+    }
   }
   is_decommissioned = false;
 }
@@ -7888,6 +7893,15 @@ bool Server::listen_internal() {
   auto ret = true;
   is_running_ = true;
   auto se = detail::scope_exit([&]() { is_running_ = false; });
+  /* A stop that arrived before this point had no listener to close. Consume it now, before the
+   * accept loop, and close the socket here so the caller returns as from a normal stop. */
+  if (stop_requested_.exchange(false)) {
+    const socket_t sock = svr_sock_.exchange(INVALID_SOCKET);
+    if (sock != INVALID_SOCKET) {
+      detail::shutdown_socket(sock);
+      detail::close_socket(sock);
+    }
+  }
 
   {
     std::unique_ptr<TaskQueue> task_queue(new_task_queue());
@@ -7953,6 +7967,8 @@ bool Server::listen_internal() {
     task_queue->shutdown();
   }
 
+  /* A stop that closed the loop's socket was this run's; the next listen starts clean. */
+  stop_requested_ = false;
   is_decommissioned = !ret;
   return ret;
 }

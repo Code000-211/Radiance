@@ -3432,7 +3432,9 @@ int Engine::start() {
                 strips.push_back(st);
             }
         }
-        RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
+        /* The no-loan reference measures the plan's start placement without borrowed copies: the
+         * lender is not registered at all, so nothing can be carved, offered or filled. */
+        if (!cfg_.draft_reference) RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
         if (r->mover.flex_capacity() > 0) lending_ = true;
     }
     /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
@@ -3521,7 +3523,7 @@ int Engine::start() {
             st.bytes = most;
             st.unit_bytes = 1;
             st.unit_tokens = 1;
-            RAD_TRY(r->mover.lend_from(Mover::kLendArena, { st }));
+            if (!cfg_.draft_reference) RAD_TRY(r->mover.lend_from(Mover::kLendArena, { st }));
         }
         (void)rad_dev_set(ranks_[0]->device);
         if (ok) {
@@ -3532,7 +3534,11 @@ int Engine::start() {
                 lv += fmt("%s%s while steps are at most %lld tokens",
                           k > 1 ? ", " : "", humanb(ranks_[0]->arena_lent[k]).c_str(),
                           (long long)arena_rows_[k]);
-            RAD_INFO("activation arena: lends %s", lv.c_str());
+            if (cfg_.draft_reference)
+                RAD_INFO("activation arena: reference calibration -- levels %s are recorded in the "
+                         "profile's identity, nothing is lent", lv.c_str());
+            else
+                RAD_INFO("activation arena: lends %s", lv.c_str());
         } else {
             RAD_WARN("activation arena: a level would not bind; nothing is lent");
             for (auto& r : ranks_) r->arena_lent.clear();

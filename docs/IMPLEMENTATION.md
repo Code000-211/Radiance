@@ -47,6 +47,7 @@ data/             kernels.rkb and kernels_moe.rkb: recorded references rad-kbenc
                   no model. Two, because no one container declares the whole vocabulary.
                   recipes/: the quantisation recipes of the containers this tree serves
 docs/KERNELS.md   what rad-kbench last measured, generated and checked in
+docs/ADAPTIVE-MTP.md  the adaptive draft policy's contracts, profile/manifest formats and owners
 vendor/           llama.cpp lifts tracked to an upstream commit (vendor/UPSTREAM), changed only
                   through vendor/patches/; nlohmann/json and cpp-httplib
 tests/            ctest
@@ -58,11 +59,35 @@ adds every architecture directory itself.
 
 ## Build
 
+The compiler is the one the engine ships with: ROCm's clang 23, named by the handoff as
+`/opt/rocm/llvm/bin/clang` for C and `/opt/rocm/llvm/bin/clang++` for C++. Every build and every
+compiled test uses it, the host backend included. The HIP backend is built by
+`${ROCM_PATH:-/opt/rocm}/bin/hipcc`, which drives the same clang; `CMakeLists.txt` finds it with
+`find_program(RAD_HIPCC hipcc HINTS /opt/rocm/bin /opt/rocm/llvm/bin ENV ROCM_PATH)`.
+A distribution compiler on PATH (CMake would pick `/usr/bin/c++`) is not a substitute, and neither
+is a different system GCC: results from another compiler are not comparable, so they do not
+verify a change.
+
+The two `llvm/bin` spellings are the same compiler, not a second toolchain. On the delivered
+ROCm 10.0.0 image, `/opt/rocm/llvm/bin/{clang,clang++}` and `/opt/rocm/lib/llvm/bin/{clang,clang++}`
+all resolve to `/opt/rocm/core-10.0/lib/llvm/bin/clang-23` (one inode, `2103776`; sha256
+`241bf4da7ec39bc00b68ed74f6be751516d9892ed990e8c7fa372bad18500247`), and both paths print the same
+`AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git
+8f497e0992fb7513f7f78a6f6b6f1056c375e961)`. `hipcc --version` reports HIP 7.15.26333 and that same
+clang 23 build. ROCm clang/LLVM 23 is the requirement; no ROCm 10.1 or other version is derived
+from it.
+
+The entry points name it, so no build depends on what happens to be on PATH: `./build.sh` passes `-DCMAKE_C_COMPILER=${ROCM_PATH:-/opt/rocm}/llvm/bin/clang` and `-DCMAKE_CXX_COMPILER=.../clang++` and stops with a named blocker when they are missing, and `CMakePresets.json`'s `default` preset (which `asan`, `tsan` and the test presets inherit) sets the same pair. A direct configure must name both:
+
 ```sh
-cmake -S . -B build -G Ninja           # host backend; no ROCm required
+cmake -S . -B build -G Ninja -DRAD_WITH_HIP=OFF \
+  -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Each result states the compiler path and version it was built with (`/opt/rocm/llvm/bin/clang++ --version`). If the shipped toolchain is missing, report that blocker; do not build with another compiler to get a green result.
 
 A change is done when its directory compiles and its tests pass.
 
