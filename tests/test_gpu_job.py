@@ -12,8 +12,11 @@ import unittest
 from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parents[1] / "scripts" / "gpu_job.py"
+# Runs as the woken candidate's own runner; records the finished issue's final status.
+SECOND = ("from pathlib import Path; import os; r=Path(os.environ['FAKE_STATE']); "
+          "(r/'second').write_text(r.joinpath(os.environ['FAKE_FINISHED']).read_text())")
 FAKE_CLI = '''#!/usr/bin/env python3
-import fcntl, json, os, sys
+import fcntl, json, os, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_STATE"])
 args = sys.argv[1:]
@@ -37,6 +40,13 @@ def dispatch(name, kind):
     with (root / "events").open("a") as f:
         f.write("dispatch " + name + " " + kind + " " + state + "\\n")
 
+def follow(name):
+    # What the platform's wakeup does: run the woken candidate's own runner.
+    if not os.environ.get("FAKE_CHAIN"):
+        return
+    subprocess.run([sys.executable, "-c", os.environ["FAKE_LAUNCHER"], "--issue", name,
+                    "--", sys.executable, "-c", os.environ["FAKE_SECOND_CMD"]], timeout=60)
+
 if args[:2] == ["issue", "get"]:
     print(json.dumps(row(root / args[2])))
 elif args[:2] == ["issue", "list"]:
@@ -58,15 +68,35 @@ elif args[:2] == ["issue", "wakeup"] and args[2] == "list":
     rules = root / ("wakeups-" + args[3])
     print(rules.read_text() if rules.exists() else "[]")
 elif args[:2] == ["issue", "wakeup"] and args[2] == "trigger":
-    dispatch(args[3].removeprefix("id-"), "trigger")
-elif args[:2] == ["issue", "wakeup"] and args[2] == "create":
-    agent = args[args.index("--agent-id") + 1]
     name = args[3].removeprefix("id-")
-    with (root / ("wakeups-" + args[3])).open("a") as f:
-        f.write(json.dumps([{"id": "created", "enabled": True}]))
+    if (root / ("reject-" + name)).exists():
+        with (root / "events").open("a") as f:
+            f.write("reject " + name + "\\n")
+        sys.exit(3)
+    dispatch(name, "trigger")
+    if (root / ("ambiguous-" + name)).exists():
+        print("not json")
+        sys.exit(0)
+    follow(name)
+elif args[:2] == ["issue", "wakeup"] and args[2] == "create":
+    name = args[3].removeprefix("id-")
+    if (root / ("reject-" + name)).exists():
+        with (root / "events").open("a") as f:
+            f.write("reject " + name + "\\n")
+        sys.exit(3)
+    agent = args[args.index("--agent-id") + 1]
+    instruction = args[args.index("--instruction") + 1]
+    rules_file = root / ("wakeups-" + args[3])
+    rules = json.loads(rules_file.read_text()) if rules_file.exists() else []
+    rules.append({"id": "created", "enabled": True, "agent_id": agent, "instruction": instruction})
+    rules_file.write_text(json.dumps(rules))
     with (root / "events").open("a") as f:
         f.write("agent " + name + " " + agent + "\\n")
     dispatch(name, "create")
+    if (root / ("ambiguous-" + name)).exists():
+        print("not json")
+        sys.exit(0)
+    follow(name)
 else:
     sys.exit(2)
 '''
@@ -93,6 +123,7 @@ class GpuJobTests(unittest.TestCase):
 
             "sys.exit(m.main())"
         )
+        self.env["FAKE_LAUNCHER"] = self.launcher
 
     def start(self, code, issue="MAIN-1", after="in_review"):
         process = subprocess.Popen(
@@ -113,7 +144,7 @@ class GpuJobTests(unittest.TestCase):
             stream.close()
 
     def finish(self, process, expected):
-        out, err = process.communicate(timeout=10)
+        out, err = process.communicate(timeout=30)
         self.assertEqual(process.returncode, expected, out + err)
         return out, err
 
@@ -131,23 +162,42 @@ class GpuJobTests(unittest.TestCase):
             return []
         return [line for line in path.read_text().splitlines() if line.startswith(prefix)]
 
-    def test_initial_dispatch_and_automatic_handover(self):
+    def chain(self, code, expected_rc, after, first_final):
+        """One manual start (the first runner); the woken continuation starts the next one."""
+        self.env.update(FAKE_CHAIN="1", FAKE_SECOND_CMD=SECOND, FAKE_FINISHED="MAIN-1")
+        self.finish(self.start(code, after=after), expected_rc)
+        self.assertEqual((self.root / "MAIN-1").read_text(), first_final)
+        # The continuation could only observe the final status, so it ran after cleanup.
+        self.assertEqual((self.root / "second").read_text(), first_final)
+        self.assertEqual((self.root / "MAIN-2").read_text(), "in_review")
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.unlocked()
+
+    def test_initial_dispatch_starts_on_empty_window(self):
+        (self.root / "MAIN-2").write_text("blocked")
+        # No testing issue and no lock holder: the first start is not a handover.
+        code = ("from pathlib import Path; import os; r=Path(os.environ['FAKE_STATE']); "
+                "(r/'start').write_text(r.joinpath('MAIN-1').read_text())")
+        self.finish(self.start(code), 0)
+        self.assertEqual((self.root / "start").read_text(), "testing")
+        self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
+        self.assertEqual(self.events("dispatch "), [])
+
+    def test_chain_executes_continuation_after_success(self):
+        self.chain("pass", 0, "in_review", "in_review")
+
+    def test_chain_executes_continuation_after_failure(self):
+        self.chain("raise SystemExit(7)", 7, "in_review", "blocked")
+
+    def test_chain_executes_continuation_after_in_progress(self):
+        self.chain("pass", 0, "in_progress", "in_progress")
+
+    def test_handover_dispatches_one_successor_after_release(self):
         (self.root / "MAIN-3").write_text("blocked")
         self.finish(self.start("pass"), 0)
         self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
-        # Exactly one successor, woken for its own assignee, only after this window was released.
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
         self.assertEqual(self.events("agent "), ["agent MAIN-2 agent-MAIN-2"])
-
-    def test_handover_after_failure(self):
-        self.finish(self.start("raise SystemExit(7)"), 7)
-        self.assertEqual((self.root / "MAIN-1").read_text(), "blocked")
-        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
-
-    def test_handover_after_in_progress(self):
-        self.finish(self.start("pass", after="in_progress"), 0)
-        self.assertEqual((self.root / "MAIN-1").read_text(), "in_progress")
-        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
 
     def test_handover_skips_parent_with_open_child(self):
         (self.root / "MAIN-3").write_text("ready_for_testing")
@@ -156,10 +206,45 @@ class GpuJobTests(unittest.TestCase):
         self.finish(self.start("pass"), 0)
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-3 create free"])
 
-    def test_handover_reuses_existing_wakeup(self):
-        (self.root / "wakeups-id-MAIN-2").write_text(json.dumps([{"id": "rule", "enabled": True}]))
+    def test_handover_reuses_own_gpu_rule(self):
+        (self.root / "wakeups-id-MAIN-2").write_text(json.dumps([
+            {"id": "rule", "enabled": True, "agent_id": "agent-MAIN-2",
+             "instruction": "python3 scripts/gpu_job.py --issue MAIN-2 -- ./probe"}]))
         self.finish(self.start("pass"), 0)
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 trigger free"])
+
+    def test_handover_ignores_foreign_and_unrelated_rules(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        foreign = json.dumps([
+            {"id": "other-agent", "enabled": True, "agent_id": "agent-MAIN-3",
+             "instruction": "scripts/gpu_job.py --issue MAIN-3 -- ./probe"},
+            {"id": "human-approval", "enabled": True, "agent_id": "agent-MAIN-2",
+             "instruction": "Ask code211 to approve the next run."}])
+        (self.root / "wakeups-id-MAIN-2").write_text(foreign)
+        (self.root / "wakeups-id-MAIN-3").write_text(json.dumps([
+            {"id": "foreign-agent", "enabled": True, "agent_id": "some-other-agent",
+             "instruction": "scripts/gpu_job.py --issue MAIN-3 -- ./probe"}]))
+        self.finish(self.start("pass"), 0)
+        # MAIN-2 has no own GPU continuation -> dedicated rule; nothing foreign is triggered.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        stored = json.loads((self.root / "wakeups-id-MAIN-2").read_text())
+        self.assertEqual([r["id"] for r in stored], ["other-agent", "human-approval", "created"])
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
+
+    def test_handover_rejected_candidate_tries_next(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "reject-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        self.assertEqual(self.events("reject "), ["reject MAIN-2"])
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-3 create free"])
+
+    def test_handover_ambiguous_error_stops_dispatch(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "ambiguous-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        # The write may have happened: no second candidate may be dispatched.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
 
     def test_loser_does_not_dispatch(self):
         (self.root / "MAIN-2").write_text("testing")

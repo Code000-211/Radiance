@@ -46,6 +46,8 @@ def testing_issues() -> list[str]:
 HANDOVER = ("A GPU test window is free. Re-read this issue's blockers, then run its already-authorized "
             "GPU phase through: python3 scripts/gpu_job.py --issue {issue} -- <foreground command>. "
             "If the window is taken, stay ready_for_testing; the next finished runner hands off again.")
+# Only a rule carrying this marker is a GPU continuation; anything else waits for its own reason.
+GPU_RULE_MARKER = "scripts/gpu_job.py"
 
 
 def open_children(issue_id: str) -> list[dict[str, Any]]:
@@ -56,34 +58,61 @@ def open_children(issue_id: str) -> list[dict[str, Any]]:
     return [c for c in rows if c.get("status") not in ("done", "cancelled")]
 
 
+def gpu_continuation(rule: dict[str, Any], agent_id: str) -> bool:
+    """An enabled rule that wakes this candidate's own agent with a GPU-runner instruction."""
+    return (bool(rule.get("enabled")) and rule.get("agent_id") == agent_id
+            and GPU_RULE_MARKER in (rule.get("instruction") or ""))
+
+
+def dispatch(candidate: dict[str, Any]) -> None:
+    """Reuse the candidate's own GPU continuation rule, else create a dedicated one-shot rule.
+
+    Raises CalledProcessError when the CLI rejected the write; other errors may be ambiguous.
+    """
+    name = candidate["identifier"]
+    rules = [r for r in multica("issue", "wakeup", "list", candidate["id"]) or []
+             if gpu_continuation(r, candidate["assignee_id"])]
+    if rules:
+        multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
+    else:
+        multica("issue", "wakeup", "create", candidate["id"], "--kind", "at",
+                "--after", "1s", "--agent-id", candidate["assignee_id"],
+                "--instruction", HANDOVER.format(issue=name))
+
+
 def hand_over(finished: str) -> None:
     """One-shot dispatch of the next runnable waiter through existing Multica wakeups."""
     try:
         candidates = issues_with_status("ready_for_testing")
-        for candidate in sorted(candidates, key=lambda i: i["number"]):
-            name = candidate["identifier"]
-            if name == finished:
-                continue
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        print(f"handover: cannot read waiting candidates: {exc}", file=sys.stderr)
+        return
+    for candidate in sorted(candidates, key=lambda i: i["number"]):
+        name = candidate["identifier"]
+        if name == finished:
+            continue
+        if candidate.get("assignee_type") != "agent" or not candidate.get("assignee_id"):
+            print(f"handover: {name} has no agent assignee; skipped", file=sys.stderr)
+            continue
+        try:
             # A parent whose child work is still open must not duplicate the child's measurement.
-            if candidate.get("assignee_type") != "agent" or not candidate.get("assignee_id"):
-                print(f"handover: {name} has no agent assignee; skipped", file=sys.stderr)
-                continue
             if open_children(candidate["id"]):
                 print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
                 continue
-            rules = [r for r in multica("issue", "wakeup", "list", candidate["id"]) or []
-                     if r.get("enabled")]
-            if rules:
-                multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
-            else:
-                multica("issue", "wakeup", "create", candidate["id"], "--kind", "at",
-                        "--after", "1s", "--agent-id", candidate["assignee_id"],
-                        "--instruction", HANDOVER.format(issue=name))
-            print(f"handover: dispatched {name}", file=sys.stderr)
+            dispatch(candidate)
+        except subprocess.CalledProcessError as exc:
+            # The platform rejected this candidate's wakeup; no run was queued, so try the next one.
+            print(f"handover: {name} dispatch rejected (exit {exc.returncode}); trying next candidate",
+                  file=sys.stderr)
+            continue
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            # Could have been written before the error: stop instead of risking a second run.
+            print(f"handover: ambiguous dispatch for {name}; not trying another candidate: {exc}",
+                  file=sys.stderr)
             return
-        print("handover: no runnable waiting candidate", file=sys.stderr)
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-        print(f"handover failed: {exc}", file=sys.stderr)
+        print(f"handover: dispatched {name}", file=sys.stderr)
+        return
+    print("handover: no runnable waiting candidate", file=sys.stderr)
 
 
 def reap_children() -> None:

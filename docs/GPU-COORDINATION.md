@@ -47,9 +47,15 @@ written:
   issue is excluded, and a parent whose child issue is still open is skipped because the
   child carries that measurement;
 - candidates ordered by issue number, one dispatched per finished window;
-- the candidate's own agent assignee is woken (`--agent-id`); an enabled wakeup rule is
-  triggered if one exists, otherwise one one-shot `at` wakeup with the resumption
-  instruction is created. No scheduler is added.
+- the candidate's own agent assignee is woken (`--agent-id`). An enabled rule is reused only
+  when it wakes that same assignee **and** its instruction names
+  `scripts/gpu_job.py` (a GPU continuation). Foreign or differently-motivated rules are
+  left untouched and a dedicated one-shot `at` continuation is created instead. No
+  scheduler is added;
+- a wakeup the platform rejects (nonzero CLI exit) is reported and the next candidate is
+  tried, so one unusable candidate cannot stall the queue. An ambiguous write error
+  (timeout, unknown exit, unparsable response) stops the handover, because the rule may
+  already exist and a second dispatch could double-start the next run.
 
 If the handover call fails it is reported on stderr and does not rewrite the finished
 test's exit code; use the existing Sweeper as backstop. A stale `testing` issue (owner
@@ -114,11 +120,15 @@ uvx mypy --check-untyped-defs scripts/gpu_job.py tests/test_gpu_job.py
 Tests use a temporary lock and fake CLI, with no GPU load or production lock.
 They prove two competing agents produce one test window/one `testing`; the loser
 launches nothing and dispatches nothing, and a later run can reuse the lock. Also
-covered: initial dispatch on a free window, automatic handover with no second
-runner (success, `--after in_progress`, and failure to `blocked`), exactly one
-successor dispatched after the lock is released and for its own agent, skipping a
-blocked candidate and a parent with open child work, reuse of an existing wakeup
-rule, blocked/stale issue refusal, failed initial/final status updates, command
-failure (no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both
-successful exit statuses, and successful execution without foreign process/FD
-inspection permissions.
+covered: initial dispatch on an empty window (the command observes `testing` before
+it starts), an executed continuation chain for success, failure to `blocked`, and
+`--after in_progress` (the woken candidate's own runner starts without any second
+manual start in the test body, after the finished issue's final status, and releases
+the lock again), exactly one successor dispatched after release for its own agent,
+skipping a blocked candidate and a parent with open child work, reuse of an own GPU
+rule and ignoring foreign/unrelated rules, a rejected dispatch that falls through to
+the next candidate, an ambiguous dispatch that stops instead of double-starting,
+blocked/stale issue refusal, failed initial/final status updates, command failure
+(no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both successful exit
+statuses, and successful execution without foreign process/FD inspection
+permissions.
