@@ -24,24 +24,6 @@ def multica(*args: str) -> Any:
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def gpu_holders() -> list[int]:
-    """Inspect open device files without initializing HIP; unreadable processes fail closed."""
-    holders = []
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            for fd in (proc / "fd").iterdir():
-                try:
-                    device = os.readlink(fd)
-                except FileNotFoundError:
-                    continue
-                if device == "/dev/kfd" or device.startswith("/dev/dri/render"):
-                    holders.append(int(proc.name))
-                    break
-        except FileNotFoundError:
-            continue
-    return holders
-
-
 def testing_issues() -> list[str]:
     found: list[str] = []
     offset = 0
@@ -89,10 +71,9 @@ def run_job(issue: str, command: list[str], after: str) -> int:
         except BlockingIOError:
             print(f"WAIT: lock held; recorded owner: {lock.read(4096) or 'legacy/unknown'}", file=sys.stderr)
             return 75
-        holders = gpu_holders()
         active = testing_issues()
-        if holders or active:
-            print(f"WAIT: GPU PIDs={holders}; testing={active}", file=sys.stderr)
+        if active:
+            print(f"WAIT: another agent test window is recorded: {active}", file=sys.stderr)
             return 75
         # PR_SET_CHILD_SUBREAPER: orphaned grandchildren must not outlive the lock window.
         if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:

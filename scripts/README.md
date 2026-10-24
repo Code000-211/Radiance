@@ -18,8 +18,9 @@ and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname 
 For issue-owned GPU work, see [GPU-COORDINATION.md](../docs/GPU-COORDINATION.md).
 `gpu_job.py --issue MAIN-N -- COMMAND...` owns one nonblocking pair-lock window,
 sets `testing` before launching, and cleans up children before the final status.
-This runner is opt-in; existing scripts below are **not yet migrated** and must not
-be assumed to enforce project-wide GPU exclusivity or preserve foreign servers.
+Agent-owned GPU tests must use this runner; it serializes participating agents
+without inspecting GPU processes. Existing scripts below do not acquire this outer
+agent-test window automatically and must not be assumed to preserve foreign servers.
 
 ## Bringing a model up
 

@@ -53,8 +53,7 @@ class GpuJobTests(unittest.TestCase):
             f"s=importlib.util.spec_from_file_location('gpu_job',{str(RUNNER)!r}); "
             "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
             f"m.LOCK=Path({str(self.lock)!r}); "
-            f"m.gpu_holders=lambda: [999] if Path({str(self.root / 'foreign')!r}).exists() else []; "
-            f"m.gpu_holders=(lambda: (_ for _ in ()).throw(PermissionError('unreadable /proc'))) if Path({str(self.root / 'unreadable')!r}).exists() else m.gpu_holders; "
+
             "sys.exit(m.main())"
         )
 
@@ -155,24 +154,23 @@ class GpuJobTests(unittest.TestCase):
         self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
         self.unlocked()
 
-    def test_foreign_load_and_stale_testing_refuse(self):
-        for marker in ("foreign", "stale"):
-            with self.subTest(marker=marker):
-                if marker == "foreign":
-                    (self.root / marker).touch()
-                else:
-                    (self.root / "MAIN-2").write_text("testing")
-                self.finish(self.start("raise SystemExit('must not run')"), 75)
-                self.assertEqual((self.root / "MAIN-1").read_text(), "ready_for_testing")
-                self.unlocked()
-                (self.root / "foreign").unlink(missing_ok=True)
-
-    def test_unreadable_process_table_fails_closed(self):
-        (self.root / "unreadable").touch()
-        marker = self.root / "load"
-        self.finish(self.start(f"from pathlib import Path; Path({str(marker)!r}).touch()"), 1)
-        self.assertFalse(marker.exists())
+    def test_existing_testing_issue_refuses_second_agent(self):
+        (self.root / "MAIN-2").write_text("testing")
+        self.finish(self.start("raise SystemExit('must not run')"), 75)
         self.assertEqual((self.root / "MAIN-1").read_text(), "ready_for_testing")
+        self.unlocked()
+
+    def test_no_foreign_process_visibility_required(self):
+        # Device/foreign FD scans are not part of the agent-serialization contract.
+        self.launcher = self.launcher.replace(
+            "sys.exit(m.main())",
+            "from unittest.mock import patch; "
+            "patch('pathlib.Path.iterdir', side_effect=PermissionError('foreign proc')).start(); "
+            "patch('os.readlink', side_effect=PermissionError('foreign fd')).start(); "
+            "sys.exit(m.main())",
+        )
+        self.finish(self.start("pass"), 0)
+        self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
         self.unlocked()
 
     def test_blocked_issue_is_not_promoted(self):
