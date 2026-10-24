@@ -47,7 +47,13 @@ enum AdvMode : int32_t {
     /* A block drafter (RAD_DRAFT_BLOCK) on the card: */
     ADV_BLOCK  = 6,   /* before the query pass: the anchor at the committed end, then the masks */
     ADV_BTAKE  = 7,   /* after it: its `round` proposals into the state, behind the bonus token */
+    ADV_TREE_ACCEPT = 8,   /* after a tree verify's sampler: the winner walk over its nodes */
 };
+
+/* The most nodes a tree verify can stage, so the deepest step emits this many tokens. Kept equal
+ * to kTreeMaxNodes (arch/common/rad_tree_candidate.h) by a check in tests/tree_dispatch_test.cpp;
+ * advance_impl.h cannot include the host model into the kernel. */
+inline constexpr int32_t kAdvTreeMaxNodes = 65;
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,
  * which every rank carves identically. */
@@ -84,7 +90,8 @@ struct AdvanceArgs {
     StepSlot* st = nullptr;   /* [max_seqs], by scheduler slot */
     /* ADV_ACCEPT and ADV_HIST: the verify step's sampled tokens, one a row. ADV_ROUND and
      * ADV_TAKE: the last round's proposals, row i at i * src_pitch. ADV_BTAKE: the block's
-     * proposals, row i's from i * src_pitch. */
+     * proposals, row i's from i * src_pitch. ADV_TREE_ACCEPT: the target's pick at every node of
+     * the row's tree, node 0 first, so a node's pick is at src[rout + node]. */
     const int32_t* src = nullptr;
     int64_t src_pitch = 1;
     const int32_t* eog = nullptr;   /* end-of-generation ids, sorted */
@@ -96,6 +103,9 @@ struct AdvanceArgs {
      * components, as a media token needs. */
     int64_t rope_off = -1;
     int32_t rope_pitch = 0;
+    /* ADV_TREE_ACCEPT: [n_tok] parent ids, -1 at each row's root, staged by the builder from
+     * TreeStep::parents. A parent is always a lower id than its child, so id order is row order. */
+    int64_t parent_off = 0;
     /* A serial head with no cache of its own (rad_drafter_shared_kv), read by ADV_HIST and
      * ADV_ROUND only: its history pass is one row per sequence at the committed position, and
      * every round sits there too, with context ending at that position. `rot_shift` is the rotary
