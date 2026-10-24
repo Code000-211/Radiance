@@ -45,11 +45,13 @@ struct RadQsaAttnCall {
     const int32_t* row_off; /* [M] the row's table offset into the flat tab plane */
     const int32_t* pos;     /* [M] the row's last token position */
     const int32_t* bt;      /* [n_seq][bt_pitch] the sequence's block table, -1 for a dead block */
-    const int32_t* seq;     /* [M] the row's sequence index */
+    /* [seqs + 1] the batch's `cu_seqlens`, or null: row m belongs to the sequence holding it, so a
+     * row set of several sequences needs no per-row id operand (the batch has none). */
+    const int32_t* cu;
     void*          out;     /* [M][n_head * head_dim] */
 
     int64_t M, n_head, kv_heads, gqa, head_dim, block_size, ratio;
-    int64_t tile, u_max, tiles, topk, blocks;
+    int64_t tile, u_max, tiles, topk, blocks, seqs;
     int64_t q_pitch, out_pitch, bt_pitch;              /* elements between rows */
     int64_t kv_sb, kv_sh, kv_so, kv_sd;                /* cache strides: block, head, slot, dim */
     float   scale;
@@ -68,14 +70,34 @@ int rad_qsa_attn_args(const RadArgs*, RadQsaAttnCall*);
 int rad_qsa_attn_launch(const RadArgs*, RadStream);
 int rad_ref_qsa_attn(const RadArgs*);
 
+/* The row's sequence: the last `cu` entry at or before the row. A null `cu` is the caller's "every
+ * row is this sequence" form -- it slices `bt` to that one. */
+/* `inline` in both halves: the kernel reads a row's sequence through this too, so it carries the
+ * device qualifier where there is one -- and this header also compiles as plain C++ (the emulator
+ * and the host reference), where those keywords do not exist. */
+#if defined(__HIPCC__)
+#define RAD_QSA_HD __host__ __device__ inline
+#else
+#define RAD_QSA_HD inline
+#endif
+RAD_QSA_HD int64_t rad_qsa_attn_seq(const RadQsaAttnCall& c, int64_t row) {
+    if (!c.cu) return 0;
+    int64_t lo = 0, hi = c.seqs;   /* cu[lo] <= row, and row < cu[hi] when hi < seqs */
+    while (lo + 1 < hi) {
+        const int64_t mid = (lo + hi) / 2;
+        if (c.cu[mid] <= row) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
 /* One row's key order, in the shape every implementation walks: the union's entries the row's mask
  * holds, ascending, then the partial page's visible tokens. `visit(block, page, first, last)` is
  * called once per entry, `first..last` the tokens of that page the row sees; a page that maps to no
- * cache block is skipped, as `attn_paged` skips a -1 entry. Shared by the oracle and by the test's
- * own port so the three cannot drift. */
+ * cache block is skipped, as `attn_paged` skips a -1 entry. Shared by the oracle, the kernel and the
+ * test's own port so they cannot drift. */
 template <class Visit>
 void rad_qsa_attn_keys(const RadQsaAttnCall& c, int64_t row, Visit visit) {
-    const int64_t s = c.seq[row];
+    const int64_t s = rad_qsa_attn_seq(c, row);
     const int64_t p = c.pos[row];
     const int64_t own = (p + 1) / c.ratio;
     const int64_t tile = c.row_off[row] / c.u_max;

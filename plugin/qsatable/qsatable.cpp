@@ -13,7 +13,7 @@ namespace {
 
 #define PI(k) { k, RAD_P_INT, RAD_REQUIRED, 0 }
 const RadParamSpec kTableParams[] = {
-    PI("M"), PI("blocks"), PI("topk"), PI("tile"), PI("ratio"),
+    PI("M"), PI("blocks"), PI("topk"), PI("tile"), PI("ratio"), PI("u_max"),
 };
 #undef PI
 
@@ -31,7 +31,7 @@ const RadOperandSpec kTableOperands[] = {
 };
 
 const RadOpSchema kSchemas[] = {
-    { "qsa_table", kTableParams, 5, kTableOperands, 7,
+    { "qsa_table", kTableParams, 6, kTableOperands, 7,
       "The block table a query tile shares: the union of the rows' `selb` selections in block order "
       "(tab, tlen), and per row the membership mask that filters it back to that row's own list "
       "(mask, row_off). The partial page is not in the table; a row appends it. Union order is what "
@@ -70,7 +70,12 @@ int table_geometry(const RadParam* p, int n, bool range, RadQsaTableCall* c) {
     if (c->ratio < 1 || c->ratio > INT32_MAX) return RAD_E_UNSUPPORTED;
     if (c->blocks < 1 || c->blocks > INT32_MAX) return RAD_E_UNSUPPORTED;
     c->tiles = (c->M + c->tile - 1) / c->tile;
-    c->u_max = rad_qsa_table_u_max(c->tile, c->topk, c->blocks);
+    /* The plane's declared width, not one derived from `tile`: a caller that launches tiles of
+     * fewer rows than the buffer was sized for keeps one width, so the table op and its reader
+     * agree on the pitch without either re-deriving it (docs/OPS.md). The union can never exceed
+     * one entry per (row, slot), which bounds it. */
+    c->u_max = rad_param_geti(p, n, "u_max", 0);
+    if (c->u_max < 1 || c->u_max > c->tile * c->topk) return RAD_E_UNSUPPORTED;
     return RAD_OK;
 }
 

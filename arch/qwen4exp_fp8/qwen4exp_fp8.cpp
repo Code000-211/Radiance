@@ -840,6 +840,31 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               { g.max_tok, m.qsacfg.topk + 1 });
         m.qsaw.nsel  = decl_b(b, nm.f("qsa_nsel"),  RAD_I32, { g.max_tok });
         m.qsaw.sequ  = decl_b(b, nm.f("qsa_sequ"),  RAD_I32, { g.max_tok });
+        /* The shared-table read path, the prototype behind RADIANCE_QSA_TABLE=1
+         * (arch/common/rad_qsa.h: qsa_table_on()). One union per tile of kQsaTile query rows and
+         * the membership mask that turns it back into each row's own list, one buffer for the
+         * whole model because every layer reads the same step's table.
+         *
+         * `u_max` is the plane's width and the two ops' `u_max` parameter; the union of `tile` rows
+         * holds at most `tile * topk` entries and never more than the blocks there are. The mask is
+         * the widest of the planes, `max_tok * u_max` int32 -- 64 MiB at a 2048-row step and 8 KiB
+         * of union, which is the prototype's cost, and a bitmask (1 bit an entry) is the obvious
+         * next step if it ever matters. */
+        if (qsa_table_on()) {
+            const int64_t tile = kQsaTile;
+            const int64_t umax = std::min(tile * m.qsacfg.topk, m.qsacfg.max_blocks);
+            const int64_t tiles = (g.max_tok + tile - 1) / tile;
+            if (umax < 1) return RAD_E_INVAL;
+            m.qsacfg.u_max = umax;
+            m.qsaw.selb = decl_b(b, nm.f("qsa_selb"), RAD_I32,
+                                 { g.max_tok, m.qsacfg.topk + 1 });
+            m.qsaw.tab  = decl_b(b, nm.f("qsa_tab"),  RAD_I32, { tiles, umax });
+            m.qsaw.tlen = decl_b(b, nm.f("qsa_tlen"), RAD_I32, { tiles });
+            m.qsaw.mask = decl_b(b, nm.f("qsa_mask"), RAD_I32, { g.max_tok, umax });
+            m.qsaw.roff = decl_b(b, nm.f("qsa_roff"), RAD_I32, { g.max_tok });
+            if (!m.qsaw.selb || !m.qsaw.tab || !m.qsaw.tlen || !m.qsaw.mask || !m.qsaw.roff)
+                return RAD_E_INVAL;
+        }
         if (!m.qsaw.qk || !m.qsaw.q || !m.qsaw.stage || !m.qsaw.page ||
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)
@@ -1092,6 +1117,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 lay.attn.qsa_sel      = m.qsaw.sel;
                 lay.attn.qsa_sequ     = m.qsaw.sequ;
                 lay.attn.qsa_topk     = m.qsacfg.topk;
+                /* The shared table, when it was declared: the two ops are bound but only the gate
+                 * and a library that declares them decide whether a step reads it
+                 * (rad_block_attn_gated_fp8.h). */
+                lay.attn.qsa_nsel     = m.qsaw.nsel;
+                lay.attn.qsa_selb     = m.qsaw.selb;
+                lay.attn.qsa_tab      = m.qsaw.tab;
+                lay.attn.qsa_tlen     = m.qsaw.tlen;
+                lay.attn.qsa_mask     = m.qsaw.mask;
+                lay.attn.qsa_roff     = m.qsaw.roff;
+                lay.attn.qsa_table    = m.qsaw.selb != 0;
+                lay.attn.qsa_umax     = m.qsacfg.u_max;
+                lay.attn.qsa_tile     = kQsaTile;
+                lay.attn.qsa_ratio    = m.qsacfg.ratio;
+                lay.attn.qsa_blocks   = m.qsacfg.max_blocks;
                 /* The exactness bound, below which prefill issues the cheaper dense attention.
                  * Decode ignores it and always takes the sparse path, keeping that path exercised
                  * on every step. */
@@ -1367,6 +1406,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.mtp.attn.qsa_sel      = m.qsaw.sel;
             m.mtp.attn.qsa_sequ     = m.qsaw.sequ;
             m.mtp.attn.qsa_topk     = m.qsacfg.topk;
+            m.mtp.attn.qsa_nsel     = m.qsaw.nsel;
+            m.mtp.attn.qsa_selb     = m.qsaw.selb;
+            m.mtp.attn.qsa_tab      = m.qsaw.tab;
+            m.mtp.attn.qsa_tlen     = m.qsaw.tlen;
+            m.mtp.attn.qsa_mask     = m.qsaw.mask;
+            m.mtp.attn.qsa_roff     = m.qsaw.roff;
+            m.mtp.attn.qsa_table    = m.qsaw.selb != 0;
+            m.mtp.attn.qsa_umax     = m.qsacfg.u_max;
+            m.mtp.attn.qsa_tile     = kQsaTile;
+            m.mtp.attn.qsa_ratio    = m.qsacfg.ratio;
+            m.mtp.attn.qsa_blocks   = m.qsacfg.max_blocks;
             m.mtp.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
             ts.qsa         = m.qsacfg;
             ts.qsa.mode    = m.mtp.attn.mode;

@@ -22,6 +22,21 @@
 namespace rad {
 namespace arch {
 
+/* The prototype's switch for the shared-table read path (docs/QSA.md, "The masked read"): with it
+ * set, a sparse step builds one block table per query tile and reads it through each row's
+ * membership mask instead of issuing the attention once per row. The loader reads no switch, so an
+ * unset variable leaves every launch on the row path this branch shipped before -- that is the
+ * measurement's control arm. `RADIANCE_QSA_TABLE=1` takes the treatment arm. Read per call, not
+ * cached, so a test can flip it. */
+inline bool qsa_table_on() {
+    const char* v = std::getenv("RADIANCE_QSA_TABLE");
+    return v && *v && !(v[0] == '0' && v[1] == '\0');
+}
+
+/* Query rows one table covers, and the constant both ops that share the plane agree on: the union
+ * of `tile` rows holds at most `tile * topk` entries, so the plane's width is derived from this. */
+constexpr int64_t kQsaTile = 16;
+
 struct QsaIndexer {
     struct Config {
         int64_t     heads    = 0;   /* indexer_n_heads      -- 4 */
@@ -60,6 +75,10 @@ struct QsaIndexer {
          * wider than them is one sequence (RadBuildCtx::max_mixed_tok); such a step scores and
          * selects in windows of this many rows (step()). */
         int64_t     plane_rows = 0;
+        /* The shared-table planes' width (Wire::tab), `min(kQsaTile * topk, max_blocks)`; 0 leaves
+         * them undeclared and every step on the row path. Set by the caller, which sizes the
+         * buffers. */
+        int64_t     u_max      = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -94,6 +113,19 @@ struct QsaIndexer {
         rad_buf sel   = 0;   /* [max_tok, topk + 1]   i32 */
         rad_buf nsel  = 0;   /* [max_tok]             i32 */
         rad_buf sequ  = 0;   /* [max_tok]             i32 */
+        /* The selection as BLOCK indices, `qsa_select`'s `selb`: the same entries in the same
+         * order. A page id does not sort by block (a dead block drops out of the block table, the
+         * prefix cache re-orders the rest), so a table a tile of query rows shares is built from
+         * these and only then mapped to page ids. Declared only with `qsa_table_on()`. */
+        rad_buf selb  = 0;   /* [max_tok, topk + 1]   i32 */
+        /* The shared-table planes (docs/QSA.md, "The masked read"), one union per tile of kQsaTile
+         * rows plus the membership mask that turns it back into each row's own list. Declared here
+         * rather than in the attention block: every layer reads the same step's table, and a plane
+         * per layer would be that many copies of it. Width `Config::u_max`. */
+        rad_buf tab   = 0;   /* [ceil(max_tok / kQsaTile), u_max] i32 */
+        rad_buf tlen  = 0;   /* [ceil(max_tok / kQsaTile)]        i32 */
+        rad_buf mask  = 0;   /* [max_tok, u_max]                  i32 */
+        rad_buf roff  = 0;   /* [max_tok]                         i32 */
         /* The model's cos/sin plane, [rope_table_rows, rot], or 0 if it builds none. Filled once a
          * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
          * `theta` and `scale`. Without it the unfused per-head norms run. */
@@ -249,12 +281,19 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.q, w.nc}, {w.score});
-    op_select = rw(b, RAD_OP(b, "qsa_select",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
-                                 RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
-                                 RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
-                      RAD_NOWEIGHTS),
-                  {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+    /* `selb` is the schema's ninth operand and always issued: without the shared-table path it is
+     * RAD_NONE at issue, which is a null operand, not a shorter list (abi/rad_plugin.h). */
+    op_select = RAD_OP(b, "qsa_select",
+                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                  RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                  RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
+                       RAD_NOWEIGHTS);
+    if (op_select) {
+        const rad_buf ins[2]  = { w.score, w.nc };
+        const rad_buf outs[4] = { w.sel, w.nsel, w.sequ, w.selb };
+        rad_op_reads(b, op_select, ins, 2);
+        rad_op_writes(b, op_select, outs, w.selb ? 4 : 3);
+    }
     return RAD_OK;
 }
 
@@ -387,7 +426,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                         brows(w.nc, S), praw(batch->positions + w0, RAD_I32, PR),
                         praw(win_cu, RAD_I32, 2),
                         brow_slice(w.sel, w0, PR, c.topk + 1), brow_slice(w.nsel, w0, PR, 1),
-                        brow_slice(w.sequ, w0, PR, 1));
+                        brow_slice(w.sequ, w0, PR, 1),
+                        w.selb ? brow_slice(w.selb, w0, PR, c.topk + 1) : RAD_NONE);
             if (w0 + PR >= T) break;
             w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
         }
@@ -403,7 +443,8 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
                 brows(w.nc, S), praw(batch->positions, RAD_I32, T),
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
-                brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+                brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T),
+                w.selb ? brows(w.selb, T) : RAD_NONE);
 
     /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
      * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the

@@ -35,8 +35,6 @@ int rad_ref_qsa_attn(const RadArgs* a) {
     std::vector<double>  acc((size_t)c.head_dim);
     std::vector<float>   sc;
     for (int64_t row = 0; row < c.M; ++row) {
-        const int64_t s = c.seq[row];
-        if (s < 0) return RAD_E_INVAL;
         for (int64_t h = 0; h < c.n_head; ++h) {
             const int64_t kh = h / c.gqa;
             const char* qrow = (const char*)c.q + (row * c.q_pitch + h * c.head_dim) * esz_q;

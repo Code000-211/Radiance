@@ -182,9 +182,21 @@ table per row (tile 1) and through the tile's union and requires the two outputs
 byte, and both within rounding of the op's f64 oracle. What the table saves there is what the
 measurement is for: 2.1x to 10x fewer entries for a tile of 4 to 32 rows.
 
-Neither op is issued by the architecture yet: the sparse path in
-`arch/common/rad_block_attn_gated_fp8.h` still issues `attn_paged` once per query row with that row's
-own selection, which is the control arm.
+The sparse path in `arch/common/rad_block_attn_gated_fp8.h` now reads through them, behind
+`RADIANCE_QSA_TABLE=1` (read on every call, so a step is either fully on or fully off). With the
+switch on, a chunk of sparse query rows becomes one `qsa_table` launch building the union of its
+tiles and one `qsa_attn` launch reading it per row; with it unset, nothing of the path is declared
+and the row path runs unchanged. That is what makes the two arms a measurement inside one build
+rather than a comparison across builds, and it is also why the switch lives on the architecture side
+and not in the loader: `plugin/qsatable` is a plugin like any other and reads no switch.
+
+A chunk narrower than one tile still runs on the row path: the table needs a whole tile, and the
+paths are byte-identical, so which arm a row lands in cannot move its number. A library that does not
+declare both ops sends the same rows down the row path too.
+
+`qsa_select` grew a ninth operand for this (`selb`, the block indices above). Operands are
+positional, so its arrival moved every issue hash once; the graph is unchanged and
+`tests/arch_test.cpp` re-pins the step hashes with that written down.
 
 ## Cost
 

@@ -150,7 +150,10 @@ struct DsaCache {
         RAD_ISSUE_N(ctx, op_select, T, bcol_at(w.score, 0, c.blocks, 0, live, T),
                     praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S),
                     praw(batch->positions, RAD_I32, T), praw(batch->cu_seqlens, RAD_I32, S + 1),
-                    brows(w.selected, T), brows(w.nsel, T), brows(w.length, T));
+                    brows(w.selected, T), brows(w.nsel, T), brows(w.length, T),
+                    /* DSA reads the page ids; `selb` is the schema's ninth operand and an absent
+                     * optional operand is a null one, not a shorter list (abi/rad_plugin.h). */
+                    RAD_NONE);
     }
 };
 

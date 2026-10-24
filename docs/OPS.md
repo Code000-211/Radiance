@@ -2564,8 +2564,8 @@ order, not a slow one.
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused`, `selb`? |
-| `qsa_table` | `M`(range) `blocks` `topk` `tile` `ratio` | `selb`, `nsel`, `pos` → `tab`, `tlen`, `mask`, `row_off` |
-| `qsa_attn` | `M`(range) `n_head` `head_dim` `gqa` `block_size` `ratio` `tile` `topk` `blocks` `max_seqs` `scale`/opt `q_dtype` `kv_dtype` | `q`, `kv`, `tab`, `tlen`, `mask`, `row_off`, `pos`, `bt`, `seq` → `out` |
+| `qsa_table` | `M`(range) `blocks` `topk` `tile` `ratio` `u_max` | `selb`, `nsel`, `pos` → `tab`, `tlen`, `mask`, `row_off` |
+| `qsa_attn` | `M`(range) `n_head` `head_dim` `gqa` `block_size` `ratio` `tile` `topk` `blocks` `max_seqs` `u_max` `scale`/opt `q_dtype` `kv_dtype` | `q`, `kv`, `tab`, `tlen`, `mask`, `row_off`, `pos`, `bt`, `cu` → `out` |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
@@ -2724,8 +2724,17 @@ a masked read of it saves.
 - **The partial page is not in the table.** Its block index is `(pos + 1) / ratio` by construction, so
   the bound `b < own` already keeps it out of the union; a reader appends it after filtering, which
   is the page it must read last anyway.
-- **It is not wired into the architecture.** The read is `qsa_attn` below; nothing in `arch/` issues
-  either op yet (the sparse path still issues `attn_paged` per query row, the control arm).
+- **`u_max` is a parameter, not a derivation**, and both ops read the same one. It is the pitch of
+  every plane, so a caller that launches tiles of fewer rows than the plane was sized for still
+  agrees with the reader on one number; validated `1 <= u_max <= tile * topk`.
+- **The architecture declares it behind `RADIANCE_QSA_TABLE=1`, and only then.** With the switch on,
+  `arch/qwen4exp_fp8` declares `qsa_selb`/`qsa_tab`/`qsa_tlen`/`qsa_mask`/`qsa_roff` in
+  `QsaIndexer::Wire` and the sparse path in `arch/common/rad_block_attn_gated_fp8.h` issues
+  `qsa_table` once per chunk and `qsa_attn` once per chunk instead of `attn_paged` per query row;
+  with it unset, not one buffer or op of the path is declared and the control arm runs unchanged
+  (`tests/arch_test.cpp`, `flashnext_reads_attention_through_the_shared_table_only_behind_its_switch`).
+  A library that does not declare both ops sends the same rows down the row path: the ops the
+  builder cannot resolve are optional, not required.
 
 ### `qsa_attn`
 
@@ -2745,6 +2754,11 @@ through the row's block table, and appending the row's partial page last.
 - **One lane per (query row, query head), no LDS.** A prototype statement of the op, not a serving
   kernel: a real one keeps a row's union in LDS and scores the tile's rows in one wave. `head_dim` is
   capped at 512, and dtypes are bf16, f32 and fp8_e4m3.
+- **`cu` is required and names the row's sequence**, which is where its `bt` slice comes from; there
+  is no per-row sequence operand, and `cu` may describe sequences with no row in this chunk. `block_size` must equal `ratio`: the table's indices are blocks, so a page holding more or
+  fewer tokens would read the wrong token range.
+- **It takes the ungated epilogue**, because the fused `attn_paged_gate_quant` has no table form. Both
+  write the same bytes, so which arm is on screen does not move a number.
 
 ### `qsa_tail_store`
 

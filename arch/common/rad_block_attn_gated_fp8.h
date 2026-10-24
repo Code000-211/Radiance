@@ -70,6 +70,19 @@ struct AttnGatedFP8 {
      * wide and the kernel takes its block-table pitch from the operand. */
     rad_buf     qsa_sel  = 0;
     rad_buf     qsa_sequ = 0;
+    /* The shared-table read path (docs/QSA.md, "The masked read"), the prototype behind
+     * `RADIANCE_QSA_TABLE=1` (arch/common/rad_qsa.h: qsa_table_on()). `qsa_nsel`/`qsa_selb` are the
+     * table op's inputs -- `qsa_select`'s other two outputs, as block indices -- and
+     * `qsa_tab`/`qsa_tlen`/`qsa_mask`/`qsa_roff` the planes it writes and this block's attention
+     * reads. All zero, or `qsa_table` false, leaves every step on the per-row path, which is the
+     * measurement's control arm. */
+    rad_buf     qsa_nsel = 0, qsa_selb = 0;
+    rad_buf     qsa_tab  = 0, qsa_tlen = 0, qsa_mask = 0, qsa_roff = 0;
+    bool        qsa_table = false;
+    int64_t     qsa_umax  = 0;    /* the planes' width, `min(tile * topk, blocks)` */
+    int64_t     qsa_tile  = 16;   /* query rows one table covers */
+    int64_t     qsa_ratio = 0;    /* the indexer's compress ratio, one page per block */
+    int64_t     qsa_blocks = 0;   /* the widest block table */
     /* Context length up to which dense attention gives the same result, `budget + ratio - 1`.
      * Below it every complete block is selected, the paths agree to the bit, and dense is cheaper
      * at prefill (it reads each key once per query tile, sparse reads a table per query). Zero
@@ -87,6 +100,11 @@ struct AttnGatedFP8 {
      * launch cost no longer matters. */
     static constexpr int64_t kQsaRows = 256;
     int64_t qsa_rows() const { return g.max_seqs > kQsaRows ? g.max_seqs : kQsaRows; }
+    /* The same rounded up to a whole number of tiles: a chunk boundary is a tile boundary, which
+     * is what lets a chunk's table rows be sliced by `off / qsa_tile`. */
+    int64_t qsa_chunk() const {
+        return (qsa_rows() + qsa_tile - 1) / qsa_tile * qsa_tile;
+    }
     /* The gated form takes the whole step in one launch: its band is q_len 1, so partials are only
      * `rows * n_head * (2 * head_dim + 8)` bytes (12.8 MiB for 2048 rows on this model). One
      * 2048-row launch is about 2.16 ms per layer versus 3.0 ms for eight 256-row launches, each
@@ -114,6 +132,7 @@ struct AttnGatedFP8 {
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    rad_op     op_tab = 0, op_attn_tab = 0;                  /* qsa_table + qsa_attn */
     /* The output gate as `sigmoid` then `mul`: the bf16-linear form (Geom::w_bf16), and with fp8
      * linears the chain gate_quant_fp8 fuses, where it is not served. `gate` is the sigmoid's
      * output (the wire's with bf16 linears, the block's own otherwise) and `q_gate` the chain's
@@ -301,7 +320,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                 RAD_INT("block_size", kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK),
                                 /* The sparse path issues one row per query, so the split-KV
                                  * scratch is sized for the widest launch (kQsaRows). */
-                                RAD_INT("max_seqs", (qsa_sel && qsa_sequ) ? qsa_rows()
+                                RAD_INT("max_seqs", (qsa_sel && qsa_sequ) ? qsa_chunk()
                                                                           : g.max_seqs),
                                 RAD_INT("max_ctx", g.max_ctx),
                                 RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
@@ -314,6 +333,51 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         const rad_buf rd[3] = { w.q, qsa_sel, qsa_sequ };
         rad_op_reads(b, op_attn, rd, (qsa_sel && qsa_sequ) ? 3 : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
+    }
+
+    /* The shared table a sparse step reads instead of one list per row (docs/QSA.md, "The masked
+     * read"). Declared only when the caller declares the planes, the prototype's switch is on, and
+     * a loaded library declares both ops; otherwise step() keeps the row path, and a fake builder
+     * (tests/arch_fakes.h) whose vocabulary lacks them takes the row path too.
+     *
+     * `block_size` must equal the compress ratio: `selb` holds block-table entries and the table is
+     * paged at the ratio, so a page holds exactly one block. Any other geometry keeps the row
+     * path, which maps a block to its page like any other list. */
+    const int64_t qsa_page = kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK;
+    if (qsa_table && qsa_tab && qsa_tlen && qsa_mask && qsa_roff && qsa_nsel && qsa_selb &&
+        qsa_umax > 0 && qsa_ratio > 0 && qsa_blocks > 0 && qsa_page == qsa_ratio &&
+        rad_op_declared(b, "qsa_table") && rad_op_declared(b, "qsa_attn")) {
+        op_tab = RAD_OP(b, "qsa_table",
+                        RAD_PARAMS(RAD_RANGE("M", 1, qsa_chunk()), RAD_INT("blocks", qsa_blocks),
+                                   RAD_INT("topk", qsa_topk), RAD_INT("tile", qsa_tile),
+                                   RAD_INT("ratio", qsa_ratio), RAD_INT("u_max", qsa_umax)),
+                        RAD_NOWEIGHTS);
+        op_attn_tab = RAD_OP(b, "qsa_attn",
+                             RAD_PARAMS(RAD_RANGE("M", 1, qsa_chunk()),
+                                        RAD_INT("n_head", g.n_head),
+                                        RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("gqa", g.gqa()), RAD_INT("block_size", qsa_page),
+                                        RAD_INT("ratio", qsa_ratio), RAD_INT("tile", qsa_tile),
+                                        RAD_INT("topk", qsa_topk), RAD_INT("blocks", qsa_blocks),
+                                        RAD_INT("max_seqs", qsa_chunk()),
+                                        RAD_INT("u_max", qsa_umax),
+                                        RAD_STR("q_dtype", g.dtype),
+                                        RAD_STR("kv_dtype", g.kv_dtype)),
+                             RAD_NOWEIGHTS);
+        /* The planes outlive `qsa_select`, so the table op must declare them as its inputs and the
+         * attention as its own: otherwise the arena may overlay another buffer and the read walks
+         * garbage entries -- an aperture violation outside the cache. */
+        if (op_tab) {
+            const rad_buf in[2]  = { qsa_selb, qsa_nsel };
+            const rad_buf out[4] = { qsa_tab, qsa_tlen, qsa_mask, qsa_roff };
+            RAD_ARCH_TRY(rad_op_reads (b, op_tab, in, 2));
+            RAD_ARCH_TRY(rad_op_writes(b, op_tab, out, 4));
+        }
+        if (op_attn_tab) {
+            const rad_buf in[5] = { w.q, qsa_tab, qsa_tlen, qsa_mask, qsa_roff };
+            RAD_ARCH_TRY(rad_op_reads (b, op_attn_tab, in, 5));
+            RAD_ARCH_TRY(rad_op_writes(b, op_attn_tab, &w.attn.x, 1));
+        }
     }
 
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
@@ -534,7 +598,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
-    const bool gated = sparse && op_attn_gq;
+    /* The shared-table path takes the ungated attention and runs the gate epilogue below unfused:
+     * the fused op has no table form, and the two epilogues write the same bytes. */
+    const bool tabulated = sparse && op_tab && op_attn_tab;
+    const bool gated = sparse && op_attn_gq && !tabulated;
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
@@ -579,8 +646,54 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.cq(), off, rows, qw),
                         brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
         }
+    } else if (tabulated) {
+        /* One union per tile of `qsa_tile` rows, then the attention reads it through each row's
+         * membership mask. A last chunk narrower than a tile runs on the row path below: the table
+         * needs one whole tile, and the two paths are byte-identical (tests/r4d_emu/test_qsa.cpp,
+         * "masked read"), so the arm a row lands in cannot move its numbers.
+         *
+         * `bt` is the sequence's own block table here, not the row's selection: the table holds
+         * block indices and the reader maps them, in block order, to the pages the prefix cache
+         * gave them. */
+        const int64_t chunk = qsa_chunk();
+        const int64_t qw = g.q_dim(), tile = qsa_tile;
+        const int64_t btp = kvb ? kvb->block_table_pitch : 0;
+        for (int64_t off = 0; off < T; off += chunk) {
+            const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
+            if (rows < tile) {
+                RAD_ISSUE_N(c, op_attn, 1,
+                            brow_slice(w.q, off, rows, qw),
+                            kv_cache(kv, layer),
+                            brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                            brow_slice(qsa_sequ, off, rows, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(w.attn.x, off, rows, qw));
+                continue;
+            }
+            const int64_t tiles = (rows + tile - 1) / tile;
+            const int64_t t0 = off / tile;
+            RAD_ISSUE_N(c, op_tab, rows,
+                        brow_slice(qsa_selb, off, rows, qsa_topk + 1),
+                        brow_slice(qsa_nsel, off, rows, 1),
+                        praw(batch->positions + off, RAD_I32, rows),
+                        brow_slice(qsa_tab, t0, tiles, qsa_umax),
+                        brow_slice(qsa_tlen, t0, tiles, 1),
+                        brow_slice(qsa_mask, off, rows, qsa_umax),
+                        brow_slice(qsa_roff, off, rows, 1));
+            RAD_ISSUE_N(c, op_attn_tab, 1,
+                        brow_slice(w.q, off, rows, qw),
+                        kv_cache(kv, layer),
+                        brow_slice(qsa_tab, t0, tiles, qsa_umax),
+                        brow_slice(qsa_tlen, t0, tiles, 1),
+                        brow_slice(qsa_mask, off, rows, qsa_umax),
+                        brow_slice(qsa_roff, off, rows, 1),
+                        praw(batch->positions + off, RAD_I32, rows),
+                        praw2(table, RAD_I32, batch->n_seq, btp),
+                        praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                        brow_slice(w.attn.x, off, rows, qw));
+        }
     } else if (sparse) {
-        const int64_t chunk = qsa_rows();
+        const int64_t chunk = qsa_chunk();
         const int64_t qw = g.q_dim();
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;

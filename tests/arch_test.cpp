@@ -6963,6 +6963,50 @@ TEST(flashnext_sparse_attention_chunks_by_its_scratch_not_by_max_seqs) {
     }
 }
 
+/* The shared-table read path, the prototype behind RADIANCE_QSA_TABLE=1: with the switch on, the
+ * per-tile planes are declared and a sparse chunk issues `qsa_table` once per tile and `qsa_attn`
+ * once for the chunk, and `qsa_select` grows the block-index operand the table is built from. With
+ * the switch unset, not one buffer or op of it is declared -- the control arm of the measurement is
+ * the graph this branch shipped before, because both arms have to run in one build. */
+TEST(flashnext_reads_attention_through_the_shared_table_only_behind_its_switch) {
+    for (int on = 0; on < 2; ++on) {
+        if (on) setenv("RADIANCE_QSA_TABLE", "1", 1);
+        else unsetenv("RADIANCE_QSA_TABLE");
+        RadBuilder b;
+        RadBuildCtx ctx = q4_ctx(0, 1, 4);
+        MetaKV mk = q4_small();
+        const RadModelMeta& meta = *mk.meta();
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+        const bool declared = find_b(b, "qsa_tab") != nullptr;
+        CHECK_EQ(declared, on != 0);
+        const auto k = kit(b, {}, { 1024 }, 9000);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { k.get() });
+        CHECK_PASSES(b, v);
+        /* Two full-attention layers. With the switch on, 1024 rows go in chunks of 256 (max_seqs 4
+         * rounds up to a whole tile) as one table per chunk and one read per chunk; with it off, the
+         * control arm is what the branch already shipped: the fused gated op over the whole chunk. */
+        const auto tab = issues_of(b, *v[0], "qsa_table");
+        const auto rd = issues_of(b, *v[0], "qsa_attn");
+        const auto row = issues_of(b, *v[0], "attn_paged");
+        const auto gq = issues_of(b, *v[0], "attn_paged_gate_quant");
+        CHECK_EQ(tab.size(), on ? (size_t)2 * 4 : (size_t)0);
+        CHECK_EQ(rd.size(), on ? (size_t)2 * 4 : (size_t)0);
+        CHECK_EQ(row.size(), (size_t)0);
+        CHECK_EQ(gq.size(), on ? (size_t)0 : (size_t)2);
+        for (const RecIssue* i : tab) CHECK_EQ(i->opd[0].rows, 256);   /* rows of one chunk */
+        for (const RecIssue* i : rd) CHECK_EQ(i->opd[0].rows, 256);    /* queries of one chunk */
+        for (const RecIssue* i : gq) CHECK_EQ(i->opd[0].rows, 1024);
+        /* The selection's operand list is positional, so the block indices are the ninth operand
+         * whether or not the path is on: RAD_NONE keeps the count, and a dropped operand would be
+         * a silent shift of everything after it. */
+        for (const RecIssue* i : issues_of(b, *v[0], "qsa_select")) {
+            REQUIRE_EQ(i->opd.size(), (size_t)9);
+            CHECK_EQ(i->opd[8].kind, on ? RAD_OPK_BUF : RAD_OPK_NONE);
+        }
+        if (on) unsetenv("RADIANCE_QSA_TABLE");
+    }
+}
+
 /* The indexer's unfinished block is state, not scratch: each QSA layer stores it in the linear
  * `kv_qsa_tail` group at its own layer, so two layers never share one tail and a slot survives
  * across steps. */
@@ -8559,11 +8603,14 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x14b9cab0bea2591full, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xc9bcbf1b538b597full, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x8b2f1786a4ac12b8ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
+        /* The steps moved once, when `qsa_select` grew its ninth operand (`selb`, the same entries
+         * as block indices, RAD_NONE without the shared-table path): operands are positional, so
+         * the issued list is one longer at every issue. The graph is unchanged. */
+        { "qwen4exp_fp8", 1, 0, 0x14b9cab0bea2591full, 0x81e3b5c2d26a3062ull },
+        { "qwen4exp_fp8", 2, 0, 0xc9bcbf1b538b597full, 0xf16ad463d8e97197ull },
+        { "qwen4exp_fp8", 2, 1, 0x8b2f1786a4ac12b8ull, 0x56edd03c1af81c97ull },
+        { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0x664a14802019ed6bull },
+        { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x4238f06998784f93ull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
         { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
         { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },

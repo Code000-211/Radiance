@@ -92,7 +92,7 @@ __global__ void qsa_attn_kernel(RadQsaAttnCall c) {
     const int64_t tlen = c.tlen[tile];
     const int32_t* tab  = c.tab + c.row_off[row];
     const int32_t* mask = c.mask + row * c.u_max;
-    const int32_t* bts  = c.bt + (int64_t)c.seq[row] * c.bt_pitch;
+    const int32_t* bts  = c.bt + rad_qsa_attn_seq(c, row) * c.bt_pitch;
 
     float qf[kMaxHeadDim];
     for (int64_t d = 0; d < c.head_dim; ++d)

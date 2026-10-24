@@ -594,11 +594,11 @@ int shared_table_case() {
             tens(tlen.data(), RAD_I32, {tiles}),         tens(mask.data(), RAD_I32, {M, u_max}),
             tens(roff.data(), RAD_I32, {M}),
         };
-        RadParam p[5]{};
+        RadParam p[6]{};
         p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()};
         p[2] = {"topk", RAD_P_INT, f.topk}; p[3] = {"tile", RAD_P_INT, (int)tile};
-        p[4] = {"ratio", RAD_P_INT, f.ratio};
-        RadArgs a{}; a.t = t; a.n_t = 7; a.p = p; a.n_p = 5;
+        p[4] = {"ratio", RAD_P_INT, f.ratio}; p[5] = {"u_max", RAD_P_INT, (int)u_max};
+        RadArgs a{}; a.t = t; a.n_t = 7; a.p = p; a.n_p = 6;
         const int rc = rad_qsa_table_launch(&a, nullptr);
         if (rc != RAD_OK) {
             std::printf("FAIL %-46s qsa_table returned %d\n", f.name.c_str(), rc);
@@ -715,11 +715,11 @@ int build_table(const Fix& f, const SelOut& got, int64_t tile, SharedTab& t) {
         tens(t.tlen.data(), RAD_I32, {t.tiles}),  tens(t.mask.data(), RAD_I32, {M, t.u_max}),
         tens(t.roff.data(), RAD_I32, {M}),
     };
-    RadParam p[5]{};
+    RadParam p[6]{};
     p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()};
     p[2] = {"topk", RAD_P_INT, f.topk}; p[3] = {"tile", RAD_P_INT, (int)tile};
-    p[4] = {"ratio", RAD_P_INT, f.ratio};
-    RadArgs args{}; args.t = a; args.n_t = 7; args.p = p; args.n_p = 5;
+    p[4] = {"ratio", RAD_P_INT, f.ratio}; p[5] = {"u_max", RAD_P_INT, (int)t.u_max};
+    RadArgs args{}; args.t = a; args.n_t = 7; args.p = p; args.n_p = 6;
     return rad_qsa_table_launch(&args, nullptr);
 }
 
@@ -734,18 +734,16 @@ int read_table(const Fix& f, const SharedTab& t, int64_t hd, int64_t nh, int64_t
         tens((void*)t.tab.data(), RAD_I32, {t.tiles, t.u_max}), tens((void*)t.tlen.data(), RAD_I32, {t.tiles}),
         tens((void*)t.mask.data(), RAD_I32, {M, t.u_max}),       tens((void*)t.roff.data(), RAD_I32, {M}),
         tens((void*)f.pos.data(), RAD_I32, {M}),                 tens((void*)f.bt.data(), RAD_I32, {f.S, f.nb_t}, f.t_ld),
-        tens((void*)f.cu.data(), RAD_I32, {f.S}),                tens(out.data(), RAD_BF16, {M, nh * hd}),
+        /* `cu_seqlens`: the row's sequence is the interval holding it, so no per-row id operand. */
+        tens((void*)f.cu.data(), RAD_I32, {f.S + 1}),            tens(out.data(), RAD_BF16, {M, nh * hd}),
     };
-    std::vector<int32_t> seq((size_t)M);
-    for (int m = 0; m < M; ++m) seq[(size_t)m] = f.seq_of(m);
-    a[8] = tens(seq.data(), RAD_I32, {M});
     std::vector<RadParam> p;
     auto pi = [&](const char* k, long long v) { RadParam x{}; x.key = k; x.kind = RAD_P_INT; x.ival = v; p.push_back(x); };
     auto ps = [&](const char* k, const char* v) { RadParam x{}; x.key = k; x.kind = RAD_P_STR; x.sval = v; p.push_back(x); };
     auto pf = [&](const char* k, double v) { RadParam x{}; x.key = k; x.kind = RAD_P_F64; x.dval = v; p.push_back(x); };
     pi("M", M); pi("n_head", nh); pi("head_dim", hd); pi("gqa", gqa);
     pi("block_size", f.ratio); pi("ratio", f.ratio); pi("tile", t.tile);
-    pi("topk", f.topk); pi("blocks", blocks); pi("max_seqs", f.S);
+    pi("topk", f.topk); pi("blocks", blocks); pi("max_seqs", f.S); pi("u_max", (long long)t.u_max);
     pf("scale", 1.0 / std::sqrt((double)hd));
     ps("q_dtype", "bf16"); ps("kv_dtype", "bf16");
     RadArgs args{}; args.t = a; args.n_t = 10; args.p = p.data(); args.n_p = (int)p.size();
@@ -756,6 +754,7 @@ int masked_read_case() {
     std::vector<Fix> fx = {
         fix_shared_scores("masked read: decode depth 3, 8K", 4, 2048, 512, 300, 0, 21),
         fix_shared_scores("masked read: decode depth 6, 8K", 8, 2048, 512, 300, 0, 22),
+        fix_shared_scores("masked read: decode depth 3, 32K", 4, 8192, 512, 300, 0, 27),
         fix_shared_scores("masked read: depth 6, 32K, rows that agree less", 8, 8192, 512, 900, 0, 23),
         fix_shared_scores("masked read: depth 6, 32K, a coarse grid of ties", 8, 8192, 512, 40, 64, 24),
         fix_shared_prefill(2048, 16, 300, 25),

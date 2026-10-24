@@ -24,6 +24,7 @@ const RadParamSpec kAttnParams[] = {
     { "topk",       RAD_P_INT,   RAD_REQUIRED, 0 },
     { "blocks",     RAD_P_INT,   RAD_REQUIRED, 0 },
     { "max_seqs",   RAD_P_INT,   RAD_REQUIRED, 0 },
+    { "u_max",      RAD_P_INT,   RAD_REQUIRED, 0 },
     { "scale",      RAD_P_F64,   0, 0 },
     { "q_dtype",    RAD_P_STR,   RAD_REQUIRED, 0 },
     { "kv_dtype",   RAD_P_STR,   RAD_REQUIRED, 0 },
@@ -41,12 +42,12 @@ const RadOperandSpec kAttnOperands[] = {
     { "row_off", RAD_OPD_IN,  0 },
     { "pos",     RAD_OPD_IN,  0 },
     { "bt",      RAD_OPD_IN,  0 },
-    { "seq",     RAD_OPD_IN,  0 },
+    { "cu",      RAD_OPD_IN,  0 },
     { "out",     RAD_OPD_OUT, 0 },
 };
 
 const RadOpSchema kSchemas[] = {
-    { "qsa_attn", kAttnParams, 13, kAttnOperands, 10,
+    { "qsa_attn", kAttnParams, 14, kAttnOperands, 10,
       "Paged attention over a table a query tile shares: the union's entries the row's membership "
       "mask holds, in block order, then the row's partial page. Same keys in the same order as the "
       "row path, so the same sum." },
@@ -76,12 +77,18 @@ int attn_geometry(const RadParam* p, int n, RadQsaAttnCall* c) {
     if (c->n_head < 1 || c->head_dim < 1 || c->gqa < 1) return RAD_E_UNSUPPORTED;
     if (c->n_head % c->gqa) return RAD_E_SHAPE;
     if (c->block_size < 1 || c->ratio < 1 || c->topk < 1 || c->blocks < 1) return RAD_E_UNSUPPORTED;
-    if (tile < 1 || tile > c->M) return RAD_E_UNSUPPORTED;
+    /* `tab` holds block-table entries and the table is paged at the compress ratio, so a cache page
+     * has to be exactly one block: a wider page would make the partial page's token range wrong. */
+    if (c->block_size != c->ratio) return RAD_E_UNSUPPORTED;
+    if (tile < 1 || tile > c->M || tile > 32) return RAD_E_UNSUPPORTED;
     c->kv_heads = c->n_head / c->gqa;
     c->tile     = tile;
     c->tiles    = (c->M + tile - 1) / tile;
-    /* The same width the table op declares, so the two agree on one plane. */
-    c->u_max    = rad_qsa_table_u_max(tile, c->topk, c->blocks);
+    /* The table's declared width, read from the same `u_max` parameter `qsa_table` was issued
+     * with: the reader cannot re-derive it, since a tile of fewer rows than the plane was sized
+     * for still fills that width. */
+    c->u_max    = rad_param_geti(p, n, "u_max", 0);
+    if (c->u_max < 1 || c->u_max > c->tile * c->topk) return RAD_E_UNSUPPORTED;
     c->scale    = (float)rad_param_getf(p, n, "scale", 1.0 / std::sqrt((double)c->head_dim));
     return RAD_OK;
 }
@@ -90,7 +97,7 @@ int attn_geometry(const RadParam* p, int n, RadQsaAttnCall* c) {
 
 /* Operand 0 is [M, n_head * head_dim]; the cache is [blocks, kv_heads, block_size, 2 * head_dim];
  * the four table operands are the ones `qsa_table` declares; `bt` is the sequence's block table at
- * its declared ceiling; `seq` is one index a row. */
+ * its declared ceiling; `cu` is the batch's `cu_seqlens`. */
 int rad_qsa_attn_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
     if (!out || i < 0 || i >= 10) return RAD_E_INVAL;
     RadQsaAttnCall g{};
@@ -113,6 +120,7 @@ int rad_qsa_attn_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
     case 3: d.shape[0] = g.tiles; break;
     case 4: d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.u_max; break;
     case 7: d.rank = 2; d.shape[0] = rad_param_geti(p, n, "max_seqs", 1); d.shape[1] = g.blocks; break;
+    case 8: d.shape[0] = rad_param_geti(p, n, "max_seqs", 1) + 1; break;   /* cu_seqlens */
     default: break;
     }
     if (d.dtype == RAD_DT_INVALID) return RAD_E_UNSUPPORTED;
@@ -150,7 +158,12 @@ int rad_qsa_attn_args(const RadArgs* a, RadQsaAttnCall* out) {
             return RAD_E_SHAPE;
     if (a->t[7].rank != 2 || a->t[7].dtype != RAD_I32) return RAD_E_SHAPE;
     if (a->t[7].shape[0] < rad_args_geti_or(a, "max_seqs", 1)) return RAD_E_SHAPE;
-    if (a->t[8].rank != 1 || a->t[8].dtype != RAD_I32 || a->t[8].shape[0] < c.M) return RAD_E_SHAPE;
+    /* `cu_seqlens`, one entry per sequence and one past the last, so its width is the sequence
+     * count plus one and never the row count. */
+    if (a->t[8].rank != 1 || a->t[8].dtype != RAD_I32) return RAD_E_SHAPE;
+    if (a->t[8].shape[0] < 2 || a->t[8].shape[0] > rad_args_geti_or(a, "max_seqs", 1) + 1)
+        return RAD_E_SHAPE;
+    c.seqs = a->t[8].shape[0] - 1;
     if (a->t[9].rank != 2 || a->t[9].shape[0] != c.M ||
         a->t[9].shape[1] != c.n_head * c.head_dim) return RAD_E_SHAPE;
     if (a->t[9].stride[0] < c.n_head * c.head_dim) return RAD_E_STRIDE;
@@ -166,7 +179,7 @@ int rad_qsa_attn_args(const RadArgs* a, RadQsaAttnCall* out) {
     c.row_off = (const int32_t*)a->t[5].data;
     c.pos     = (const int32_t*)a->t[6].data;
     c.bt      = (const int32_t*)a->t[7].data;
-    c.seq     = (const int32_t*)a->t[8].data;
+    c.cu      = (const int32_t*)a->t[8].data;
     c.out     = a->t[9].data;
     c.q_pitch   = a->t[0].stride[0];
     c.out_pitch = a->t[9].stride[0];
