@@ -58,25 +58,35 @@ def open_children(issue_id: str) -> list[dict[str, Any]]:
     return [c for c in rows if c.get("status") not in ("done", "cancelled")]
 
 
+def wake_target(candidate: dict[str, Any]) -> str | None:
+    """Agent to wake: the assignee itself, or the leader for a squad-assigned issue."""
+    kind, ident = candidate.get("assignee_type"), candidate.get("assignee_id")
+    if kind == "agent" and ident:
+        return ident
+    if kind == "squad" and ident:
+        return (multica("squad", "get", ident) or {}).get("leader_id")
+    return None
+
+
 def gpu_continuation(rule: dict[str, Any], agent_id: str) -> bool:
     """An enabled rule that wakes this candidate's own agent with a GPU-runner instruction."""
     return (bool(rule.get("enabled")) and rule.get("agent_id") == agent_id
             and GPU_RULE_MARKER in (rule.get("instruction") or ""))
 
 
-def dispatch(candidate: dict[str, Any]) -> None:
+def dispatch(candidate: dict[str, Any], target: str) -> None:
     """Reuse the candidate's own GPU continuation rule, else create a dedicated one-shot rule.
 
     Raises CalledProcessError when the CLI rejected the write; other errors may be ambiguous.
     """
     name = candidate["identifier"]
     rules = [r for r in multica("issue", "wakeup", "list", candidate["id"]) or []
-             if gpu_continuation(r, candidate["assignee_id"])]
+             if gpu_continuation(r, target)]
     if rules:
         multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
     else:
         multica("issue", "wakeup", "create", candidate["id"], "--kind", "at",
-                "--after", "1s", "--agent-id", candidate["assignee_id"],
+                "--after", "1s", "--agent-id", target,
                 "--instruction", HANDOVER.format(issue=name))
 
 
@@ -91,15 +101,16 @@ def hand_over(finished: str) -> None:
         name = candidate["identifier"]
         if name == finished:
             continue
-        if candidate.get("assignee_type") != "agent" or not candidate.get("assignee_id"):
-            print(f"handover: {name} has no agent assignee; skipped", file=sys.stderr)
-            continue
         try:
+            target = wake_target(candidate)
+            if not target:
+                print(f"handover: {name} has no wakable agent or squad leader; skipped", file=sys.stderr)
+                continue
             # A parent whose child work is still open must not duplicate the child's measurement.
             if open_children(candidate["id"]):
                 print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
                 continue
-            dispatch(candidate)
+            dispatch(candidate, target)
         except subprocess.CalledProcessError as exc:
             # The platform rejected this candidate's wakeup; no run was queued, so try the next one.
             print(f"handover: {name} dispatch rejected (exit {exc.returncode}); trying next candidate",

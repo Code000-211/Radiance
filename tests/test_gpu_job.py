@@ -23,9 +23,11 @@ args = sys.argv[1:]
 
 def row(path):
     name = path.name
+    squad = (root / ("squad-" + name)).exists()
     return {"id": "id-" + name, "identifier": name, "number": int(name.split("-")[1]),
             "project_id": "a64348a9-c661-493a-b111-6777ed95a9a3", "status": path.read_text(),
-            "assignee_id": "agent-" + name, "assignee_type": "agent"}
+            "assignee_id": ("squad-" if squad else "agent-") + name,
+            "assignee_type": "squad" if squad else "agent"}
 
 def dispatch(name, kind):
     try:
@@ -64,6 +66,8 @@ elif args[:2] == ["issue", "status"]:
 elif args[:2] == ["issue", "children"]:
     tree = root / ("children-" + args[2])
     print(tree.read_text() if tree.exists() else json.dumps({"stages": [], "unstaged": [], "total": 0}))
+elif args[:2] == ["squad", "get"]:
+    print(json.dumps({"id": args[2], "leader_id": "leader-" + args[2]}))
 elif args[:2] == ["issue", "wakeup"] and args[2] == "list":
     rules = root / ("wakeups-" + args[3])
     print(rules.read_text() if rules.exists() else "[]")
@@ -198,6 +202,11 @@ class GpuJobTests(unittest.TestCase):
         self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
         self.assertEqual(self.events("agent "), ["agent MAIN-2 agent-MAIN-2"])
+
+    def test_handover_wakes_squad_leader(self):
+        (self.root / "squad-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        self.assertEqual(self.events("agent "), ["agent MAIN-2 leader-squad-MAIN-2"])
 
     def test_handover_skips_parent_with_open_child(self):
         (self.root / "MAIN-3").write_text("ready_for_testing")

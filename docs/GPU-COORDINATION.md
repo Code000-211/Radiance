@@ -47,7 +47,9 @@ written:
   issue is excluded, and a parent whose child issue is still open is skipped because the
   child carries that measurement;
 - candidates ordered by issue number, one dispatched per finished window;
-- the candidate's own agent assignee is woken (`--agent-id`). An enabled rule is reused only
+- the wake target is the candidate's own agent assignee, or the squad leader for a
+  squad-assigned issue (the platform starts only that leader on a squad assignment). An
+  enabled rule is reused only
   when it wakes that same assignee **and** its instruction names
   `scripts/gpu_job.py` (a GPU continuation). Foreign or differently-motivated rules are
   left untouched and a dedicated one-shot `at` continuation is created instead. No
@@ -125,8 +127,8 @@ it starts), an executed continuation chain for success, failure to `blocked`, an
 `--after in_progress` (the woken candidate's own runner starts without any second
 manual start in the test body, after the finished issue's final status, and releases
 the lock again), exactly one successor dispatched after release for its own agent,
-skipping a blocked candidate and a parent with open child work, reuse of an own GPU
-rule and ignoring foreign/unrelated rules, a rejected dispatch that falls through to
+skipping a blocked candidate and a parent with open child work, waking a squad
+leader, reuse of an own GPU rule and ignoring foreign/unrelated rules, a rejected dispatch that falls through to
 the next candidate, an ambiguous dispatch that stops instead of double-starting,
 blocked/stale issue refusal, failed initial/final status updates, command failure
 (no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both successful exit
