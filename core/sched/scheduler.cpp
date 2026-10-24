@@ -393,16 +393,30 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* The named baseline, run only on a cycle no candidate could be priced for: the ladder's
      * middle tier, not the ceiling. A profile prices the shapes it measured, keyed by the row count
      * among others (draft_cost.cpp), so a batch wider than every bucket it holds can price nothing
-     * -- and at the ceiling that made a wide batch run every cycle at its maximum depth. One step
-     * off the top is the depth such a cycle drafts instead; --draft-fallback-k overrides it, and an
-     * explicit baseline deeper than the head is refused below rather than planned past it. */
+     * -- and at the ceiling that made a wide batch run every cycle at its maximum depth. The middle
+     * tier is the depth such a cycle drafts instead -- of a five-tier ladder the third, which is
+     * two tiers below the top, and of an even one the upper of the two middles
+     * (`tiers[n_tiers / 2]`). --draft-fallback-k overrides it; a baseline above the head's depth or
+     * above the ladder's own top is refused below rather than planned past it. */
+    /* --draft-fallback-k together with --draft-profile-out: the recording run's baseline is the
+     * executable depth by construction, so the given value would be dropped without a word. Refused
+     * by name instead of silently discarded, like every other flag that would parse and do
+     * nothing. */
+    if (cfg.draft_fallback_k >= 0 && !cfg.draft_profile_out.empty()) {
+        RAD_ERR("--draft-fallback-k %d cannot be combined with --draft-profile-out: a recording run "
+                "measures the depth its export is priced at, the executable head depth %d",
+                (int)cfg.draft_fallback_k, (int)exec_depth);
+        return RAD_E_UNSUPPORTED;
+    }
+
     dp.policy.fallback_k = exec_depth;   /* and the depth every other policy keeps */
     if (cfg.draft_policy == DraftPolicyKind::Cost) {
         if (dp.policy.n_tiers > 0) dp.policy.fallback_k = dp.policy.tiers[dp.policy.n_tiers / 2];
         if (cfg.draft_fallback_k >= 0) dp.policy.fallback_k = cfg.draft_fallback_k;
         /* A recording run measures the depth its export is priced at, so its baseline stays the
          * executable depth; the middle tier would export buckets for a depth serving then reads
-         * first (docs/ADAPTIVE-MTP.md, --draft-profile-out). */
+         * first (docs/ADAPTIVE-MTP.md, --draft-profile-out). An explicit --draft-fallback-k that
+         * this overrides is refused by name below, not discarded here. */
         if (!cfg.draft_profile_out.empty()) dp.policy.fallback_k = exec_depth;
         if (dp.policy.fallback_k > exec_depth) {
             RAD_ERR("--draft-fallback-k %d is above the executable head depth %d (ceiling %d, "
@@ -410,6 +424,26 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                     (int)cfg.n_spec, (int)prog.drafter.depth);
             return RAD_E_UNSUPPORTED;
         }
+        /* The baseline must be a depth the ladder offers. Above its top the coverage gate refuses
+         * every cycle that has a row the baseline would draft deeper, and the engine ends the whole
+         * run there -- at the first unpriceable shape, which in a serving run can be hours in. Fail
+         * at startup instead: a baseline the ladder never reaches is unusable by construction on
+         * exactly the cycle it is there for. */
+        if (cfg.draft_profile_out.empty() &&
+            dp.policy.fallback_k > dp.policy.tiers[dp.policy.n_tiers - 1]) {
+            RAD_ERR("the draft baseline K%d is above the ladder's top tier K%d (--draft-depth-tiers "
+                    "%d..%d): the cycle it exists for -- no candidate priced -- would be refused "
+                    "for the coverage gap, not planned", (int)dp.policy.fallback_k,
+                    (int)dp.policy.tiers[dp.policy.n_tiers - 1], (int)dp.policy.tiers[0],
+                    (int)dp.policy.tiers[dp.policy.n_tiers - 1]);
+            return RAD_E_UNSUPPORTED;
+        }
+        /* A zero baseline is legal -- K0 learns buckets of its own and can price itself later --
+         * but on a deployment that cannot price this shape it means the policy drafts nothing at
+         * all. Say so once at startup rather than only in the per-request ledger at its end. */
+        if (dp.policy.fallback_k <= 0)
+            RAD_WARN("the cost policy drafts nothing on an unpriced cycle: its baseline is K%d, so "
+                     "a shape no bucket covers runs without speculation", (int)dp.policy.fallback_k);
     }
     /* --draft-hysteresis both: only the cost policy has a hold to apply to a reduction; anywhere
      * else the flag would parse and do nothing, so it is refused by name. */
@@ -2498,6 +2532,10 @@ void Scheduler::draft_cost_cycle(bool direct_step) {
          * and promote_next() then refuse to draft, and the engine stops the run through
          * fail_loop(). */
         if (draft_.planner().coverage_gap_refused()) {
+            /* Which latch fired decides what the engine reports: a ladder gap is a configuration
+             * the operator can fix, a residency drift is not. The first latch keeps the cause, so a
+             * drift already reported is not relabelled by a later gap. */
+            if (!draft_cost_aborted_) draft_cost_gap_ = true;
             draft_cost_aborted_ = true;
             return;
         }

@@ -377,6 +377,10 @@ using DraftEstimateFn = int (*)(void* ctx, const DraftVerifyShape& shape, DraftC
 struct DraftCostModel {
     void*           ctx = nullptr;
     DraftEstimateFn estimate = nullptr;
+    /* A recording run (--draft-profile-out) prices nothing by construction: its table answers every
+     * query with an invalid estimate. The policy reads the flag rather than the empty answer, so a
+     * calibration is not diagnosed as a ladder it can never price. */
+    bool            records_only = false;
 };
 
 /* ------------------------------------------------------------------ B: the prediction */

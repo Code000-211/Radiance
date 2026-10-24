@@ -738,11 +738,19 @@ int Engine::step_loop() {
         else        b = sched_.step();
         /* A cycle whose policy ended on a refused plan -- a residency drift, or a shape the
          * ladder cannot price -- is refused above; the run stops here, on the engine's existing
-         * error path, instead of drafting the rest of it at the ceiling. */
+         * error path, instead of drafting the rest of it at the ceiling. The two causes are
+         * reported apart: a ladder/baseline gap is a configuration the operator can fix, and
+         * naming the residency for it sends them into the wrong diagnosis. */
         if (sched_.draft_cost_aborted()) {
-            RAD_ERR("draft cost: no cycle can be priced on this run (the residency does not match "
-                    "the profile, or the ladder cannot price this shape); stopping instead of "
-                    "drafting at the ceiling");
+            if (sched_.draft_cost_gap())
+                RAD_ERR("draft cost: no cycle can be priced on this run -- the ladder's top tier is "
+                        "unpriced for a shape the named baseline would draft deeper, and the ladder "
+                        "never offers that depth; end --draft-depth-tiers at the baseline, or set "
+                        "--draft-fallback-k inside the ladder; stopping instead of drafting at the "
+                        "ceiling");
+            else
+                RAD_ERR("draft cost: no cycle can be priced on this run -- the residency does not "
+                        "match the profile; stopping instead of drafting at the ceiling");
             return fail_loop(RAD_E_STATE);
         }
         if (!b) {

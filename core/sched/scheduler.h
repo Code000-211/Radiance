@@ -513,6 +513,11 @@ public:
      * engine ends it on its error path rather than drafting at the ceiling. Not a fallback
      * admission; the table stays inactive. */
     bool                  draft_cost_aborted() const { return draft_cost_aborted_; }
+    /* Which latch stopped the run: the ladder's coverage gap (the baseline drafts deeper than the
+     * ladder's top, so no cycle of this deployment can price it -- a configuration) rather than a
+     * residency drift from the profile (an environment the run cannot repair). The engine names the
+     * one that fired; both end the run the same way. */
+    bool                  draft_cost_gap() const { return draft_cost_gap_; }
     const DraftPredictState* draft_predict_state(int32_t slot) const {
         if (slot < 0 || (size_t)slot >= draft_predict_state_.size()) return nullptr;
         return &draft_predict_state_[(size_t)slot];
@@ -800,6 +805,9 @@ private:
     /* A cost cycle was refused after the drift: the run cannot price and must not fall back to the
      * ceiling, so the next planning site reports it and the engine stops. One-way. */
     bool             draft_cost_aborted_ = false;
+    /* The abort above came from the ladder's coverage gap, not from a residency drift; set by the
+     * first latch only, so the engine's diagnostic names the cause that stopped the run. */
+    bool             draft_cost_gap_ = false;
 
     /* The one sticky drift decision, shared by step_finished (the bracket that just closed) and
      * draft_residency (before the next cycle opens). Requires mu_. */

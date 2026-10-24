@@ -50,9 +50,12 @@ struct Cycle {
         f.add(i, id, remaining, e);
         draft_fake::predict(&pred, f.view, &f.pred);
     }
+    /* A recording run (--draft-profile-out): the model prices nothing and says so. */
+    bool records_only = false;
     int choose() {
-        return planner.choose(f.view, f.pred, DraftCostModel{ &costs, draft_fake::estimate },
-                              &f.plan);
+        DraftCostModel m{ &costs, draft_fake::estimate };
+        m.records_only = records_only;
+        return planner.choose(f.view, f.pred, m, &f.plan);
     }
     /* A model that has measured every window: `ms[k]` grows as ms0 + step_ms * k. */
     void measure(double ms0, double step_ms) {
@@ -1902,6 +1905,54 @@ TEST(the_priced_switch_prices_the_frozen_window_its_transition_cycle_runs) {
     }
     CHECK(transition);   /* the one cycle the move spends, at the window it really runs */
     CHECK(stationary);   /* and the dwell's steady shape, which is what the depth is worth */
+}
+
+/* The coverage gate is the second line, not the deployment rule: Scheduler::init refuses a serving
+ * run whose baseline sits above the ladder's top, so a scheduler never reaches this. The contract
+ * of choose() stays, because it is what the batch means: the gap belongs to the batch, not to one
+ * row -- if any row's own remaining budget would run past the ladder's top, the deepest offered plan
+ * cannot be priced for the cycle's shape and the whole cycle is refused, including the row whose own
+ * cap is under the top. A recording run is exempt: it prices nothing by construction, and the depth
+ * it learns at is what its export is priced at. */
+TEST(a_mixed_batch_with_one_row_past_the_ladder_is_refused_whole) {
+    DraftPolicyConfig cfg = cost_config(6);
+    cfg.tiers[0]   = 0;
+    cfg.tiers[1]   = 2;
+    cfg.n_tiers    = 2;
+    cfg.fallback_k = 6;   /* the configuration Scheduler::init refuses; the planner still refuses it */
+    Cycle c(6, cfg);
+    c.f.view.pipeline_depth = 0;
+    c.add(0, 1, 64);      /* room for K6 */
+    c.add(1, 2, 2);       /* its own budget clamps it to K1 */
+    CHECK_EQ(c.choose(), RAD_E_UNSUPPORTED);
+    CHECK(c.planner.coverage_gap_refused());
+    CHECK_EQ(c.f.plan.n_seq, 0);   /* nothing was written: the refusal came before finish() */
+    CHECK_EQ(c.costs.calls, 2);    /* both offered tiers were asked before the gate */
+    CHECK(!c.costs.measured);
+
+    /* Rows whose own budgets clamp the baseline under the ladder's top are not a gap: the fallback
+     * runs the shape the ladder offered, which this ladder can query later. */
+    Cycle clamped(6, cfg);
+    clamped.f.view.pipeline_depth = 0;
+    clamped.add(0, 1, 2);
+    clamped.add(1, 2, 2);
+    REQUIRE_EQ(clamped.choose(), RAD_OK);
+    CHECK(!clamped.planner.coverage_gap_refused());
+    CHECK(clamped.f.plan.source == DraftPlanSource::Fallback);
+    CHECK_EQ(clamped.f.plan.max_k, 1);   /* the baseline, clamped by the rows' own budgets */
+
+    /* The recording run is exempt: the same batch, a table that prices nothing on purpose, and the
+     * baseline runs -- that is the depth the export is priced at. */
+    Cycle rec(6, cfg);
+    rec.records_only = true;
+    rec.f.view.pipeline_depth = 0;
+    rec.add(0, 1, 64);
+    rec.add(1, 2, 2);
+    REQUIRE_EQ(rec.choose(), RAD_OK);
+    CHECK(!rec.planner.coverage_gap_refused());
+    CHECK(rec.f.plan.source == DraftPlanSource::Fallback);
+    CHECK_EQ(rec.f.plan.k[0], 6);
+    CHECK_EQ(rec.f.plan.k[1], 1);
 }
 
 RAD_TEST_MAIN()

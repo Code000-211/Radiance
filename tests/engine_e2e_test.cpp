@@ -1998,20 +1998,22 @@ TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_
     CHECK_EQ(cost.stop(), 0);
 }
 
-/* The coverage gap on a real serving run, through the writer -> file -> reader path with a real
- * no-loan reference. The writer calibrates with --draft-reference (both lenders off); the file says
- * `basis: "no-loan"` and carries no live loan. The reader binds it with --draft-profile and may
- * price only the exact shapes the writer measured -- a reference is Measured-only.
+/* A serving run whose reference profile cannot price a shape, through the writer -> file -> reader
+ * path with a real no-loan reference. The writer calibrates with --draft-reference (both lenders
+ * off); the file says `basis: "no-loan"` and carries no live loan. The reader binds it with
+ * --draft-profile and may price only the exact shapes the writer measured -- a reference is
+ * Measured-only.
  *
  * The ladder's top is K2 while the executable depth is K6, so a shape the reference does not hold
- * has no priceable plan and the named baseline would run at a depth the ladder never offers. The
- * cycle is refused by name and the run stops on the existing fail-closed latch: the request is
- * answered with an error, the process exits non-zero, no plan is issued and no later cycle drafts
- * at the ceiling. Two cases: the first request already has an unmeasured shape (it is Sampled; the
- * writer measured Greedy), and a run that serves a priced Greedy request first and meets the gap
- * only on the next request. The first case also proves the reader prices nothing new: a reference
- * is immutable. */
-TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_cannot_price) {
+ * has no priceable plan. What the cycle drafts then is the named baseline -- the ladder's middle
+ * tier by default, which here is the ladder's own top, K2: an offered depth, so the sample it
+ * learns is queryable by this ladder later. The same deployment with `--draft-fallback-k 6` names a
+ * depth the ladder never offers and is refused at startup instead, where the operator can read it.
+ *
+ * Two requests per run: the first has a shape the reference did not measure (it is Sampled, the
+ * writer measured Greedy), the second does not. Both are served, at the priced depth and at the
+ * baseline respectively -- and the per-request ledger says which of the two cycles was which. */
+TEST(a_serving_run_drafts_the_ladders_middle_for_a_shape_the_reference_cannot_price) {
     tiny::TempDir dir("ref_gap");
     REQUIRE(dir.ok());
     tiny::Gemma4 s;
@@ -2053,54 +2055,23 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
     CHECK(!fp.contains("live_loan"));      /* a no-loan reference names no loan */
     REQUIRE(!profile.value("buckets", json::array()).empty());
 
-    /* The baseline is configured above the ladder on purpose: that is the deployment the coverage
-     * gap belongs to. Left at its default the baseline is the ladder's own middle tier (K2), an
-     * offered depth, so an unpriced cycle would simply run there instead of being refused. */
-    const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
-                                                   "--draft-depth-tiers", "0,2",
-                                                   "--draft-window", "fixed",
-                                                   "--draft-policy", "cost",
-                                                   "--draft-fallback-k", "6",
-                                                   "--draft-profile", out };
-
-    /* The first request already has a shape the reference never measured: it is Sampled, the
-     * writer only measured Greedy. The reader's very first cycle cannot be priced. */
+    /* The ladder's top is K2 and the baseline is left at its default, which is the ladder's own
+     * middle tier (K2) -- an offered depth. */
     {
         Server reader;
-        REQUIRE(reader.start(dir.path, reader_args));
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-profile", out };
+        REQUIRE(reader.start(dir.path, args));
         const std::string bound = reader.output();
         if (bound.find("basis no-loan") == std::string::npos)
             fprintf(stderr, "    the reader did not bind the reference:\n%s\n", tail(bound).c_str());
         CHECK(bound.find("basis no-loan") != std::string::npos);
 
-        const json refused =
-            post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
-        (void)refused;
-        const std::string log = reader.output();
-        if (status < 400)
-            fprintf(stderr, "    the unpriced request was not answered with an error (%d: %s):\n%s\n",
-                    status, why.c_str(), tail(log).c_str());
-        /* A real HTTP error response on the existing path, not a served result and not a reset. */
-        CHECK(status >= 400);
-        CHECK(status < 600);
-        if (log.find("deepest offered tier K2") == std::string::npos)
-            fprintf(stderr, "    the gap was not diagnosed:\n%s\n", tail(log).c_str());
-        CHECK(log.find("deepest offered tier K2") != std::string::npos);
-        CHECK(log.find("named baseline would run at K6") != std::string::npos);
-        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
-        CHECK(log.find("has no plan (") == std::string::npos);   /* not the legacy continuation */
-        const int reader_exit = reader.stop();
-        if (reader_exit == 0)
-            fprintf(stderr, "    the run did not stop on the refused cycle:\n%s\n", tail(log).c_str());
-        CHECK(reader_exit != 0);
-    }
-
-    /* A run that serves a priced Greedy request first -- the reference holds its shapes, so the run
-     * drafts the ladder's K2 (six positions would be the unnamed ceiling) -- and meets the gap only
-     * on the next, Sampled request. The gap is later, not a start failure. */
-    {
-        Server reader;
-        REQUIRE(reader.start(dir.path, reader_args));
+        /* The priced request: the writer measured this shape, so the run drafts the ladder's top
+         * -- two positions, not six. */
         const json served = post(reader.port, "/completion", completion(prompt, 24), &status, &why);
         if (status != 200)
             fprintf(stderr, "    the priced request failed: %s\n%s\n", why.c_str(),
@@ -2109,32 +2080,55 @@ TEST(a_serving_run_stops_instead_of_drafting_at_the_ceiling_when_the_reference_c
         REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
         CHECK_EQ(draft_positions(reader.port), 2);
 
-        post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
+        /* The unmeasured one: Sampled, and the reference measured Greedy. Nothing prices it, so the
+         * cycle drafts the baseline -- K2, an offered depth -- and the request is served. Under the
+         * old ceiling baseline this same request killed the run. */
+        const json unpriced =
+            post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
+        if (status != 200)
+            fprintf(stderr, "    the unpriced request was not served (%d: %s):\n%s\n", status,
+                    why.c_str(), tail(reader.output()).c_str());
+        CHECK_EQ(status, 200);
+        CHECK_EQ(tokens_of(unpriced).size(), (size_t)24);
+        CHECK_EQ(draft_positions(reader.port), 2);   /* still the ladder's top, not six */
+        CHECK_EQ(reader.stop(), 0);                  /* the run did not stop on the unpriced cycle */
+
+        /* Both requests ended in a ledger line. The unpriced one took part in at least one cost
+         * cycle that priced no tier at all -- the counter the depth alone cannot tell apart from a
+         * decision. */
         const std::string log = reader.output();
-        if (status < 400)
-            fprintf(stderr, "    the unpriced request was not answered with an error (%d: %s):\n%s\n",
-                    status, why.c_str(), tail(log).c_str());
-        CHECK(status >= 400);
-        CHECK(status < 600);
-        CHECK(log.find("deepest offered tier K2") != std::string::npos);
-        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
-        CHECK(log.find("has no plan (") == std::string::npos);
-        const int reader_exit = reader.stop();
-        if (reader_exit == 0)
-            fprintf(stderr, "    the run did not stop on the refused later cycle:\n%s\n",
-                    tail(log).c_str());
-        CHECK(reader_exit != 0);
+        CHECK(log.find("without a priced candidate") != std::string::npos);
+        CHECK(log.find("priced tiers per cycle 0:") != std::string::npos);
+        CHECK(log.find("deepest offered tier K2") == std::string::npos);   /* no gap refused */
+    }
+
+    /* The depth the ladder never offers, named by name: refused at startup, before a request is
+     * admitted, instead of after the first unpriceable shape hours into a serving run. */
+    {
+        Server reader;
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-fallback-k", "6",
+                                                "--draft-profile", out };
+        const bool started = reader.start(dir.path, args);
+        const std::string log = reader.output();
+        if (started)
+            fprintf(stderr, "    the baseline above the ladder was accepted:\n%s\n", tail(log).c_str());
+        CHECK(!started);
+        CHECK(log.find("the draft baseline K6 is above the ladder's top tier K2") !=
+              std::string::npos);
     }
 }
 
-/* The coverage gap on the streaming path. `stream: true` puts 200 and the event-stream headers on
- * the wire before the first token, so a refused cycle can no longer become an HTTP status: the
- * failed choice has to become an error event, and the stream has to end by itself. A silent close
- * would pass a truncated answer off as complete, and a stream the run never ends would hang its
- * client. The same two cases as the buffered test above: a first request whose shape the reference
- * never measured, and a run that serves one priced request before the gap. The reader is given 60 s
- * without progress, so a stream that never ends fails the case instead of the suite. */
-TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
+/* The same two cycles on the streaming path: `stream: true` commits 200 and the event-stream
+ * headers before the first token, so what a client gets there is decided per request. A priced
+ * request and an unmeasured one are both served whole, framed, and end in exactly one terminator
+ * with no error event -- the baseline cycle is not a failure. (A stream the engine really fails, and
+ * the failure event it ends in, is server_test.cpp's `a_failed_stream_ends_in_its_apis_own_failure`;
+ * a baseline cycle no longer produces one, so there is nothing to trigger it here.) */
+TEST(a_streaming_run_serves_the_ladder_middle_for_a_shape_the_reference_cannot_price) {
     tiny::TempDir dir("ref_gap_stream");
     REQUIRE(dir.ok());
     tiny::Gemma4 s;
@@ -2142,7 +2136,6 @@ TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
     REQUIRE(tiny::write_gemma4(dir.path, s));
     const std::string out = dir / "reference.json";
 
-    /* The writer, as in the buffered case: a real no-loan reference export. */
     Server writer;
     {
         const std::vector<std::string> a = { "--num-speculative-tokens", "2",
@@ -2165,26 +2158,23 @@ TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
                 tail(writer.output()).c_str());
     REQUIRE_EQ(writer_exit, 0);
 
-    /* The baseline is configured above the ladder on purpose: that is the deployment the coverage
-     * gap belongs to. Left at its default the baseline is the ladder's own middle tier (K2), an
-     * offered depth, so an unpriced cycle would simply run there instead of being refused. */
-    const std::vector<std::string> reader_args = { "--num-speculative-tokens", "6",
-                                                   "--draft-depth-tiers", "0,2",
-                                                   "--draft-window", "fixed",
-                                                   "--draft-policy", "cost",
-                                                   "--draft-fallback-k", "6",
-                                                   "--draft-profile", out };
+    Server reader;
+    const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                            "--draft-depth-tiers", "0,2",
+                                            "--draft-window", "fixed",
+                                            "--draft-policy", "cost",
+                                            "--draft-profile", out };
+    REQUIRE(reader.start(dir.path, args));
 
-    /* What a stream that ended on the gap has to look like: the committed 200 and event-stream
-     * headers, well-framed events, exactly one error event naming the engine failure, and no choice
-     * that claims a normal finish. */
-    auto check_gap_stream = [](const Streamed& r, const char* which) {
+    /* What a stream served whole has to look like: the committed 200 and event-stream headers, well
+     * framed events, no error event, and the terminator last. */
+    auto check_served_stream = [](const Streamed& r, const char* which) {
         if (r.timed_out)
             fprintf(stderr, "    the %s stream never ended: no progress for 60 s\n", which);
         CHECK(!r.timed_out);
         if (r.status != 200)
-            fprintf(stderr, "    the %s stream was answered with status %d instead of the "
-                            "committed 200 (%s)\n", which, r.status, r.why.c_str());
+            fprintf(stderr, "    the %s stream was answered with status %d (%s)\n", which, r.status,
+                    r.why.c_str());
         CHECK_EQ(r.status, 200);
         CHECK(r.head.find("content-type: text/event-stream") != std::string::npos);
 
@@ -2194,19 +2184,13 @@ TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
             fprintf(stderr, "    the %s stream is not well framed:\n%s\n", which, r.body.c_str());
         CHECK(framed);
 
-        int errors = 0, last_error = -1;
-        std::string message;
+        int errors = 0;
         bool finished = false;
-        for (size_t i = 0; i < payloads.size(); ++i) {
-            if (payloads[i] == "[DONE]") continue;
-            const json j = json::parse(payloads[i], nullptr, false);
+        for (const std::string& p : payloads) {
+            if (p == "[DONE]") continue;
+            const json j = json::parse(p, nullptr, false);
             if (!j.is_object()) { framed = false; continue; }
-            if (j.contains("error")) {
-                ++errors;
-                last_error = (int)i;
-                message = j["error"].value("message", std::string());
-                continue;
-            }
+            if (j.contains("error")) { ++errors; continue; }
             if (!j.contains("choices") || j["choices"].empty()) continue;
             const json& f = j["choices"][0]["finish_reason"];
             if (f.is_string() && (f.get<std::string>() == "stop" ||
@@ -2214,76 +2198,25 @@ TEST(a_streaming_run_ends_its_stream_with_an_error_at_the_coverage_gap) {
                 finished = true;
         }
         CHECK(framed);
-        if (errors != 1)
-            fprintf(stderr, "    the %s stream carried %d error event(s):\n%s\n", which, errors,
-                    r.body.c_str());
-        CHECK_EQ(errors, 1);
-        CHECK(message.find("the engine failed this request") != std::string::npos);
-        /* The abort is the stream's last word: no choice finished normally, and the only payload
-         * after the error is the terminator. */
-        CHECK(!finished);
-        if (last_error < 0 || (size_t)last_error + 2 < payloads.size())
-            fprintf(stderr, "    the %s stream did not end with the error and [DONE]:\n%s\n", which,
-                    r.body.c_str());
-        CHECK_EQ(last_error, (int)payloads.size() - 2);
+        CHECK_EQ(errors, 0);
+        CHECK(finished);                     /* the stream says how it ended */
+        CHECK(!payloads.empty() && payloads.back() == "[DONE]");
         CHECK(payloads.size() >= 2);
-        if (payloads.size() >= 2) CHECK_EQ(payloads.back(), std::string("[DONE]"));
     };
 
-    /* First request, unmeasured shape: the very first cycle cannot be priced, after the 200 has
-     * gone out. */
-    {
-        Server reader;
-        REQUIRE(reader.start(dir.path, reader_args));
-        const Streamed r = stream_completion(reader.port, prompt, 24, 0.7, 7);
-        check_gap_stream(r, "first");
-        const std::string log = reader.output();
-        CHECK(log.find("deepest offered tier K2") != std::string::npos);
-        CHECK(log.find("named baseline would run at K6") != std::string::npos);
-        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
-        CHECK(log.find("has no plan (") == std::string::npos);
-        const int reader_exit = reader.stop();
-        if (reader_exit == 0)
-            fprintf(stderr, "    the run did not stop on the refused cycle:\n%s\n",
-                    tail(log).c_str());
-        CHECK(reader_exit != 0);
-    }
+    /* The priced request, then the unmeasured one: both served, both at the ladder's top. */
+    check_served_stream(stream_completion(reader.port, prompt, 24, 0.0, 0), "priced");
+    CHECK_EQ(draft_positions(reader.port), 2);
+    check_served_stream(stream_completion(reader.port, prompt, 24, 0.7, 7), "unpriced");
+    CHECK_EQ(draft_positions(reader.port), 2);   /* the baseline, not the ceiling */
 
-    /* A priced streaming request is served whole, and the gap on the next one ends that stream. */
-    {
-        Server reader;
-        REQUIRE(reader.start(dir.path, reader_args));
-        const Streamed first = stream_completion(reader.port, prompt, 24, 0.0, 0);
-        if (first.status != 200 || first.timed_out)
-            fprintf(stderr, "    the priced stream failed (%d%s):\n%s\n", first.status,
-                    first.timed_out ? ", no end" : "", tail(reader.output()).c_str());
-        CHECK_EQ(first.status, 200);
-        CHECK(!first.timed_out);
-        bool framed = true;
-        const std::vector<std::string> payloads = stream_payloads(first.body, &framed);
-        int errors = 0;
-        for (const std::string& p : payloads) {
-            if (p == "[DONE]") continue;
-            const json j = json::parse(p, nullptr, false);
-            if (j.is_object() && j.contains("error")) ++errors;
-        }
-        CHECK(framed);
-        CHECK_EQ(errors, 0);
-        CHECK(!payloads.empty() && payloads.back() == "[DONE]");
-        CHECK_EQ(draft_positions(reader.port), 2);
-
-        const Streamed later = stream_completion(reader.port, prompt, 24, 0.7, 7);
-        check_gap_stream(later, "later");
-        const std::string log = reader.output();
-        CHECK(log.find("deepest offered tier K2") != std::string::npos);
-        CHECK(log.find("no cycle can be priced on this run") != std::string::npos);
-        CHECK(log.find("has no plan (") == std::string::npos);
-        const int reader_exit = reader.stop();
-        if (reader_exit == 0)
-            fprintf(stderr, "    the run did not stop on the refused later cycle:\n%s\n",
-                    tail(log).c_str());
-        CHECK(reader_exit != 0);
-    }
+    const std::string log = reader.output();
+    CHECK(log.find("without a priced candidate") != std::string::npos);
+    CHECK(log.find("deepest offered tier K2") == std::string::npos);
+    const int reader_exit = reader.stop();
+    if (reader_exit != 0)
+        fprintf(stderr, "    the reading run exited %d:\n%s\n", reader_exit, tail(log).c_str());
+    CHECK_EQ(reader_exit, 0);
 }
 
 /* The start path's lender registration, on a model that can lend at all. A model that can lend

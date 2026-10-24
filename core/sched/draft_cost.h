@@ -362,7 +362,7 @@ public:
     const DraftCostObserve& last_observe() const { return last_observe_; }
 
     /* The P00 handle the pipeline wires into DraftHooks::costs. */
-    DraftCostModel handle() { return DraftCostModel{this, &estimate_thunk}; }
+    DraftCostModel handle() { return DraftCostModel{this, &estimate_thunk, record_only_}; }
     static int estimate_thunk(void* ctx, const DraftVerifyShape& shape, DraftCostEstimate* out);
 
 private:

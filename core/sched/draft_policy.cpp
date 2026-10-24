@@ -503,14 +503,15 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
     }
 
     if (!best_p.valid) {
-        /* No offered tier has a measurement. R's named baseline is evidence only when it runs the
-         * offered top's own shape: the default ladder (fallback_k == the deepest tier) or rows
-         * whose remaining budget clamps both to the same k. When the baseline would run at a
-         * deeper k -- an explicit ladder below exec_depth -- its bucket can never be queried by
-         * this ladder, so the run would stay in the fallback and never price an offered tier.
+        /* No offered tier has a measurement. R's named baseline is evidence only when it runs a
+         * shape this ladder can reach: the baseline inside the ladder, or rows whose remaining
+         * budget clamps both to the same k. When the baseline would run at a deeper k than the
+         * ladder's top -- an explicit ladder below exec_depth, or a configured baseline above it,
+         * which Scheduler::init refuses at startup -- its bucket can never be queried by this
+         * ladder, so the run would stay in the fallback and never price an offered tier.
          * Diagnose that cycle and issue nothing: extending the ladder or moving the baseline is
          * the operator's call, and a sample must not be learnt at a depth the ladder never offers. */
-        if (c_.fallback_k > deepest) {
+        if (c_.fallback_k > deepest && !costs.records_only) {
             bool deeper_row = false;
             for (int32_t i = 0; i < view.n_seq; ++i)
                 if (cap_of(view.seq[i], c_.k_ceiling) > deepest) {
@@ -534,7 +535,8 @@ int DraftPlanner::choose(const DraftBatchView& view, const DraftPredictions& pre
          * middle tier by default (Scheduler: fallback_k, --draft-fallback-k), not the executable
          * depth: a profile that prices no shape of this batch would otherwise run every one of its
          * cycles at the maximum depth. It is not a policy choice, so the hysteresis incumbent does
-         * not move. Every tier was asked, and the trace lists each as unpriced. */
+         * not move. Every tier was asked, and the trace lists each as unpriced. A recording run
+         * prices nothing at all by construction, which is why the gap rule above skips it. */
         for (int32_t i = 0; i < view.n_seq; ++i) {
             const int32_t c = cap_of(view.seq[i], c_.k_ceiling);
             out->k[i] = c_.fallback_k < c ? c_.fallback_k : c;
