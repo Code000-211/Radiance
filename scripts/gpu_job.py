@@ -68,12 +68,13 @@ def wake_target(candidate: dict[str, Any]) -> str | None:
     return None
 
 
-class DispatchRejected(Exception):
-    """The platform provably stored no wakeup; no run was queued."""
-
-
 class DispatchAmbiguous(Exception):
     """A write failed without proof about whether the wakeup exists; never try a second one."""
+
+
+def agent_exists(agent_id: str) -> bool:
+    """Pre-write reachability check: a woken agent that no longer exists queues nothing."""
+    return any(a.get("id") == agent_id for a in multica("agent", "list") or [])
 
 
 def gpu_continuation(rule: dict[str, Any], agent_id: str) -> bool:
@@ -111,14 +112,15 @@ def dispatch(candidate: dict[str, Any], target: str) -> None:
                 "--after", "1s", "--agent-id", target,
                 "--instruction", HANDOVER.format(issue=name))
     except subprocess.CalledProcessError as exc:
-        # The CLI exited, so the write either committed or not; only a stored rule proves it did.
+        # A local exit does not prove the server stored nothing: a rule that is visible (possibly
+        # already fired and disabled) means it landed; an empty read proves nothing and stops too.
         try:
             landed = own_rules(candidate["id"], target)
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as read_exc:
             raise DispatchAmbiguous(f"create exit {exc.returncode}, rules unreadable: {read_exc}") from exc
         if landed:
             return
-        raise DispatchRejected(f"create exit {exc.returncode}, no rule stored") from exc
+        raise DispatchAmbiguous(f"create exit {exc.returncode}, no rule visible: may still have landed") from exc
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         raise DispatchAmbiguous(f"create failed: {exc}") from exc
 
@@ -138,6 +140,7 @@ def hand_over(finished: str) -> None:
             target = wake_target(candidate)
             # A parent whose child work is still open must not duplicate the child's measurement.
             open_work = open_children(candidate["id"]) if target else []
+            reachable = agent_exists(target) if target else False
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             # Nothing was written for this candidate; skipping it cannot double-start anything.
             print(f"handover: cannot inspect {name}; skipped: {exc}", file=sys.stderr)
@@ -145,14 +148,14 @@ def hand_over(finished: str) -> None:
         if not target:
             print(f"handover: {name} has no wakable agent or squad leader; skipped", file=sys.stderr)
             continue
+        if not reachable:
+            print(f"handover: {name} wake target no longer exists; skipped", file=sys.stderr)
+            continue
         if open_work:
             print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
             continue
         try:
             dispatch(candidate, target)
-        except DispatchRejected as exc:
-            print(f"handover: {name} rejected ({exc}); trying next candidate", file=sys.stderr)
-            continue
         except DispatchAmbiguous as exc:
             print(f"handover: ambiguous dispatch for {name}; not trying another candidate: {exc}",
                   file=sys.stderr)

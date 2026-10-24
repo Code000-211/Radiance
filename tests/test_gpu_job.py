@@ -68,9 +68,21 @@ elif args[:2] == ["issue", "children"]:
     print(tree.read_text() if tree.exists() else json.dumps({"stages": [], "unstaged": [], "total": 0}))
 elif args[:2] == ["squad", "get"]:
     print(json.dumps({"id": args[2], "leader_id": "leader-" + args[2]}))
+elif args[:2] == ["agent", "list"]:
+    rows = []
+    for path in root.glob("MAIN-*"):
+        if not (root / ("gone-" + path.name)).exists():
+            rows.append({"id": "agent-" + path.name})
+        if (root / ("squad-" + path.name)).exists():
+            rows.append({"id": "leader-squad-" + path.name})
+    print(json.dumps(rows))
 elif args[:2] == ["issue", "wakeup"] and args[2] == "list":
+    name = args[3].removeprefix("id-")
     rules = root / ("wakeups-" + args[3])
-    print(rules.read_text() if rules.exists() else "[]")
+    if (root / ("hide-" + name)).exists():
+        print("[]")  # simulates a rule that is not yet visible after a lost response
+    else:
+        print(rules.read_text() if rules.exists() else "[]")
 elif args[:2] == ["issue", "wakeup"] and args[2] == "trigger":
     name = args[3].removeprefix("id-")
     if (root / ("reject-" + name)).exists():
@@ -95,6 +107,8 @@ elif args[:2] == ["issue", "wakeup"] and args[2] == "create":
     rules_file = root / ("wakeups-" + args[3])
     rules = json.loads(rules_file.read_text()) if rules_file.exists() else []
     rules.append({"id": "created", "enabled": True, "agent_id": agent, "instruction": instruction})
+    if (root / ("fired-" + name)).exists():
+        rules[-1].update(enabled=False, fire_count=1)  # one-shot already consumed
     rules_file.write_text(json.dumps(rules))
     with (root / "events").open("a") as f:
         f.write("agent " + name + " " + agent + "\\n")
@@ -244,12 +258,31 @@ class GpuJobTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in stored], ["other-agent", "human-approval", "created"])
         self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
 
-    def test_handover_rejected_candidate_tries_next(self):
+    def test_handover_skips_unreachable_agent_tries_next(self):
+        # Pre-write proof: the woken agent no longer exists, so nothing can be queued for it.
         (self.root / "MAIN-3").write_text("ready_for_testing")
-        (self.root / "reject-MAIN-2").touch()
+        (self.root / "gone-MAIN-2").touch()
         self.finish(self.start("pass"), 0)
-        self.assertEqual(self.events("reject "), ["reject MAIN-2"])
         self.assertEqual(self.events("dispatch "), ["dispatch MAIN-3 create free"])
+        self.assertFalse((self.root / "wakeups-id-MAIN-2").exists())
+
+    def test_handover_fired_rule_after_lost_create_stops_dispatch(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "lost-MAIN-2").touch()
+        (self.root / "fired-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        # Stored but already fired/disabled: still a landed write, never a fallthrough.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
+
+    def test_handover_delayed_rule_visibility_stops_dispatch(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "lost-MAIN-2").touch()
+        (self.root / "hide-MAIN-2").touch()
+        self.finish(self.start("pass"), 0)
+        # An empty follow-up read does not prove the server stored nothing.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.assertNotIn("MAIN-3", "".join(self.events("dispatch ")))
 
     def test_handover_lost_create_response_is_reconciled(self):
         (self.root / "MAIN-3").write_text("ready_for_testing")

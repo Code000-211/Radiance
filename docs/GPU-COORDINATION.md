@@ -54,13 +54,16 @@ written:
   `scripts/gpu_job.py` (a GPU continuation). Foreign or differently-motivated rules are
   left untouched and a dedicated one-shot `at` continuation is created instead. No
   scheduler is added;
-- a nonzero exit of a `wakeup create` proves nothing on its own, so it is reconciled by
-  re-reading the candidate's rules: a stored own GPU rule means the write landed (stop, it
-  is dispatched), and only a provably absent rule counts as rejected — then the next
-  candidate is tried, so one unusable candidate cannot stall the queue. An unreadable rule
-  list, a timeout, an unparsable response, or any failed `wakeup trigger` stops the
-  handover: that write may already have queued a run, and a second dispatch could
-  double-start the next test.
+- a nonzero exit (or any error) of a `wakeup create`/`wakeup trigger` proves nothing on
+  its own, so the handover stops instead of waking a second candidate: the write may
+  already have queued a run. A visible own GPU rule — even one already fired and
+  disabled — is treated as landed; an empty follow-up read is **not** evidence of
+  rejection, because a local CLI exit neither contradicts a stored rule nor proves a
+  delayed one absent. No sleep-retry is used; the Sweeper stays the backstop;
+- the queue still advances past a candidate that is provably unexecutable **before any
+  write**: a wake target (assignee agent or squad leader) that is no longer in the agent
+  list, a squad without a leader, or an unreadable children list is skipped, so one
+  unusable candidate cannot stall the handover.
 
 If the handover call fails it is reported on stderr and does not rewrite the finished
 test's exit code; use the existing Sweeper as backstop. A stale `testing` issue (owner
@@ -131,9 +134,10 @@ it starts), an executed continuation chain for success, failure to `blocked`, an
 manual start in the test body, after the finished issue's final status, and releases
 the lock again), exactly one successor dispatched after release for its own agent,
 skipping a blocked candidate and a parent with open child work, waking a squad
-leader, reuse of an own GPU rule and ignoring foreign/unrelated rules, a rejected create that falls through to the
-next candidate, and three no-double-start cases (a create whose response was lost after
-committing, a lost trigger response, an unparsable create response),
+leader, reuse of an own GPU rule and ignoring foreign/unrelated rules, skipping a candidate whose wake target no
+longer exists with the next candidate dispatched, and four no-double-start cases: a
+create whose response was lost after committing, the same with the stored rule already
+fired/disabled, the same with the rule not yet visible, and a lost trigger response,
 blocked/stale issue refusal, failed initial/final status updates, command failure
 (no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both successful exit
 statuses, and successful execution without foreign process/FD inspection
