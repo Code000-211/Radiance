@@ -13,6 +13,15 @@ are environment overrides (`M=` for the container, `P=` for the port, and so on)
 header lists its own. Scripts that only attach to a live server need `curl` and `jq`; `cardclock.py`
 and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname "$0")`.
 
+## Multica GPU coordination
+
+For issue-owned GPU work, see [GPU-COORDINATION.md](../docs/GPU-COORDINATION.md).
+`gpu_job.py --issue MAIN-N -- COMMAND...` owns one nonblocking pair-lock window,
+sets `testing` before launching, and cleans up children before the final status.
+Agent-owned GPU tests must use this runner; it serializes participating agents
+without inspecting GPU processes. Existing scripts below do not acquire this outer
+agent-test window automatically and must not be assumed to preserve foreign servers.
+
 ## Bringing a model up
 
 | | |
