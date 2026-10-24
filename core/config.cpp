@@ -258,6 +258,25 @@ static const Flag g_flags[] = {
     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
     "                                    rest run as the base, in the same steps (a mixed batch)" },
 
+    { "--diagnose",           "DIR",    "instead of serving, run a fixed workload on this engine and write\n"
+    "                                    diagnose.json and diagnose.md to DIR: decode by prompt category,\n"
+    "                                    a concurrency sweep, a prefill sweep with decode at each depth and\n"
+    "                                    a prompt arriving into running streams -- step times, tokens a\n"
+    "                                    step, draft acceptance, TTFT, emission intervals, jitter. Prompts\n"
+    "                                    are salted so the prefix cache serves none of them" },
+    { "--diagnose-tokens",    "N",      "tokens a --diagnose decode stream generates (default 256)" },
+    { "--diagnose-runs",      "N",      "measured runs of every --diagnose point, after one unmeasured (default 3)" },
+    { "--diagnose-concurrency", "LIST", "stream counts of the concurrency sweep, comma-separated (default\n"
+    "                                    1,2,4,8; counts above --max-num-seqs are skipped and reported)" },
+    { "--diagnose-prefill",   "LIST",   "prompt lengths of the prefill sweep in tokens, comma-separated\n"
+    "                                    (default 1024,4096,16384,65536; lengths the context cannot hold\n"
+    "                                    are skipped and reported)" },
+    { "--diagnose-corpus",    "FILE",   "JSONL of category prompts, one {\"category\", \"messages\" or \"prompt\",\n"
+    "                                    \"max_tokens\"?} a line; default: a built-in set of code, reasoning,\n"
+    "                                    prose, json, file_edit and summarization prompts" },
+    { "--diagnose-baseline",  "FILE",   "an earlier diagnose.json of the same workload: compare every request's\n"
+    "                                    tokens with it and fail the run on any difference (parity)" },
+
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
@@ -333,6 +352,25 @@ static bool parse_int(const char* flag, const char* v, int64_t lo, int64_t hi, i
         return false;
     }
     *out = n;
+    return true;
+}
+
+/* A comma-separated list of whole numbers (--diagnose-concurrency, --diagnose-prefill). An empty
+ * element, a trailing comma or a value out of range refuses the list rather than dropping it. */
+static bool parse_int_list(const char* flag, const char* v, int64_t lo, int64_t hi,
+                           std::vector<int>* out) {
+    std::vector<int> got;
+    const char* p = v;
+    for (;;) {
+        const char* comma = std::strchr(p, ',');
+        const std::string one(p, comma ? (size_t)(comma - p) : std::strlen(p));
+        int64_t n = 0;
+        if (!parse_int(flag, one.c_str(), lo, hi, &n)) return false;
+        got.push_back((int)n);
+        if (!comma) break;
+        p = comma + 1;
+    }
+    *out = std::move(got);
     return true;
 }
 
@@ -832,6 +870,29 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
+        else if (S("--diagnose"))              { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose = v; }
+        else if (S("--diagnose-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 2, 1 << 20, &n)) return RAD_E_INVAL;
+            c->diagnose_tokens = (int)n;
+        }
+        else if (S("--diagnose-runs")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 1, 100, &n)) return RAD_E_INVAL;
+            c->diagnose_runs = (int)n;
+        }
+        else if (S("--diagnose-concurrency")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int_list(a.c_str(), v, 1, 4096, &c->diagnose_concurrency)) return RAD_E_INVAL;
+        }
+        else if (S("--diagnose-prefill")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int_list(a.c_str(), v, 16, 1 << 24, &c->diagnose_prefill)) return RAD_E_INVAL;
+        }
+        else if (S("--diagnose-corpus"))       { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_corpus = v; }
+        else if (S("--diagnose-baseline"))     { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_baseline = v; }
         else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--kld-lora-sources"))      { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora_sources = v; }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
@@ -890,6 +951,19 @@ int config_parse(int argc, char** argv, Config* c) {
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
         RAD_ERR("--kld-out is the --kld-ref report");
+        return RAD_E_INVAL;
+    }
+
+    /* ONE MODE A RUN. Each replaces serving with its own driver, so two given together would have
+     * to pick one silently; --debug-graph returns before either runs. */
+    if (!c->diagnose_mode() && (!c->diagnose_corpus.empty() || !c->diagnose_baseline.empty())) {
+        RAD_ERR("--diagnose-corpus and --diagnose-baseline belong to the --diagnose workload; give "
+                "--diagnose DIR as well");
+        return RAD_E_INVAL;
+    }
+    if (c->diagnose_mode() && (c->kld() || c->debug_graph)) {
+        RAD_ERR("--diagnose runs its own workload; it cannot be combined with --kld-record, --kld-ref "
+                "or --debug-graph");
         return RAD_E_INVAL;
     }
 
@@ -1134,6 +1208,19 @@ const ShowRow kShow[] = {
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
     { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--kld-lora-sources",   [](const Config& c) { return or_none(c.kld_lora_sources, "every document"); } },
+    { "--diagnose",           [](const Config& c) { return or_none(c.diagnose, "off (serve)"); } },
+    { "--diagnose-tokens",    [](const Config& c) { return num(c.diagnose_tokens); } },
+    { "--diagnose-runs",      [](const Config& c) { return num(c.diagnose_runs); } },
+    { "--diagnose-concurrency", [](const Config& c) {
+          std::string s;
+          for (int n : c.diagnose_concurrency) s += (s.empty() ? "" : ",") + num(n);
+          return s; } },
+    { "--diagnose-prefill",   [](const Config& c) {
+          std::string s;
+          for (int n : c.diagnose_prefill) s += (s.empty() ? "" : ",") + num(n);
+          return s; } },
+    { "--diagnose-corpus",    [](const Config& c) { return or_none(c.diagnose_corpus, "the built-in set"); } },
+    { "--diagnose-baseline",  [](const Config& c) { return or_none(c.diagnose_baseline, "none"); } },
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },

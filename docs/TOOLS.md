@@ -811,6 +811,44 @@ theirs: that is how a mixed batch is checked.
 
 ---
 
+## The diagnose mode
+
+```
+radiance --model M.rad ... --diagnose DIR        the workload, the report, and the exit code
+```
+
+Runs a fixed workload on the engine instead of serving it — decode by prompt category, a
+concurrency sweep, a prefill sweep with decode at each depth, and a prompt arriving into running
+streams — and writes `DIR/diagnose.json` and `DIR/diagnose.md`: step times and their spread, tokens
+a step, draft positions drafted and accepted, TTFT, per-token emission intervals and jitter, per
+request and per phase, with the machine and the settings it ran under. It starts as a serve would
+(same placement, same kernels, same prefix cache) and exits, so it can be run on every candidate
+build and compared.
+
+| flag | default | |
+|---|---|---|
+| `--diagnose DIR` | — | run the workload and write the report to DIR; `diagnose.json` is the whole report, `diagnose.md` reads it |
+| `--diagnose-tokens N` | 256 | tokens a decode stream generates |
+| `--diagnose-runs N` | 3 | measured runs of each point, after one unmeasured; median and spread are reported |
+| `--diagnose-concurrency LIST` | 1,2,4,8 | stream counts of the concurrency sweep; a count above `--max-num-seqs` is skipped and reported |
+| `--diagnose-prefill LIST` | 1024,4096,16384,65536 | prompt lengths of the prefill sweep, in tokens; a length the context cannot hold is skipped and reported |
+| `--diagnose-corpus FILE` | built-in | JSONL, one `{"category", "messages" or "prompt", "max_tokens"?}` a line: code, reasoning, prose, json, file_edit, summarization |
+| `--diagnose-baseline FILE` | — | an earlier `diagnose.json` of the same workload: compare every request's tokens with it and fail the run on any difference |
+
+Every prompt is salted so the prefix cache serves none of it, the cache is emptied before every
+run, and each request's cached-token count is checked afterwards: a hit, or step records the ring
+overwrote before they were read, makes the verdict `NOT A MEASUREMENT` and the exit code non-zero.
+Requests run at temperature 1 with the server's top_k/top_p/min_p and a fixed seed per request, so
+two builds of the same model are compared token for token. `--diagnose` is a mode of the engine
+like `--kld-ref`: it cannot be combined with the KL flags or `--debug-graph`, and `--diagnose-corpus`
+and `--diagnose-baseline` need it.
+
+The report says in `not_measured` what it does not cover — per-kernel device time, placement and
+link counters per phase, op correctness over a step window, and the HTTP path. What the numbers
+mean, what makes a run a measurement and what is still missing: [DIAGNOSE.md](DIAGNOSE.md).
+
+---
+
 ## The shell harnesses
 
 `scripts/` drives a running engine: bring a model up, measure it, and assert on what comes back
