@@ -38,6 +38,28 @@ namespace rad {
 int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
                   int32_t* out, int32_t* n_accepted);
 
+class CandidateTree;
+
+/* The same rule over a candidate tree (arch/common/rad_tree_candidate.h): the verified rows are
+ * nodes, and a node is accepted only when its token equals the target's own pick at its PARENT's
+ * row. `pick` is the target's token at each node's row, [tree.node_count()] -- the argmax at
+ * temperature 0, the sampled draw above it. Each row draws once at its own position, so walking
+ * matching children emits exactly what a serial verify of that path would, and a sibling never
+ * gets a second draw after a mismatch. Ties between children carrying the same token go to the
+ * lower node id, which is what makes the result independent of row order.
+ *
+ * Writes the accepted draft tokens into `out[0..accepted-1]` and the target's own token past the
+ * last accepted node into `out[accepted]` -- the bonus, `accepted + 1` tokens, the same shape
+ * accept_greedy produces. `out_path`, when given, receives the node id of each accepted token
+ * and of the root, [accepted + 1]: the rows the passes after the verify read. `accept_cut_at_eog`
+ * applies to the emitted tokens unchanged, so a stop token inside the tree ends the step where it
+ * would end a chain.
+ *
+ * Returns RAD_E_INVAL for a malformed tree or a `pick` shorter than the tree (every visited row
+ * needs its pick), and RAD_E_STATE when the walk ends without a bonus token. */
+int accept_tree_greedy(const CandidateTree& tree, const int32_t* pick, int32_t n_pick,
+                       int32_t* out, int32_t* n_accepted, int32_t* out_path);
+
 /* Where a verify step's emission ends: at the first end-of-generation token among `out`'s
  * n_accepted + 1 tokens (accept_greedy's output), which is emitted, or after all of them. Returns
  * the number of accepted drafts to commit, at most `n_accepted`. A drafter that predicts the stop
