@@ -18,7 +18,11 @@
  */
 #include "spechub.h"
 
-#include "../../libr4d/r4d_emit.h"   /* only for the three globals it declares */
+/* Only for the three globals it declares. Device sources include it for r4d_emit itself; a host
+ * build has no HIP headers, and nothing else in this plain C++ file needs one. */
+#ifdef RAD_SPECHUB_WITH_DEVICE
+#include "../../libr4d/r4d_emit.h"
+#endif
 
 /* THE DISPATCH LOG IS THIS DSO'S OWN. r4d_emit.h routes every launch through this recorder so a test
  * can name the functions it dispatched, but the loader maps plugins RTLD_LOCAL: a plugin cannot
