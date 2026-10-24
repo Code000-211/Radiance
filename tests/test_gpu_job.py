@@ -1,6 +1,7 @@
 """CPU-only process/CLI integration tests; never open GPU devices or the production lock."""
 
 import fcntl
+import json
 import os
 import select
 import signal
@@ -12,16 +13,36 @@ from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parents[1] / "scripts" / "gpu_job.py"
 FAKE_CLI = '''#!/usr/bin/env python3
-import json, os, sys
+import fcntl, json, os, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_STATE"])
 args = sys.argv[1:]
+
+def row(path):
+    name = path.name
+    return {"id": "id-" + name, "identifier": name, "number": int(name.split("-")[1]),
+            "project_id": "a64348a9-c661-493a-b111-6777ed95a9a3", "status": path.read_text(),
+            "assignee_id": "agent-" + name, "assignee_type": "agent"}
+
+def dispatch(name, kind):
+    try:
+        with open(os.environ["FAKE_LOCK"], "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                state = "free"
+            except BlockingIOError:
+                state = "locked"
+    except FileNotFoundError:
+        state = "free"
+    with (root / "events").open("a") as f:
+        f.write("dispatch " + name + " " + kind + " " + state + "\\n")
+
 if args[:2] == ["issue", "get"]:
-    print(json.dumps({"identifier": args[2], "project_id": "a64348a9-c661-493a-b111-6777ed95a9a3",
-                      "status": (root / args[2]).read_text()}))
+    print(json.dumps(row(root / args[2])))
 elif args[:2] == ["issue", "list"]:
-    print(json.dumps({"issues": [{"identifier": p.name} for p in root.glob("MAIN-*")
-                                  if p.read_text() == "testing"], "has_more": False}))
+    status = args[args.index("--status") + 1]
+    rows = [row(p) for p in root.glob("MAIN-*") if p.read_text() == status]
+    print(json.dumps({"issues": rows, "has_more": False}))
 elif args[:2] == ["issue", "status"]:
     with (root / "events").open("a") as f:
         f.write(args[2] + " " + args[3] + "\\n")
@@ -30,6 +51,22 @@ elif args[:2] == ["issue", "status"]:
     (root / args[2]).write_text(args[3])
     if args[3] == "testing" and (root / "fail-testing").exists():
         sys.exit(1)  # ambiguous error: server already changed status
+elif args[:2] == ["issue", "children"]:
+    tree = root / ("children-" + args[2])
+    print(tree.read_text() if tree.exists() else json.dumps({"stages": [], "unstaged": [], "total": 0}))
+elif args[:2] == ["issue", "wakeup"] and args[2] == "list":
+    rules = root / ("wakeups-" + args[3])
+    print(rules.read_text() if rules.exists() else "[]")
+elif args[:2] == ["issue", "wakeup"] and args[2] == "trigger":
+    dispatch(args[3].removeprefix("id-"), "trigger")
+elif args[:2] == ["issue", "wakeup"] and args[2] == "create":
+    agent = args[args.index("--agent-id") + 1]
+    name = args[3].removeprefix("id-")
+    with (root / ("wakeups-" + args[3])).open("a") as f:
+        f.write(json.dumps([{"id": "created", "enabled": True}]))
+    with (root / "events").open("a") as f:
+        f.write("agent " + name + " " + agent + "\\n")
+    dispatch(name, "create")
 else:
     sys.exit(2)
 '''
@@ -46,7 +83,7 @@ class GpuJobTests(unittest.TestCase):
         cli.chmod(0o700)
         for issue in ("MAIN-1", "MAIN-2"):
             (self.root / issue).write_text("ready_for_testing")
-        self.env = dict(os.environ, FAKE_STATE=str(self.root),
+        self.env = dict(os.environ, FAKE_STATE=str(self.root), FAKE_LOCK=str(self.lock),
                         PATH=str(self.root) + os.pathsep + os.environ["PATH"])
         self.launcher = (
             "import importlib.util,sys; from pathlib import Path; "
@@ -88,6 +125,47 @@ class GpuJobTests(unittest.TestCase):
         with self.lock.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def events(self, prefix):
+        path = self.root / "events"
+        if not path.exists():
+            return []
+        return [line for line in path.read_text().splitlines() if line.startswith(prefix)]
+
+    def test_initial_dispatch_and_automatic_handover(self):
+        (self.root / "MAIN-3").write_text("blocked")
+        self.finish(self.start("pass"), 0)
+        self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
+        # Exactly one successor, woken for its own assignee, only after this window was released.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+        self.assertEqual(self.events("agent "), ["agent MAIN-2 agent-MAIN-2"])
+
+    def test_handover_after_failure(self):
+        self.finish(self.start("raise SystemExit(7)"), 7)
+        self.assertEqual((self.root / "MAIN-1").read_text(), "blocked")
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+
+    def test_handover_after_in_progress(self):
+        self.finish(self.start("pass", after="in_progress"), 0)
+        self.assertEqual((self.root / "MAIN-1").read_text(), "in_progress")
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
+
+    def test_handover_skips_parent_with_open_child(self):
+        (self.root / "MAIN-3").write_text("ready_for_testing")
+        (self.root / "children-id-MAIN-2").write_text(json.dumps(
+            {"stages": [], "total": 1, "unstaged": [{"identifier": "MAIN-9", "status": "todo"}]}))
+        self.finish(self.start("pass"), 0)
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-3 create free"])
+
+    def test_handover_reuses_existing_wakeup(self):
+        (self.root / "wakeups-id-MAIN-2").write_text(json.dumps([{"id": "rule", "enabled": True}]))
+        self.finish(self.start("pass"), 0)
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 trigger free"])
+
+    def test_loser_does_not_dispatch(self):
+        (self.root / "MAIN-2").write_text("testing")
+        self.finish(self.start("raise SystemExit('must not run')"), 75)
+        self.assertEqual(self.events("dispatch "), [])
+
     def test_competing_jobs_only_one_testing(self):
         first = self.start("import sys; print('ready',flush=True); sys.stdin.read()")
         self.assertEqual(self.ready(first), "ready")
@@ -101,6 +179,8 @@ class GpuJobTests(unittest.TestCase):
         self.finish(first, 0)
         self.assertEqual((self.root / "MAIN-1").read_text(), "in_review")
         self.unlocked()
+        # The handover (not this test) dispatched MAIN-2; it can now reuse the released window.
+        self.assertEqual(self.events("dispatch "), ["dispatch MAIN-2 create free"])
         self.finish(self.start("pass", "MAIN-2", "in_progress"), 0)
         self.assertEqual((self.root / "MAIN-2").read_text(), "in_progress")
 
@@ -141,6 +221,7 @@ class GpuJobTests(unittest.TestCase):
         out, _ = self.finish(self.start(code), 1)
         self.assertFalse(Path(f"/proc/{int(out.strip())}").exists())
         self.assertEqual((self.root / "MAIN-1").read_text(), "testing")
+        self.assertEqual(self.events("dispatch "), [])
         self.unlocked()
         self.finish(self.start("raise SystemExit('must not run')", "MAIN-2"), 75)
 

@@ -24,19 +24,66 @@ def multica(*args: str) -> Any:
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def testing_issues() -> list[str]:
-    found: list[str] = []
+def issues_with_status(status: str) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
     offset = 0
     while True:
-        page = multica("issue", "list", "--project", PROJECT, "--status", "testing",
+        page = multica("issue", "list", "--project", PROJECT, "--status", status,
                        "--limit", "100", "--offset", str(offset))
         rows = page["issues"]
-        found.extend(i["identifier"] for i in rows)
+        found.extend(rows)
         if not page.get("has_more", len(rows) == 100):
             return found
         if not rows:
-            raise RuntimeError("incomplete testing issue listing")
+            raise RuntimeError(f"incomplete {status} issue listing")
         offset += len(rows)
+
+
+def testing_issues() -> list[str]:
+    return [i["identifier"] for i in issues_with_status("testing")]
+
+
+HANDOVER = ("A GPU test window is free. Re-read this issue's blockers, then run its already-authorized "
+            "GPU phase through: python3 scripts/gpu_job.py --issue {issue} -- <foreground command>. "
+            "If the window is taken, stay ready_for_testing; the next finished runner hands off again.")
+
+
+def open_children(issue_id: str) -> list[dict[str, Any]]:
+    tree = multica("issue", "children", issue_id) or {}
+    rows = list(tree.get("unstaged") or [])
+    for stage in tree.get("stages") or []:
+        rows.extend(stage.get("issues") or [])
+    return [c for c in rows if c.get("status") not in ("done", "cancelled")]
+
+
+def hand_over(finished: str) -> None:
+    """One-shot dispatch of the next runnable waiter through existing Multica wakeups."""
+    try:
+        candidates = issues_with_status("ready_for_testing")
+        for candidate in sorted(candidates, key=lambda i: i["number"]):
+            name = candidate["identifier"]
+            if name == finished:
+                continue
+            # A parent whose child work is still open must not duplicate the child's measurement.
+            if candidate.get("assignee_type") != "agent" or not candidate.get("assignee_id"):
+                print(f"handover: {name} has no agent assignee; skipped", file=sys.stderr)
+                continue
+            if open_children(candidate["id"]):
+                print(f"handover: {name} still has open child work; skipped", file=sys.stderr)
+                continue
+            rules = [r for r in multica("issue", "wakeup", "list", candidate["id"]) or []
+                     if r.get("enabled")]
+            if rules:
+                multica("issue", "wakeup", "trigger", candidate["id"], rules[0]["id"])
+            else:
+                multica("issue", "wakeup", "create", candidate["id"], "--kind", "at",
+                        "--after", "1s", "--agent-id", candidate["assignee_id"],
+                        "--instruction", HANDOVER.format(issue=name))
+            print(f"handover: dispatched {name}", file=sys.stderr)
+            return
+        print("handover: no runnable waiting candidate", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        print(f"handover failed: {exc}", file=sys.stderr)
 
 
 def reap_children() -> None:
@@ -108,7 +155,10 @@ def run_job(issue: str, command: list[str], after: str) -> int:
             finally:
                 for s, handler in previous.items():
                     signal.signal(s, handler)
-        return result if result >= 0 else 128 - result
+        return_code = result if result >= 0 else 128 - result
+    # Only after the lock is released: the next agent may acquire the window it is woken for.
+    hand_over(record["identifier"])
+    return return_code
 
 
 def main() -> int:

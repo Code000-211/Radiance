@@ -35,17 +35,33 @@ from the lock metadata or recorded issue, without scanning GPU processes. Legacy
 locks can lack metadata; report that rather than guessing. Never unlink the lock
 file, sleep-retry, choose a different lock, or start a second uncoordinated test.
 
-Use existing Multica wakeups/dispatch to resume; check the waiter's existing rules
-before registering another. For example:
+Use existing Multica wakeups/dispatch to resume. The runner itself hands off: after a
+window closes (success, `--after in_progress`, or failure to `blocked`) it wakes exactly
+one runnable waiter through the platform's persistent wakeups. A waiting agent does not
+start a second runner or poll.
+
+Handover candidate rules, applied after the lock is released and the final status is
+written:
+
+- only issues in `ready_for_testing` (so `blocked` work is never promoted); the finished
+  issue is excluded, and a parent whose child issue is still open is skipped because the
+  child carries that measurement;
+- candidates ordered by issue number, one dispatched per finished window;
+- the candidate's own agent assignee is woken (`--agent-id`); an enabled wakeup rule is
+  triggered if one exists, otherwise one one-shot `at` wakeup with the resumption
+  instruction is created. No scheduler is added.
+
+If the handover call fails it is reported on stderr and does not rewrite the finished
+test's exit code; use the existing Sweeper as backstop. A stale `testing` issue (owner
+never reached its final write) blocks handover and needs coordination with its owner.
+The runner cannot see arbitrary queued/running tasks, so the resumed agent must not start
+a duplicate run; it rechecks its state before its GPU command.
 
 ```bash
-multica issue wakeup create MAIN-WAITER --until-issue MAIN-HOLDER \
-  --until-issue-state in_review --expires-in 24h --on-timeout wake \
-  --instruction-file ./resume-test.md
+# Created by the finishing runner, not by hand:
+multica issue wakeup create MAIN-WAITER --kind at --after 1s --agent-id AGENT-ID \
+  --instruction "A GPU test window is free. ... python3 scripts/gpu_job.py --issue MAIN-WAITER -- ..."
 ```
-
-The instruction rechecks the issue's blockers and reacquires the lock. A failed
-holder or stale `testing` needs coordination with its owner, not a polling loop.
 
 ## Completion and cleanup
 
@@ -97,7 +113,12 @@ uvx mypy --check-untyped-defs scripts/gpu_job.py tests/test_gpu_job.py
 
 Tests use a temporary lock and fake CLI, with no GPU load or production lock.
 They prove two competing agents produce one test window/one `testing`; the loser
-launches nothing, and a later run can reuse the lock. Also covered: blocked/stale
-issue refusal, failed initial/final status updates, command failure,
-SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both successful exit statuses,
-and successful execution without foreign process/FD inspection permissions.
+launches nothing and dispatches nothing, and a later run can reuse the lock. Also
+covered: initial dispatch on a free window, automatic handover with no second
+runner (success, `--after in_progress`, and failure to `blocked`), exactly one
+successor dispatched after the lock is released and for its own agent, skipping a
+blocked candidate and a parent with open child work, reuse of an existing wakeup
+rule, blocked/stale issue refusal, failed initial/final status updates, command
+failure (no handover), SIGINT/SIGTERM/SIGHUP, detached/orphan cleanup, both
+successful exit statuses, and successful execution without foreign process/FD
+inspection permissions.
