@@ -2349,9 +2349,14 @@ that concurrent reclaim and rewrite wrote every byte as the table has it.
 The window is forced on its own: a reader parks in it (the `r4d_ple_probe` test hook, `r4d.h`),
 the same launch's other blocks reclaim the way it holds and publish a row that is no row's, so the
 parked reader loads that rewrite and has to reject it at the recheck that follows the load. The
-case fails unless the counters show both the park and the recheck that found the way rewritten, and
-the row that parked reader writes must still be the table's -- taking the generation check out puts
-the rewritten bytes in the output.
+case fails unless the counters show, separately, that a block rewrote the parked way, that the
+parked reader's recheck read a generation two on from its lookup, that the rewrite released the
+park (a park the handshake's bound released instead leaves a timeout word and fails the case,
+since a reader released that way may have loaded a row nobody rewrote), and that the row the
+parked reader writes is still the table's. Taking the generation check out of the recheck puts the
+rewritten bytes in that row, which is what turns this stage red.
+The handshake and its bounded waits live in a kernel entry of the test's; the gather every launch
+uses takes no probe word and has no probe branch.
 What the hit rate is worth on a given workload is a measurement this option does not make for you.
 
 ### `ngram_ids`

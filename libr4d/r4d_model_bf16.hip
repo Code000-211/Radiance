@@ -235,10 +235,14 @@ __device__ __forceinline__ int32_t ple_claim(int32_t* __restrict__ tags,
  * for 2^31 publications of that way, after which its generation wraps back onto `g` and the check
  * can no longer tell the two apart (the local form of the wrap above).
  *
- * `probe` is a test's, not the gather's: null on every launch that is not a test, and when it is
- * set the words of r4d_ple_probe (r4d.h) hold a reader still between its lookup and its payload
- * load while another block rewrites the way it holds, so the load reads that rewrite and the
- * recheck has to reject it. Nothing else changes: same branches, same stores, same bytes. */
+ * The body is one template, so the two entries below cannot drift; `Probe` false is the gather's
+ * translation of it, statement for statement, and the words of r4d_ple_probe (r4d.h) appear only
+ * in the `Probe` true instantiation -- the test's forced window, which no launch of the gather
+ * can reach. */
+
+/* A park or a wait in the handshake is bounded: a grid whose servant block is never resident (or
+ * whose block 0 never parks) must still end, and it fails on the words below, not by hanging. */
+constexpr uint32_t kPleProbePoll = 1u << 22;
 
 /* Test-only: reclaim the way the parked reader named, write a payload that is no row, and publish
  * it -- the reclaim-and-rewrite that reader's recheck has to see. One block a run serves: two
@@ -283,7 +287,8 @@ __device__ __forceinline__ bool ple_probe_rewrite(int32_t* __restrict__ tags,
     return true;
 }
 
-__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
+template <bool Probe>
+__device__ __forceinline__ void ple_embed_lookup_q_row(
     const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
@@ -291,16 +296,17 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
     uint32_t* __restrict__ probe) {
     const uint32_t lane = threadIdx.x, m = blockIdx.x;
 
-    if (probe && probe[r4d_ple_probe_mode] && blockIdx.x > 0) {
-        /* The test's servant blocks: wait for block 0 to park in its window, before the payload
-         * load that follows, rewrite the way it holds, then gather this row as any launch would.
-         * Bounded, so a run that never gets a park still ends -- and fails on the conflict
-         * counter. */
-        for (uint32_t i = 0; i < (1u << 26); ++i)
-            if (ple_probe_rewrite(tags, gen, data, probe, lane) ||
-                __hip_atomic_load(probe + r4d_ple_probe_rewrites, __ATOMIC_RELAXED,
-                                  __HIP_MEMORY_SCOPE_AGENT))
-                break;
+    if constexpr (Probe) {
+        if (blockIdx.x > 0 && probe[r4d_ple_probe_mode]) {
+            /* The test's servant blocks: wait for block 0 to park in its window, before the payload
+             * load that follows, rewrite the way it holds, then gather this row as any launch
+             * would. */
+            for (uint32_t i = 0; i < kPleProbePoll; ++i)
+                if (ple_probe_rewrite(tags, gen, data, probe, lane) ||
+                    __hip_atomic_load(probe + r4d_ple_probe_rewrites, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT))
+                    break;
+        }
     }
 
     const int32_t id = tok[m] - vocab_off;
@@ -316,50 +322,63 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
 
     uint4 v = make_uint4(0u, 0u, 0u, 0u);
     if (slot >= 0) {
-        /* The test's handshake: park here, between the lookup and the payload load, until another
-         * block has rewritten this way -- so the load reads the rewritten payload, which is no
-         * row, and only the generation check can still send this reader to the decode path. A
-         * reader that took the hit would put those bytes in the output, which is what makes the
-         * check load-bearing for the case. Bounded -- a run that never gets its rewrite fails on
-         * the conflict counter, not on a hang. */
-        if (probe && probe[r4d_ple_probe_mode] && blockIdx.x == 0 && lane == 0 &&
-            atomicCAS((int*)(probe + r4d_ple_probe_claim), 0, 1) == 0) {
-            __hip_atomic_store(probe + r4d_ple_probe_slot, (uint32_t)slot, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-            __hip_atomic_store(probe + r4d_ple_probe_gen, g, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-            __hip_atomic_store(probe + r4d_ple_probe_id, (uint32_t)id, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-            __threadfence();
-            __hip_atomic_store(probe + r4d_ple_probe_parked, 1u, __ATOMIC_RELEASE,
-                               __HIP_MEMORY_SCOPE_AGENT);
-            for (uint64_t i = 0; i < (1ull << 26); ++i)
-                if (!__hip_atomic_load(probe + r4d_ple_probe_parked, __ATOMIC_ACQUIRE,
-                                       __HIP_MEMORY_SCOPE_AGENT))
-                    break;
+        if constexpr (Probe) {
+            /* The handshake: lane 0 parks here, between the lookup and the payload load, until a
+             * servant has rewritten this way -- so the load reads that rewrite, which is no row,
+             * and only the generation check can still send this reader to the decode path. A park
+             * the bound released sets the timeout word: the case fails on it rather than reading a
+             * row that was never rewritten as if the window had been forced. */
+            if (probe[r4d_ple_probe_mode] && blockIdx.x == 0 && lane == 0 &&
+                atomicCAS((int*)(probe + r4d_ple_probe_claim), 0, 1) == 0) {
+                __hip_atomic_store(probe + r4d_ple_probe_slot, (uint32_t)slot, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __hip_atomic_store(probe + r4d_ple_probe_gen, g, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __hip_atomic_store(probe + r4d_ple_probe_id, (uint32_t)id, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                __threadfence();
+                __hip_atomic_store(probe + r4d_ple_probe_parked, 1u, __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+                uint32_t i = 0;
+                for (; i < kPleProbePoll; ++i)
+                    if (!__hip_atomic_load(probe + r4d_ple_probe_parked, __ATOMIC_ACQUIRE,
+                                           __HIP_MEMORY_SCOPE_AGENT))
+                        break;
+                if (i == kPleProbePoll)
+                    __hip_atomic_store(probe + r4d_ple_probe_timeout, 1u, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+            }
+            __syncwarp();                  /* every lane waits for lane 0's park, before the load */
         }
-        __syncwarp();
         if (lane < kPleLanes)
             v = *(const uint4*)(data + (size_t)slot * (kPleRow * 2u) + (size_t)lane * 16u);
         __threadfence();                   /* every lane's payload load is done before the recheck */
         __syncwarp();
         bool hit = false;
         if (lane == 0) {
-            const bool same_gen =
-                __hip_atomic_load(gen + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == g;
-            const bool same_id =
-                __hip_atomic_load(tags + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id;
-            if (probe && !same_gen && same_id) {
-                atomicAdd(probe + r4d_ple_probe_conflicts, 1u);   /* the window, entered */
-                /* Retire the way the rewriter published: a row with this id's tag and a payload
-                 * that is no row's would be a hit for the next launch. 0 is empty, so it reads as
-                 * a miss and is refilled; a lost swap means a writer has it, and it is then its
-                 * own to publish. */
-                const uint32_t cur =
+            if constexpr (Probe) {
+                const uint32_t now =
                     __hip_atomic_load(gen + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                atomicCAS((int*)(gen + slot), (int)cur, 0);
+                const bool same_id =
+                    __hip_atomic_load(tags + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == id;
+                if (now != g) {
+                    __hip_atomic_store(probe + r4d_ple_probe_recheck_gen, now, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+                    if (same_id) {
+                        atomicAdd(probe + r4d_ple_probe_conflicts, 1u);   /* the window, entered */
+                        /* Retire the way the rewriter published: a row with this id's tag and a
+                         * payload that is no row's would be a hit for the next launch. 0 is empty,
+                         * so it reads as a miss and is refilled; a lost swap means a writer has it,
+                         * and it is then its own to publish. */
+                        atomicCAS((int*)(gen + slot), (int)now, 0);
+                    }
+                }
+                hit = now == g && same_id;
+            } else {
+                hit = __hip_atomic_load(gen + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == g &&
+                      __hip_atomic_load(tags + slot, __ATOMIC_RELAXED,
+                                        __HIP_MEMORY_SCOPE_AGENT) == id;
             }
-            hit = same_gen && same_id;
         }
         hit = __shfl((int)hit, 0) != 0;
         if (hit) {
@@ -399,6 +418,28 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
                                                __HIP_MEMORY_SCOPE_AGENT);
         __hip_atomic_store(gen + islot, odd + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     }
+}
+
+/* The gather every launch uses: no probe word in the signature, no probe branch in the body. */
+__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets) {
+    ple_embed_lookup_q_row<false>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
+                                  heat, data, num_sets, nullptr);
+}
+
+/* The test's, not the gather's: the same row with the r4d_ple_probe handshake. No launch outside
+ * r4d_selftest's ple_cache names it, and r4d_ple_probe (r4d.h) is what makes a cache use it. */
+__global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_probe_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
+    const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
+    int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
+    uint32_t* __restrict__ probe) {
+    ple_embed_lookup_q_row<true>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
+                                 heat, data, num_sets, probe);
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -1031,14 +1072,15 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
  * write the same bytes as embed_lookup_q_kernel, which r4d_selftest's `ple_cache` checks against a
  * host gather at every stage: cold, warm, colliding, after a table change, after a reset, and from
  * four concurrent streams. That case also attaches the r4d_ple_probe handshake, which forces the
- * reclaim/rewrite window on one reader and counts the rechecks that land in it.
+ * reclaim/rewrite window on one reader and counts the rechecks that land in it -- from the test's
+ * own kernel entry (ple_embed_lookup_q_probe_kernel), so this struct and the gather below carry
+ * no probe state.
  */
 struct PleVramCache {
     int32_t*  tags = nullptr;    /* row id per way, valid under an even generation */
     uint32_t* gen  = nullptr;    /* 0 empty, odd owned by a writer, even published (the seqlock) */
     uint32_t* heat = nullptr;    /* hit counter per way: the replacement policy's age */
     uint8_t*  data = nullptr;    /* kPleCacheRowBytes rows, decoded bf16 */
-    uint32_t* probe = nullptr;   /* a test's r4d_ple_probe words; null everywhere else */
     uint32_t  sets = 0;
     int       device = -1;
     std::atomic<const void*> table{nullptr};
@@ -1103,11 +1145,14 @@ extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
     ple_cache_free((PleVramCache*)instance);
 }
 
-/* Test hook, not part of the plugin ABI (r4d.h): the probe words the kernel's handshake uses. The
- * test allocates them; a cache no test touched keeps `probe` null and its launches pass null. */
+/* Test hook, not part of the plugin ABI (r4d.h): the probe words the test's kernel entry uses, and
+ * which entry a launch takes. Attached the gathers run ple_embed_lookup_q_probe_kernel with those
+ * words; a run no test attaches launches the gather above, unchanged. Null detaches. */
+static unsigned* g_ple_probe = nullptr;
+
 extern "C" int r4d_ple_probe(void* instance, unsigned* ctl) {
     if (!instance) return -1;
-    ((PleVramCache*)instance)->probe = ctl;
+    g_ple_probe = ctl;
     return 0;
 }
 
@@ -1125,10 +1170,15 @@ static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, co
                                       bool sc_f32, uint16_t* x, long long M, int32_t n_vocab,
                                       int32_t vocab_off, long long x_ld, PleVramCache* c,
                                       RadStream stream) {
+    if (g_ple_probe)                       /* a test attached its words: its own entry, same row */
+        return R4D_EMIT(stream, (ple_embed_lookup_q_probe_kernel), dim3((uint32_t)M),
+                        dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
+                        (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
+                        c->sets, g_ple_probe) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
                     dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                     (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                    c->sets, c->probe) == RAD_OK ? 0 : -4;
+                    c->sets) == RAD_OK ? 0 : -4;
 }
 
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,

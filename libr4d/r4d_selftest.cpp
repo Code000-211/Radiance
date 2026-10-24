@@ -23562,12 +23562,17 @@ static void ple_cache_case(const Plugin& pl) {
      * lookup and its recheck, which a run that never does cannot show; here a reader parks in that
      * window (r4d_ple_probe, r4d.h) while the same launch's other blocks reclaim the way it holds
      * (ple_claim's protocol: even -> odd, write, publish) and write a payload that is no row's. The
-     * reader then loads that payload and its recheck must land two generations on, and the counters
-     * must show that it did: a probe that never parks, or never gets its rewrite, fails this case
-     * rather than passing quietly. One id a set, so the way rewritten under the reader is only ever
-     * read by that one row -- the poison can reach no other -- and the parked row must still write
-     * the table's bytes, which is what taking the generation check out breaks: those bytes would go
-     * into the output. */
+     * reader then loads that payload and its recheck must land two generations on.
+     *
+     * What the counters have to show, and each is its own assertion because the park, the rewrite
+     * and the recheck are three different events: a rewrite happened under the park; the park was
+     * released by that rewrite and not by the handshake's bound (the timeout word stays 0), since a
+     * reader the bound released could have loaded a row that was never rewritten and the
+     * counters would still look plausible; the recheck read a generation two on from the one the
+     * lookup held, which is what makes the load it follows the rewritten payload; and the row the
+     * reader writes is still the table's. One id a set, so the way rewritten under the reader is
+     * only ever read by that one row -- the poison can reach no other -- and taking the generation
+     * check out puts that poison in the output. */
     if (!pl.ple_probe) {
         bad += "no r4d_ple_probe hook; ";
     } else {
@@ -23580,8 +23585,9 @@ static void ple_cache_case(const Plugin& pl) {
         for (uint32_t s = 0; s < (uint32_t)M2; ++s) rd_ids.push_back(bucket[s][0]);
         void* d_tok2 = dalloc((size_t)M2 * 4);
         void* d_x2 = dalloc(row_b);
+        /* Mode 0 for the warming launches: the probe entry, the gather's path -- nothing parks and
+         * no block waits. Only the third launch forces the window. */
         unsigned words[r4d_ple_probe_words] = { 0 };
-        words[r4d_ple_probe_mode] = 1;            /* park and serve; every counter starts at zero */
         unsigned* d_probe = (unsigned*)dalloc(sizeof(words));
         st_memcpy(d_probe, words, sizeof(words), hipMemcpyHostToDevice);
         auto launch2 = [&](const std::vector<int32_t>& ids, void* out, hipStream_t st, void* inst_) {
@@ -23633,13 +23639,21 @@ static void ple_cache_case(const Plugin& pl) {
              * output buffer. */
             check2("probe warm", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
             check2("probe warm again", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
+            const unsigned on = 1;            /* park and serve; every counter is still zero */
+            st_memcpy(d_probe + r4d_ple_probe_mode, &on, sizeof(on), hipMemcpyHostToDevice);
             check2("probe reader", rd_ids, d_x2, launch2(rd_ids, d_x2, nullptr, inst4));
             std::vector<unsigned> seen((size_t)r4d_ple_probe_words);
             st_memcpy(seen.data(), d_probe, seen.size() * 4, hipMemcpyDeviceToHost);
-            ok("PLE row cache: a reader parks in its window, before the payload load",
+            ok("PLE row cache: a block reclaims and rewrites the way a parked reader holds",
                seen[r4d_ple_probe_rewrites] > 0);
             ok("PLE row cache: that recheck lands on a way rewritten for its own id",
                seen[r4d_ple_probe_conflicts] > 0);
+            ok("PLE row cache: the rewrite released the park, the handshake's bound did not",
+               seen[r4d_ple_probe_timeout] == 0);
+            ok("PLE row cache: its recheck read the way two generations on from its lookup",
+               seen[r4d_ple_probe_conflicts] > 0 &&
+                   seen[r4d_ple_probe_recheck_gen] - seen[r4d_ple_probe_gen] >= 2);
+            pl.ple_probe(inst4, nullptr);     /* detach before the instance and its words go */
             r->fini(inst4);
         }
     }
