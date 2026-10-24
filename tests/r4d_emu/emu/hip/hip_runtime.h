@@ -68,6 +68,9 @@ EmuIdx& emu_grid_dim();
 #define blockDim (emu_block_dim())
 #define gridDim (emu_grid_dim())
 void __syncthreads();
+/* the wave barrier (__syncwarp): the lanes of one wave, which is 32 here */
+void emu_syncwarp();
+#define __syncwarp() emu_syncwarp()
 /* the block barrier, returning whether any thread passed a nonzero predicate */
 int __syncthreads_or(int p);
 int emu_bpermute(int addr, int v);
@@ -124,6 +127,8 @@ template <class T>
 inline T atomicMax(T* p, T v) { const T o = *p; if (v > o) *p = v; return o; }
 template <class T>
 inline T atomicCAS(T* p, T expect, T v) { const T o = *p; if (o == expect) *p = v; return o; }
+template <class T>
+inline T atomicExch(T* p, T v) { const T o = *p; *p = v; return o; }
 /* v_wmma_f32_16x16x16_bf16 (gfx12, wave32): A[M][K] lane M + 16 * (K / 8) element K % 8; B[K][N]
  * lane N + 16 * (K / 8) element K % 8; D[M][N] lane N + 16 * (M / 8) element M % 8 */
 typedef short emu_v8s __attribute__((ext_vector_type(8)));
@@ -160,6 +165,13 @@ int emu_cvt_pk_fp8(float a, float b, int old, bool hi);
 #define __builtin_amdgcn_cvt_pk_fp8_f32(a, b, old, hi) emu_cvt_pk_fp8((a), (b), (old), (hi))
 extern int emu_last_block;     /* threads a block of the last grid had: which kernel ran */
 
+/* Test-side scheduling: hold block `block` of the next grid at its nth cross-lane exchange (a
+ * __shfl, __syncwarp or shuffle builtin) while the rest of the grid runs, then let it go. Returns
+ * a handle for emu_park_hit. A park stays armed until emu_park_clear; a hit one never parks twice. */
+int emu_park(int block, unsigned nth);
+int emu_park_hit(int park);
+void emu_park_clear();
+
 /* Blocks run one after another on one OS thread, so a fence orders nothing that is not already in
  * order and an atomic is a plain read-modify-write. Enough for the split-K arrival pattern
  * (r4d_lora_bf16.hip): the last block of a group in launch order is the one that reduces. */
@@ -169,12 +181,18 @@ inline void __threadfence() {}
 template <typename T> inline T emu_atomic_fetch_add(T* p, T v) { const T o = *p; *p = o + v; return o; }
 /* The device allocations a unit makes for itself (counter blocks): host memory here. */
 inline hipError_t hipMalloc(void** p, size_t n) { *p = std::calloc(n ? n : 1, 1); return *p ? 0 : 2; }
+inline hipError_t hipFree(void* p) { std::free(p); return 0; }
+inline hipError_t hipMemset(void* p, int v, size_t n) { std::memset(p, v, n); return 0; }
 inline hipError_t hipMemsetAsync(void* p, int v, size_t n, hipStream_t) { std::memset(p, v, n); return 0; }
 
 struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };
 struct alignas(16) int4   { int x, y, z, w; };
 struct alignas(16) float4 { float x, y, z, w; };
+struct uchar4 { unsigned char x, y, z, w; };
+inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, unsigned char d) {
+    return uchar4{a, b, c, d};
+}
 inline uint4 make_uint4(unsigned a, unsigned b, unsigned c, unsigned d) { return uint4{a, b, c, d}; }
 inline uint2 make_uint2(unsigned a, unsigned b) { return uint2{a, b}; }
 inline float4 make_float4(float a, float b, float c, float d) { return float4{a, b, c, d}; }

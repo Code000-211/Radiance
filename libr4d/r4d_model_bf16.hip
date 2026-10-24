@@ -1081,7 +1081,10 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
  * reclaim/rewrite window on one reader and counts the rechecks that land in it -- from the test's
  * own kernel entry (ple_embed_lookup_q_probe_kernel). The words hang off the instance (probe
  * below), and the kernel arguments are the gather's plus that word, so what the two entries share
- * is the row's device code; one host-side test per launch still picks the entry.
+ * is the row's device code; one host-side test per launch still picks the entry. The probe entry's
+ * recheck hoists its two loads into locals, so that case does not see a mutation of the expression
+ * below it: this entry's own recheck is forced by tests/r4d_emu/test_plecache.cpp, in the emulator,
+ * where a block can be parked between its load and its recheck on any host.
  */
 struct PleVramCache {
     int32_t*  tags = nullptr;    /* row id per way, valid under an even generation */

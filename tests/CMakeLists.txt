@@ -377,12 +377,14 @@ endif()
 # ================================================================== libr4d's kernels, on the host
 #
 # Some libr4d ops (the sandwich-norm joins, expert_scale) have no libref oracle by design
-# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of thirteen units
+# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of fourteen units
 # written against r4d_launch.h on the host: the windowed paged attention, pair_argmax, the joins,
 # expert_scale, the QSA block selection, the runtime-LoRA pair, the F32 routing projection's tile
 # forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
-# recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings and GLM's MoE decode
-# fusions, whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the
+# recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
+# fusions and the PLE gather's VRAM row cache -- the last with emu_park, which holds one block at a
+# chosen cross-lane barrier while the rest of the grid runs, so a cross-block window is placed and
+# not hoped for -- whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the
 # HIP names, each GPU thread is a fiber, and __syncthreads and cross-lane ops are barriers (one not
 # reached uniformly is reported as a deadlock). Checked against ports of libref's ref_attn_paged and
 # ref_qsa_select, the host arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit,
@@ -400,8 +402,9 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_norm_join_bf16.hip ${R4D_DIR}/r4d_expert_scale_bf16.hip
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_fp8_f32scale.hip ${R4D_DIR}/r4d_kda.hip
-                ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip)
-set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
+                ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
+                ${R4D_DIR}/r4d_model_bf16.hip)
+set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse plecache)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -440,7 +443,7 @@ else()
                 ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
                 ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp ${R4D_EMU}/test_fp8f32.cpp
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
-                ${R4D_EMU}/test_moefuse.cpp)
+                ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_plecache.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -477,7 +480,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
+  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse plecache)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -488,6 +491,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
+                       r4d_emu_plecache
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

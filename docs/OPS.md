@@ -2367,8 +2367,21 @@ Taking the generation check out of that recheck puts the rewritten bytes in the 
 turns this stage red. The recheck it turns red is the probe entry's: the two entries are one
 template body, but the hit test is not shared -- the probe instantiation hoists the two loads into
 locals its bookkeeping needs -- so a mutation of the gather's own test statement leaves the test's
-path intact. The gather's recheck is covered here against the host gather, byte for byte, at every
-stage above; it is not covered by a mutation probe, and no run in this repo claims it is.
+path intact.
+The gather's own test statement has a case of its own, and no card:
+`tests/r4d_emu/test_plecache.cpp` runs the gather's entry in the SIMT emulator and forces the same
+window from the outside. A grid's blocks run one after another there, so the case arms `emu_park`
+(`tests/r4d_emu/emu`) to leave one block standing at its second cross-lane exchange -- after its
+lookup, before its payload load -- while the rest of the grid runs: a second block reclaims the way
+it holds and publishes a row that is no row's, a third re-claims that same way for the same id and
+is held between its tag write and its payload write, and the first block is then let go. Its load
+reads the second block's payload while the way's generation has moved on and its tag is its own id
+again, so only the generation term can still send it to the decode path, and the case compares the
+bytes it writes against the same launch on the uncached path. Dropping that term from the gather's
+`else` branch puts the reclaimed payload in the row -- all 160 entries of it -- and the case names
+the entry that differs. It also asserts what it forced: both parks reached and `emu_last_kernel`
+naming the gather's entry, so a window that never formed fails as a dead fixture rather than
+passing. Host-only, no HIP runtime, a hundredth of a second.
 The handshake and its bounded waits live in a kernel entry of the test's, and the words hang off
 the instance they were attached to, so another cache's launches stay on the gather's entry. What
 remains host-side is one test a launch (`c->probe`) that picks the entry; the gather's device code

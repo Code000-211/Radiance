@@ -1,5 +1,6 @@
 #include "hip/hip_runtime.h"
 #include "rad_plugin.h"
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,17 @@ emu_switch:
 
 namespace {
 constexpr size_t kStack = 512 * 1024;
+/* A park: the test holds block `block` at its `nth` cross-lane exchange (the wave barrier of the
+ * nth __shfl/__syncwarp/__builtin_amdgcn_* it enters) while the rest of the grid runs, then lets
+ * it go. That places a cross-block interleaving exactly where a case wants it -- the window
+ * between a load and the check after it -- instead of hoping the block order gives it. */
+struct EmuPark {
+    int block = 0;
+    unsigned nth = 0;
+    bool hit = false;      /* the block reached it */
+    bool released = false; /* and the test has let it go */
+    int wave = 0;
+};
 struct Fiber {
     void* sp = nullptr;
     /* left uninitialised so the OS commits only the pages a fiber touches: a 1024-thread block
@@ -59,7 +71,30 @@ struct Sched {
     int slot[64][2][32] = {};
     int tag[64][2][32] = {};   /* which op, and its uniform operand, each lane posted */
     unsigned xparity[1024] = {};
+    /* the park a test armed for this block, and how many cross-lane exchanges the block has
+     * entered (the nth of them is where a park lands) */
+    EmuPark* park = nullptr;
+    unsigned barriers = 0;
+    bool parked = false;
 } S;
+
+/* A block left standing at a park. Everything below is the whole grid's scratch, one block at a
+ * time by construction: the blocks that run while it stands at its park leave theirs there, and one
+ * set of stacks per thread is likewise reused. So the parked block's own goes out with the park and
+ * back with the release, and its fibers resume on the frames they were interrupted in. */
+struct Held {
+    std::array<unsigned, 3> b{};
+    EmuIdx bid{};
+    unsigned nt = 0;
+    int arrive = 0; unsigned gen = 0; int or_acc[3] = {};
+    int warrive[64] = {}; unsigned wgen[64] = {};
+    int slot[64][2][32] = {}; int tag[64][2][32] = {};
+    unsigned xparity[1024] = {};
+    unsigned barriers = 0;
+    std::vector<void*> sp;                  /* where each fiber stood, [sp, top) being its frames */
+    std::vector<int> waiting;
+    std::vector<std::vector<char>> frames;
+};
 
 void yield() { Fiber& me = S.f[S.cur]; emu_switch(&me.sp, S.main_sp); }
 
@@ -108,7 +143,23 @@ int __syncthreads_or(int p) {
 static void wave_barrier(int w) {
     Fiber& me = S.f[S.cur];
     const unsigned g = S.wgen[w];
-    if (++S.warrive[w] == 32) { S.warrive[w] = 0; ++S.wgen[w]; return; }
+    if (me.tid.x == 0) {
+        ++S.barriers;
+        if (S.park && !S.park->hit && S.barriers == S.park->nth) {
+            S.park->hit = true;
+            S.park->wave = w;
+        }
+    }
+    if (++S.warrive[w] == 32) {
+        /* The armed park's barrier does not complete: the whole wave waits, the scheduler leaves
+         * this block and runs the rest of the grid, and the barrier completes on release. */
+        if (!(S.park && S.park->hit && !S.park->released)) {
+            S.warrive[w] = 0;
+            ++S.wgen[w];
+            return;
+        }
+        S.parked = true;
+    }
     me.waiting = 2;
     while (S.wgen[w] == g) yield();
     me.waiting = 0;
@@ -255,6 +306,33 @@ static void lds_reserve(size_t bytes) {
 int emu_grids = 0;
 int emu_last_block = 0;
 const char* emu_last_kernel = "";
+
+void emu_syncwarp() { wave_barrier((int)(S.f[S.cur].tid.x >> 5)); }
+
+/* r4d_p2p_copy2d is the AR unit's (r4d_ar_oneshot_2rank_exact.hip), which the emulator does not
+ * build; among the units it does build r4d_model_bf16.hip's cast op is its only caller, and no
+ * emulated case reaches it. A row copy is exact here for the same reason every other copy is: the
+ * "device" buffers are host memory. Kept so a unit that references it links. */
+extern "C" int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width,
+                             long height, long stream) {
+    (void)stream;
+    for (long r = 0; r < height; ++r)
+        std::memcpy((void*)(uintptr_t)(dst + r * dpitch),
+                    (const void*)(uintptr_t)(src + r * spitch), (size_t)width);
+    return 0;
+}
+
+/* The parks a test armed, in the order it armed them. */
+static std::vector<EmuPark> g_parks;
+int emu_park(int block, unsigned nth) {
+    g_parks.push_back(EmuPark{block, nth, false, false, 0});
+    return (int)g_parks.size() - 1;
+}
+int emu_park_hit(int park) {
+    return park >= 0 && park < (int)g_parks.size() && g_parks[(size_t)park].hit;
+}
+void emu_park_clear() { g_parks.clear(); }
+
 void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t dyn_lds) {
     ++emu_grids;
     const int n = (int)(block.x * block.y * block.z);
@@ -270,12 +348,17 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
     S.gdim = EmuIdx{grid.x, grid.y, grid.z};
     S.f.resize(n);
     for (auto& f : S.f) if (!f.stack) f.stack.reset(new char[kStack]);
-    for (unsigned bz = 0; bz < grid.z; ++bz)
-    for (unsigned by = 0; by < grid.y; ++by)
-    for (unsigned bx = 0; bx < grid.x; ++bx) {
+
+    auto park_of = [&](unsigned bx, unsigned by, unsigned bz) -> EmuPark* {
+        const int idx = (int)((bz * grid.y + by) * grid.x + bx);
+        for (auto& p : g_parks)
+            if (p.block == idx) return &p;
+        return nullptr;
+    };
+    auto begin = [&](unsigned bx, unsigned by, unsigned bz) {
         S.bid = EmuIdx{bx, by, bz};
         std::memset(g_lds, 0xA5, dyn_lds);
-        S.arrive = 0; S.gen = 0;
+        S.arrive = 0; S.gen = 0; S.barriers = 0; S.parked = false;
         for (int& a : S.or_acc) a = 0;
         for (int w = 0; w < 64; ++w) { S.warrive[w] = 0; S.wgen[w] = 0; }
         for (int t = 0; t < n; ++t) {
@@ -288,7 +371,10 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
             for (int r = 0; r < 6; ++r) *--top = nullptr;
             f.sp = top;
         }
-        int live = n;
+    };
+    auto run = [&](unsigned bx, unsigned by, unsigned bz) -> bool {   /* true: it parked */
+        int live = 0;
+        for (auto& f : S.f) live += !f.done;
         while (live > 0) {
             const int live_before = live;
             const unsigned g0 = S.gen; unsigned wg0[64]; for (int w = 0; w < 64; ++w) wg0[w] = S.wgen[w];
@@ -304,6 +390,7 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
             bool progressed = S.gen != g0 || S.arrive != arr0 || live != live_before;
             for (int w = 0; w < 64; ++w) progressed |= (S.wgen[w] != wg0[w]) || (S.warrive[w] != warr0[w]);
             if (live > 0 && !progressed) {
+                if (S.parked) return true;     /* every lane of the wave at the armed park */
                 int done = 0, wb = 0, bb = 0;
                 for (auto& f : S.f) { done += f.done; wb += f.waiting == 2; bb += f.waiting == 1; }
                 std::fprintf(stderr, "emu: DEADLOCK in block (%u,%u,%u): %d threads done, %d at a block "
@@ -312,5 +399,80 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
                 std::abort();
             }
         }
+        return false;
+    };
+
+    /* A block a test armed a park on runs first and is left standing at that barrier: the grid's
+     * other blocks then run to completion in dispatch order, and only then does the parked block
+     * go on. One interleaving, one order, whichever day it runs on. */
+    auto take = [&](unsigned bx, unsigned by, unsigned bz) {
+        Held w;
+        w.b = {bx, by, bz};
+        w.bid = S.bid;
+        w.arrive = S.arrive; w.gen = S.gen;
+        std::memcpy(w.or_acc, S.or_acc, sizeof w.or_acc);
+        std::memcpy(w.warrive, S.warrive, sizeof w.warrive);
+        std::memcpy(w.wgen, S.wgen, sizeof w.wgen);
+        std::memcpy(w.slot, S.slot, sizeof w.slot);
+        std::memcpy(w.tag, S.tag, sizeof w.tag);
+        std::memcpy(w.xparity, S.xparity, sizeof w.xparity);
+        w.barriers = S.barriers;
+        /* The stacks are one set of kStack per thread, and the blocks that run next take them
+         * over, so the part of them this block is using goes with the park. Only [sp, top): a
+         * kernel's frames here are kilobytes. */
+        w.nt = S.nthreads;
+        w.sp.resize(w.nt); w.waiting.resize(w.nt); w.frames.resize(w.nt);
+        for (unsigned t = 0; t < w.nt; ++t) {
+            Fiber& f = S.f[t];
+            int* top = (int*)(f.stack.get() + kStack);
+            w.sp[t] = f.sp;
+            w.waiting[t] = f.waiting;
+            w.frames[t].assign((char*)f.sp, (char*)top);
+        }
+        return w;
+    };
+    auto put = [&](const Held& w) {
+        S.bid = w.bid;
+        S.arrive = w.arrive; S.gen = w.gen;
+        std::memcpy(S.or_acc, w.or_acc, sizeof S.or_acc);
+        std::memcpy(S.warrive, w.warrive, sizeof S.warrive);
+        std::memcpy(S.wgen, w.wgen, sizeof S.wgen);
+        std::memcpy(S.slot, w.slot, sizeof S.slot);
+        std::memcpy(S.tag, w.tag, sizeof S.tag);
+        std::memcpy(S.xparity, w.xparity, sizeof S.xparity);
+        S.barriers = w.barriers;
+        for (unsigned t = 0; t < w.nt; ++t) {
+            Fiber& f = S.f[t];
+            char* top = f.stack.get() + kStack;
+            std::memcpy(top - w.frames[t].size(), w.frames[t].data(), w.frames[t].size());
+            f.sp = w.sp[t];
+            f.waiting = w.waiting[t];
+            f.done = false;
+        }
+    };
+    std::vector<Held> held;
+    for (unsigned bz = 0; bz < grid.z; ++bz)
+    for (unsigned by = 0; by < grid.y; ++by)
+    for (unsigned bx = 0; bx < grid.x; ++bx) {
+        S.park = park_of(bx, by, bz);
+        begin(bx, by, bz);
+        if (run(bx, by, bz)) held.push_back(take(bx, by, bz));
     }
+    for (size_t h = 0; h < held.size(); ++h) {
+        const std::array<unsigned, 3> b = held[h].b;   /* held may grow below */
+        EmuPark* p = park_of(b[0], b[1], b[2]);
+        if (!p || !p->hit) {
+            std::fprintf(stderr, "emu: block (%u,%u,%u) parked and never reached the armed barrier %u\n",
+                         b[0], b[1], b[2], p ? p->nth : 0u);
+            std::abort();
+        }
+        put(held[h]);
+        p->released = true;
+        S.warrive[p->wave] = 0;      /* the barrier this block stood at now completes */
+        ++S.wgen[p->wave];
+        S.park = p;
+        S.parked = false;
+        if (run(b[0], b[1], b[2])) held.push_back(take(b[0], b[1], b[2]));
+    }
+    S.park = nullptr;
 }
