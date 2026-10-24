@@ -45,6 +45,12 @@
 
 namespace rad {
 
+/* The refusal that ends a cost run, by cause: a ladder whose top no offered price reaches -- a
+ * configuration to fix -- and a run whose residency left the profile, an environment to fix. Named
+ * here rather than inline in the loop so the two texts can be checked apart from the run that
+ * prints one of them (Scheduler::draft_cost_gap latches which). */
+const char* draft_cost_abort_message(bool gap);
+
 class Kld;
 class StallWatch;
 class OpStager;   /* runtime/stager.h; test_set_stager only */

@@ -103,7 +103,7 @@ int DraftController::configure(const Params& p) {
         planner_ = DraftPlanner{};
         return RAD_E_UNSUPPORTED;
     }
-    const int rc = planner_.configure(pc);
+    const int rc = planner_.configure(pc, p.costs.records_only);
     if (rc < 0) return rc;
     plan_cur_ = -1;
     cost_failed_ = false;

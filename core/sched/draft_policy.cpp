@@ -56,7 +56,7 @@ bool apply_draft_budget(const DraftBatchView& view, int32_t* k, DraftFallback* w
 
 }  /* namespace */
 
-int DraftPlanner::configure(const DraftPolicyConfig& c) {
+int DraftPlanner::configure(const DraftPolicyConfig& c, bool records_only) {
     if (c.k_ceiling < 0 || c.k_ceiling > RAD_SCHED_MAX_SPEC) {
         RAD_ERR("draft policy: ceiling %d is outside 0..%d", (int)c.k_ceiling,
                 (int)RAD_SCHED_MAX_SPEC);
@@ -125,11 +125,15 @@ int DraftPlanner::configure(const DraftPolicyConfig& c) {
     if (c_.hold_reductions && c_.max_seqs > 0 && held_k_.size() < (size_t)c_.max_seqs)
         held_k_.assign((size_t)c_.max_seqs, 0);
     if (c_.mode == DraftPolicyMode::Cost)
-        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), baseline K%d, a depth change is "
-                 "priced against the one cycle it costs over a %g-cycle dwell (%.0f%% net margin)%s",
+        RAD_INFO("draft policy: cost, ceiling %d, tiers %d..%d (%d), baseline K%d%s, a depth change "
+                 "is priced against the one cycle it costs over a %g-cycle dwell (%.0f%% net "
+                 "margin)%s",
                  (int)c_.k_ceiling, (int)c_.tiers[0], (int)c_.tiers[c_.n_tiers - 1],
-                 (int)c_.n_tiers, (int)c_.fallback_k, dwell_of(c_.hold),
-                 100.0 * c_.hyst, c_.hold_reductions ? ", and so is a reduction" : "");
+                 (int)c_.n_tiers, (int)c_.fallback_k,
+                 records_only ? " (a recording run: it measures that depth and prices nothing)"
+                                    : "",
+                 dwell_of(c_.hold), 100.0 * c_.hyst,
+                 c_.hold_reductions ? ", and so is a reduction" : "");
     return RAD_OK;
 }
 

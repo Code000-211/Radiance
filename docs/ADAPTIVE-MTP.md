@@ -827,12 +827,16 @@ are regenerated, never rescaled.
   head depth and recorded as such. When the loaded profile prices the ladder's top, the cycle runs
   it at that K; this is the ordinary priced reload (calibrate K2, serve with a ceiling of 6), and
   the named baseline is never issued, so the deeper head depth is irrelevant. On a serving run a
-  baseline above the ladder's top is refused at startup (`Scheduler::init`), so the runtime gate
-  cannot fire for it; what remains reachable there is a ladder the loaded profile simply does not
-  price, which is the gap the choice diagnoses once, refuses, and stops the run on the existing
-  fail-closed path instead of drafting at the ceiling without a plan. The list is neither silently
-  extended nor the calibration depth moved to fit it: whoever wants to offer only K=2 either prices
-  it or sets the ceiling to 2 as well.
+  baseline above the ladder's top is refused at startup (`Scheduler::init`), which removes the one
+  state in which the choice's coverage gate could still stop a run: with the baseline inside the
+  ladder, a cycle no candidate could be priced for takes the named baseline and the run keeps
+  serving -- an unpriced ladder is a deployment that drafts the baseline, not a failure. The gate
+  itself is unchanged and stays as the second line behind the startup check (a baseline that
+  reaches the planner above the ladder's top is refused there, exactly once, instead of drafting
+  at the ceiling without a plan); `Scheduler::draft_cost_gap()` names that cause apart from a
+  residency drift if it ever fires. The list is neither silently extended nor the calibration depth
+  moved to fit it: whoever wants to offer only K=2 either prices it or sets the ceiling to 2 as
+  well.
   The default ladder keeps its trimming. A recording run's fallback shape equals the deepest offered
   plan's, so a fallback cycle measures it and a later cycle can price it. A reload with a default
   ladder and a deeper ceiling is that case: init trims or extends the ladder to its executable
@@ -840,11 +844,11 @@ are regenerated, never rescaled.
   the exact shape they executed, so a later cycle can price the deepest offered plan. A serving run
   takes the baseline at the ladder's middle tier instead (a batch whose row count no bucket covers
   prices nothing, and the ceiling is the wrong depth for it), so its fallback cycles measure that
-  depth and the feedback loop is the same one, one or two tiers lower according to the ladder's
-  length. Offering a
+  depth and the feedback loop is the same one, the middle tier -- zero to three tiers below the
+  top, according to the ladder's length. Offering a
   tier deeper than the file covers is not a way to run deeper: once the ladder's top is above what
-  the profile prices, a cycle is refused by the coverage-gap rule (explicit ladder, which stops the
-  run) or takes the named baseline at the same shape (default ladder).
+  the profile prices, a cycle takes the named baseline at the same shape, and a baseline the ladder
+  does not reach at all is refused before the run.
   Each cycle's record names the depth the step really
   caps each row at (the head's own depth, the adaptive window, 0 for a row that may not speculate),
   so a bucket describes a shape the run could execute. A cycle with more decode rows than

@@ -339,6 +339,26 @@ TEST(a_move_between_the_idle_tick_and_the_next_plan_ends_the_cost_run) {
     CHECK_EQ(p->n_seq, 0);
 }
 
+/* The refusal's cause, apart from the run that prints it. A cost run stops on one of two
+ * messages, and which one it prints is the whole diagnosis: the ladder's gap is a configuration to
+ * fix, the residency's is an environment to fix. Scheduler::draft_cost_gap latches the first cause;
+ * the loop prints the text that latch names. The drift case above reaches the residency branch
+ * through a real run; the ladder's branch cannot be reached from that fixture, because a cycle
+ * that plans speculatable rows is a decode cycle and this fixture declares no sampler
+ * (Sampler::build_step answers RAD_E_STATE for the first step it is asked to build), so the two
+ * texts are checked here instead of through a loop that cannot get there. */
+TEST(the_cost_refusal_names_its_cause) {
+    const std::string gap = rad::draft_cost_abort_message(/*gap=*/true);
+    CHECK(has(gap, "the ladder's top tier is unpriced for a shape the named baseline would draft "
+                   "deeper"));
+    CHECK(has(gap, "end --draft-depth-tiers at the baseline, or set --draft-fallback-k inside the "
+                   "ladder"));
+    CHECK(!has(gap, "residency"));
+    const std::string drift = rad::draft_cost_abort_message(/*gap=*/false);
+    CHECK(has(drift, "the residency does not match the profile"));
+    CHECK(!has(drift, "ladder"));
+}
+
 }  /* namespace */
 
 RAD_TEST_MAIN()

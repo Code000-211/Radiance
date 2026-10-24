@@ -167,6 +167,59 @@ std::string tail(const std::string& log, int n = 12) {
     return at == std::string::npos || at >= log.size() ? log : log.substr(at + 1);
 }
 
+/* One line of the scheduler's per-request cost ledger:
+ *   draft policy: req <id> over <cycles> cost cycle(s), <unpriced> without a priced candidate;
+ *   priced tiers per cycle <tier>:<n> ...
+ * Parsed, not searched: the claim below is about the request it names, so the line has to be
+ * picked by its id rather than by whichever line happens to hold the substring. */
+struct CostLine {
+    bool found = false;
+    int  id = 0;
+    int  cycles = 0;
+    int  unpriced = 0;
+    int  binned = 0;
+    int  bins[8] = {};
+};
+CostLine parse_cost_line(const std::string& log) {
+    CostLine r;
+    size_t at = log.find("draft policy: req ");
+    if (at == std::string::npos) return r;
+    const char* p = log.c_str() + at + strlen("draft policy: req ");
+    char* end = nullptr;
+    r.id = (int)strtol(p, &end, 10);
+    p = strstr(end, " over ");
+    if (!p) return r;
+    r.cycles = (int)strtol(p + strlen(" over "), &end, 10);
+    p = strstr(end, ", ");
+    if (!p) return r;
+    r.unpriced = (int)strtol(p + 2, &end, 10);
+    p = strstr(end, "priced tiers per cycle ");
+    if (!p) return r;
+    p += strlen("priced tiers per cycle ");
+    for (;;) {
+        const int bin = (int)strtol(p, &end, 10);
+        if (end == p || *end != ':') break;
+        p = end + 1;
+        const int n = (int)strtol(p, &end, 10);
+        if (end == p) break;
+        if (bin >= 0 && bin < 8) { r.bins[bin] = n; r.binned += n; }
+        p = end;
+        if (*p != ' ') break;
+        ++p;
+    }
+    r.found = true;
+    return r;
+}
+
+/* Every ledger line the run wrote, one per request. */
+std::vector<CostLine> cost_lines(const std::string& log) {
+    std::vector<CostLine> out;
+    const std::string tag = "draft policy: req ";
+    for (size_t at = log.find(tag); at != std::string::npos; at = log.find(tag, at + tag.size()))
+        out.push_back(parse_cost_line(log.substr(at)));
+    return out;
+}
+
 #define REQUIRE_RAN(r)                                                                  \
     do { if ((r).status != 0) fprintf(stderr, "    child exited %d:\n%s\n", (r).status, \
                                       tail((r).log).c_str());                         \
@@ -2093,12 +2146,33 @@ TEST(a_serving_run_drafts_the_ladders_middle_for_a_shape_the_reference_cannot_pr
         CHECK_EQ(draft_positions(reader.port), 2);   /* still the ladder's top, not six */
         CHECK_EQ(reader.stop(), 0);                  /* the run did not stop on the unpriced cycle */
 
-        /* Both requests ended in a ledger line. The unpriced one took part in at least one cost
-         * cycle that priced no tier at all -- the counter the depth alone cannot tell apart from a
-         * decision. */
+        /* Both requests ended in a ledger line, one line each, and the lines are read by id: the
+         * unpriced request is the later of the two, and its own line -- not a substring of the
+         * log -- must say that every cycle it took part in priced no tier at all. That is the
+         * counter the chosen depth cannot tell apart from a decision. */
         const std::string log = reader.output();
-        CHECK(log.find("without a priced candidate") != std::string::npos);
-        CHECK(log.find("priced tiers per cycle 0:") != std::string::npos);
+        const std::vector<CostLine> lines = cost_lines(log);
+        if (lines.size() != 2)
+            fprintf(stderr, "    %zu ledger line(s) for two requests:\n%s\n", lines.size(),
+                    tail(log, 30).c_str());
+        REQUIRE_EQ(lines.size(), (size_t)2);
+        for (const CostLine& l : lines) {
+            CHECK(l.found);
+            CHECK(l.cycles > 0);
+            CHECK(l.unpriced >= 0);
+            CHECK(l.unpriced <= l.cycles);
+            /* The line's own arithmetic: every cycle is counted once in a bin, and a cycle with no
+             * priced tier is one of the zero-tier ones. */
+            CHECK_EQ(l.binned, l.cycles);
+            CHECK_EQ(l.bins[0], l.unpriced);
+        }
+        const CostLine& priced   = lines[0].id < lines[1].id ? lines[0] : lines[1];
+        const CostLine& unprice  = lines[0].id < lines[1].id ? lines[1] : lines[0];
+        CHECK(priced.id != unprice.id);
+        CHECK(unprice.unpriced == unprice.cycles);      /* nothing priced, every cycle */
+        CHECK(unprice.bins[0] == unprice.cycles);
+        CHECK(priced.unpriced < priced.cycles);         /* the measured shape priced somewhere */
+        CHECK(priced.bins[0] < priced.cycles);
         CHECK(log.find("deepest offered tier K2") == std::string::npos);   /* no gap refused */
     }
 
@@ -2119,6 +2193,29 @@ TEST(a_serving_run_drafts_the_ladders_middle_for_a_shape_the_reference_cannot_pr
         CHECK(!started);
         CHECK(log.find("the draft baseline K6 is above the ladder's top tier K2") !=
               std::string::npos);
+    }
+
+    /* A profile written for another deployment -- here the same one with one fingerprint field
+     * changed -- is refused at startup too, before a request is admitted: `configure` keeps the
+     * table inactive and names the field that differs. That is why this cannot carry an HTTP-facing
+     * seam: there is no request, no cycle and no response to fail. */
+    {
+        json stale = profile;
+        stale["fingerprint"]["kernels"] = "another-kernel-set";
+        const std::string stale_path = dir / "stale.json";
+        REQUIRE(tiny::write_text(stale_path, stale.dump(2)));
+        Server reader;
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-profile", stale_path };
+        const bool started = reader.start(dir.path, args);
+        const std::string log = reader.output();
+        if (started)
+            fprintf(stderr, "    the foreign profile was accepted:\n%s\n", tail(log).c_str());
+        CHECK(!started);
+        CHECK(log.find("profile fingerprint differs: kernels") != std::string::npos);
     }
 }
 

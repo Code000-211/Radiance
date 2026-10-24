@@ -147,7 +147,9 @@ struct DraftTierPrice {
 
 class DraftPlanner {
 public:
-    int  configure(const DraftPolicyConfig& c);
+    /* `records_only` only shapes the startup banner: a recording run's baseline is not a policy
+     * choice but the depth its export is priced at, and the line says so. */
+    int  configure(const DraftPolicyConfig& c, bool records_only = false);
     const DraftPolicyConfig& config() const { return c_; }
     /* Forget the previous cycle: the next choose() is a first choice. */
     void reset();

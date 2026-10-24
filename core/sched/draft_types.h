@@ -379,7 +379,9 @@ struct DraftCostModel {
     DraftEstimateFn estimate = nullptr;
     /* A recording run (--draft-profile-out) prices nothing by construction: its table answers every
      * query with an invalid estimate. The policy reads the flag rather than the empty answer, so a
-     * calibration is not diagnosed as a ladder it can never price. */
+     * calibration is not diagnosed as a ladder it can never price. Snapshotted by
+     * Scheduler::init -- set it before init, and on the table the engine configures: the planner
+     * keeps this copy, so setting it later leaves the gate armed. */
     bool            records_only = false;
 };
 

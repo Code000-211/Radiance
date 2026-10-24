@@ -684,6 +684,15 @@ int Engine::fail_loop(int st) {
     return st;
 }
 
+const char* draft_cost_abort_message(bool gap) {
+    return gap ? "draft cost: no cycle can be priced on this run -- the ladder's top tier is "
+                 "unpriced for a shape the named baseline would draft deeper, and the ladder never "
+                 "offers that depth; end --draft-depth-tiers at the baseline, or set "
+                 "--draft-fallback-k inside the ladder; stopping instead of drafting at the ceiling"
+               : "draft cost: no cycle can be priced on this run -- the residency does not match "
+                 "the profile; stopping instead of drafting at the ceiling";
+}
+
 int Engine::step_loop() {
     /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
      * device; the backend's current device is thread-local and starts at device 0. */
@@ -742,15 +751,7 @@ int Engine::step_loop() {
          * reported apart: a ladder/baseline gap is a configuration the operator can fix, and
          * naming the residency for it sends them into the wrong diagnosis. */
         if (sched_.draft_cost_aborted()) {
-            if (sched_.draft_cost_gap())
-                RAD_ERR("draft cost: no cycle can be priced on this run -- the ladder's top tier is "
-                        "unpriced for a shape the named baseline would draft deeper, and the ladder "
-                        "never offers that depth; end --draft-depth-tiers at the baseline, or set "
-                        "--draft-fallback-k inside the ladder; stopping instead of drafting at the "
-                        "ceiling");
-            else
-                RAD_ERR("draft cost: no cycle can be priced on this run -- the residency does not "
-                        "match the profile; stopping instead of drafting at the ceiling");
+            RAD_ERR("%s", draft_cost_abort_message(sched_.draft_cost_gap()));
             return fail_loop(RAD_E_STATE);
         }
         if (!b) {
@@ -1968,6 +1969,11 @@ int Engine::begin_draft_calibration() {
                 "planner's plans, not a fixed window");
         return RAD_E_INVAL;
     }
+    /* One table cannot play both roles, and refusing here is what keeps the recording flag:
+     * load_draft_cost_profile runs after prepare_serving, and its configure() -> clear() would drop
+     * record_only() and replace the empty recording table -- the run would then price from a
+     * foreign profile against a baseline the ladder never offers, which is the state the startup
+     * check refuses. */
     if (!cfg_.draft_profile.empty()) {
         RAD_ERR("--draft-profile-out with --draft-profile: a calibration run measures its own "
                 "profile and does not read one; pass only one of the two");
