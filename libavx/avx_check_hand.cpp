@@ -2820,9 +2820,15 @@ void qsa_cases(std::vector<Hand>& hs) {
                 std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(),
                                  [](float l, float r) { return l > r; });
                 const float thr = ord[(size_t)(topk - 1)];
-                for (int64_t b : live) if (val[(size_t)b] > thr) take.push_back(b);
-                for (int64_t b : live)
-                    if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+                int64_t above = 0;
+                for (int64_t b : live) above += val[(size_t)b] > thr;
+                /* One ascending pass: a tie can sit below a block above the threshold, and the
+                 * selection is emitted in block order (docs/QSA.md). */
+                int64_t ties = 0;
+                for (int64_t b : live) {
+                    if (val[(size_t)b] > thr) take.push_back(b);
+                    else if (val[(size_t)b] == thr && ties < topk - above) { take.push_back(b); ++ties; }
+                }
             }
             int64_t* row = &want[(size_t)(m * (topk + 1))];
             int64_t out = 0;
@@ -2911,7 +2917,7 @@ void qsa_cases(std::vector<Hand>& hs) {
          .dense(RAD_I32, { 2 }, sent, true)
          .dense(RAD_I32, { 2 }, sent, true)
          .pi("M", 2).pi("blocks", 8).pi("topk", 3).pi("ratio", 4).pi("seqs", 2).pi("signed", 1)
-         .expect(5, { 103, 102, 105, -1, 110, 113, 112, -1 });
+         .expect(5, { 102, 103, 105, -1, 110, 112, 113, -1 });   /* block order, not rank */
         hs.push_back(std::move(h));
     }
     {

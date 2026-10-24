@@ -297,9 +297,10 @@ enum { kBins = 1024, kBinShift = 21, kBinShiftSigned = 22 };
 
 struct SelJob {
     const RadTensor *sc, *bt, *nc, *po, *se, *ns, *su;
+    const RadTensor* sb;               /* `selb`: the same entries as block indices, optional */
     const int64_t* seq;
     int64_t nb, topk, ratio;
-    int64_t s_rs, s_cs, bt_rs, bt_cs, o_rs, o_cs;
+    int64_t s_rs, s_cs, bt_rs, bt_cs, o_rs, o_cs, b_rs, b_cs;
     bool sgn;                          /* the `signed` order */
 };
 
@@ -436,20 +437,25 @@ static uint32_t threshold(const uint32_t* key, int64_t n, int64_t topk, bool sgn
     return thr;
 }
 
-/* Writes the page ids of the keys above `thr` in block order at row[0 .. gt), then the first
- * `ties` keys equal to it in block order at row[gt ..). */
-static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uint32_t thr,
-                 int64_t gt, int64_t ties, int32_t* row) {
+/* Writes the page ids of the keys above `thr` and the first `ties` keys equal to it in ONE
+ * ascending pass. A tie can sit below a block above the threshold, so the two sets interleave; the
+ * order is the contract (docs/QSA.md), because the attention sums a query's pages in table order
+ * and a table shared by a query tile is their union in the same order. */
+static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, int64_t m,
+                 uint32_t thr, int64_t gt, int64_t ties, int32_t* row) {
     const int64_t bb = s * j.bt_rs;
-    int64_t og = 0, ot = 0, b = 0;
+    int64_t o = 0, ot = 0, b = 0;
     auto one = [&](int64_t i) {
         const uint32_t k = key[i];
-        if (k > thr) row[og++] = (int32_t)ldi(j.bt, bb + i * j.bt_cs);
-        else if (k == thr && ot < ties) row[gt + ot++] = (int32_t)ldi(j.bt, bb + i * j.bt_cs);
+        if (k > thr || (k == thr && ot < ties)) {
+            if (k == thr) ++ot;
+            row[o++] = (int32_t)ldi(j.bt, bb + i * j.bt_cs);
+            if (j.sb) st_int_dt(j.sb->dtype, j.sb->data, m * j.b_rs + (o - 1) * j.b_cs, i);
+        }
     };
 #if AVX_LEVEL == 3
     const __m512i vt = _mm512_set1_epi32((int)thr);
-    for (; b + 16 <= n && (og < gt || ot < ties); b += 16) {
+    for (; b + 16 <= n && o < gt + ties; b += 16) {
         const __m512i k = _mm512_loadu_si512((const void*)(key + b));
         unsigned hit = (unsigned)(_mm512_cmpge_epu32_mask(k, vt));
         while (hit) {
@@ -461,7 +467,7 @@ static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uin
     /* Keys are below 2^31, so the signed compare orders them; signed-order keys take the scalar
      * loop. */
     const __m256i vt = _mm256_set1_epi32((int)thr - 1);
-    for (; !j.sgn && b + 8 <= n && (og < gt || ot < ties); b += 8) {
+    for (; !j.sgn && b + 8 <= n && o < gt + ties; b += 8) {
         const __m256i k = _mm256_loadu_si256((const __m256i*)(key + b));
         unsigned hit = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(k, vt)));
         while (hit) {
@@ -470,7 +476,7 @@ static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uin
         }
     }
 #endif
-    for (; b < n && (og < gt || ot < ties); ++b) one(b);
+    for (; b < n && o < gt + ties; ++b) one(b);
 }
 
 static void select_row(const SelJob& j, int64_t m) {
@@ -486,19 +492,28 @@ static void select_row(const SelJob& j, int64_t m) {
     if (live <= topk) {
         const int64_t bb = s * j.bt_rs;
         for (int64_t b = 0; b < n && out < live; ++b)
-            if (key[b]) row[out++] = (int32_t)ldi(j.bt, bb + b * j.bt_cs);
+            if (key[b]) {
+                if (j.sb) st_int_dt(j.sb->dtype, j.sb->data, m * j.b_rs + out * j.b_cs, b);
+                row[out++] = (int32_t)ldi(j.bt, bb + b * j.bt_cs);
+            }
     } else {
         uint32_t* cand = (uint32_t*)scratch_f32_c((size_t)n);
         int64_t gt = 0;
         const uint32_t thr = threshold(key, n, topk, j.sgn, hist, cand, &gt);
-        emit(j, key, n, s, thr, gt, topk - gt, row);
+        emit(j, key, n, s, m, thr, gt, topk - gt, row);
         out = topk;
     }
     if (n < j.nb && (p + 1) % j.ratio != 0) {
         const int64_t part = ldi(j.bt, s * j.bt_rs + n * j.bt_cs);
-        if (part >= 0) row[out++] = (int32_t)part;
+        if (part >= 0) {
+            if (j.sb) st_int_dt(j.sb->dtype, j.sb->data, m * j.b_rs + out * j.b_cs, n);
+            row[out++] = (int32_t)part;
+        }
     }
-    for (int64_t i = out; i <= topk; ++i) row[i] = -1;
+    for (int64_t i = out; i <= topk; ++i) {
+        row[i] = -1;
+        if (j.sb) st_int_dt(j.sb->dtype, j.sb->data, m * j.b_rs + i * j.b_cs, -1);
+    }
     const int64_t ob = m * j.o_rs;
     if (j.se->dtype == RAD_I32 && j.o_cs == 1) {
         std::memcpy((int32_t*)j.se->data + ob, row, (size_t)(topk + 1) * sizeof(int32_t));
@@ -516,14 +531,17 @@ static void select_row(const SelJob& j, int64_t m) {
 /* ------------------------------------------------------------------ qsa_select */
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
- * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when `topk` or fewer are live, else every block above the topk-th
- * largest value in block order, then the blocks equal to it in block order until topk are taken.
+ * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when
+ * `topk` or fewer are live, else every block above the topk-th largest value and the blocks equal to
+ * it until topk are taken, the whole selection in block order.
  * The partial page bt[n] follows when (pos + 1) % ratio != 0 and n < width, and -1 pads the row
  * to topk + 1. A row no sequence holds reads sequence 0, as libref's and libr4d's do. */
 AVX_KERNEL(qsa_select) {
     if (!rad_args_have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    /* Optional, last: the same entries as block indices. */
+    const RadTensor* sb = a->n_t > 8 && a->t[8].data ? &a->t[8] : nullptr;
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
     const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
@@ -535,6 +553,7 @@ AVX_KERNEL(qsa_select) {
     if (bt->shape[0] < n_seq || numel(nc) < n_seq) return RAD_E_SHAPE;
     if (se->shape[0] < M || se->shape[1] < topk + 1) return RAD_E_SHAPE;
     if (numel(ns) < M || numel(po) < M || numel(su) < M) return RAD_E_SHAPE;
+    if (sb && (sb->rank != 2 || sb->shape[0] < M || sb->shape[1] < topk + 1)) return RAD_E_SHAPE;
     for (int64_t s = 0; s < n_seq; ++s)
         if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
     for (int64_t m = 0; m < M; ++m)
@@ -543,11 +562,12 @@ AVX_KERNEL(qsa_select) {
     int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
     seq_rows(cu, n_seq, M, 0, seq);
     SelJob j{};
-    j.sc = sc; j.bt = bt; j.nc = nc; j.po = po; j.se = se; j.ns = ns; j.su = su;
+    j.sc = sc; j.bt = bt; j.nc = nc; j.po = po; j.se = se; j.ns = ns; j.su = su; j.sb = sb;
     j.seq = seq; j.nb = nb; j.topk = topk; j.ratio = ratio;
     j.s_rs = sc->stride[0]; j.s_cs = sc->stride[1];
     j.bt_rs = bt->stride[0]; j.bt_cs = bt->stride[1];
     j.o_rs = se->stride[0]; j.o_cs = se->stride[1];
+    j.b_rs = sb ? sb->stride[0] : 0; j.b_cs = sb ? sb->stride[1] : 0;
     j.sgn = sgn != 0;
     AVX_PARALLEL_FOR_IF(M * nb >= AVX_PAR_MIN && M > 1)
     for (int64_t m = 0; m < M; ++m) select_row(j, m);

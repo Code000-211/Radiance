@@ -1291,7 +1291,7 @@ static const RadOperandSpec oQsaSelect[] = {
      * dead block drops out of the table and the prefix cache re-orders the rest -- so a table
      * shared by a tile of query rows, the rows' union in block order, is built from this. Additive:
      * `sel` is unchanged and a caller may leave it out. */
-    { "selb",    RAD_OPD_OUT, 0 },
+    { "selb",    RAD_OPD_OUT, 1 },
 };
 
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
