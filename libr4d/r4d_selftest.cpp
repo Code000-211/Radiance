@@ -23328,8 +23328,13 @@ static void embed_lookup_q_case(const Plugin& pl) {
  *   6. and that window forced: one reader parks in it (the r4d_ple_probe handshake) while the same
  *      launch's other blocks reclaim the way it holds and publish a payload that is no row's, so
  *      its payload load reads that rewrite and its recheck -- which follows the load -- must land
- *      on a generation two on. The counters have to show it did, and the parked reader must still
- *      write the table's bytes: the stage that goes red when the generation check is taken out.
+ *      on the generation the rewrite published with release, the park having been released by
+ *      that rewrite's acquire store and not by the handshake's bound. The counters have to show
+ *      it did, and the parked reader must still write the table's bytes: the stage that goes red
+ *      when the generation check is taken out. The check it takes out is the probe entry's; the
+ *      gather's own hit test is written as its own expression (r4d_model_bf16.hip), so a mutation
+ *      of that statement leaves this stage green -- the gather's recheck is held to the host
+ *      gather byte for byte above, not by a mutation here.
  *
  * Then the instance is freed and re-initialised, which must start cold, and a launch with no
  * instance (the default, no cache) must write the same bytes as the cached one.
@@ -23569,10 +23574,13 @@ static void ple_cache_case(const Plugin& pl) {
      * released by that rewrite and not by the handshake's bound (the timeout word stays 0), since a
      * reader the bound released could have loaded a row that was never rewritten and the
      * counters would still look plausible; the recheck read a generation two on from the one the
-     * lookup held, which is what makes the load it follows the rewritten payload; and the row the
+     * lookup held -- read with the timeout word, since the difference alone does not order the
+     * rewrite against the load (a rewrite after the load leaves the same two), while the release
+     * store that publishes the way and the acquire load that released the park do; and the row the
      * reader writes is still the table's. One id a set, so the way rewritten under the reader is
      * only ever read by that one row -- the poison can reach no other -- and taking the generation
-     * check out puts that poison in the output. */
+     * check out of this entry's recheck puts that poison in the output. The gather's own hit test
+     * is a separate expression, so this mutation is the probe entry's alone. */
     if (!pl.ple_probe) {
         bad += "no r4d_ple_probe hook; ";
     } else {

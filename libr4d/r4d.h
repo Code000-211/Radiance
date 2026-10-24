@@ -677,11 +677,13 @@ int r4d_record_dispatches(const void** fns, int cap);
 // Test hook for the PLE row cache's seqlock (r4d_model_bf16.hip): `ctl` is a device buffer of
 // r4d_ple_probe_words uint32 words, or null to take the probe away. Null is every launch outside
 // a test: the gather then allocates nothing, takes no probe word and compiles to itself -- the
-// words are read by a kernel entry of the test's, not by the gather.
+// words are read by a kernel entry of the test's, not by the gather. The buffer is attached to
+// that one cache instance; every other instance's launches keep the gather's entry.
 // With word 0 set, a reader that found its row parks in its window, before the payload load that
 // follows, and a block that finds it parked reclaims that way, writes a row that is not the row's,
-// and publishes, so the load reads that rewrite and the recheck after it is forced to fall on a
-// generation two on. Word 1 counts those rechecks, word 9 is a park the handshake's bound released
+// and publishes, so the load reads that rewrite and the recheck after it must see the generation,
+// two on, that the rewrite published with release before the reader's acquire load of the word
+// that released its park. Word 1 counts those rechecks, word 9 is a park the handshake's bound released
 // (no block served it: the window was not forced, and the case fails on it), and words 2.. carry
 // the parking handshake. See the words below.
 enum {

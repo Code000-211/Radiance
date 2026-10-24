@@ -238,7 +238,13 @@ __device__ __forceinline__ int32_t ple_claim(int32_t* __restrict__ tags,
  * The body is one template, so the two entries below cannot drift; `Probe` false is the gather's
  * translation of it, statement for statement, and the words of r4d_ple_probe (r4d.h) appear only
  * in the `Probe` true instantiation -- the test's forced window, which no launch of the gather
- * can reach. */
+ * can enter.
+ *
+ * One statement is not shared: the hit test. `Probe` false asks the two loads directly; `Probe`
+ * true hoists them into `now` and `same_id`, because the window's bookkeeping (the conflict count,
+ * the recheck generation, the retire) needs the generation it saw. Same predicate, different
+ * expression -- so a mutation of the production statement alone leaves the test's path intact, and
+ * `ple_cache`'s red evidence is the test's recheck, not the gather's. See docs/OPS.md. */
 
 /* A park or a wait in the handshake is bounded: a grid whose servant block is never resident (or
  * whose block 0 never parks) must still end, and it fails on the words below, not by hanging. */
@@ -1073,8 +1079,9 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
  * host gather at every stage: cold, warm, colliding, after a table change, after a reset, and from
  * four concurrent streams. That case also attaches the r4d_ple_probe handshake, which forces the
  * reclaim/rewrite window on one reader and counts the rechecks that land in it -- from the test's
- * own kernel entry (ple_embed_lookup_q_probe_kernel), so this struct and the gather below carry
- * no probe state.
+ * own kernel entry (ple_embed_lookup_q_probe_kernel). The words hang off the instance (probe
+ * below), and the kernel arguments are the gather's plus that word, so what the two entries share
+ * is the row's device code; one host-side test per launch still picks the entry.
  */
 struct PleVramCache {
     int32_t*  tags = nullptr;    /* row id per way, valid under an even generation */
@@ -1083,6 +1090,7 @@ struct PleVramCache {
     uint8_t*  data = nullptr;    /* kPleCacheRowBytes rows, decoded bf16 */
     uint32_t  sets = 0;
     int       device = -1;
+    unsigned* probe = nullptr;   /* r4d_ple_probe's words: this instance's launches take the entry */
     std::atomic<const void*> table{nullptr};
 };
 
@@ -1147,12 +1155,14 @@ extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
 
 /* Test hook, not part of the plugin ABI (r4d.h): the probe words the test's kernel entry uses, and
  * which entry a launch takes. Attached the gathers run ple_embed_lookup_q_probe_kernel with those
- * words; a run no test attaches launches the gather above, unchanged. Null detaches. */
-static unsigned* g_ple_probe = nullptr;
-
+ * words; a run no test attaches launches the gather above, unchanged. Null detaches.
+ *
+ * The words hang off the instance, not off a process-wide symbol: a hook set on one cache leaves
+ * every other instance's launches on the gather's own entry. What survives is one host-side test a
+ * launch (`c->probe` in embed_lookup_q_cached_emit), which picks the entry and passes the words. */
 extern "C" int r4d_ple_probe(void* instance, unsigned* ctl) {
     if (!instance) return -1;
-    g_ple_probe = ctl;
+    ((PleVramCache*)instance)->probe = ctl;    /* test-owned memory; fini does not free it */
     return 0;
 }
 
@@ -1170,11 +1180,11 @@ static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, co
                                       bool sc_f32, uint16_t* x, long long M, int32_t n_vocab,
                                       int32_t vocab_off, long long x_ld, PleVramCache* c,
                                       RadStream stream) {
-    if (g_ple_probe)                       /* a test attached its words: its own entry, same row */
+    if (c->probe)                          /* a test attached its words: its own entry, same row */
         return R4D_EMIT(stream, (ple_embed_lookup_q_probe_kernel), dim3((uint32_t)M),
                         dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                         (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                        c->sets, g_ple_probe) == RAD_OK ? 0 : -4;
+                        c->sets, c->probe) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
                     dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                     (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,

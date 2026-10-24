@@ -2346,17 +2346,33 @@ gather cold, warm, colliding, under four concurrent streams whose launches are a
 the first read-back, in a single set of four ways that every launch reclaims, and after a reset.
 Whether those streams land a reader inside that window is the card's, so that stage shows only
 that concurrent reclaim and rewrite wrote every byte as the table has it.
+The kernel entry itself is compared by machine rather than by hand: `tools/verify-ple-kernel-
+neutrality.sh` exports two revisions (`bdb4454` and the tree, by default), compiles
+`libr4d/r4d_model_bf16.hip` for both with the same hipcc line, takes the code object out of the
+`.hip_fatbin` and diffs `ple_embed_lookup_q_kernel`'s `.text` size, mangled name, kernarg block
+(size, align, per-argument offsets) and disassembly, leaving those files behind. It compiles and
+reads ELF, so it needs no GPU and no benchmark.
 The window is forced on its own: a reader parks in it (the `r4d_ple_probe` test hook, `r4d.h`),
 the same launch's other blocks reclaim the way it holds and publish a row that is no row's, so the
 parked reader loads that rewrite and has to reject it at the recheck that follows the load. The
 case fails unless the counters show, separately, that a block rewrote the parked way, that the
-parked reader's recheck read a generation two on from its lookup, that the rewrite released the
-park (a park the handshake's bound released instead leaves a timeout word and fails the case,
-since a reader released that way may have loaded a row nobody rewrote), and that the row the
-parked reader writes is still the table's. Taking the generation check out of the recheck puts the
-rewritten bytes in that row, which is what turns this stage red.
-The handshake and its bounded waits live in a kernel entry of the test's; the gather every launch
-uses takes no probe word and has no probe branch.
+rewrite released the park and not the handshake's bound (a park the bound released leaves a
+timeout word and fails the case, since a reader released that way may have loaded a row nobody
+rewrote), that the recheck then read the generation the rewrite had published with release -- two
+on from the one the lookup held -- and that the row the parked reader writes is still the table's.
+`recheck_gen - gen >= 2` does not carry that ordering on its own, since a rewrite after the load
+leaves the same difference; it is read together with `timeout == 0`, and both stand on the release
+store that publishes the way and on the acquire load that released the park.
+Taking the generation check out of that recheck puts the rewritten bytes in the row, which is what
+turns this stage red. The recheck it turns red is the probe entry's: the two entries are one
+template body, but the hit test is not shared -- the probe instantiation hoists the two loads into
+locals its bookkeeping needs -- so a mutation of the gather's own test statement leaves the test's
+path intact. The gather's recheck is covered here against the host gather, byte for byte, at every
+stage above; it is not covered by a mutation probe, and no run in this repo claims it is.
+The handshake and its bounded waits live in a kernel entry of the test's, and the words hang off
+the instance they were attached to, so another cache's launches stay on the gather's entry. What
+remains host-side is one test a launch (`c->probe`) that picks the entry; the gather's device code
+and kernel arguments are the ones a launch without a probe takes.
 What the hit rate is worth on a given workload is a measurement this option does not make for you.
 
 ### `ngram_ids`
