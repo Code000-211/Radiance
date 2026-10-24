@@ -2748,7 +2748,9 @@ through the row's block table, and appending the row's partial page last.
   equality between a per-row table (tile 1) and the tile's union (tile 16) over the same rows, and
   (`row path:`) holds that read to `libref`'s `attn_paged` byte for byte as well, which is why the
   kernel runs the row path's two passes -- max over the keys, then the sum -- in the row path's own
-  expressions instead of an online softmax.
+  expressions instead of an online softmax. The comparison is required: a build whose
+  `$RADIANCE_HOME/kernels/libref.so` is missing or declares no `attn_paged` fails the case and names
+  the reason, rather than reporting the table alone as green.
 - **`tab` carries block indices, not page ids**, and the cache stride set is separate
   (`kv_sb`/`kv_sh`/`kv_so`/`kv_sd`) so the page layout is the attention group's, not this op's.
 - **The partial page is appended, never read off the table.** Its block index is `(pos + 1) / ratio`
