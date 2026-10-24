@@ -11,12 +11,21 @@
 #
 # The compilers are ROCm's clang for both languages, as the candidate's CMakeLists requires:
 # hipcc's wrapper would add its own flags to the host half.
+#
+# NO CARD IS TOUCHED. The DSO links libamdhip64, so every child here runs with HIP_VISIBLE_DEVICES
+# and ROCR_VISIBLE_DEVICES emptied: HIP initialises without a device, a launch that got past the
+# body's refusals would fail instead of running, and no KFD context is claimed. Each child also
+# runs under `timeout`, because a child that hangs keeps whatever context it did claim, and a
+# leaked KFD context on this host is not free: it holds 150+ MB that the scheduler's measured
+# budget then misses by (tests/kbench_mutant_test.cpp and tests/oot_plugins.sh hide devices the
+# same way). Neither is optional.
 set -eu
 S=${1:-"$(cd "$(dirname "$0")/../.." && pwd)/.."}
 ROCM=${ROCM:-/opt/rocm}
 CLANG=$ROCM/llvm/bin/clang++
 ROCMLIB=${ROCM_LIB:-$ROCM/core-10.0}
 ARCH=${ARCH:-gfx1201}
+LIMIT=${LIMIT:-120}
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
@@ -52,10 +61,15 @@ echo "exports: the ABI's set, nothing from libr4d"
          "$S/candidates/shared-i8a8-down/test/si8_test.cpp" -o "$D/si8_test" -ldl
 
 echo
+# A child that outlives its case is a leaked KFD context, so every one of them is bounded here and
+# sealed off from the card. See the note at the top of this file.
+NOCARD="HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 RADIANCE_HOST_VRAM_MIB=512"
 echo "--- plugin off (RADIANCE_SHARED_I8A8_DOWN unset)"
-env -u RADIANCE_SHARED_I8A8_DOWN "$D/si8_test" --off "$D/shared_i8a8_down.so"
+env -u RADIANCE_SHARED_I8A8_DOWN $NOCARD timeout "$LIMIT" \
+    "$D/si8_test" --off "$D/shared_i8a8_down.so"
 echo "--- plugin on (RADIANCE_SHARED_I8A8_DOWN=1)"
-RADIANCE_SHARED_I8A8_DOWN=1 "$D/si8_test" --on "$D/shared_i8a8_down.so"
+env $NOCARD RADIANCE_SHARED_I8A8_DOWN=1 timeout "$LIMIT" \
+    "$D/si8_test" --on "$D/shared_i8a8_down.so"
 echo
 echo "host tests passed. Not run here: the numerics (compare.hip) and every served-path number,"
 echo "both of which need a gfx1201 card."
