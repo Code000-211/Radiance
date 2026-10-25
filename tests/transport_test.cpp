@@ -384,6 +384,30 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(big.status, 401);
 }
 
+/* A normal server stop answers a boundary a handler is still waiting on, and it does so before the
+ * transport drains: the handler is released by the stop's close, not by its own bound, so the drain
+ * is not left sitting on the handler's whole wait. The order is a state, not a duration -- the fake
+ * records whether the close released it or whether it ran out of its own bound. */
+TEST(a_normal_server_stop_answers_a_boundary_a_handler_is_waiting_on) {
+    LiveServer s(4, 1);
+    REQUIRE(s.srv->port() > 0);
+    s.sched.calib_block    = true;
+    s.sched.calib_ack.rc   = RAD_E_STATE;    /* the fake answers "not quiet" once released */
+    Reply reply;
+    std::thread waiting([&] { reply = ::ask(s, post("/admin/draft-calib-boundary", "{}")); });
+    REQUIRE(s.sched.wait_calib_in_call(10000));   /* the handler is inside the boundary call */
+
+    s.srv->stop();                                /* the stop path the engine uses */
+    waiting.join();
+
+    CHECK_EQ(s.sched.calib_close_calls, 1);
+    CHECK_EQ(s.sched.calib_released_by_close, true);   /* the stop released it, not the bound */
+    CHECK_EQ(s.sched.calib_released_by_timeout, false);
+    /* The handler had its answer, so it could write one: the peer is gone only if the drain closed
+     * the connection first, which is the transport's business and not this route's. */
+    CHECK(reply.status == 409 || reply.status == 0);
+}
+
 /* The calibration boundary's whole matrix, over the real transport instead of the router: keyed and
  * keyless, present and absent credentials, and each of the three answers the handler gives -- 200
  * (a boundary was taken), 409 (not quiet, nothing dropped) and 501 (not a calibration). The one row

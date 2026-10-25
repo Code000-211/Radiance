@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -724,6 +725,16 @@ struct FakeScheduler : IScheduler {
      * Default is a serving deployment's answer (no calibration, so 501). */
     server::DraftCalibAck calib_ack{};
     int calib_calls = 0;
+    /* A handler's boundary call can be made to park here until the server closes the boundary, so a
+     * test can stop the server *while* a call is in flight and see who woke it: the stop's close, or
+     * the fake's own bound (a timeout means the wiring is missing). */
+    bool calib_block = false;
+    int  calib_close_calls = 0;
+    bool calib_closed = false;
+    bool calib_in_call = false;
+    bool calib_released_by_close = false;
+    bool calib_released_by_timeout = false;
+    std::condition_variable calib_cv;
 
     std::mutex mu;
     std::vector<uint64_t> submitted;
@@ -752,8 +763,31 @@ struct FakeScheduler : IScheduler {
     }
 
     server::DraftCalibAck draft_calib_boundary(int /*timeout_ms*/) override {
+        std::unique_lock<std::mutex> lk(mu);
         ++calib_calls;
+        if (!calib_block) return calib_ack;
+        calib_in_call = true;
+        calib_cv.notify_all();
+        /* Bounded only so a missing close fails the assertion instead of hanging the suite. */
+        const bool by_close =
+            calib_cv.wait_for(lk, std::chrono::seconds(30), [this] { return calib_closed; });
+        calib_in_call = false;
+        (by_close ? calib_released_by_close : calib_released_by_timeout) = true;
         return calib_ack;
+    }
+    void draft_calib_close() override {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ++calib_close_calls;
+            calib_closed = true;
+        }
+        calib_cv.notify_all();
+    }
+    /* The test's side: block until a boundary call is actually in flight. */
+    bool wait_calib_in_call(int ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        return calib_cv.wait_for(lk, std::chrono::milliseconds(ms),
+                                 [this] { return calib_in_call; });
     }
 
     uint64_t submit(Request&& r) override {

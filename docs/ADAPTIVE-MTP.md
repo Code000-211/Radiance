@@ -807,6 +807,9 @@ withdraw, the mutation and the answer all take `mu_calib_`. A scheduler that is 
 the boundary first -- before it takes `mu_`, so the two lock orders cannot deadlock -- refuses and
 wakes a request the step loop has not answered yet, and leaves an answer that is already there
 alone: that answer was linearized before the shutdown and its caller still collects it. The
+server's own stop does the same before its transport drains (`Server::stop`), so a handler that is
+waiting on the boundary is released by the stop itself instead of keeping the drain sitting on its
+whole bounded wait. The
 capacity the deployment reserved is kept across the reset (`clear()`, not `shrink_to_fit()`), so the
 scored phase records into memory that is already there.
 
@@ -827,19 +830,29 @@ and it gets that before the mode is looked at, so it learns nothing about whethe
 calibrating. A recorder built with this boundary is a new calibration basis: its SHA, binary and
 deployment identity have to be logged before a profile measured on it is compared with any other.
 
-**What is covered by tests.** The scheduler-level fixture drives the ordering without the engine:
-unsupported outside a calibration, busy while work is in flight, served at the idle point of a
-finished run (warmup dropped, scored phase's samples equal to one phase's worth, never two), an
-empty calibration, a withdrawn timeout that is never applied later, two concurrent requests (one
-applied, one busy), shutdown with a request outstanding, an answer that a shutdown arrives on top of
-and that is still collected afterwards, four callers hammering the slot (one epoch per collected
-answer, no answer claiming another request's drops), and the samples-only reset's binding and
-capacity. The route's whole transport matrix -- keyed and keyless, wrong key, `200`/`409`/`501` --
-runs on a real socket in `transport_test`; the `403` a keyless server gives a remote peer is proven
-against the handler's peer in `server_test`, because every client on that socket is loopback. `engine_e2e_test` runs the real thing: a cost calibration on a tiny model, one warmup
-request that finishes on its own `max_tokens`, one `POST`, one scored request, the orderly
-shutdown's export -- and the exported sample count must be the scored request's alone, with the log
-naming `recording epoch 2`.
+**What is covered by tests.** The interleavings are *forced*, not sampled: a test installs a probe
+(`Scheduler::set_draft_calib_probe`) that parks a caller of the boundary at the two points the slot
+contract is about -- registered but unanswered, and answered but uncollected -- and the probe is
+called with no scheduler lock held, so the test asks, answers and closes from its own thread while
+the caller stands still. No sleep, no spinning, no contention, and nothing decides at a probe
+point: the slot is re-read under `mu_calib_` afterwards. Covered that way: the first caller is
+answered while still uncollected, the second finds the slot taken and its epoch, the first then
+collects its own boundary and only then does the second get a boundary of its own; a close while a
+request is pending refuses it, wakes it, and no later idle point applies it; a close on top of an
+answer that is waiting for its caller keeps that answer; a timeout that expires while pending is
+withdrawn before any idle point can see it; and an answer that is already there when a zero timeout
+runs is that caller's own success. Around those: unsupported outside a calibration, busy while work
+is in flight, served at the idle point of a finished run (warmup dropped, the scored phase's samples
+equal to one phase's worth, never two), an empty calibration, shutdown with a request outstanding,
+and the samples-only reset's binding and capacity. The route's whole transport matrix -- keyed and
+keyless, wrong key, `200`/`409`/`501` -- runs on a real socket in `transport_test`, together with a
+normal `Server::stop` while a handler is inside the boundary call: the stop's close must release it
+(the fake records whether the close or its own bound woke it), which is also how the missing wiring
+is caught. The `403` a keyless server gives a remote peer is proven against the handler's peer in
+`server_test`, because every client on that socket is loopback. `engine_e2e_test` runs the real
+thing: a cost calibration on a tiny model, one warmup request that finishes on its own `max_tokens`,
+one `POST`, one scored request, the orderly shutdown's export -- and the exported sample count must
+be the scored request's alone, with the log naming `recording epoch 2`.
 
 ## Draft profile format, version 4
 

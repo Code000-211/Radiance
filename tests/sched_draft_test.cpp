@@ -6294,27 +6294,162 @@ TEST(two_concurrent_boundary_requests_get_one_answer_each) {
         }
 }
 
-/* A boundary the step loop has already answered is linearized: the shutdown that follows refuses
- * new requests and wakes whatever is still waiting, but it must not take back an answer that is
- * already here. The caller collects the boundary it was promised -- in both interleavings, so the
- * assertion does not depend on which thread wins. */
-TEST(a_boundary_answered_before_the_shutdown_is_still_collected) {
+namespace {
+
+/* Parks a caller of the boundary at each probe point until the test lets it go. This is how the
+ * interleavings the slot contract is about become states a test stands in: no sleep, no spinning,
+ * no lock taken from the test side -- the scheduler holds neither mu_ nor mu_calib_ while a caller
+ * is parked, so the test can ask, answer and close from its own thread in the middle. */
+struct ParkedCaller {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::string at;
+    bool release = false;
+    std::string visited;
+
+    Scheduler::DraftCalibProbe hook() {
+        return [this](const char* where) {
+            std::unique_lock<std::mutex> lk(mu);
+            visited += std::string(visited.empty() ? "" : ",") + where;
+            at = where;
+            cv.notify_all();
+            cv.wait(lk, [this] { return release; });
+            release = false;
+            at.clear();
+        };
+    }
+    /* The bound is a hang guard, not a wait: every assertion below is about the state the caller is
+     * parked in, and a missed point fails instead of hanging the suite. */
+    bool wait_at(const std::string& where) {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, std::chrono::seconds(10), [&] { return at == where; });
+    }
+    void let_go() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            release = true;
+        }
+        cv.notify_all();
+    }
+};
+
+}  /* namespace */
+
+/* The slot is held from the request until its caller collects the answer. Forced, point by point:
+ * the first caller is answered while it is parked short of the collect, a second caller finds the
+ * slot taken, the first collects its own boundary, and only then does the second get one of its
+ * own. This is the ordering the previous release-at-answer let through: the second caller could be
+ * applied, take the epoch, and answer the first with "nothing was dropped" for a boundary that had
+ * already dropped its samples. */
+TEST(a_boundary_slot_stays_taken_until_its_answer_is_collected) {
     Fixture f;
-    start_recording(f, "sched_boundary_answered_shutdown.json");
+    start_recording(f, "sched_boundary_slot_owner.json");
     const uint64_t a = f.submit(160), b = f.submit(170);
     cycle_to_eog(f, { a, b });
     idle_step(f, /*serve=*/false);
     const int64_t warm = samples_of(f);
     REQUIRE(warm > 0);
 
+    ParkedCaller parked;
+    f.sch.set_draft_calib_probe(parked.hook());
+
+    Scheduler::DraftCalibAck first, second, third;
+    std::thread t([&] { first = f.sch.request_draft_calib_boundary(60000); });
+    REQUIRE(parked.wait_at("pending"));       /* in the slot, not answered yet */
+
+    second = f.sch.request_draft_calib_boundary(0);
+    CHECK_EQ(second.rc, RAD_E_STATE);         /* busy at once, and it dropped nothing */
+    CHECK_EQ(second.samples, 0);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+
+    /* The step loop answers while its caller is still parked short of the collect. */
+    f.sch.serve_draft_calib_boundary();
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
+    parked.let_go();
+    REQUIRE(parked.wait_at("answered"));      /* answered, and deliberately not collected */
+
+    second = f.sch.request_draft_calib_boundary(0);
+    CHECK_EQ(second.rc, RAD_E_STATE);         /* not this one's boundary, and not a second cut */
+    CHECK_EQ(second.samples, 0);
+    CHECK_EQ(second.buckets, 0);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);   /* nothing applied behind the first caller's back */
+
+    parked.let_go();
+    t.join();
+    CHECK_EQ(first.rc, RAD_OK);               /* its own answer, intact */
+    CHECK_EQ(first.epoch, 2u);
+    CHECK_EQ(first.samples, warm);
+    CHECK(f.sch.draft_costs().buckets().empty());
+
+    /* The collect is what frees the slot: the next caller gets its own boundary, in its own epoch. */
+    std::thread t2([&] { third = f.sch.request_draft_calib_boundary(60000); });
+    REQUIRE(parked.wait_at("pending"));
+    f.sch.serve_draft_calib_boundary();
+    parked.let_go();
+    REQUIRE(parked.wait_at("answered"));
+    parked.let_go();
+    t2.join();
+    CHECK_EQ(third.rc, RAD_OK);
+    CHECK_EQ(third.epoch, 3u);
+    CHECK_EQ(third.samples, 0);               /* an empty phase still opens the next epoch */
+}
+
+/* A server that stops while a request is still pending refuses it and wakes it -- and a later idle
+ * point cannot apply it afterwards. Forced: the close happens while the caller is parked at the
+ * request point, so no scheduling decides whether the two meet. */
+TEST(a_close_with_a_request_pending_refuses_it_and_applies_nothing_later) {
+    Fixture f;
+    start_recording(f, "sched_boundary_close_pending.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    REQUIRE(samples_of(f) > 0);
+    const size_t buckets = f.sch.draft_costs().buckets().size();
+
+    ParkedCaller parked;
+    f.sch.set_draft_calib_probe(parked.hook());
     Scheduler::DraftCalibAck ack;
     std::thread t([&] { ack = f.sch.request_draft_calib_boundary(60000); });
-    for (int guard = 0; guard < 2000000 && f.sch.draft_calib_epoch() == 1; ++guard) {
-        f.sch.serve_draft_calib_boundary();
-        std::this_thread::yield();
-    }
-    REQUIRE_EQ(f.sch.draft_calib_epoch(), 2u);
-    f.sch.shutdown("test shutdown after an answer", RAD_E_STATE);
+    REQUIRE(parked.wait_at("pending"));
+
+    f.sch.draft_calib_close();
+    parked.let_go();
+    REQUIRE(parked.wait_at("settled"));
+    parked.let_go();
+    t.join();
+
+    CHECK_EQ(ack.rc, RAD_E_STATE);
+    CHECK_EQ(ack.samples, 0);
+    CHECK_EQ(ack.buckets, 0);
+    CHECK_EQ(ack.cycles_done, 0);
+    f.sch.serve_draft_calib_boundary();       /* an idle point after the refusal */
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets);   /* nothing was dropped */
+}
+
+/* A close on top of an answer that is waiting for its caller keeps the answer: it was linearized
+ * before the shutdown, and its caller still collects the boundary it was promised. Forced the same
+ * way -- the close happens while that caller is parked at the answered point. */
+TEST(a_close_with_an_answer_waiting_for_its_caller_keeps_it) {
+    Fixture f;
+    start_recording(f, "sched_boundary_close_answered.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    const int64_t warm = samples_of(f);
+    REQUIRE(warm > 0);
+
+    ParkedCaller parked;
+    f.sch.set_draft_calib_probe(parked.hook());
+    Scheduler::DraftCalibAck ack;
+    std::thread t([&] { ack = f.sch.request_draft_calib_boundary(60000); });
+    REQUIRE(parked.wait_at("pending"));
+    f.sch.serve_draft_calib_boundary();
+    parked.let_go();
+    REQUIRE(parked.wait_at("answered"));
+
+    f.sch.draft_calib_close();
+    parked.let_go();
     t.join();
 
     CHECK_EQ(ack.rc, RAD_OK);
@@ -6323,75 +6458,65 @@ TEST(a_boundary_answered_before_the_shutdown_is_still_collected) {
     CHECK(f.sch.draft_costs().buckets().empty());
 }
 
-/* The pairing has to hold for every schedule, not for the one the test happens to get: a boundary
- * may only be applied together with an answer that reaches the request which asked for it. The
- * answered-but-uncollected window is where the two used to come apart -- a second caller could be
- * given the slot, apply a second boundary and take the first request's reply with it -- so the test
- * hammers that window from four threads and asserts the pairing, not an order. */
-TEST(boundary_answers_and_requests_stay_paired_under_contention) {
+/* Timeout against application, the first way round: a request that expires while still pending is
+ * withdrawn before any idle point can see it. Forced -- the caller is parked at the request point
+ * when its zero timeout begins to run, so the withdrawal is complete before the test serves. */
+TEST(a_timeout_withdraws_before_the_next_idle_point_can_apply_it) {
     Fixture f;
-    start_recording(f, "sched_boundary_pairing.json");
+    start_recording(f, "sched_boundary_timeout_pending.json");
     const uint64_t a = f.submit(160), b = f.submit(170);
     cycle_to_eog(f, { a, b });
     idle_step(f, /*serve=*/false);
-    REQUIRE(f.sch.draft_costs().buckets().size() > 0);
+    REQUIRE(samples_of(f) > 0);
+    const size_t buckets = f.sch.draft_costs().buckets().size();
 
-    std::atomic<bool> stop{false};
-    std::atomic<int> stop_serving{0};
-    /* A step loop on its own: it serves whenever it has nothing else to do, exactly as
-     * Engine::step_loop's idle branch does, and it is the only place a boundary is applied. */
-    std::thread loop([&] {
-        while (!stop.load()) {
-            f.sch.serve_draft_calib_boundary();
-            std::this_thread::yield();
-        }
-    });
-    const int64_t epoch_at_start = (int64_t)f.sch.draft_calib_epoch();
-    const int kThreads = 4, kRounds = 40;
-    std::vector<Scheduler::DraftCalibAck> acks((size_t)kThreads * kRounds);
-    {
-        std::vector<std::thread> ts;
-        for (int t = 0; t < kThreads; ++t)
-            ts.emplace_back([&, t] {
-                for (int r = 0; r < kRounds; ++r) {
-                    Scheduler::DraftCalibAck& out = acks[(size_t)t * kRounds + r];
-                    /* Generous enough that a request is answered whenever the engine is quiet, and
-                     * short enough that a busy answer does not hold the test up: the timeout is
-                     * the caller's own, never the engine's. */
-                    out = f.sch.request_draft_calib_boundary(20);
-                }
-            });
-        for (std::thread& t : ts) t.join();
-    }
-    stop.store(true);
-    loop.join();
+    ParkedCaller parked;
+    f.sch.set_draft_calib_probe(parked.hook());
+    Scheduler::DraftCalibAck ack;
+    std::thread t([&] { ack = f.sch.request_draft_calib_boundary(0); });
+    REQUIRE(parked.wait_at("pending"));
 
-    /* Every boundary that was applied is answered exactly once, and every answer that claims a
-     * boundary names one: the epoch the run ended on minus the one it started from is the number of
-     * successful answers, never more. */
-    int64_t served = 0;
-    int64_t busy = 0;
-    std::vector<int64_t> epochs;
-    for (const Scheduler::DraftCalibAck& k : acks) {
-        if (k.rc == RAD_OK) {
-            ++served;
-            epochs.push_back((int64_t)k.epoch);
-        } else {
-            CHECK_EQ(k.rc, RAD_E_STATE);
-            ++busy;
-            /* "Busy" is a claim about the caller's own request: it dropped nothing. */
-            CHECK_EQ(k.buckets, 0);
-            CHECK_EQ(k.samples, 0);
-            CHECK_EQ(k.cycles_done, 0);
-        }
-    }
-    CHECK_EQ(served + busy, (int64_t)acks.size());
-    /* One epoch per applied boundary: the run ends as many epochs further on as there were
-     * successful answers, and no two callers were handed the same one. */
-    const int64_t end_epoch = (int64_t)f.sch.draft_calib_epoch();
-    CHECK_EQ(end_epoch - epoch_at_start, served);
-    std::sort(epochs.begin(), epochs.end());
-    for (size_t i = 0; i < epochs.size(); ++i) CHECK_EQ(epochs[i], epoch_at_start + 1 + (int64_t)i);
+    parked.let_go();                          /* the zero timeout runs, and withdraws */
+    REQUIRE(parked.wait_at("settled"));
+    parked.let_go();
+    t.join();
+
+    CHECK_EQ(ack.rc, RAD_E_STATE);
+    CHECK_EQ(ack.samples, 0);
+    f.sch.serve_draft_calib_boundary();
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets);
+}
+
+/* Timeout against application, the second way round: an answer that is already here when the wait
+ * expires is this caller's own and is returned as a success -- the boundary happened, and "busy,
+ * nothing dropped" would be a lie. Forced: the step loop answers while the caller is parked at the
+ * request point, before its zero-timeout wait even starts. */
+TEST(an_answer_that_arrives_at_the_timeout_is_this_callers_own) {
+    Fixture f;
+    start_recording(f, "sched_boundary_timeout_answered.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    const int64_t warm = samples_of(f);
+    REQUIRE(warm > 0);
+
+    ParkedCaller parked;
+    f.sch.set_draft_calib_probe(parked.hook());
+    Scheduler::DraftCalibAck ack;
+    std::thread t([&] { ack = f.sch.request_draft_calib_boundary(0); });
+    REQUIRE(parked.wait_at("pending"));
+
+    f.sch.serve_draft_calib_boundary();       /* answered before the wait begins */
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
+    parked.let_go();
+    REQUIRE(parked.wait_at("answered"));
+    parked.let_go();
+    t.join();
+
+    CHECK_EQ(ack.rc, RAD_OK);
+    CHECK_EQ(ack.epoch, 2u);
+    CHECK_EQ(ack.samples, warm);
     CHECK(f.sch.draft_costs().buckets().empty());
 }
 

@@ -339,6 +339,10 @@ std::string Server::check_thinking_budget() const {
 
 void Server::stop() {
     stopping_.store(true);
+    /* Before the transport drains, not after: a handler that is waiting for the calibration
+     * boundary would otherwise keep the drain sitting on its bounded wait, and the stop would look
+     * like a hang for as long as a step loop that is already gone never answers. */
+    if (deps_.sched) deps_.sched->draft_calib_close();
     transport_.stop();
     stop_videos();
     drain_graveyard(2000);

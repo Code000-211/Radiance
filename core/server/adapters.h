@@ -229,6 +229,8 @@ public:
         return o;
     }
 
+    void draft_calib_close() override { s_->draft_calib_close(); }
+
     /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
      * to "seconds ago" here, so only the monotonic clock is authoritative. */
     TierCounters tier_counters() const override {

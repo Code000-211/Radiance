@@ -286,6 +286,13 @@ public:
      * to bound. */
     virtual DraftCalibAck draft_calib_boundary(int /*timeout_ms*/) { return DraftCalibAck{}; }
 
+    /* Called when the server stops, before its transport drains: a handler waiting on the boundary
+     * is answered here instead of being waited out, which is the difference between a stop that
+     * takes milliseconds and one that sits on the handler's whole bounded wait. Refuses a request
+     * the step loop has not answered yet and leaves an answer that is already there for its caller.
+     * Default: nothing to close -- a scheduler without a calibration has no such request. */
+    virtual void draft_calib_close() {}
+
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }
 

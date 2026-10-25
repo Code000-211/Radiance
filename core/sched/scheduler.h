@@ -22,6 +22,7 @@
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -545,6 +546,22 @@ public:
     /* Called from the step loop, at the point where it holds no work of its own. Cheap when no
      * boundary was asked for (one relaxed load). */
     void          serve_draft_calib_boundary();
+    /* Close the boundary: a request the step loop has not answered yet is refused and woken, and an
+     * answer that is already here stays for its caller to collect. Called by the server's stop
+     * before the transport drains, and by shutdown/fini before mu_ is taken -- it takes mu_calib_
+     * alone, so it must never run while mu_ is held. Idempotent. */
+    void          draft_calib_close();
+    /* Where a caller of request_draft_calib_boundary can be parked by a test: "pending" once its
+     * request is in the slot and the step loop has not answered it, "answered" when the answer is
+     * here and not collected yet, "settled" when the wait ended without one. Called with no
+     * scheduler lock held -- neither mu_ nor mu_calib_ -- so a probe may call back into the
+     * boundary, and decided at neither point but re-read under the lock afterwards. Unset in a
+     * deployment; the cost when unset is one empty-function check per request. */
+    using DraftCalibProbe = std::function<void(const char*)>;
+    /* Install before the run starts, and only from a test: the interleavings this makes reachable
+     * are exactly the two the slot contract is about. */
+    void          set_draft_calib_probe(DraftCalibProbe probe);
+
     /* The recording epoch the run's samples belong to: 1 until a boundary opens the next one. */
     uint64_t      draft_calib_epoch() const {
         return draft_calib_epoch_.load(std::memory_order_relaxed);
@@ -858,6 +875,7 @@ private:
      * Scheduler::shutdown closes the boundary before it takes mu_ -- and no lock taken on the step
      * path is ever taken above it. */
     enum CalibSlot { kCalibIdle = 0, kCalibPending = 1, kCalibAnswered = 2 };
+    DraftCalibProbe       draft_calib_probe_;      /* mu_calib_: set before the run, may be empty */
     std::atomic<int>      draft_calib_slot_{kCalibIdle}; /* mu_calib_ for every transition */
     uint64_t              draft_calib_slot_id_ = 0;     /* mu_calib_: whose answer the slot holds */
     uint64_t              draft_calib_next_id_ = 0;     /* mu_calib_ */
@@ -976,9 +994,6 @@ private:
     /* Whether the samples-only boundary may be applied right now (see the public declaration).
      * Caller holds mu_. */
     bool draft_calib_quiet_locked() const;
-    /* Shutdown: refuse whatever is still outstanding and wake its caller. Takes mu_calib_ alone, so
-     * it must run before mu_ is taken. */
-    void draft_calib_close();
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
         return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);
