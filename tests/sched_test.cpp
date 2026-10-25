@@ -1053,6 +1053,89 @@ TEST(a_growing_chunk_does_not_preempt_a_decoder) {
     CHECK_EQ(b_steps, 24);         /* the decoder ran every step of the window */
 }
 
+/* --prefill-growth-guard, saturated: the pool is full of unfinished prefills. With no decoding row
+ * there is no block for the guard to protect, and nothing in the step would release one, so it
+ * must leave the ordinary growth and preemption in place -- otherwise every chunk waits, step()
+ * plans nothing and neither prompt ever finishes (review repro: two 500-token prompts, 40 blocks). */
+TEST(a_saturated_pool_of_prefills_still_makes_progress) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64, /*max_tok=*/128, /*max_ctx=*/1024);
+    f.cfg.busy_prefill_chunk = 64;
+    f.cfg.prefill_growth_guard = true;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(500, 8);
+    const uint64_t b = f.submit(500, 8);
+    const auto live = [&](uint64_t id) {
+        const Request* r = f.sch.find(id);
+        return r && r->state != ReqState::Finished && r->state != ReqState::Failed &&
+               r->state != ReqState::Cancelled;
+    };
+    int steps = 0;
+    while ((live(a) || live(b)) && steps < 200) {
+        CHECK(f.sch.step() != nullptr);   /* a step that plans nothing is the deadlock */
+        f.commit_plain(7);
+        ++steps;
+    }
+    CHECK(steps < 200);                   /* both prompts and their decodes finished */
+    CHECK(!live(a));
+    CHECK(!live(b));
+}
+
+/* --prefill-growth-guard's eviction order, decode side: a decode row that cannot grow takes the
+ * least invested running work, not the latest arrival -- a recompute repeats that work, and the
+ * sequence evicted last is the one a serving run re-admits last anyway. Here the first arrival is
+ * the least invested, so evicting by arrival would keep it. */
+static void blocked_decode_victim() {
+    Fixture f;
+    f.build(/*blocks=*/23, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/1024);
+    f.cfg.prefill_growth_guard = true;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(100, 64);     /* first arrival, least computed */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t b = f.submit(300, 64);     /* last arrival, most computed */
+    bool saw = false;
+    for (int k = 0; k < 128 && !saw; ++k) {
+        /* A preemption step can plan nothing: the victim went and the rest waits a step. */
+        if (f.sch.step()) f.commit_plain(11);
+        const Request* ra = f.sch.find(a);
+        if (ra && ra->state == ReqState::Preempted) saw = true;
+    }
+    CHECK(saw);
+    const Request* ra = f.sch.find(a);
+    CHECK(ra != nullptr);
+    CHECK_EQ((int)ra->state, (int)ReqState::Preempted);   /* the first arrival went */
+    const Request* rb = f.sch.find(b);
+    CHECK(rb != nullptr);
+    CHECK_EQ((int)rb->state, (int)ReqState::Running);     /* the last arrival kept its blocks */
+}
+
+TEST(a_blocked_decode_preempts_the_least_invested_work_not_the_last_arrival) {
+    blocked_decode_victim();
+}
+
+/* The tie in the same order: at equal invested work a prefill goes before a decode -- both re-run
+ * the same tokens, but a decode has a client's stream waiting. Both hold 128 computed tokens and
+ * the pool is full when the decode needs its next block. */
+TEST(at_equal_work_a_prefill_goes_before_a_decode) {
+    Fixture f;
+    f.build(/*blocks=*/16, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/1024);
+    f.cfg.busy_prefill_chunk = 64;
+    f.cfg.prefill_growth_guard = true;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(128, 8);   /* the decode, arrives first */
+    const uint64_t p = f.submit(200, 8);   /* the prefill, at the same 128 computed tokens */
+    bool saw = false;
+    for (int k = 0; k < 16 && !saw; ++k) {
+        if (f.sch.step()) f.commit_plain(11);
+        const Request* rp = f.sch.find(p);
+        if (rp && rp->state == ReqState::Preempted) saw = true;
+    }
+    CHECK(saw);
+    CHECK(f.sch.find(a) != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+}
+
 /* ================================================================== the step batch */
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
@@ -2054,6 +2137,36 @@ TEST(a_measured_budget_under_the_stager_pass_falls_back_to_interleaving) {
     bool back = false;
     for (const StepEntry& e : f.sch.plan().e) if (e.seq == a && e.is_prefill) back = true;
     CHECK(back);
+}
+
+/* The measured cap is the chunk's ceiling for the step it shares, not just busy_cap's answer: the
+ * budget held back for the decode rows and then unused must not grow the chunk back over the time
+ * the mode is for. A review repro: cap 128 tokens, a 448-token chunk in the plan. */
+TEST(the_time_cap_holds_in_the_step_it_was_measured_for) {
+    Fixture f;
+    share_fixture(f, /*auto=*/-1);
+    f.cfg.mixed_time_budget = 2.0;
+    /* Two measured rates, as step_finished would leave them: 2 * 40 ms * 2000 tok/s = 160
+     * tokens, floored to the quantum, 128. A host test's own steps are far too short to show it. */
+    f.sch.set_rates_for_test(/*prefill_tps=*/2000.0f, /*step_ns_decode=*/40'000'000,
+                             /*steps_decode=*/1);
+    CHECK_OK(f.start());
+    f.submit(100, 512);                      /* the decoder */
+    CHECK(f.sch.step() != nullptr);          /* its own prompt */
+    f.commit_plain(11);
+    CHECK(f.sch.step() != nullptr);          /* it decodes beside nothing yet */
+    f.commit_plain(11);
+    f.submit(3500, 64);                      /* the long chunk arrives beside the decoder */
+    CHECK(f.sch.step() != nullptr);
+    bool chunk = false, decodes = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill) { decodes = true; continue; }
+        chunk = true;
+        CHECK(e.n_tokens <= 128);            /* above the 64-token floor: a cap, not a fallback */
+    }
+    CHECK(chunk);
+    CHECK(decodes);
+    CHECK(f.sch.metrics().prefill_chunks_capped >= 1);
 }
 
 /* ================================================================== decode-only steps between chunks */

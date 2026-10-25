@@ -422,6 +422,11 @@ public:
      * quantum (the caller falls back to --prefill-interleave). */
     static int64_t mixed_time_cap(const Config& cfg, const SchedMetrics& m, int64_t quantum);
 
+    /* Visible for tests: the rates mixed_time_cap reads. Only step_finished sets them in a run,
+     * and a host test's steps are microseconds, so no measured cap would reach the stager's floor
+     * there. Sets nothing else. */
+    void set_rates_for_test(float prefill_tps, int64_t step_ns_decode, int64_t steps_decode);
+
 private:
     Program*      prog_ = nullptr;
     Config        cfg_{};

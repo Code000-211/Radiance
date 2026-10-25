@@ -1031,7 +1031,9 @@ sample (the chunk dominates its time), so the measurement comes from the decode-
 running deployment already has. Under the prefill stager's
 smallest pass no cap can be honoured -- the floor above exists because a shorter step reads every
 routed layer's experts synchronously -- so that step keeps its whole chunk and the next ones carry
-decode rows only, the `--prefill-interleave` fallback (counted as `steps_held`).
+decode rows only, the `--prefill-interleave` fallback (counted as `steps_held`). The cap is the
+chunk's ceiling for the whole step, so the budget it reserved for the decode rows and they did not
+use is not returned to it either; only the fallback gives the chunk the whole step.
 
 **`--prefill-growth-guard`** (default off). A chunk growing into the KV pool takes blocks a decoding
 sequence needs for its next token; the row then finds the pool dry, the latest arrival is preempted
@@ -1039,7 +1041,9 @@ by recompute and re-prefilled, and the prefill load grows by the work the chunk 
 With the flag a chunk grows only into the blocks the decoding rows do not need this step, and a
 prefill never preempts: it takes what is left beyond that reserve or waits a step. A decode row
 short of a block preempts the least invested running request (by tokens computed, prefill before
-decode at a tie) instead of the latest arrival.
+decode at a tie) instead of the latest arrival. With no decoding row needing a block (a pool full of
+unfinished prefills) there is nothing to protect and no release to wait for, so the guard leaves the
+ordinary growth and preemption path alone: a chunk may then finish and free the pool.
 
 **Check the prefix cache after changing the chunk.** The larger arena shrinks the KV pool (here
 516,864 to 499,920 pool tokens, 3.3%), and §4.3's cliff is sharp. With two ~180K sessions (first

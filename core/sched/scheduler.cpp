@@ -927,6 +927,14 @@ int64_t Scheduler::mixed_time_cap(const Config& cfg, const SchedMetrics& m, int6
     return (int64_t)(tok / (double)Q) * Q;
 }
 
+void Scheduler::set_rates_for_test(float prefill_tps, int64_t step_ns_decode,
+                                   int64_t steps_decode) {
+    std::lock_guard<std::mutex> lk(mu_);
+    m_.prefill_tps = prefill_tps;
+    m_.step_ns_decode = step_ns_decode;
+    m_.steps_decode = steps_decode;
+}
+
 /* --prefill-growth-guard: what is left of the free list once every decoding row has room for this
  * step's tokens. A chunk grows only into that, so its growth cannot take a decode row's block and
  * hand the row a recompute (which is more prefill, not less). */
@@ -1326,6 +1334,10 @@ const RadBatch* Scheduler::step() {
             ++guard_dec;
         }
     }
+    /* A pool full of unfinished prefills has no decoding row whose block is at stake, and nothing
+     * in the step would release memory if every chunk waited: the guard is only about not taking a
+     * decoder's block, so with no decoder it leaves the ordinary growth and preemption in place. */
+    const bool growth_guard = cfg_.prefill_growth_guard && guard_dec > 0;
     /* The first prefill chunk held back this step (its index in plan_.e before the sort) and what
      * it would have taken: whatever the work it made room for did not use goes back to it. */
     int32_t capped_at = -1;
@@ -1360,7 +1372,7 @@ const RadBatch* Scheduler::step() {
             want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
             /* --prefill-growth-guard: grow only into the blocks the decoding rows do not need.
              * A chunk that has to wait a step leaves them their token and preempts nobody. */
-            if (want > 0 && cfg_.prefill_growth_guard) {
+            if (want > 0 && growth_guard) {
                 const int64_t room = prefill_growth_limit(r.n_computed, guard_dec, dec_row_tok) -
                                      r.n_computed;
                 if (room < want) want = plan_chunk(r.n_computed, target, std::max<int64_t>(room, 0),
@@ -1420,7 +1432,7 @@ const RadBatch* Scheduler::step() {
                 continue;
             /* --prefill-growth-guard: a prefill never preempts. It takes what is free beyond the
              * decoding rows' reserve, or waits a step. */
-            if (prefill && cfg_.prefill_growth_guard) {
+            if (prefill && growth_guard) {
                 const int64_t room = prefill_growth_limit(r.n_computed, guard_dec, dec_row_tok) -
                                      r.n_computed;
                 if (room >= Q && room < want) {
@@ -1448,7 +1460,7 @@ const RadBatch* Scheduler::step() {
              * invested running work, not the latest arrival -- a decode sequence evicted at the
              * back is re-prefilled by recompute and becomes the prefill load it was meant to
              * avoid. */
-            const int32_t victim = cfg_.prefill_growth_guard ? preempt_victim() : -1;
+            const int32_t victim = growth_guard ? preempt_victim() : -1;
             if (victim >= 0) {
                 preempt_slot(victim);
                 preempted_here = true;
@@ -1610,13 +1622,18 @@ const RadBatch* Scheduler::step() {
         const int64_t had = e.n_tokens;
         /* An explicit --busy-prefill-chunk N is a ceiling, not a forecast: the chunk grows back
          * to it at most. */
+        int64_t n_dec = 0;
+        for (const StepEntry& x : plan_.e) if (!x.is_prefill) ++n_dec;
         int64_t limit = std::min(capped_full, had + budget);
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
-        if (cfg_.prefill_growth_guard) {
+        /* --mixed-time-budget: the measured cap was this chunk's ceiling for the step, and the
+         * unused budget of the work it made room for does not lift it while a decode row shares
+         * the step -- that would put the chunk back over the decode time it was capped to. Only
+         * the fallback (a cap under the stager's floor) gives the chunk the whole step. */
+        if (time_cap >= 0 && !time_fallback && n_dec > 0) limit = std::min(limit, time_cap);
+        if (growth_guard) {
             /* Not into the blocks the decoding rows need this step either: the guard held this
              * chunk back for them, and the leftover budget does not undo that. */
-            int64_t n_dec = 0;
-            for (const StepEntry& x : plan_.e) if (!x.is_prefill) ++n_dec;
             limit = std::min(limit, prefill_growth_limit(r.n_computed, n_dec, dec_row_tok));
         }
         int64_t ckpt = -1;
