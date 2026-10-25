@@ -1136,6 +1136,34 @@ TEST(at_equal_work_a_prefill_goes_before_a_decode) {
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
 }
 
+/* The tie within one phase: two decodes at equal invested work are equally good victims, so the
+ * order has to be the stable one -- the first in `running_` order, which the walk reached first
+ * and a restart re-admits first. Neither the least-work case nor prefill-before-decode pins this:
+ * an ordering that takes the later equal candidate keeps both of them green. */
+TEST(at_equal_work_the_first_decode_in_running_order_is_the_victim) {
+    Fixture f;
+    f.build(/*blocks=*/16, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/1024);
+    f.cfg.prefill_growth_guard = true;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(128, 8);       /* first arrival */
+    const uint64_t b = f.submit(128, 8);       /* second arrival, the same length */
+    CHECK(a && b);
+    /* Both prefills fill the pool exactly: eight blocks each of the sixteen, nothing free. */
+    const RadBatch* s1 = f.sch.step();
+    CHECK(s1 != nullptr);
+    CHECK_EQ(s1->n_seq, 2);
+    f.commit_plain(11);
+    /* Level at 128 computed tokens, both decoding and both one block short. The walk reaches A
+     * first with B still unplanned, so both are candidates of equal work and the same phase. */
+    CHECK_EQ(f.sch.find(a)->n_computed, 128);
+    CHECK_EQ(f.sch.find(b)->n_computed, 128);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);   /* the first candidate went */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);     /* not the later one */
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain(11);
+}
+
 /* ================================================================== the step batch */
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
