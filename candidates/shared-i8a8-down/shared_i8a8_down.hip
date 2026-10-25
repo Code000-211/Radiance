@@ -103,6 +103,14 @@ __global__ __launch_bounds__(32) void dot(const int8_t* __restrict__ w,
                     const uint32_t* wp = (const uint32_t*)(w + tile + lane * 32 + frag * 8);
                     const uint32_t w0 = wp[0], w1 = wp[1];
 #pragma unroll
+                    /* V_DOT4_I32_IU8: two packed 4-D i8 operands dot into an i32 accumulator, one
+                     * NEG bit per source selecting signed or unsigned. Both are 1 here, i.e. i8 x
+                     * i8 sign-extended; the sixth argument is CLAMP, 0. Source: "RDNA4"
+                     * Instruction Set Architecture: Reference Guide, §16.10 VOP3P Instructions,
+                     * V_DOT4_I32_IU8, p. 393 of 697 (PDF p. 403), revision 2025-03-27,
+                     * gpuopen.com/download/rdna4-instruction-set-architecture.pdf. The four byte
+                     * loads per dword are the instruction's, not this kernel's: a and w are read as
+                     * 4-byte-aligned dwords, which is all a global dword load requires. */
                     for (int m = 0; m < Rows; ++m) {
                         const uint32_t* ap = (const uint32_t*)(a + m * k + kb);
                         sum[m] = __builtin_amdgcn_sudot4(true, w0, true, ap[0], sum[m], false);
