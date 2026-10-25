@@ -777,22 +777,27 @@ TEST(the_draft_confidence_rule_is_scale_offset_and_floor) {
     }
 }
 
-/* --draft-policy takes exactly two names. Whether the deployment can run the cost policy (a serial
- * drafter, a positive ceiling) is decided by the scheduler with the program in hand. */
-TEST(the_draft_policy_is_legacy_or_cost) {
+/* --draft-policy takes exactly three names. Whether the deployment can run the cost policy (a
+ * serial drafter, a positive ceiling, a matching profile) is decided at startup with the program in
+ * hand: `cost` refuses, `auto` resolves to legacy and says what is missing. */
+TEST(the_draft_policy_is_legacy_cost_or_auto) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.draft_policy == kDraftPolicyDefault);
+    CHECK(d.draft_policy == DraftPolicyKind::Legacy);
     Config c;
     CHECK_EQ(parse({ "--draft-policy", "cost" }, &c), RAD_OK);
     CHECK(c.draft_policy == DraftPolicyKind::Cost);
     CHECK_EQ(parse({ "--draft-policy", "legacy" }, &c), RAD_OK);
     CHECK(c.draft_policy == DraftPolicyKind::Legacy);
-    for (const char* bad : { "Cost", "auto", "adaptive", "1", "" })
+    CHECK_EQ(parse({ "--draft-policy", "auto" }, &c), RAD_OK);
+    CHECK(c.draft_policy == DraftPolicyKind::Auto);
+    for (const char* bad : { "Cost", "Auto", "automatic", "adaptive", "1", "" })
         CHECK_EQ(parse({ "--draft-policy", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
     CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
+    CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Auto)), std::string("auto"));
 }
 
 /* --draft-hysteresis names which depth moves wait for the hold: raise (the default) or both.

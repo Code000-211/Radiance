@@ -2826,6 +2826,58 @@ TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
         fprintf(stderr, "    the cost run lent nothing (experts: %s)\n",
                 rst["experts"].dump().c_str());
     CHECK(rst["experts"].value("flex_bytes", 0.0) > 0.0);
+
+    /* ---- the deployment default on the same profile: `auto` resolves to cost ----
+     * A start line that asks for the deployment default, not for a policy: same profile, same
+     * fixture, and the line says which policy it settled on. The demotion is the next test. */
+    std::vector<std::string> autodef = common;
+    autodef.insert(autodef.end(), { "--draft-policy", "auto", "--draft-profile", profile });
+    Server adef;
+    REQUIRE(adef.start(dir.path, autodef, device_env(32)));
+    const std::string adef_log = adef.output();
+    if (adef_log.find("--draft-policy auto: cost, with the profile") == std::string::npos)
+        fprintf(stderr, "    the auto run did not resolve to cost:\n%s\n", tail(adef_log).c_str());
+    CHECK(has(adef_log, "--draft-policy auto: cost, with the profile"));
+    CHECK(!has(adef_log, "cost is not usable here"));
+    const json adef_served =
+        post(adef.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(adef_served).size() != 24)
+        fprintf(stderr, "    the auto run's request answered status %d (%s): %s\n", status,
+                why.c_str(), adef_served.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(tokens_of(adef_served).size(), (size_t)24);
+    CHECK_EQ(adef.stop(), 0);
+}
+
+/* --draft-policy auto never turns a start that would have run into a refusal. The demotion: this
+ * model declares no draft head at all, so cost is impossible and the run is the legacy one --
+ * said once, served normally. The control is the same start under an explicit `cost`, which still
+ * refuses: the default is forgiving, the flag is not. */
+TEST(the_auto_policy_demotes_to_legacy_and_says_why) {
+    World& w = world();
+    REQUIRE(w.ok);
+    Server run;
+    REQUIRE(run.start(w.qwen35, { "--draft-policy", "auto" }));
+    const std::string log = run.output();
+    int status = 0;
+    std::string why;
+    const json served = post(run.port, "/completion", completion(prompt_ids(7, 8), 8), &status, &why);
+    const int exit = run.stop();
+    CHECK_EQ(exit, 0);
+    if (!has(log, "--draft-policy auto: cost is not usable here"))
+        fprintf(stderr, "    the auto run did not name the demotion:\n%s\n", tail(log).c_str());
+    CHECK(has(log, "--draft-policy auto: cost is not usable here"));
+    CHECK(has(log, "no serial draft head"));
+    CHECK(!has(log, "--draft-policy cost:"));
+    REQUIRE_EQ(status, 200);
+    CHECK_EQ(tokens_of(served).size(), (size_t)8);
+
+    /* The control: the same fixture under the explicit flag refuses at startup, so the demotion
+     * above is the default's leniency and not a relaxed gate. */
+    const Ran refused = radiance(w.qwen35, { "--draft-policy", "cost" }, {}, 120);
+    CHECK(refused.status != 0);
+    CHECK(refused.status != 124);
+    CHECK(has(refused.log, "--draft-policy cost: needs a serial draft head"));
 }
 
 /* The activation arena's levels, and the identity they hand a profile.

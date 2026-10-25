@@ -1955,7 +1955,45 @@ int Engine::load_draft_cost_profile(const DraftCostRuntime& runtime) {
  * any plan published -- cannot arise. A cost run executes exactly that start cycle, and the table
  * is put in record-only mode for it: the run measures the fallback baseline it really runs and
  * prices nothing from the buckets it is still filling. */
+int Engine::resolve_draft_policy() {
+    if (cfg_.draft_policy != DraftPolicyKind::Auto) return RAD_OK;
+    const RadDrafterDecl& d = ranks_[0]->program.drafter;
+    /* The first fact that rules cost out, in the order Scheduler::init would hit it. `auto` is the
+     * deployment's default, so a start it cannot serve is not an error -- it is the legacy run
+     * this deployment had before the policy existed, said out loud once. */
+    std::string why;
+    if      (d.kind != RAD_DRAFT_SERIAL) why = "the model has no serial draft head";
+    else if (d.depth <= 0)               why = "the serial draft head has no depth";
+    else if (cfg_.n_spec <= 0)           why = "no positive draft ceiling";
+    else if (cfg_.draft_profile.empty()) why = "no --draft-profile, and auto never picks one";
+    else if (!sched_.draft_costs().active())
+        why = "the named profile is not used here: " + (sched_.draft_costs().reason().empty()
+                     ? std::string("it does not match this deployment") 
+                     : sched_.draft_costs().reason());
+    else if (!sched_.draft_costs().has_usable_bucket() &&
+             !sched_.draft_costs().fallback_admitted())
+        why = "the named profile has no measured bucket and no admitted fallback baseline";
+    if (why.empty()) {
+        cfg_.draft_policy = DraftPolicyKind::Cost;
+        RAD_INFO("--draft-policy auto: cost, with the profile '%s' bound to this runtime",
+                 cfg_.draft_profile.c_str());
+        return RAD_OK;
+    }
+    cfg_.draft_policy = DraftPolicyKind::Legacy;
+    RAD_WARN("--draft-policy auto: cost is not usable here (%s), so this run is legacy; pass "
+             "--draft-policy cost to be told that at startup instead", why.c_str());
+    return RAD_OK;
+}
+
 int Engine::begin_draft_calibration() {
+    if (!cfg_.draft_profile_out.empty() && cfg_.draft_policy == DraftPolicyKind::Auto) {
+        /* A calibration is not the deployment default: it runs the cost planner's ladder and
+         * measures its plans, and `auto` would have to be resolved before the profile it is meant
+         * to write exists. Refused by name rather than resolved to one of the two. */
+        RAD_ERR("--draft-policy auto is the deployment default, not a calibration: a recording run "
+                "measures the cost planner's plans, so pass --draft-policy cost explicitly");
+        return RAD_E_INVAL;
+    }
     if (cfg_.draft_profile_out.empty()) {
         if (cfg_.draft_calib_n > 0) {
             RAD_ERR("--draft-calib-k forces a fixed depth sequence and needs --draft-profile-out: "
@@ -2404,6 +2442,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             RAD_TRY(draft_cost_runtime(&runtime));
             RAD_TRY(load_draft_cost_profile(runtime));
         }
+        /* --draft-policy auto: every fact cost needs is now known -- the head from the program,
+         * the ceiling from the config, the table from the profile just loaded -- and nothing has
+         * been refused yet. Resolved once, here, so every check below reads a real policy. */
+        RAD_TRY(resolve_draft_policy());
         /* A runtime that cannot record a pass runs every one of them live and unkeyed, which is a
          * fact about the deployment the cost view can carry -- but only when every rank proves it:
          * the pass spans them, so one rank that may record (or no rank asked at all) leaves the

@@ -417,6 +417,14 @@ private:
      * the first error, and serve stops there -- no fingerprint, profile or price follows a start
      * placement that did not complete. */
     int  prepare_serving();
+    /* --draft-policy auto: the deployment default resolved once, where every fact the cost policy
+     * needs is known and before Scheduler::init refuses anything -- a serial head, a positive
+     * ceiling, and a profile that matched this runtime with a measured bucket or an admitted
+     * fallback baseline. Cost only when all of them hold; otherwise legacy, with one line naming
+     * the first that does not, and never a start error. An explicit `cost` keeps the refusals:
+     * a flag that asks for cost and cannot run it must not start as legacy silently. Runs after
+     * load_draft_cost_profile and before sched_.init. See docs/ADAPTIVE-MTP.md. */
+    int  resolve_draft_policy();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
      * them. */

@@ -47,12 +47,18 @@ static const std::string g_draft_window_help =
     draft_window_name(kDraftWindowDefault);
 
 static const std::string g_draft_policy_help =
-    std::string("legacy | cost: what decides each cycle's draft window. legacy uses the\n"
-                "                                    fixed depth, or --draft-window adaptive's per-sequence\n"
-                "                                    stop; cost runs the adaptive-MTP policy, which prices the\n"
-                "                                    batch shape and chooses each request's K per cycle. A\n"
-                "                                    deployment without a measured profile falls back to the\n"
-                "                                    configured depth. Default ") +
+    std::string("legacy | cost | auto: what decides each cycle's draft window. legacy uses\n"
+                "                                    the fixed depth, or --draft-window adaptive's\n"
+                "                                    per-sequence stop; cost runs the adaptive-MTP policy,\n"
+                "                                    which prices the batch shape and chooses each\n"
+                "                                    request's K per cycle. A deployment without a\n"
+                "                                    measured profile falls back to the configured depth.\n"
+                "                                    auto is a deployment default, not a third policy: it\n"
+                "                                    runs cost when this start can really run it (a serial\n"
+                "                                    head, a ceiling, and the profile named by --draft-profile\n"
+                "                                    matching this runtime with a measured bucket or an\n"
+                "                                    admitted baseline) and stays legacy otherwise, naming\n"
+                "                                    what is missing. It never chooses a profile. Default ") +
     draft_policy_name(kDraftPolicyDefault);
 
 static const Flag g_flags[] = {
@@ -730,6 +736,7 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "legacy")) c->draft_policy = DraftPolicyKind::Legacy;
             else if (!std::strcmp(v, "cost"))   c->draft_policy = DraftPolicyKind::Cost;
+            else if (!std::strcmp(v, "auto"))   c->draft_policy = DraftPolicyKind::Auto;
             else {
                 RAD_ERR("--draft-policy takes legacy or cost, not '%s'", v);
                 return RAD_E_INVAL;

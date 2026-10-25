@@ -161,12 +161,19 @@ inline const char* draft_window_name(DraftWindow w) {
  *           the plan it chooses is what every proposal site reads for the cycle. Without a
  *           measured profile the model has no anchor, so the policy issues its named fallback at
  *           the configured depth rather than inventing a price.
- * The default is kDraftPolicyDefault, read by the help text and the startup line.
+ *   Auto    a deployment default, not a policy: resolved once at startup to Cost when THIS run can
+ *           really run it -- a serial head with a positive depth, a ceiling, and a named profile
+ *           that matched this runtime and holds a measured bucket or an admitted fallback
+ *           baseline -- otherwise to Legacy, with one line naming what is missing. It never picks
+ *           a profile and never turns a start that would have run into a refusal
+ *           (Engine::resolve_draft_policy).
+ * The default is kDraftPolicyDefault, read by the help text and the startup line. `Auto` is the
+ * start-line choice of a deployment, so the default stays Legacy and a bare start is unchanged.
  * `Kind`, not `DraftPolicy`: that name is the seam's choose hook (core/sched/draft_types.h). */
-enum class DraftPolicyKind { Legacy = 0, Cost = 1 };
+enum class DraftPolicyKind { Legacy = 0, Cost = 1, Auto = 2 };
 constexpr DraftPolicyKind kDraftPolicyDefault = DraftPolicyKind::Legacy;
 inline const char* draft_policy_name(DraftPolicyKind p) {
-    return p == DraftPolicyKind::Cost ? "cost" : "legacy";
+    return p == DraftPolicyKind::Cost ? "cost" : p == DraftPolicyKind::Auto ? "auto" : "legacy";
 }
 /* The most K values --draft-depth-tiers carries; sizes Config::draft_tiers and the planner's
  * ladder (RAD_DRAFT_MAX_TIERS, core/sched/draft_policy.h). */
