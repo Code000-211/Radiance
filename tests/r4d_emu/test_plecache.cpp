@@ -46,6 +46,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 extern "C" int r4d_rad_embed_lookup_q_init(const RadParam*, int, int, int, void** out);
@@ -157,6 +159,27 @@ std::vector<uint16_t> oracle(Fx& f) {
     f.clear_out();
     if (f.launch(nullptr) != RAD_OK) std::printf("  oracle launch refused\n");
     return std::vector<uint16_t>(f.x, f.x + (size_t)f.M * kRow);
+}
+
+/* Everything a call wrote to stderr. The init diagnostic is the observable: a run that meant to
+ * measure the cache must be told why it is off, and a run that never asked must stay quiet. */
+template <class F>
+std::string stderr_of(F fn) {
+    std::fflush(stderr);
+    FILE* tmp = std::tmpfile();
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+    fn();
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+    std::rewind(tmp);
+    std::string s;
+    char buf[512];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, tmp)) > 0) s.append(buf, n);
+    std::fclose(tmp);
+    return s;
 }
 
 }  // namespace
@@ -308,6 +331,71 @@ int main() {
         if (!ok) {
             ++fails;
             std::printf("  counters: the uncached path moved the cache's counters\n");
+        }
+    }
+
+    /* Off has to be said, and only when it was asked for: an explicit 0 or a value that is not a
+     * number allocates nothing and prints why, so a run that meant to measure the cache cannot read
+     * the tables' traffic as its misses. Unset is the default and stays silent. */
+    {
+        bool off_ok   = false;
+        const std::string said = stderr_of([&] {
+            (void)setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "0", 1);
+            void* off = nullptr;
+            const int r = r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &off);
+            off_ok = r == RAD_OK && off == nullptr;
+            (void)unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        });
+        const std::string quiet = stderr_of([] {
+            void* off = nullptr;
+            (void)r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &off);
+        });
+        const bool named = said.find("RADIANCE_PLE_VRAM_CACHE_SETS") != std::string::npos;
+        ++cases;
+        if (!off_ok || !named || !quiet.empty()) {
+            ++fails;
+            std::printf("  cache off: instance %s, explicit 0 %s, unset said %zu byte(s)\n",
+                        off_ok ? "none" : "HANDED OUT", named ? "named" : "SILENT",
+                        quiet.size());
+        }
+    }
+
+    /* A table in VRAM: a miss reads no host bytes, which is the whole of the link accounting. The
+     * emulator's allocations read as host, so the range is marked device -- what
+     * hipPointerGetAttributes reports for a table the engine placed in VRAM -- and a second cache
+     * instance is asked, binding being per instance. The counters are the same, so a zero here is
+     * the table's residence and not a dead statistic. */
+    {
+        R4dPleCacheStats host_side{};
+        bool ok = r4d_ple_stats(cache, &host_side) == 0 && host_side.table_host == 1;
+        f.shape({X});
+        emu_mark_device(f.wte.data(), f.wte.size());
+        (void)setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "32", 1);
+        void* vram = nullptr;
+        const int ri2 = r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &vram);
+        (void)unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        ok = ok && ri2 == RAD_OK && vram != nullptr;
+        if (ok) {
+            const Snap before = Snap::of(vram);
+            f.clear_out();
+            const int lr = f.launch(vram, RAD_PHASE_PREFILL);
+            const Snap d  = Snap::of(vram).less(before);
+            R4dPleCacheStats cs{};
+            const bool stats = r4d_ple_stats(vram, &cs) == 0;
+            const int64_t mem = r4d_ple_mem_bytes(vram);
+            ok = lr == RAD_OK && d.misses[0] == 1 && d.hits[0] == 0 && d.bytes[0] == 0 &&
+                 stats && cs.table_host == 0 && mem > 0;
+            if (!ok)
+                std::printf("  vram table (launch %d): h/m/b %llu/%llu/%llu, table_host %d, %lld "
+                            "byte(s) reserved\n", lr, d.hits[0], d.misses[0], d.bytes[0],
+                            cs.table_host, (long long)mem);
+            r4d_rad_embed_lookup_q_fini(vram);
+        }
+        emu_clear_devices();
+        ++cases;
+        if (!ok) {
+            ++fails;
+            std::printf("  the table in VRAM did not read as a device-resident table\n");
         }
     }
 

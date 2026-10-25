@@ -33,6 +33,16 @@ static double paged_share(const VramBudget& b) {
     return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
 }
 
+/* The named part of `already held`: kernel instances that hold device bytes of their own report
+ * them through RadMemFn, and init() ran before the reading, so those bytes are inside already held.
+ * Printed as a sub-line, never subtracted a second time; empty when no instance declares any. */
+static std::string plugin_held_line(const VramBudget& b) {
+    if (b.plugin_held <= 0) return std::string();
+    return fmt("    of which plugins %10s   kernel instances' own reservations, the PLE VRAM cache\n"
+               "                                  among them, counted inside already held\n",
+               humanb(b.plugin_held).c_str());
+}
+
 /* The resolver. `log` is false for vram_budget_trial, whose split may never be used, so its
  * refusals must not print as startup failures. */
 static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out, bool log) {
@@ -59,6 +69,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.kv_ceiling = std::max(b.kv_ceiling, f.kv_ceiling);
         b.kv_fixed   = std::max(b.kv_fixed, f.kv_fixed);
         b.statics    = std::max(b.statics, f.statics);
+        b.plugin_held = std::max(b.plugin_held, f.plugin_held);
         b.expert_ceiling = std::max(b.expert_ceiling, f.experts);
         layer_max        = std::max(layer_max, f.expert_layer_max);
         /* The rank that needs most on the card sets the floor. */
@@ -111,6 +122,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
             "  already held       %10s   (driver context, code objects, anything else on the card)\n"
+            "%s"
             "  driver drift       %10s   (what that moves by after it is read)\n"
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
@@ -121,7 +133,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  short by           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
             "or free the card.\n",
-            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
+            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(),
+            plugin_held_line(b).c_str(), humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
             humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str());
@@ -255,6 +268,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "VRAM budget, per card:\n"
         "  card total         %10s\n"
         "  already held       %10s   measured: driver context, code objects, anything else resident\n"
+        "%s"
         "  driver drift       %10s   what that moves by after it is read: kept free\n"
         "  activation arena   %10s   computed from the buffer plan\n"
         "  step staging       %10s   the step batch's block tables and media staging, and the\n"
@@ -276,8 +290,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "  vram_kv            %10s   %s\n"
         "  unclaimed          %10s   the headroom, the unusable above, and what MiB rounding\n"
         "                                  could not place\n",
-        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
-        humanb(b.arena).c_str(), humanb(b.staging).c_str(),
+        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), plugin_held_line(b).c_str(),
+        humanb(b.drift).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
         humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(), humanb(b.prefetch).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
         shared ? "integrated graphics: this memory is the host's"

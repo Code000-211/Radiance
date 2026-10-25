@@ -552,6 +552,45 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     CHECK(unclaimed < 114 * MiB);
 }
 
+/* A kernel instance that holds device bytes of its own (the PLE VRAM cache) reports them through
+ * RadMemFn. init() ran before the free memory was read, so those bytes are inside `already held`:
+ * the report names them there and the split is identical to the same card without them, which is
+ * the difference between naming a reservation and charging it twice. */
+TEST(a_plugins_own_reservation_is_named_inside_already_held) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+
+    VramBudget plain;
+    CHECK_OK(vram_budget_resolve(c, { f }, &plain));
+    CHECK(plain.report.find("of which plugins") == std::string::npos);   /* nothing to name */
+
+    Config c2 = small_config();
+    c2.vram_weights_mib = 0;
+    c2.vram_kv_mib      = 0;
+    c2.gpu_headroom_mib = 96;
+    VramFacts g = f;
+    g.plugin_held = 40LL << 20;
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c2, { g }, &b));
+    CHECK_EQ(b.plugin_held, 40LL << 20);
+    CHECK(b.report.find("of which plugins") != std::string::npos);
+    /* Named, not subtracted: every term the split is made of is the plain card's. */
+    CHECK_EQ(b.already_held, plain.already_held);
+    CHECK_EQ(b.claimable, plain.claimable);
+    CHECK_EQ(b.experts, plain.experts);
+    CHECK_EQ(b.kv, plain.kv);
+}
+
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     Config c = small_config();
     c.vram_weights_mib = 0;

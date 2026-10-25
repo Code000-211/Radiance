@@ -299,8 +299,11 @@ __device__ __forceinline__ bool ple_probe_rewrite(int32_t* __restrict__ tags,
 constexpr uint32_t kPleStatsPhases = 3;              /* prefill, decode, mixed */
 struct PleCacheStats {
     unsigned long long hits[kPleStatsPhases];        /* rows served from VRAM, 320 B each */
-    unsigned long long misses[kPleStatsPhases];      /* rows read over the link, 160 B each */
-    unsigned long long host_bytes[kPleStatsPhases];  /* kPleRow per miss: the link traffic */
+    unsigned long long misses[kPleStatsPhases];      /* rows whose payload came from the table */
+    /* kPleRow per miss that fetched the row from a table in host memory: the link traffic. A miss
+     * against a device-resident table is served from VRAM and adds nothing, so this stays 0 there
+     * and the dump's `table=` word says why (see ple_table_host below). */
+    unsigned long long host_bytes[kPleStatsPhases];
 };
 
 /* A phase outside RAD_PHASE_PREFILL..MIXED (an unset RadArgs::phase, -1) reads as MIXED: a caller
@@ -315,7 +318,8 @@ __device__ __forceinline__ void ple_embed_lookup_q_row(
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
     uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
-    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase) {
+    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase,
+    uint32_t table_host) {
     const uint32_t lane = threadIdx.x, m = blockIdx.x;
 
     if constexpr (Probe) {
@@ -417,14 +421,16 @@ __device__ __forceinline__ void ple_embed_lookup_q_row(
     }
 
     /* The miss half, outside the lookup's `slot >= 0`, because a row with no slot at all is a miss
-     * too: it reads kPleRow bytes over the link from the pinned table (the `wte` load below), so a
-     * miss costs two words -- the counter and the bytes. A row whose id is out of range reads
-     * neither table and is counted in neither, so hits + misses is the rows that reached the check,
-     * not the batch's row count. */
+     * too: it reads kPleRow bytes from the table (the `wte` load below), so a miss costs two words
+     * -- the counter and, when that table is host memory, the bytes it put on the link. A miss
+     * against a table the device can read costs the counter alone; counting its bytes as host reads
+     * would report a transfer that never happened (table_host, decided on the host). A row whose id
+     * is out of range reads neither table and is counted in neither, so hits + misses is the rows
+     * that reached the check, not the batch's row count. */
     if (lane == 0 && keep) {
         const uint32_t ph = ple_stats_phase(phase);
         atomicAdd(stats->misses + ph, 1ull);
-        atomicAdd(stats->host_bytes + ph, (unsigned long long)kPleRow);
+        if (table_host) atomicAdd(stats->host_bytes + ph, (unsigned long long)kPleRow);
     }
 
     const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
@@ -465,9 +471,9 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
     uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
-    PleCacheStats* __restrict__ stats, uint32_t phase) {
+    PleCacheStats* __restrict__ stats, uint32_t phase, uint32_t table_host) {
     ple_embed_lookup_q_row<false>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
-                                  heat, data, num_sets, nullptr, stats, phase);
+                                  heat, data, num_sets, nullptr, stats, phase, table_host);
 }
 
 /* The test's, not the gather's: the same row with the r4d_ple_probe handshake. No launch outside
@@ -477,9 +483,10 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_probe_ker
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
     uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
-    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase) {
+    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase,
+    uint32_t table_host) {
     ple_embed_lookup_q_row<true>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
-                                 heat, data, num_sets, probe, stats, phase);
+                                 heat, data, num_sets, probe, stats, phase, table_host);
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -1127,6 +1134,9 @@ struct PleVramCache {
     uint8_t*  data = nullptr;    /* kPleCacheRowBytes rows, decoded bf16 */
     uint32_t  sets = 0;
     int       device = -1;
+    /* The space the bound table lives in: 1 host memory, 0 device, -1 not asked or could not tell
+     * (ple_table_host). Only a host table makes a miss's fetch a link read. */
+    int       table_host = -1;
     unsigned* probe = nullptr;   /* r4d_ple_probe's words: this instance's launches take the entry */
     PleCacheStats* stats = nullptr;   /* the counters below; part of this instance's reservation */
     std::atomic<const void*> table{nullptr};
@@ -1146,28 +1156,78 @@ constexpr uint32_t kPleCacheWays     = 4;
 constexpr uint32_t kPleCacheRowBytes = 320;          /* 160 bf16, kPleRow above */
 constexpr uint32_t kPleCacheMaxSets  = 1u << 18;     /* 1,048,576 rows: 320 MiB of payload */
 
-static uint32_t ple_cache_sets_from_env() {
+static uint32_t ple_cache_sets_from_env(std::string* why_off) {
     const char* e = std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS");
-    if (!e || !*e) return 0;
+    if (!e || !*e) return 0;                      /* unset: the default, and silent */
     char* end = nullptr;
     const long want = std::strtol(e, &end, 10);
-    if (end == e) return 0;
-    if (want <= 0) return 0;
+    if (end == e || *end) {
+        *why_off = "is not a number";
+        return 0;
+    }
+    if (want <= 0) {
+        *why_off = "asks for no sets";
+        return 0;
+    }
     long sets = 1;
     while (sets * 2 <= want && (uint32_t)(sets * 2) <= kPleCacheMaxSets) sets *= 2;
     return (uint32_t)sets;
+}
+
+/* True when `table` is host memory, which is what makes a miss's kPleRow a link read. Asked once,
+ * at bind, on the host: hipPointerGetAttributes names the allocation's space. -1 when it cannot say
+ * (a plugin-side table pointer the driver does not know), where the launch counts misses but no
+ * host bytes -- overstating the link is the error to avoid. A managed table reads as device: the
+ * driver migrates it, so its rows are not a transfer this cache can attribute. */
+static int ple_table_host(const void* table) {
+    hipPointerAttribute_t a{};
+    if (!table || hipPointerGetAttributes(&a, table) != hipSuccess) return -1;
+    return a.type == hipMemoryTypeHost ? 1 : 0;
+}
+
+/* What the instance holds on the device, counted the way init allocated it: a tag, generation,
+ * heat counter and payload row a way, plus the stats block. init prints it, and the core reads it
+ * back through RadMemFn so the VRAM budget can name it inside "already held" (core/mem/vram_budget). */
+static int64_t ple_cache_reserved_bytes(const PleVramCache* c) {
+    if (!c || !c->data) return 0;
+    const size_t ways = (size_t)c->sets * kPleCacheWays;
+    return (int64_t)(ways * (kPleCacheRowBytes + 12) + sizeof(PleCacheStats));
+}
+
+extern "C" int64_t r4d_ple_mem_bytes(void* instance) {
+    return ple_cache_reserved_bytes((const PleVramCache*)instance);
 }
 
 extern "C" int r4d_rad_embed_lookup_q_init(const RadParam* p, int n_p, int rank, int world,
                                            void** out) {
     (void)p; (void)n_p; (void)rank; (void)world;
     if (out) *out = nullptr;
-    const uint32_t sets = ple_cache_sets_from_env();
-    if (!sets) return RAD_OK;
+    std::string why_off;
+    const uint32_t sets = ple_cache_sets_from_env(&why_off);
+    if (!sets) {
+        /* Unset is the default and stays quiet; an explicit value that asks for no cache says so,
+         * so a run that meant to measure the cache does not read the tables' traffic as this
+         * cache's misses. */
+        if (!why_off.empty())
+            std::fprintf(stderr, "[r4d] ple cache: RADIANCE_PLE_VRAM_CACHE_SETS=\"%s\" %s; the "
+                                 "cache stays off and every gather reads the table\n",
+                         std::getenv("RADIANCE_PLE_VRAM_CACHE_SETS"), why_off.c_str());
+        return RAD_OK;
+    }
     int dev = -1;
-    if (hipGetDevice(&dev) != hipSuccess) return RAD_OK;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        std::fprintf(stderr, "[r4d] ple cache: requested %u sets but the current device could not "
+                             "be read (hipGetDevice failed); the cache stays off and every "
+                             "gather reads the table\n", sets);
+        return RAD_OK;
+    }
     PleVramCache* c = new (std::nothrow) PleVramCache();
-    if (!c) return RAD_OK;
+    if (!c) {
+        std::fprintf(stderr, "[r4d] ple cache: requested %u sets but the host-side bookkeeping "
+                             "could not be allocated; the cache stays off and every gather reads "
+                             "the table\n", sets);
+        return RAD_OK;
+    }
     c->sets = sets;
     c->device = dev;
     const size_t ways = (size_t)sets * kPleCacheWays;
@@ -1184,10 +1244,10 @@ extern "C" int r4d_rad_embed_lookup_q_init(const RadParam* p, int n_p, int rank,
         return RAD_OK;
     }
     std::fprintf(stderr, "[r4d] ple cache: device %d holds %u sets x %u ways, %.1f MiB "
-                         "(%zu rows); %llu bytes reserved, %.1f%% of the %u-set cap (%.1f MiB)\n",
+                         "(%zu rows); %lld bytes reserved, %.1f%% of the %u-set cap (%.1f MiB)\n",
                  dev, sets, kPleCacheWays,
                  (double)(ways * (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0), ways,
-                 (unsigned long long)(ways * (kPleCacheRowBytes + 12) + sizeof(PleCacheStats)),
+                 (long long)ple_cache_reserved_bytes(c),
                  100.0 * (double)sets / (double)kPleCacheMaxSets, kPleCacheMaxSets,
                  (double)((size_t)kPleCacheMaxSets * kPleCacheWays *
                           (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0));
@@ -1208,9 +1268,10 @@ extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
             const unsigned long long rows = s.hits[ph] + s.misses[ph];
             if (!rows) continue;
             std::fprintf(stderr, "[r4d] ple cache: %s rows %llu, hits %llu (%.1f%%), misses "
-                                 "%llu, host reads %.2f MiB\n", kName[ph], rows, s.hits[ph],
-                         100.0 * (double)s.hits[ph] / (double)rows, s.misses[ph],
-                         (double)s.host_bytes[ph] / (1024.0 * 1024.0));
+                                 "%llu, host reads %.2f MiB, table %s\n", kName[ph], rows,
+                         s.hits[ph], 100.0 * (double)s.hits[ph] / (double)rows, s.misses[ph],
+                         (double)s.host_bytes[ph] / (1024.0 * 1024.0),
+                         c->table_host == 1 ? "host" : c->table_host == 0 ? "device" : "unknown");
         }
     }
     ple_cache_free(c);
@@ -1245,15 +1306,17 @@ extern "C" int r4d_ple_stats(void* instance, R4dPleCacheStats* out) {
         out->misses[ph] = s.misses[ph];
         out->host_bytes[ph] = s.host_bytes[ph];
     }
+    out->table_host = c->table_host;
     return 0;
 }
 
 /* The on-demand dump (RadStatsDumpFn, abi/rad_abi.h): --profile-ops calls this with the time it
  * measured for the gather in a step of each phase, so one line a phase carries everything MAIN-60
  * needs to read -- hits, misses, the rate, the bytes the missing rows actually fetched from host
- * memory, and the op's own time. Key=value so a runner reads it without a parser. A phase the op
- * never ran in with counters of its own still prints (a step of it happened after the counters
- * were last reset); `gather_ms=na` is a phase the caller never timed. */
+ * memory and the table's own space (a device-resident table fetches no host bytes, so a 0 there is
+ * not a lost counter), and the op's own time. Key=value so a runner reads it without a parser. A
+ * phase the op never ran in with counters of its own still prints (a step of it happened after the
+ * counters were last reset); `gather_ms=na` is a phase the caller never timed. */
 extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n_phase) {
     R4dPleCacheStats s{};
     if (r4d_ple_stats(instance, &s) != 0) {
@@ -1262,6 +1325,7 @@ extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n
         return;
     }
     static const char* const kName[kPleStatsPhases] = { "prefill", "decode", "mixed" };
+    const char* const space = s.table_host == 1 ? "host" : s.table_host == 0 ? "device" : "unknown";
     for (uint32_t ph = 0; ph < kPleStatsPhases; ++ph) {
         const unsigned long long rows = s.hits[ph] + s.misses[ph];
         char ms[32] = "na";
@@ -1269,9 +1333,9 @@ extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n
             std::snprintf(ms, sizeof ms, "%.3f", phase_ms[ph]);
         if (!rows && !std::strcmp(ms, "na")) continue;
         std::fprintf(stderr, "    ple_cache phase=%s hits=%llu misses=%llu hit_rate=%.4f "
-                             "host_read_bytes=%llu gather_ms=%s\n",
+                             "host_read_bytes=%llu table=%s gather_ms=%s\n",
                      kName[ph], s.hits[ph], s.misses[ph],
-                     rows ? (double)s.hits[ph] / (double)rows : 0.0, s.host_bytes[ph], ms);
+                     rows ? (double)s.hits[ph] / (double)rows : 0.0, s.host_bytes[ph], space, ms);
     }
 }
 
@@ -1280,8 +1344,10 @@ extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n
 static bool ple_cache_binds(PleVramCache* c, const void* table) {
     const void* bound = c->table.load(std::memory_order_acquire);
     if (!bound &&
-        c->table.compare_exchange_strong(bound, table, std::memory_order_acq_rel))
+        c->table.compare_exchange_strong(bound, table, std::memory_order_acq_rel)) {
+        c->table_host = ple_table_host(table);
         return true;
+    }
     return bound == table;
 }
 
@@ -1293,11 +1359,13 @@ static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, co
         return R4D_EMIT(stream, (ple_embed_lookup_q_probe_kernel), dim3((uint32_t)M),
                         dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                         (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                        c->sets, c->probe, c->stats, phase) == RAD_OK ? 0 : -4;
+                        c->sets, c->probe, c->stats, phase,
+                        (uint32_t)(c->table_host == 1 ? 1u : 0u)) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
                     dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                     (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                    c->sets, c->stats, phase) == RAD_OK ? 0 : -4;
+                    c->sets, c->stats, phase,
+                    (uint32_t)(c->table_host == 1 ? 1u : 0u)) == RAD_OK ? 0 : -4;
 }
 
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,

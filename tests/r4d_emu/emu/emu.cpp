@@ -476,3 +476,35 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
     }
     S.park = nullptr;
 }
+
+/* ---- where a pointer lives (hipPointerGetAttributes)
+ *
+ * The emulator's allocations are host memory, so a plugin asking the driver about its own buffers
+ * gets "host" -- the PLE cache's host-read accounting, for one. A test that wants the other branch
+ * marks a range as device-resident; the range list is process-wide and cleared by emu_clear_devices.
+ */
+namespace {
+struct EmuDevRange { const char* p; size_t n; };
+std::vector<EmuDevRange> g_dev_ranges;
+}  // namespace
+
+void emu_mark_device(const void* p, size_t n) {
+    if (p && n) g_dev_ranges.push_back({(const char*)p, n});
+}
+
+void emu_clear_devices() { g_dev_ranges.clear(); }
+
+hipError_t hipPointerGetAttributes(hipPointerAttribute_t* a, const void* p) {
+    if (!a || !p) return 1;
+    *a = hipPointerAttribute_t{};
+    const char* q = (const char*)p;
+    for (const EmuDevRange& r : g_dev_ranges)
+        if (q >= r.p && q < r.p + r.n) {
+            a->type = hipMemoryTypeDevice;
+            a->devicePointer = (void*)p;
+            return 0;
+        }
+    a->type = hipMemoryTypeHost;
+    a->hostPointer = (void*)p;
+    return 0;
+}

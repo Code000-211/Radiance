@@ -1440,6 +1440,17 @@ int Engine::plan() {
             arena_plan_bytes(r->program, nullptr, &f.arena);
             f.statics = wf.statics;
             f.experts = wf.experts;
+            /* Kernel instances that hold device bytes of their own (the PLE VRAM cache). Their
+             * init() ran before this reading, so the bytes are inside what `already held` measures
+             * below; the figure only lets the budget report name that part of it. */
+            for (const OpInfo& oi : r->program.ops)
+                for (const Band& bd : oi.bands)
+                    for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                        const Resolved&            rs = bd.dom[d];
+                        const RadKernelInfo* const ki = rs.row ? rs.row->info : nullptr;
+                        if (ki && ki->mem_bytes && rs.instance)
+                            f.plugin_held += ki->mem_bytes(rs.instance);
+                    }
             wfs.push_back(wf);
             /* The cache lends where units move and the pool can return blocks in place. */
             f.lends = VMem::supported() && !cfg_.deterministic &&

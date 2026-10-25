@@ -2390,17 +2390,25 @@ What the hit rate is worth on a given workload is a measurement this option does
 
 **Reading the cache.** The gather counts what it did, where it did it: the hits and misses at the
 generation compare, and the host bytes at the read site -- 320 bytes of this cache's VRAM for a hit,
-`kPleRow` (160) bytes over the link from the pinned table for a miss. Neither figure is derived from
-a mover's transfers, so they hold when the table is resident, when it is `ram`, and when a mover
-serves the same launch. The counters are three sets, one a phase, and the phase is the step's:
-`RadBatch::phase` is copied into `RadArgs::phase` when the host builds the launch (ABI 27), and the
-gather counts into that column. Nothing is inferred from a batch size or a kernel name, so a
-`RAD_PHASE_MIXED` step's rows land in `mixed`, not in whichever column its token count suggests.
+`kPleRow` (160) bytes over the link for a miss *when the table is host memory*. Whether it is is
+asked once, at the bind: `hipPointerGetAttributes` on the table pointer names its space, and only a
+host allocation makes a miss a link read. A table the engine placed in VRAM adds misses and no host
+bytes, which is the truth of that deployment and not a dead counter; the dump and the `fini` line
+say which case it was (`table=host`, `table=device`, `table=unknown` for a pointer the driver does
+not know, where misses are counted and bytes are not, since overstating the link is the worse
+error). Neither figure is derived from a mover's transfers, so they hold when the table is resident,
+when it is `ram`, and when a mover serves the same launch. The counters are three sets, one a phase,
+and the phase is the step's: `RadBatch::phase` is copied into `RadArgs::phase` when the host builds
+the launch (ABI 27/28), and the gather counts into that column. Nothing is inferred from a batch
+size or a kernel name, so a `RAD_PHASE_MIXED` step's rows land in `mixed`, not in whichever column
+its token count suggests.
 
 A row whose id is out of range reads neither table and is counted in neither, so `hits + misses` is
-the rows that reached the compare, not the batch's row count. A cache that is off (`n` unset or `0`,
-or its allocation failed) never runs this code: its gathers are the uncached kernel, which has no
-counters, and the logs say so rather than printing zeros.
+the rows that reached the compare, not the batch's row count. A cache that is off never runs this
+code: its gathers are the uncached kernel, which has no counters, and the logs say so rather than
+printing zeros. Unset is the default and silent; an explicit `0` or a value that is not a number
+prints one line naming `RADIANCE_PLE_VRAM_CACHE_SETS` and what it asked for, so a run that meant to
+measure the cache cannot read the tables' traffic as this cache's misses.
 
 Two ways to read them:
 
@@ -2415,17 +2423,32 @@ telemetry, op 'embed_lookup_q' (embed_lookup_q_bf16):
     ple_cache phase=decode hits=8123 misses=77 hit_rate=0.9906 host_read_bytes=12320 gather_ms=0.402
 ```
 
-`gather_ms` is the time the same dump measured for the op in that phase (the row under it in the
-table is the whole run's). A phase the op never ran in prints `gather_ms=na` if its counters moved
-anyway, and a phase with neither is left out. The hook is `RadStatsDumpFn` (abi/rad_abi.h), a null
-field on every kernel that keeps no counters: the core calls it with the op's per-phase milliseconds
-(`-1` where the op never ran in that phase) and the plugin prints its own line, so the counters and
-the timing meet in one place without the core learning what a PLE row is. On the host side the
-counters hang off the instance (`r4d_ple_stats(instance, &out)`, `libr4d/r4d.h`, the test hook), not
-off a process-wide symbol, and a run that takes the uncached path leaves them at zero.
+`gather_ms` is the time the same dump measured *for that instance* in that phase (the row under it
+in the table is the whole run's, summed over every band and domain the op resolved into). An op with
+more than one counted instance -- a prefill band and a decode band, each with its own `init` -- gets
+one block an instance, `instance 2 of 2`, and each is handed its own time; handing both the op's
+cross-band sum would put a prefill chunk's milliseconds under a decode hit rate. A phase the
+instance never ran in prints `gather_ms=na` if its counters moved anyway, and a phase with neither
+is left out. The hook is `RadStatsDumpFn` (abi/rad_abi.h), a null field on every kernel that keeps
+no counters: the core calls it with that instance's per-phase milliseconds (`-1` where it never ran
+in that phase) and the plugin prints its own line, so the counters and the timing meet in one place
+without the core learning what a PLE row is. On the host side the counters hang off the instance
+(`r4d_ple_stats(instance, &out)`, `libr4d/r4d.h`, the test hook), not off a process-wide symbol, and
+a run that takes the uncached path leaves them at zero.
+
+**Where the reservation shows up.** The instance's own device bytes are reported through
+`RadMemFn` (abi/rad_abi.h, `r4d_ple_mem_bytes`): the tags, generations, heat counters and payload
+rows, plus the stats block, counted the way `init` allocated them. `init` runs before the engine
+measures free VRAM, so those bytes are already inside the budget's `already held`, and the startup
+report names them as a sub-line of it (`of which plugins ... kernel instances' own reservations`)
+instead of leaving the largest unexplained term unexplained. They are named, never subtracted again:
+the split is the same with and without the line.
+
 `tests/r4d_emu/test_plecache.cpp` asserts them a launch: one set a phase, `-1` rows counted in
-neither, one 160-byte link read for a two-row launch with one miss, and an uncached launch that
-moves nothing. That test is also the host-only check of the whole path: it needs no card and no
+neither, one 160-byte link read for a two-row launch with one miss, an uncached launch that moves
+nothing, an explicit `0` that allocates nothing and says why while unset stays silent, and a table
+marked device (`emu_mark_device`) where the same miss adds no host bytes and `r4d_ple_stats` reports
+`table_host=0`. That test is also the host-only check of the whole path: it needs no card and no
 HIP runtime.
 
 ### `ngram_ids`

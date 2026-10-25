@@ -722,12 +722,22 @@ private:
      * supply, so profiled and unprofiled runs are not comparable (spec §16). */
     bool                 profiling_ = false;
     struct ProfSlot { RadEvent a = nullptr, b = nullptr; int32_t op = 0; uint8_t lane = 0;
-                      uint8_t phase = 0; };   /* RAD_PHASE_* of the step that issued it */
+                      uint8_t phase = 0;   /* RAD_PHASE_* of the step that issued it */
+                      int32_t inst = -1; };  /* index into prof_inst_, -1 when the op has no hook */
     std::vector<ProfSlot> prof_ring_;
     size_t                prof_n_ = 0;
     bool                  prof_overflowed_ = false;
     std::vector<double>   prof_ms_;
     std::vector<int64_t>  prof_calls_;
+    /* One counted kernel instance's own time, split by phase. A telemetry hook hangs off an
+     * instance (RadStatsDumpFn), and a launch picks one band x domain instance of its op, so the
+     * time the hook is handed must be that instance's: the op's sum over every band and domain
+     * would hand a prefill band's millisecond to a decode band's counters. Built at bind from the
+     * issue table, sorted by instance pointer so the issue path only searches. */
+    struct ProfInst { const void* inst = nullptr; const RadKernelInfo* info = nullptr;
+                      int32_t op = 0; double ms[3] = {}; int64_t calls[3] = {}; };
+    std::vector<ProfInst> prof_inst_;
+    int32_t prof_inst_find(const void* inst) const;
     /* The same per op, split by the step's phase: a PLE gather at decode is a link read a row
      * where a prefill chunk's is a stream, and one average over both says nothing about either.
      * Indexed [phase * ops + op]. */

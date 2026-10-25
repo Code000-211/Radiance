@@ -643,6 +643,9 @@ void r4d_rad_embed_lookup_q_fini(void*);
 /* RadStatsDumpFn (abi/rad_abi.h): the cached gather's per-phase counters beside --profile-ops'
  * timing of the same op. Declared here with the r4d_*_q entry points it belongs to. */
 void r4d_ple_stats_dump(void*, const double*, int);
+/* RadMemFn (abi/rad_abi.h): the cache's own device bytes, so the VRAM budget can name them inside
+ * what it already counts as held instead of leaving them unexplained. */
+int64_t r4d_ple_mem_bytes(void*);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);

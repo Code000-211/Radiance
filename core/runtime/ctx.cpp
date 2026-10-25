@@ -784,7 +784,43 @@ int Ctx::bind_profiling() {
             return RAD_E_DEVICE;
         }
     }
+
+    /* The instances a telemetry hook hangs off, and the op each belongs to: built here, before the
+     * step path runs, so an issue only searches. Collated and deduplicated by pointer, because one
+     * instance can serve several bands x domains of its op. */
+    prof_inst_.clear();
+    for (size_t i = 1; i < program_->ops.size() && i < plans_.size(); ++i) {
+        const OpPlan& op = plans_[i];
+        for (int b = 0; b < op.n_bands; ++b) {
+            for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                const size_t k = (size_t)op.plan_off + (size_t)b * RAD_N_DOMAINS + (size_t)d;
+                if (k >= issue_table_.size()) continue;
+                const IssuePlan&      ip = issue_table_[k];
+                const RadKernelInfo* ki = ip.row ? ip.row->info : nullptr;
+                if (!ki || !ki->stats_dump || !ip.args.instance) continue;
+                ProfInst pi;
+                pi.inst = ip.args.instance;
+                pi.info = ki;
+                pi.op   = (int32_t)i;
+                prof_inst_.push_back(pi);
+            }
+        }
+    }
+    std::sort(prof_inst_.begin(), prof_inst_.end(),
+              [](const ProfInst& a, const ProfInst& b) { return a.inst < b.inst; });
+    prof_inst_.erase(std::unique(prof_inst_.begin(), prof_inst_.end(),
+                                 [](const ProfInst& a, const ProfInst& b) {
+                                     return a.inst == b.inst;
+                                 }),
+                     prof_inst_.end());
     return RAD_OK;
+}
+
+int32_t Ctx::prof_inst_find(const void* inst) const {
+    if (!inst || prof_inst_.empty()) return -1;
+    const auto it = std::lower_bound(prof_inst_.begin(), prof_inst_.end(), inst,
+                                     [](const ProfInst& p, const void* k) { return p.inst < k; });
+    return it != prof_inst_.end() && it->inst == inst ? (int32_t)(it - prof_inst_.begin()) : -1;
 }
 
 void Ctx::profile_collect() {
@@ -807,6 +843,13 @@ void Ctx::profile_collect() {
         if ((size_t)s.op < program_->ops.size() && s.phase < 3) {
             prof_ms_ph_[(size_t)s.phase * program_->ops.size() + (size_t)s.op] += (double)ms;
             ++prof_calls_ph_[(size_t)s.phase * program_->ops.size() + (size_t)s.op];
+        }
+        /* The same measurement into the instance's own counters: a hook is per instance, and the
+         * launch named the one its band and domain chose. */
+        if (s.inst >= 0 && (size_t)s.inst < prof_inst_.size() && s.phase < 3) {
+            ProfInst& pi = prof_inst_[(size_t)s.inst];
+            pi.ms[s.phase] += (double)ms;
+            ++pi.calls[s.phase];
         }
         const ProfSlot*& p = prev[s.lane & 1];
         float gap = 0.0f;
@@ -884,38 +927,25 @@ void Ctx::dump_profile() const {
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
 
     /* Plugin telemetry, where a kernel's counters meet the timing this dump measured: a kernel that
-     * keeps counters prints one line a phase through RadStatsDumpFn (abi/rad_abi.h). Nothing is
-     * printed for a kernel that keeps none, so an unprofiled feature costs no output. */
+     * keeps counters prints one line a phase through RadStatsDumpFn (abi/rad_abi.h), handed its own
+     * instance's time. An op with two counted instances prints once per instance -- the prefill band
+     * and the decode band are not one number. Nothing is printed for a kernel that keeps none, so an
+     * unprofiled feature costs no output. */
     {
-        const size_t nops = program_->ops.size();
-        std::vector<const void*> seen;
         for (size_t i : order) {
-            if (i >= plans_.size()) continue;
-            const OpPlan& op = plans_[i];
-            double ms[3] = { -1.0, -1.0, -1.0 };
-            for (int ph = 0; ph < 3; ++ph) {
-                const size_t k = (size_t)ph * nops + i;
-                if (k < prof_calls_ph_.size() && prof_calls_ph_[k]) ms[ph] = prof_ms_ph_[k];
-            }
-            /* An op's bands x domains hold the plans it was bound to; the first one carrying a
-             * stats hook and an instance speaks for the op (a launch picks one instance). */
-            for (int b = 0; b < op.n_bands; ++b) {
-                for (int d = 0; d < RAD_N_DOMAINS; ++d) {
-                    const size_t k = (size_t)op.plan_off + (size_t)b * RAD_N_DOMAINS + (size_t)d;
-                    if (k >= issue_table_.size()) continue;
-                    const IssuePlan&      ip = issue_table_[k];
-                    const RadKernelInfo* ki = ip.row ? ip.row->info : nullptr;
-                    if (!ki || !ki->stats_dump || !ip.args.instance) continue;
-                    if (std::find(seen.begin(), seen.end(), ip.args.instance) != seen.end())
-                        continue;
-                    seen.push_back(ip.args.instance);
-                    fprintf(stderr, "telemetry, op '%s' (%s):\n",
-                            program_->ops[i].op.c_str(), ki->name ? ki->name : "?");
-                    ki->stats_dump(ip.args.instance, ms, 3);
-                    fprintf(stderr, "\n");
-                    b = op.n_bands;   /* this op's counter instance is known: move on */
-                    break;
-                }
+            int n_inst = 0, nth = 0;
+            for (const ProfInst& pi : prof_inst_) n_inst += pi.op == (int32_t)i;
+            if (!n_inst) continue;
+            for (const ProfInst& pi : prof_inst_) {
+                if (pi.op != (int32_t)i) continue;
+                double ms[3] = { -1.0, -1.0, -1.0 };
+                for (int ph = 0; ph < 3; ++ph)
+                    if (pi.calls[ph]) ms[ph] = pi.ms[ph];
+                fprintf(stderr, "telemetry, op '%s' (%s), instance %d of %d:\n",
+                        program_->ops[i].op.c_str(), pi.info->name ? pi.info->name : "?",
+                        ++nth, n_inst);
+                pi.info->stats_dump(const_cast<void*>(pi.inst), ms, 3);
+                fprintf(stderr, "\n");
             }
         }
     }

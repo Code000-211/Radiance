@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 27 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 28 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -450,7 +450,7 @@
 { "RadKVGroupDecl", "head_dim", 24, 8 },
 { "RadKVGroupDecl", "state_dim", 32, 16 },
 { "RadKVGroupDecl", "conv_width", 48, 8 },
-{ "RadKernelInfo", "", 0, 176 },
+{ "RadKernelInfo", "", 0, 184 },
 { "RadKernelInfo", "name", 0, 8 },
 { "RadKernelInfo", "op", 8, 8 },
 { "RadKernelInfo", "family", 16, 8 },
@@ -474,6 +474,7 @@
 { "RadKernelInfo", "unrelayout", 152, 8 },
 { "RadKernelInfo", "replaces", 160, 8 },
 { "RadKernelInfo", "stats_dump", 168, 8 },
+{ "RadKernelInfo", "mem_bytes", 176, 8 },
 { "RadLayout", "", 0, 80 },
 { "RadLayout", "tag", 0, 8 },
 { "RadLayout", "dtype", 8, 4 },

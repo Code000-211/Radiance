@@ -1144,6 +1144,54 @@ TEST(the_profile_dump_hands_a_kernel_its_own_per_phase_times) {
     CHECK(g_stats_ms[2] == -1.0);             /* and never in a mixed one */
 }
 
+/* An op that resolved into two bands has two instances, and each is handed its own time. Handing
+ * both the op's cross-band sum -- or printing one instance's line with the other's numbers -- is
+ * the bug this reddens on: a prefill instance's time is not a decode instance's. */
+static int    g_two_anchor[2] = { 0, 0 };
+static int    g_two_calls[2]  = { 0, 0 };
+static double g_two_ms[2][3];
+static void*  g_two_inst[2]   = { nullptr, nullptr };
+static void stats_dump_two(void* inst, const double* ms, int n) {
+    const int k = inst == &g_two_anchor[0] ? 0 : 1;
+    ++g_two_calls[k];
+    g_two_inst[k] = inst;
+    for (int i = 0; i < 3; ++i) g_two_ms[k][i] = i < n ? ms[i] : -3.0;
+}
+
+TEST(a_second_instance_is_handed_its_own_time) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    /* Two bands of one op, each with its own kernel row and its own instance: the shape a small-M
+     * and a large-M band of the PLE gather take, both counted. */
+    rad_op op = f.add_op("gemm_nt", "M", { 16, 8192 }, { k_pre, k_pre }, { "small", "large" },
+                         &g_gemm_schema, { w });
+    for (RadKernelInfo& ki : f.infos) ki.stats_dump = stats_dump_two;
+    f.P.ops[op].bands[0].dom[RAD_DOMAIN_DEVICE].instance = &g_two_anchor[0];
+    f.P.ops[op].bands[1].dom[RAD_DOMAIN_DEVICE].instance = &g_two_anchor[1];
+    CHECK_OK(f.start(nullptr, /*profile=*/true));
+
+    for (int n_tok : { 64, 1 }) {             /* the 8192 band in a prefill step, then the 16 one */
+        CHECK_OK(f.step(n_tok, 0, [&](Ctx& c) {
+            RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+            CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        }));
+    }
+    g_two_calls[0] = g_two_calls[1] = 0;
+    for (auto& m : g_two_ms) m[0] = m[1] = m[2] = -2.0;
+    f.ctx.dump_profile();
+
+    CHECK_EQ(g_two_calls[0], 1);              /* once an instance, not once an op */
+    CHECK_EQ(g_two_calls[1], 1);
+    CHECK(g_two_inst[0] == &g_two_anchor[0]);
+    CHECK(g_two_inst[1] == &g_two_anchor[1]);
+    CHECK(g_two_ms[1][0] >= 0.0);             /* the large band was timed in the prefill step */
+    CHECK(g_two_ms[1][1] == -1.0);            /* and never in the decode one */
+    CHECK(g_two_ms[0][1] >= 0.0);             /* the small band: the decode step only */
+    CHECK(g_two_ms[0][0] == -1.0);
+}
+
 /* The barrier is a condvar over threads in one process, not IPC: ranks share an address space and
  * the batch is shared by pointer (spec §1). It only has to order the release. */
 TEST(rank_barrier_releases_all_ranks) {

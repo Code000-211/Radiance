@@ -959,6 +959,14 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                 ++prof_calls_ph_[k];
             }
         }
+        /* The instance's own time, for the hook it hands it to: the launch names the band x domain
+         * instance, and a prefill band's time is not a decode band's. */
+        if (const int32_t ix = prof_inst_find(ip.args.instance); ix >= 0) {
+            ProfInst&      pi = prof_inst_[(size_t)ix];
+            const uint8_t ph = (uint8_t)(phase_ >= 0 && phase_ < 3 ? phase_ : 2);
+            pi.ms[ph] += ms;
+            ++pi.calls[ph];
+        }
         if ((size_t)h < prof_host_.size()) prof_host_[(size_t)h] = 1;
     } else if (profiling_) {
         /* Spec §16 per-op timing: events around the launch, read by a sync at the end of the
@@ -968,6 +976,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             ps.op = (int32_t)h;
             ps.lane = (uint8_t)lane_;
             ps.phase = (uint8_t)(phase_ >= 0 && phase_ < 3 ? phase_ : 2);
+            ps.inst = prof_inst_find(ip.args.instance);
             rad_event_record(ps.a, cur_stream());
             s = ip.launch(la, cur_stream());
             rad_event_record(ps.b, cur_stream());

@@ -189,6 +189,19 @@ inline hipError_t hipMemcpy(void* dst, const void* src, size_t n, hipMemcpyKind)
     std::memcpy(dst, src, n);
     return 0;
 }
+/* Where a pointer lives. Everything is host memory unless the test says otherwise, which is what a
+ * plugin asking the driver about its table (the PLE cache's host_bytes) needs: emu_mark_device names
+ * a range the emulator reports as device-resident, so the host-memory path is not the only one a
+ * test can reach. */
+enum hipMemoryType { hipMemoryTypeHost = 1, hipMemoryTypeDevice = 2, hipMemoryTypeManaged = 3 };
+struct hipPointerAttribute_t {
+    hipMemoryType type;
+    void*         devicePointer;
+    void*         hostPointer;
+};
+hipError_t hipPointerGetAttributes(hipPointerAttribute_t* a, const void* p);
+void       emu_mark_device(const void* p, size_t n);
+void       emu_clear_devices();
 
 struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };

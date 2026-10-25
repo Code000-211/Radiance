@@ -17,7 +17,7 @@ extern "C" {
  * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
  * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
  * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 27u
+#define RAD_ABI_VERSION 28u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -432,6 +432,14 @@ typedef int (*RadFuseFn)(const RadParam* p, int n_p, uint64_t present, int step,
  * which is the shutdown dump: it has the counters but not the timing. */
 typedef void (*RadStatsDumpFn)(void* instance, const double* phase_ms, int n_phase);
 
+/* Optional: the device bytes this instance holds for itself, counted the way it allocated them (a
+ * row cache's payload, its tags and its counters). The core reads this before it splits the VRAM,
+ * so the budget report can name the sum instead of leaving an unexplained part of "already held".
+ * The bytes are already in that measured figure -- init() runs before the reading -- so a caller
+ * discloses them there and must not subtract them a second time. Null means the instance holds
+ * nothing of its own to declare. */
+typedef int64_t (*RadMemFn)(void* instance);
+
 /* ================================================================== kernel rows */
 typedef struct RadKernelInfo {
     const char* name;       /* entry point, unique within the plugin */
@@ -475,6 +483,7 @@ typedef struct RadKernelInfo {
      * pointer type, part of that shift would still compile. Append new fields at the end. */
     RadFuseFn      replaces;
     RadStatsDumpFn stats_dump;   /* see RadStatsDumpFn: null when the kernel keeps no counters */
+    RadMemFn       mem_bytes;    /* see RadMemFn: null when the instance holds nothing of its own */
 } RadKernelInfo;
 
 /* ================================================================== kernel plugin exports */

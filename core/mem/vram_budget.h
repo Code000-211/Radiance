@@ -86,6 +86,11 @@ struct VramFacts {
      * that merely *offers* a vector would plan its expert cache against a smaller card than one
      * that does not, which is exactly the difference "off == stock" cannot allow. */
     int64_t held_out   = 0;
+    /* Kernel instances' own device reservations, as each reports them through RadMemFn
+     * (abi/rad_abi.h): the PLE VRAM cache's payload, tags and counters. They are allocated in the
+     * plugin's init(), before this reading, so they are already inside `already_held`; the figure
+     * only names that part of it, and the budget must not charge it a second time. */
+    int64_t plugin_held = 0;
     /* Integrated graphics: host memory the card must leave to the host, since device memory is
      * host memory there. 0 on a discrete card. */
     int64_t host_reserve = 0;
@@ -95,6 +100,7 @@ struct VramFacts {
  * device that reports no capacity, because the placement and pool reports want the totals. */
 struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
+    int64_t plugin_held = 0;          /* the named part of already_held (VramFacts::plugin_held) */
     int64_t drift = 0;                /* kDriverDrift: what already_held moves by after it is read */
     int64_t queues = 0;               /* n_queues * queue_bytes, from the rank that needs most */
     int64_t prefetch = 0;             /* the expert prefetch's ring and buffers */
