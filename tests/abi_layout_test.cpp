@@ -57,8 +57,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 28 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 28, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 29 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 29, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };

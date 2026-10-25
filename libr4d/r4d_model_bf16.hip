@@ -1175,11 +1175,19 @@ static uint32_t ple_cache_sets_from_env(std::string* why_off) {
 }
 
 /* True when `table` is host memory, which is what makes a miss's kPleRow a link read. Asked once,
- * at bind, on the host: hipPointerGetAttributes names the allocation's space. -1 when it cannot say
- * (a plugin-side table pointer the driver does not know), where the launch counts misses but no
- * host bytes -- overstating the link is the error to avoid. A managed table reads as device: the
+ * at bind, on the host. -1 when nothing can say, where the launch counts misses but no host bytes
+ * and the dump prints the byte column as unmeasured rather than as a measured 0 -- overstating the
+ * link is one error, reporting a figure that was never taken as 0 is the other.
+ *
+ * The engine's own placement (RadTensor::space) answers first, because it knows something the
+ * driver does not: the backend locks its host pool with hsa_amd_memory_lock_to_pool and keeps the
+ * ranges in its own table (core/device/aql.cpp), so hipPointerGetAttributes reports those bytes as
+ * an allocation it cannot classify. Only when the engine declined to say (a raw pointer, a KV
+ * pool, a weight a mover owns) does this ask the driver. A managed table reads as device: the
  * driver migrates it, so its rows are not a transfer this cache can attribute. */
-static int ple_table_host(const void* table) {
+static int ple_table_host(const void* table, int space) {
+    if (space == RAD_SPACE_HOST) return 1;
+    if (space == RAD_SPACE_DEVICE) return 0;
     hipPointerAttribute_t a{};
     if (!table || hipPointerGetAttributes(&a, table) != hipSuccess) return -1;
     return a.type == hipMemoryTypeHost ? 1 : 0;
@@ -1267,10 +1275,15 @@ extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
         for (uint32_t ph = 0; ph < kPleStatsPhases; ++ph) {
             const unsigned long long rows = s.hits[ph] + s.misses[ph];
             if (!rows) continue;
+            /* A table nothing could classify: the miss count stands, the byte count was never
+             * taken, and printing 0 here would claim the misses transferred nothing. */
+            char reads[48];
+            if (c->table_host < 0) std::snprintf(reads, sizeof reads, "n/a (table unknown)");
+            else std::snprintf(reads, sizeof reads, "%llu B", s.host_bytes[ph]);
             std::fprintf(stderr, "[r4d] ple cache: %s rows %llu, hits %llu (%.1f%%), misses "
-                                 "%llu, host reads %.2f MiB, table %s\n", kName[ph], rows,
+                                 "%llu, host reads %s, table %s\n", kName[ph], rows,
                          s.hits[ph], 100.0 * (double)s.hits[ph] / (double)rows, s.misses[ph],
-                         (double)s.host_bytes[ph] / (1024.0 * 1024.0),
+                         reads,
                          c->table_host == 1 ? "host" : c->table_host == 0 ? "device" : "unknown");
         }
     }
@@ -1332,20 +1345,23 @@ extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n
         if (phase_ms && (int)ph < n_phase && phase_ms[ph] >= 0.0)
             std::snprintf(ms, sizeof ms, "%.3f", phase_ms[ph]);
         if (!rows && !std::strcmp(ms, "na")) continue;
+        char bytes[32];
+        if (s.table_host < 0) std::snprintf(bytes, sizeof bytes, "na");
+        else std::snprintf(bytes, sizeof bytes, "%llu", s.host_bytes[ph]);
         std::fprintf(stderr, "    ple_cache phase=%s hits=%llu misses=%llu hit_rate=%.4f "
-                             "host_read_bytes=%llu table=%s gather_ms=%s\n",
+                             "host_read_bytes=%s table=%s gather_ms=%s\n",
                      kName[ph], s.hits[ph], s.misses[ph],
-                     rows ? (double)s.hits[ph] / (double)rows : 0.0, s.host_bytes[ph], space, ms);
+                     rows ? (double)s.hits[ph] / (double)rows : 0.0, bytes, space, ms);
     }
 }
 
 /* True when this launch may use `c` for `table`: the first table seen binds the instance, and any
  * other leaves the cache alone. */
-static bool ple_cache_binds(PleVramCache* c, const void* table) {
+static bool ple_cache_binds(PleVramCache* c, const void* table, int space) {
     const void* bound = c->table.load(std::memory_order_acquire);
     if (!bound &&
         c->table.compare_exchange_strong(bound, table, std::memory_order_acq_rel)) {
-        c->table_host = ple_table_host(table);
+        c->table_host = ple_table_host(table, space);
         return true;
     }
     return bound == table;
@@ -1881,7 +1897,7 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     PleVramCache* cache = (PleVramCache*)a->instance;
     if (cache && cache->sets && q && n_embd == (long long)kPleRow && x_ld >= (long long)kPleRow &&
         x_ld % 8 == 0 && M <= 0x7fffffffLL && r4d_aligned(x->data, 16) &&
-        r4d_aligned(wte->data, 8) && ple_cache_binds(cache, wte->data))
+        r4d_aligned(wte->data, 8) && ple_cache_binds(cache, wte->data, wte->space))
         return embed_lookup_q_cached_emit((const int32_t*)r4d_addr(tok), (const uint8_t*)r4d_addr(wte),
                                           sc ? (const void*)r4d_addr(sc) : nullptr,
                                           sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,

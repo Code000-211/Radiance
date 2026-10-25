@@ -122,6 +122,14 @@ An absent optional operand is a null `RadTensor.data`, not a shorter operand cou
 a shorter array shifts every later operand by one. `rad_arg_in()` in `rad_plugin.h` fetches an
 operand correctly.
 
+`RadTensor::space` is where the operand's bytes lie, as the engine's own placement knows it
+(`RAD_SPACE_DEVICE`, `RAD_SPACE_HOST`, or `RAD_SPACE_UNKNOWN` when the engine declines to say -- a
+raw pointer it did not allocate, a KV pool, a weight a mover owns). Ask it before asking the
+driver: the backend locks its host pool itself (`core/device/aql.cpp`), and `hipPointerGetAttributes`
+reports those ranges as unclassifiable rather than as host memory. A kernel that accounts for what
+it read can then tell a device read from a link read. Where neither the operand nor the driver can
+say, report the figure as unmeasured rather than as 0.
+
 ---
 
 ## 4. Optional kernel hooks

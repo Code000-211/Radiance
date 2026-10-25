@@ -486,18 +486,25 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
 namespace {
 struct EmuDevRange { const char* p; size_t n; };
 std::vector<EmuDevRange> g_dev_ranges;
+std::vector<EmuDevRange> g_unknown_ranges;   /* ranges the driver cannot classify */
 }  // namespace
 
 void emu_mark_device(const void* p, size_t n) {
     if (p && n) g_dev_ranges.push_back({(const char*)p, n});
 }
 
-void emu_clear_devices() { g_dev_ranges.clear(); }
+void emu_mark_unknown(const void* p, size_t n) {
+    if (p && n) g_unknown_ranges.push_back({(const char*)p, n});
+}
+
+void emu_clear_devices() { g_dev_ranges.clear(); g_unknown_ranges.clear(); }
 
 hipError_t hipPointerGetAttributes(hipPointerAttribute_t* a, const void* p) {
     if (!a || !p) return 1;
     *a = hipPointerAttribute_t{};
     const char* q = (const char*)p;
+    for (const EmuDevRange& r : g_unknown_ranges)
+        if (q >= r.p && q < r.p + r.n) return 1;   /* what the driver says about a locked pool */
     for (const EmuDevRange& r : g_dev_ranges)
         if (q >= r.p && q < r.p + r.n) {
             a->type = hipMemoryTypeDevice;

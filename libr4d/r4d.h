@@ -706,8 +706,10 @@ int r4d_ple_probe(void* instance, unsigned* ctl);
 // `host_bytes` the bytes those misses fetched from a table in host memory -- counted where the
 // gather compares its generation and loads its payload, not taken from a mover's transfers. A miss
 // against a device-resident table is served from VRAM and adds no host bytes; `table_host` (1 host,
-// 0 device, -1 could not tell) is why the figure reads 0. Index 0 is prefill, 1 decode, 2 mixed
-// (RAD_PHASE_*, abi/rad_runtime.h).
+// 0 device, -1 nothing could tell) is why the figure reads 0. The engine's placement
+// (RadTensor::space) is asked first, then the driver, so a table the backend locked into its host
+// pool still reads as host. At -1 the bytes were never taken: the dump prints them as `na` rather
+// than as a measured 0. Index 0 is prefill, 1 decode, 2 mixed (RAD_PHASE_*, abi/rad_runtime.h).
 // Returns 0 and fills *out from the instance's device counters (a running total, not reset), or
 // -1 when the instance holds no cache -- RADIANCE_PLE_VRAM_CACHE_SETS unset or its allocation
 // failed -- where there is nothing to count and every row is read from the table.

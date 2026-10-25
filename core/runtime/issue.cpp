@@ -626,6 +626,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             /* Template: declared dtype, rank, shape and packed strides; data is already
              * arena_base + BufferInfo::arena_offset. */
             tt = buf_tmpl_[bh];
+            tt.space = buf_host_[bh] ? RAD_SPACE_HOST : RAD_SPACE_DEVICE;
             touches_host |= buf_host_[bh] != 0;
             if (o.offset) {
                 int64_t d;
@@ -685,6 +686,15 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "returned", i, wh));
             tt      = w_tmpl_[wh];
             tt.data = resolve_weight(wh);
+            /* Where the bytes lie, for a plugin that has to account for a read: the planner's
+             * site, which already knows a table placed in host memory is read over the link
+             * (DeviceZeroCopy) and one in VRAM is not. */
+            {
+                const Site site = program_->weights[wh].site;
+                tt.space = site == Site::Device || site == Site::DeviceStaged
+                               ? RAD_SPACE_DEVICE
+                               : RAD_SPACE_HOST;
+            }
             w_direct_[wh] = 1;
             if (!tt.data)
                 return abort_step_msg(h, RAD_E_STATE,
@@ -735,6 +745,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "slice the entries at declare instead", i));
             const int rc = resolve_weight_table(h, i, (rad_weight)w0, cnt, &tt);
             if (rc < 0) return rc;
+            tt.space = RAD_SPACE_DEVICE;   /* the pointer array itself, not the entries */
             break;
         }
 
@@ -792,6 +803,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             std::memset(&tt, 0, sizeof tt);
             tt.data  = static_cast<char*>(b.base) + off;
             tt.dtype = b.dtype;
+            tt.space = RAD_SPACE_DEVICE;
             /* The operand carries the layer's shape, composed at load (see KVPoolBinding in
              * ctx.h); libr4d shims refuse a flat span. */
             if (b.rank) {

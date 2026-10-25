@@ -1965,6 +1965,29 @@ TEST(a_host_op_on_untracked_memory_drains_the_stream_first) {
     }
 }
 
+/* Where an operand lies, as the engine knows it (RadTensor::space, ABI 29). A plugin that accounts
+ * for what it read has to tell a link read from a device one, and the engine knows what the driver
+ * does not: the backend locks its host pool itself and hsa_amd_pointer_info reports those ranges as
+ * unknown (core/device/aql.cpp). So the operand says host for a host-domain buffer, device for one
+ * in the arena, and unknown for a raw pointer the core never allocated -- never host by default. */
+TEST(an_operand_carries_the_space_the_engine_placed_it_in) {
+    ord_setup();
+    Fixture f;
+    rad_buf hb = f.add_buffer("ids", RAD_I32, 8, 1, 0);
+    f.P.buffers[hb].decl.domain = RAD_DOMAIN_HOST;
+    rad_buf db = f.add_buffer("dv", RAD_I32, 8, 1, 256);
+    rad_op op = f.add_op("rope", "M", { 8192 }, { k_m64 }, { "m64" }, nullptr, {});
+    CHECK_OK(f.start());
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        const RadOperand o[3] = { RAD_B(hb), RAD_B(db), RAD_P_T(g_ord_raw, RAD_I32) };
+        CHECK_OK(c.issue(op, o, 3, RAD_N_BATCH));
+    }));
+    REQUIRE(!g_rec.empty());
+    CHECK_EQ(g_rec.back().t[0].space, RAD_SPACE_HOST);
+    CHECK_EQ(g_rec.back().t[1].space, RAD_SPACE_DEVICE);
+    CHECK_EQ(g_rec.back().t[2].space, RAD_SPACE_UNKNOWN);
+}
+
 /* A second lane built mid-step starts behind everything lane 0 issued, even though the join that
  * asked for it ran before the lane existed. Unordered, the first picture after startup came out
  * different from every later one. */

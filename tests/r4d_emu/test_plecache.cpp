@@ -80,6 +80,9 @@ struct Fx {
     std::vector<int32_t> tok;
     std::vector<uint16_t> xbuf;    /* 16-byte aligned base, M rows of kRow bf16 */
     uint16_t* x = nullptr;
+    /* What the engine says about the table (RadTensor::space). RAD_SPACE_UNKNOWN leaves the plugin
+     * to ask the driver, which is the ordinary in-tree case for a table it placed itself. */
+    int wte_space = RAD_SPACE_UNKNOWN;
 
     static_assert(kWays == 4 && kRow == 160, "the constants above are the gather's own");
 
@@ -106,6 +109,7 @@ struct Fx {
         t[1].data = wte.data(); t[1].dtype = RAD_F8E4M3; t[1].rank = 2;
         t[1].shape[0] = n_vocab; t[1].shape[1] = kRow;
         t[1].stride[0] = kRow; t[1].stride[1] = 1;
+        t[1].space = wte_space;
         t[2].data = scb.data(); t[2].dtype = RAD_BF16; t[2].rank = 1;
         t[2].shape[0] = 1; t[2].stride[0] = 1;
         t[3].data = x; t[3].dtype = RAD_BF16; t[3].rank = 2;
@@ -360,6 +364,61 @@ int main() {
         }
     }
 
+    /* Off is the generic kernel, and it has to be the one that runs: every row read from the
+     * table, nothing counted. The table here holds exactly two E4M3 codes with exact values --
+     * 0x38 is 1.0, 0x00 is zero -- at scale 1.0, so the expectation is hand-computed instead of
+     * being another launch of the same op: 160 entries of 1.0 (bf16 0x3f80) for the ones row and
+     * 160 zeros for the zeros row. The host read volume of this path is one kPleRow a valid id,
+     * 2 x 160 = 320 bytes here -- arithmetic, not a counter: nothing on the host observes a load,
+     * which is why the cache counts at the load site when it is on (docs/OPS.md). */
+    {
+        const int one_id = 7, zero_id = 9;
+        std::vector<uint8_t> wte2((size_t)32 * kRow, 0);
+        std::memset(&wte2[(size_t)one_id * kRow], 0x38, kRow);
+        std::vector<uint16_t> sc2{f2b(1.0f)};
+        std::vector<int32_t> tok2{one_id, zero_id};
+        std::vector<uint16_t> xb((size_t)tok2.size() * kRow + 16, 0xdead);
+        uint16_t* xo = (uint16_t*)(((uintptr_t)xb.data() + 15) & ~(uintptr_t)15);
+        RadTensor t[4]{};
+        t[0].data = tok2.data(); t[0].dtype = RAD_I32; t[0].rank = 1;
+        t[0].shape[0] = (int64_t)tok2.size(); t[0].stride[0] = 1;
+        t[1].data = wte2.data(); t[1].dtype = RAD_F8E4M3; t[1].rank = 2;
+        t[1].shape[0] = 32; t[1].shape[1] = kRow;
+        t[1].stride[0] = kRow; t[1].stride[1] = 1;
+        t[1].space = RAD_SPACE_HOST;
+        t[2].data = sc2.data(); t[2].dtype = RAD_BF16; t[2].rank = 1;
+        t[2].shape[0] = 1; t[2].stride[0] = 1;
+        t[3].data = xo; t[3].dtype = RAD_BF16; t[3].rank = 2;
+        t[3].shape[0] = (int64_t)tok2.size(); t[3].shape[1] = kRow;
+        t[3].stride[0] = kRow; t[3].stride[1] = 1;
+        RadArgs a{};
+        a.t = t; a.n_t = 4; a.phase = RAD_PHASE_PREFILL;
+
+        void* off = nullptr;
+        (void)setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "0", 1);
+        const int r0 = r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &off);
+        (void)unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        const int  r = r4d_rad_embed_lookup_q(&a, nullptr);
+        R4dPleCacheStats none{};
+        const bool counted = r4d_ple_stats(off, &none) == 0;   /* there is nothing to count */
+        int bad = -1;
+        for (int m = 0; m < 2 && bad < 0; ++m)
+            for (int j = 0; j < kRow; ++j)
+                if (xo[(size_t)m * kRow + (size_t)j] != (m == 0 ? 0x3f80 : 0x0000)) {
+                    std::printf("  cache off: row %d entry %d: got %04x, want %04x\n", m, j,
+                                xo[(size_t)m * kRow + (size_t)j], m == 0 ? 0x3f80 : 0x0000);
+                    bad = m;
+                    break;
+                }
+        ++cases;
+        if (r0 != RAD_OK || off != nullptr || r != RAD_OK || counted || bad >= 0) {
+            ++fails;
+            std::printf("  cache off: init %d instance %s, launch %d, counters %s, rows %s\n", r0,
+                        off ? "HANDED OUT" : "none", r, counted ? "MOVED" : "none",
+                        bad < 0 ? "as computed" : "NOT as computed");
+        }
+    }
+
     /* A table in VRAM: a miss reads no host bytes, which is the whole of the link accounting. The
      * emulator's allocations read as host, so the range is marked device -- what
      * hipPointerGetAttributes reports for a table the engine placed in VRAM -- and a second cache
@@ -396,6 +455,82 @@ int main() {
         if (!ok) {
             ++fails;
             std::printf("  the table in VRAM did not read as a device-resident table\n");
+        }
+    }
+
+    /* The table the backend pinned: hipPointerGetAttributes cannot classify memory aql locked
+     * into its host pool (core/device/aql.cpp keeps those ranges itself and the driver reports
+     * UNKNOWN), so a plugin that fell back to "device" would count the miss and report that its
+     * 160 bytes crossed no link. The engine knows where it placed the table and says so on the
+     * operand; that answer is asked first and wins. */
+    {
+        f.shape({X});
+        f.wte_space = RAD_SPACE_HOST;
+        emu_mark_unknown(f.wte.data(), f.wte.size());
+        (void)setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "32", 1);
+        void* pin = nullptr;
+        const int ri3 = r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &pin);
+        (void)unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        bool ok = ri3 == RAD_OK && pin != nullptr;
+        if (ok) {
+            const Snap before = Snap::of(pin);
+            f.clear_out();
+            const int lr = f.launch(pin, RAD_PHASE_PREFILL);
+            const Snap d  = Snap::of(pin).less(before);
+            R4dPleCacheStats cs{};
+            const bool stats = r4d_ple_stats(pin, &cs) == 0;
+            ok = lr == RAD_OK && d.misses[0] == 1 && d.hits[0] == 0 && d.bytes[0] == (unsigned)kRow &&
+                 stats && cs.table_host == 1;
+            if (!ok)
+                std::printf("  pinned table (launch %d): h/m/b %llu/%llu/%llu want 0/1/%d, "
+                            "table_host %d\n", lr, d.hits[0], d.misses[0], d.bytes[0], kRow,
+                            cs.table_host);
+            r4d_rad_embed_lookup_q_fini(pin);
+        }
+        emu_clear_devices();
+        f.wte_space = RAD_SPACE_UNKNOWN;
+        ++cases;
+        if (!ok) {
+            ++fails;
+            std::printf("  a table the backend pinned into host memory did not read as host\n");
+        }
+    }
+
+    /* And when neither the engine nor the driver can say, the byte column is unmeasured, not 0:
+     * the misses stand, the dump prints the figure as na and names the table unknown, so a reader
+     * cannot mistake "not taken" for "nothing crossed the link". */
+    {
+        f.shape({X});
+        f.wte_space = RAD_SPACE_UNKNOWN;
+        emu_mark_unknown(f.wte.data(), f.wte.size());
+        (void)setenv("RADIANCE_PLE_VRAM_CACHE_SETS", "32", 1);
+        void* unk = nullptr;
+        const int ri4 = r4d_rad_embed_lookup_q_init(nullptr, 0, 0, 1, &unk);
+        (void)unsetenv("RADIANCE_PLE_VRAM_CACHE_SETS");
+        bool ok = ri4 == RAD_OK && unk != nullptr;
+        if (ok) {
+            const Snap before = Snap::of(unk);
+            f.clear_out();
+            const int lr = f.launch(unk, RAD_PHASE_PREFILL);
+            const Snap d  = Snap::of(unk).less(before);
+            R4dPleCacheStats cs{};
+            const bool stats = r4d_ple_stats(unk, &cs) == 0;
+            const std::string said = stderr_of([&] { r4d_ple_stats_dump(unk, nullptr, 0); });
+            const bool na = said.find("host_read_bytes=na") != std::string::npos &&
+                            said.find("table=unknown") != std::string::npos;
+            ok = lr == RAD_OK && d.misses[0] == 1 && d.hits[0] == 0 && d.bytes[0] == 0 && stats &&
+                 cs.table_host == -1 && na;
+            if (!ok)
+                std::printf("  unknown table (launch %d): h/m/b %llu/%llu/%llu, table_host %d, "
+                            "dump %s\n", lr, d.hits[0], d.misses[0], d.bytes[0], cs.table_host,
+                            na ? "says na" : "DOES NOT SAY na");
+            r4d_rad_embed_lookup_q_fini(unk);
+        }
+        emu_clear_devices();
+        ++cases;
+        if (!ok) {
+            ++fails;
+            std::printf("  an unclassifiable table reported its byte count as measured 0\n");
         }
     }
 

@@ -219,6 +219,13 @@ static inline int64_t rad_dtype_bytes(uint32_t dtype, int64_t n) {
 /* ------------------------------------------------------------------ tensors */
 enum { RAD_MAX_RANK = 6 };
 
+/* Where an operand's bytes lie, as the engine's placement knows it: a buffer's declared domain,
+ * the site the planner gave a weight (WeightInfo::site, so a table placed in host memory and read
+ * over the link says HOST). UNKNOWN is the engine declining to say -- a raw pointer it did not
+ * allocate, a KV pool, a weight a mover owns -- and means a plugin may not assume either: it must
+ * either ask what it can itself or report the figure as unmeasured. */
+enum { RAD_SPACE_UNKNOWN = 0, RAD_SPACE_DEVICE = 1, RAD_SPACE_HOST = 2 };
+
 /* Strides are in elements, not bytes, since a byte stride would be fractional for sub-byte
  * dtypes. */
 typedef struct RadTensor {
@@ -227,6 +234,7 @@ typedef struct RadTensor {
     uint32_t rank;
     int64_t  shape [RAD_MAX_RANK];
     int64_t  stride[RAD_MAX_RANK];
+    int      space;   /* RAD_SPACE_*: where data lies, when the engine knows */
 } RadTensor;
 
 static inline int64_t rad_tensor_numel(const RadTensor* t) {

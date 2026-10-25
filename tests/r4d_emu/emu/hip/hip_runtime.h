@@ -201,6 +201,11 @@ struct hipPointerAttribute_t {
 };
 hipError_t hipPointerGetAttributes(hipPointerAttribute_t* a, const void* p);
 void       emu_mark_device(const void* p, size_t n);
+/* emu_mark_unknown names a range the driver cannot classify: hipPointerGetAttributes fails on it,
+ * which is what real HIP does for memory the backend locked into a host pool
+ * (hsa_amd_memory_lock_to_pool, core/device/aql.cpp). The range stays readable as host memory, so a
+ * plugin that was told where it lies by the engine (RadTensor::space) has the other answer. */
+void       emu_mark_unknown(const void* p, size_t n);
 void       emu_clear_devices();
 
 struct alignas(8)  uint2  { unsigned x, y; };

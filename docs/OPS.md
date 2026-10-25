@@ -2391,15 +2391,20 @@ What the hit rate is worth on a given workload is a measurement this option does
 **Reading the cache.** The gather counts what it did, where it did it: the hits and misses at the
 generation compare, and the host bytes at the read site -- 320 bytes of this cache's VRAM for a hit,
 `kPleRow` (160) bytes over the link for a miss *when the table is host memory*. Whether it is is
-asked once, at the bind: `hipPointerGetAttributes` on the table pointer names its space, and only a
-host allocation makes a miss a link read. A table the engine placed in VRAM adds misses and no host
-bytes, which is the truth of that deployment and not a dead counter; the dump and the `fini` line
-say which case it was (`table=host`, `table=device`, `table=unknown` for a pointer the driver does
-not know, where misses are counted and bytes are not, since overstating the link is the worse
-error). Neither figure is derived from a mover's transfers, so they hold when the table is resident,
+settled once, at the bind, and the engine is asked first: `RadTensor::space` says where the table
+operand lies (ABI 29), because the engine knows what the driver does not -- a table it locked into
+the backend's host pool (`core/device/aql.cpp` keeps those ranges itself and
+`hsa_amd_pointer_info` reports them as unknown) is host memory read over the link, and a fallback to
+`hipPointerGetAttributes` alone would call that a device table and report a miss's 160 bytes as no
+transfer at all. Only when the engine declined to say does the plugin ask the driver. A table the
+engine placed in VRAM adds misses and no host bytes, which is the truth of that deployment and not
+a dead counter; the dump and the `fini` line say which case it was (`table=host`, `table=device`,
+`table=unknown`). At `unknown` the misses are counted and the byte figure is *not taken*: the dump
+prints `host_read_bytes=na` and the shutdown line `host reads n/a`, because a measured 0 there would
+claim the misses crossed no link when nobody established that. Neither figure is derived from a mover's transfers, so they hold when the table is resident,
 when it is `ram`, and when a mover serves the same launch. The counters are three sets, one a phase,
 and the phase is the step's: `RadBatch::phase` is copied into `RadArgs::phase` when the host builds
-the launch (ABI 27/28), and the gather counts into that column. Nothing is inferred from a batch
+the launch (ABI 28/29), and the gather counts into that column. Nothing is inferred from a batch
 size or a kernel name, so a `RAD_PHASE_MIXED` step's rows land in `mixed`, not in whichever column
 its token count suggests.
 
@@ -2414,7 +2419,8 @@ Two ways to read them:
 
 - at shutdown, the cache's `init` prints what it took against the caps -- sets, ways, rows, the
   bytes it reserved and what fraction of the 262144-set cap that is -- and `fini` prints one line a
-  phase that took any row: `prefill rows N, hits H (x%), misses M, host reads MiB`.
+  phase that took any row: `prefill rows N, hits H (x%), misses M, host reads B`, where the read
+  volume is exact bytes (or `n/a (table unknown)`), not a rounded MiB.
 - on demand, `--profile-ops` prints a `telemetry` block beside the per-op table, one line a phase,
   key=value so a runner parses it without a formatter:
 
@@ -2448,8 +2454,17 @@ the split is the same with and without the line.
 neither, one 160-byte link read for a two-row launch with one miss, an uncached launch that moves
 nothing, an explicit `0` that allocates nothing and says why while unset stays silent, and a table
 marked device (`emu_mark_device`) where the same miss adds no host bytes and `r4d_ple_stats` reports
-`table_host=0`. That test is also the host-only check of the whole path: it needs no card and no
-HIP runtime.
+`table_host=0`. Three more cases hold the space question down, all without a card:
+`emu_mark_unknown` names a range the driver cannot classify -- what HIP does with the backend's
+locked pool -- and the same miss then counts 160 host bytes because the operand's `space` said
+host; with neither the operand nor the driver saying, the dump prints `host_read_bytes=na` and
+`table=unknown` rather than a 0; and after a real `init` with `RADIANCE_PLE_VRAM_CACHE_SETS=0` the
+gather is run and its output compared against a hand-computed expectation (two rows of exact E4M3
+codes at scale 1.0, so 160 entries of 1.0 and 160 of zero), with `r4d_ple_stats` reporting no
+counters at all. The host read volume of that uncached launch -- one `kPleRow` a valid id, 320 bytes
+in the case -- is arithmetic, not a counter: nothing on the host observes a device load, and the
+seam that would is the load-site counter the cached path has and the uncached one does not. That
+test is also the host-only check of the whole path: it needs no card and no HIP runtime.
 
 ### `ngram_ids`
 
