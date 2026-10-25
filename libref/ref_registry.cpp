@@ -363,6 +363,15 @@ static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
 };
+static const RadParamSpec pAttnPagedTree[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INT("root_pos")
+};
+static const RadOperandSpec oAttnPagedTree[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("ancestors")
+};
 /* Effective on kv_store, where `block_size` is RAD_REQUIRED: admits every value and refuses only a
  * query that omits it. On attn_paged the key is RAD_DERIVED and the constraint is skipped
  * (core/plugin/select.cpp). See the file header for the spec §7.2 consequence. */
@@ -1304,6 +1313,16 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_paged_tree", ARR(pAttnPagedTree), ARR(oAttnPagedTree),
+  "attn_paged over one verify step of a candidate tree (arch/common/rad_tree_candidate.h): every "
+  "query row is a node, and the tree's nodes are cache rows root_pos .. root_pos + nodes - 1, one "
+  "row a node, so siblings -- same depth, different token -- hold distinct slots. Each row attends "
+  "to the committed prefix (rows below root_pos) plus exactly the nodes its u16 `ancestors` mask "
+  "names, itself included; `ancestors[row]` bit b names the node at row root_pos + b. `causal` 1 "
+  "and `window` 0 only, because the mask decides what is visible, not the position. seqused is "
+  "the TOTAL key count including every node row. A mask missing the root, missing the row's own "
+  "node, or naming a node past this step's rows is refused, never approximated; its agreement "
+  "with the tree's parent links is the caller's check (masks_consistent)." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "Dense varlen attention over cu_seqlens segments (rows cu/cu_div). Nothing paged. `window` is "
   "attn_paged's rule over a segment's positions: causal, i - j < window; non-causal, |i - j| < "
@@ -2132,6 +2151,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
+    "paged attention over a candidate tree: each row sees the prefix plus its own ancestor set",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; u16 / u32 "
+    "ancestor masks",
+    nullptr, 0, nullptr, nullptr, ref_attn_paged_tree, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",

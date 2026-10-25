@@ -121,6 +121,40 @@ static const RadOperandSpec oAttnPaged[] = {
     { "cu_seqlens",  RAD_OPD_IN,  1 },   /* absent = one q_len for the whole batch */
     { "out",         RAD_OPD_OUT, 0 },
 };
+/* attn_paged over a candidate tree's rows: attn_paged's parameters plus `root_pos`, and its
+ * operands plus `ancestors`. Declared here (this plugin fixes the schema first) and served by
+ * libref; libr4d has no ancestor-masked kernel yet, so a card-side resolve refuses it rather than
+ * running the rows against a causal mask (sched/tree_dispatch.h). */
+static const RadParamSpec pAttnPagedTree[] = {
+    P_INT("q_len"),
+    P_INT("head_dim"),
+    P_INT("gqa"),
+    P_INTD("block_size"),
+    P_INT("causal"),
+    P_INT("window"),
+    P_STR("q_dtype"),
+    P_STR("kv_dtype"),
+    P_F64O("scale"),
+    P_INTO("max_ctx"),
+    P_INTO("n_head"),
+    P_INTO("max_seqs"),
+    /* The position of the tree's root (the last committed token): a row's position is this plus
+     * its depth, which its mask carries. */
+    P_INT("root_pos"),
+};
+static const RadOperandSpec oAttnPagedTree[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "seqused",     RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+    /* One ancestor set per query row, u16: bit b is the node at position root_pos + b, the row's
+     * own path with itself included. Required: without it the op is attn_paged. */
+    { "ancestors",   RAD_OPD_IN,  0 },
+};
 
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters plus the two of
  * gate_quant_fp8's that are not implied (its `n` is `head_dim`, its rows attn_paged's (token,
@@ -2926,6 +2960,12 @@ static const RadOpSchema kSchemas[] = {
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
            "where it lies rather than lifted into a dense block first."),
+    SCHEMA("attn_paged_tree", pAttnPagedTree, oAttnPagedTree,
+           "attn_paged over one verify step's candidate tree: every query row is a node, at "
+           "root_pos + its depth, and attends to the committed prefix plus exactly the nodes its "
+           "u16 `ancestors` mask names (its own path, itself included). `causal` 1 and `window` 0 "
+           "only: the mask, not the position, decides what is visible. Same-SHA exactness: a row's "
+           "scores are the serial path's for the tokens on that path."),
     SCHEMA("attn_paged_gate_quant", pAttnPagedGq, oAttnPagedGq,
            "attn_paged followed by gate_quant_fp8 over its output, in the split-KV merge: each "
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "

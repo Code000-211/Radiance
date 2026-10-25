@@ -942,7 +942,8 @@ TEST(op_vocabulary) {
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
-        "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
+        "attn_paged", "attn_paged_tree", "attn_dense", "kv_store", "rope", "rope_table",
+        "qk_norm_rope", "qsa_block_key",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
@@ -3009,6 +3010,111 @@ TEST(op_attn_paged_ragged) {
      * q_len of 2; with the batch maximum it would sit at position 0 and return V0 = [1,0]. */
     CHECK_NEAR(out.at(4), w0 / sum, 1e-6);
     CHECK_NEAR(out.at(5), 1.0f / sum, 1e-6);
+}
+
+/* A candidate tree's verify step (arch/common/rad_tree_candidate.h). The committed prefix is two
+ * rows, then the tree's four nodes as cache rows 2..5:
+ *
+ *     node 0  root, row 2      mask 0b0001
+ *     node 1  child of 0, 3    mask 0b0011
+ *     node 2  child of 1, 4    mask 0b0111
+ *     node 3  child of 0, 5    mask 0b1001
+ *
+ * Nodes 1 and 3 share depth 1 and so share a RoPE position, which is why a node's keys are found by
+ * its row and not by its position: only the block table keeps them apart. Values name their row
+ * (1, 2, 4, 8, 16, 32) and the queries are zero, so each row returns the mean over exactly what its
+ * mask makes visible. */
+TEST(op_attn_paged_tree_sees_the_prefix_and_its_own_path) {
+    T q(RAD_F32, {4, 1, 1}); q.f({0, 0, 0, 0});
+    T kv(RAD_F32, {2, 1, 3, 2});
+    kv.f({ 0, 1,  0, 2,  0, 4,      /* block 0: rows 0..2, K then V */
+           0, 8,  0, 16, 0, 32 });   /* block 1: rows 3..5 */
+    T bt(RAD_I32, {1, 2}); bt.n({0, 1});
+    T su(RAD_I32, {1});    su.n({6});            /* prefix 2 + four node rows */
+    T anc(RAD_U16, {4});   anc.n({1, 3, 7, 9});
+    T out(RAD_F32, {4, 1, 1});
+    A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).t(anc)
+          .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+          .i("causal", 1).i("window", 0).i("root_pos", 2)
+          .s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_tree", a));
+
+    CHECK_NEAR(out.at(0), 7.0f / 3, 1e-6);      /* 1 + 2 + 4: the prefix and the root */
+    CHECK_NEAR(out.at(1), 15.0f / 4, 1e-6);     /* + 8 */
+    CHECK_NEAR(out.at(2), 31.0f / 5, 1e-6);     /* + 16: the whole chain */
+    CHECK_NEAR(out.at(3), 39.0f / 4, 1e-6);     /* 1 + 2 + 4 + 32: node 2's row stays out */
+
+    /* Read as a linear step the same tensors give node 3's row everything, 63/6 = 10.5: what moved
+     * its answer is the mask, not the geometry. */
+    T lin(RAD_F32, {4, 1, 1});
+    A b; b.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(lin)
+          .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+          .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged", b));
+    CHECK_NEAR(lin.at(3), 63.0f / 6, 1e-6);
+    CHECK(std::fabs(lin.at(3) - out.at(3)) > 1e-3);
+}
+
+/* The operand carries sets, not parents, so every way a set can contradict the step it belongs to
+ * is refused rather than run against the nearest causal mask. */
+TEST(op_attn_paged_tree_refuses_a_mask_it_cannot_honour) {
+    T q(RAD_F32, {4, 1, 1}); q.f({0, 0, 0, 0});
+    T kv(RAD_F32, {2, 1, 3, 2});
+    kv.f({ 0, 1,  0, 2,  0, 4,  0, 8,  0, 16, 0, 32 });
+    T bt(RAD_I32, {1, 2}); bt.n({0, 1});
+    T su(RAD_I32, {1});    su.n({6});
+    T anc(RAD_U16, {4});   anc.n({1, 3, 7, 9});
+    T out(RAD_F32, {4, 1, 1});
+    /* Parameters vary per case; operands are the fixture's. */
+    auto run_tree = [&](int64_t causal, int64_t window, int64_t root_pos) -> int {
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).t(anc)
+              .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+              .i("causal", causal).i("window", window).i("root_pos", root_pos)
+              .s("q_dtype", "f32").s("kv_dtype", "f32");
+        return run("attn_paged_tree", a);
+    };
+
+    CHECK_OK(run_tree(1, 0, 2));
+
+    /* A row that does not attend to itself (node 0's mask names the root but not node 0), one that
+     * drops the root (node 1 names its parent and itself), and one that names a node this step does
+     * not have (node 2 additionally sets bit 4). */
+    anc.n({1, 3, 3, 9});
+    CHECK_EQ(run_tree(1, 0, 2), RAD_E_INVAL);
+    anc.n({1, 6, 7, 9});
+    CHECK_EQ(run_tree(1, 0, 2), RAD_E_INVAL);
+    anc.n({1, 3, 23, 9});
+    CHECK_EQ(run_tree(1, 0, 2), RAD_E_INVAL);
+    anc.n({1, 3, 7, 9});
+
+    /* A seqused that stops before the last node row: the mask would name a row the step cannot
+     * read, so the step is refused rather than answered without it. */
+    su.n({5});
+    CHECK_EQ(run_tree(1, 0, 2), RAD_E_SHAPE);
+    su.n({6});
+
+    /* Not a causal step, a window over rows (which masks by position, not by path), and a root
+     * before the context. */
+    CHECK_EQ(run_tree(0, 0, 2), RAD_E_UNSUPPORTED);
+    CHECK_EQ(run_tree(1, 1, 2), RAD_E_UNSUPPORTED);
+    CHECK_EQ(run_tree(1, 0, -1), RAD_E_INVAL);
+
+    /* And the mask operand itself: required, and an integer wide enough to hold it. */
+    {
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).tnull()
+              .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+              .i("causal", 1).i("window", 0).i("root_pos", 2)
+              .s("q_dtype", "f32").s("kv_dtype", "f32");
+        CHECK_EQ(run("attn_paged_tree", a), RAD_E_INVAL);
+    }
+    {
+        T a32(RAD_I32, {4}); a32.n({1, 3, 7, 9});
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).t(a32)
+              .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+              .i("causal", 1).i("window", 0).i("root_pos", 2)
+              .s("q_dtype", "f32").s("kv_dtype", "f32");
+        CHECK_EQ(run("attn_paged_tree", a), RAD_E_INVAL);
+    }
 }
 
 TEST(op_attn_dense) {
@@ -8009,6 +8115,10 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                            .i("block_size", 4).i("causal", 1).i("window", 0)
+                                            .s("q_dtype", "f32").s("kv_dtype", "f32")
+                                            .i("n_head", 4).i("ctx", 9).i("root_pos", 4)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
         G("kv_store", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 4)
@@ -8233,8 +8343,12 @@ std::vector<Geo> geometries() {
  * cannot be drawn; ref_shapes.cpp says why). The sweeps skip them; their hand cases above cover
  * them. */
 bool undrawable(const char* op) {
+    /* A candidate tree's ancestor sets are a topology, not a drawable tensor: a random mask names
+     * nodes that are not the row's path, which attn_paged_tree refuses by design. Its cases are
+     * written out in op_attn_paged_tree_* instead. */
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2");
+           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+           !std::strcmp(op, "attn_paged_tree");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

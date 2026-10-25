@@ -228,6 +228,7 @@ static inline int64_t ld_int(uint32_t dt, const void* p, int64_t i) {
     switch (dt) {
         case RAD_I32:  return (int64_t)((const int32_t*)p)[i];
         case RAD_U32:  return (int64_t)((const uint32_t*)p)[i];
+        case RAD_U16:  return (int64_t)((const uint16_t*)p)[i];   /* attn_paged_tree's masks */
         case RAD_I64:  return ((const int64_t*)p)[i];
         case RAD_I16:  return (int64_t)((const int16_t*)p)[i];
         case RAD_I8:   return (int64_t)((const int8_t*)p)[i];
@@ -242,6 +243,7 @@ static inline void st_int(uint32_t dt, void* p, int64_t i, int64_t v) {
     switch (dt) {
         case RAD_I32: ((int32_t*)p)[i] = (int32_t)v; break;
         case RAD_U32: ((uint32_t*)p)[i] = (uint32_t)v; break;
+        case RAD_U16: ((uint16_t*)p)[i] = (uint16_t)v; break;
         case RAD_I64: ((int64_t*)p)[i] = v; break;
         case RAD_I16: ((int16_t*)p)[i] = (int16_t)v; break;
         case RAD_I8:  ((int8_t*)p)[i]  = (int8_t)v; break;

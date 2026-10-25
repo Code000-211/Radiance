@@ -75,7 +75,11 @@ struct KvDyn  {
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
-int ref_attn_paged(const RadArgs* a, RadStream) {
+/* The shared body. `anc` null is attn_paged: causal over positions. Non-null is attn_paged_tree,
+ * where each query row is a node of a candidate tree, op 8 is its uint16 ancestor set (bit b names
+ * the node held in cache row root_pos + b) and the row sees the prefix below root_pos plus exactly
+ * the rows its mask names. See ref_attn_paged_tree for the admitted form. */
+static int ref_attn_paged_impl(const RadArgs* a, const RadTensor* anc, int64_t root_pos) {
     if (a->n_t < 8) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *kv = &a->t[1], *bt = &a->t[2], *su = &a->t[3], *o = &a->t[7];
     const RadTensor* kdes = t_in(a, 4);
@@ -112,6 +116,31 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+
+    /* A tree step's masks, checked before a row is computed. The sequence's nodes are cache rows
+     * root_pos .. root_pos + qlen - 1, one row a node, so siblings sit on distinct rows even
+     * though they share a depth; `seqused` must reach the last of them or the mask would name a row
+     * the step cannot read. A mask with a bit past its sequence's nodes, without the root, or
+     * without the row's own node conditions a row on text that is not on its path. All refused,
+     * none clamped. */
+    if (anc) {
+        if (anc->dtype != RAD_U16 && anc->dtype != RAD_U32) return RAD_E_INVAL;
+        if (numel(anc) < rows) return RAD_E_SHAPE;
+        if (causal != 1 || window != 0) return RAD_E_UNSUPPORTED;
+        if (root_pos < 0) return RAD_E_INVAL;
+        for (int64_t s = 0; s < n_seq; ++s) {
+            const int64_t qlen = cus ? cu_at(cus, s + 1) - cu_at(cus, s) : q_len;
+            if (qlen <= 0 || qlen > 32) return RAD_E_UNSUPPORTED;   /* one mask a row */
+            const int64_t first = cus ? cu_at(cus, s) : s * q_len;
+            if (ld_int(su->dtype, su->data, offlin(su, s)) < root_pos + qlen) return RAD_E_SHAPE;
+            for (int64_t i = 0; i < qlen; ++i) {
+                const int64_t m = ld_int(anc->dtype, anc->data, offlin(anc, first + i));
+                if ((m >> qlen) != 0) return RAD_E_INVAL;         /* a node this step does not have */
+                if ((m & 1) == 0) return RAD_E_INVAL;             /* the root is on every path */
+                if (((m >> i) & 1) == 0) return RAD_E_INVAL;      /* a row attends to itself */
+            }
+        }
+    }
 
     const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
     const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
@@ -158,7 +187,13 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                 const int64_t kh = h / gqa;
 
                 const int64_t ctx = ld_int(su->dtype, su->data, offlin(su, s));
-                const int64_t pos = ctx - qlen + i;
+                /* A tree row's position is not a key index: its keys are the prefix rows below
+                 * root_pos plus the node rows its mask names, and siblings share a depth while
+                 * holding distinct rows. So the causal rule over positions is replaced, and `pos`
+                 * (unused by the tree branch of key_at, window 0 there) is only the causal row's. */
+                int64_t mask = 0;
+                if (anc) mask = ld_int(anc->dtype, anc->data, offlin(anc, tok));
+                const int64_t pos = anc ? 0 : ctx - qlen + i;
                 const int64_t qb  = tok * q_rs + h * q_hs;
                 const int64_t ob  = tok * o_rs + h * o_hs;
 
@@ -170,7 +205,12 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
                 /* Key j's slot in the cache, or -1 when the mask hides it or its block is
                  * unmapped. */
                 auto key_at = [&](int64_t j) -> int64_t {
-                    if (causal && j > pos) return -1;
+                    if (anc) {
+                        /* The prefix below the root is on every path; past it, exactly the node
+                         * rows the mask names. A clear bit is a sibling, not a later position. */
+                        const int64_t rel = j - root_pos;
+                        if (rel >= 0 && ((mask >> rel) & 1) == 0) return -1;
+                    } else if (causal && j > pos) return -1;
                     if (window > 0) {
                         const int64_t d = pos - j;
                         if (causal ? (d >= window) : (d >= window || d <= -window)) return -1;
@@ -245,6 +285,32 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_attn_paged(const RadArgs* a, RadStream) { return ref_attn_paged_impl(a, nullptr, 0); }
+
+/* An ancestor-masked paged attention: one verify step of a candidate tree
+ * (arch/common/rad_tree_candidate.h). Operands 0..7 are attn_paged's; operand 8 is `ancestors`, one
+ * uint16 per query row, and the row is the tree node whose id is its index within its sequence.
+ * `root_pos` is the row index of the root (the last committed token): the tree's nodes occupy cache
+ * rows root_pos .. root_pos + nodes - 1, one row a node, which is what keeps siblings -- same
+ * depth, different token -- on distinct slots. A row attends to the committed prefix (rows below
+ * root_pos) plus exactly the node rows its mask names, itself included, so the mask decides which
+ * text is on the row's path where a causal kernel would decide by position alone. `seqused` is the
+ * sequence's total key count including every node of the tree. The row's RoPE position (its depth
+ * past the root) is the rope stage's, not this op's.
+ *
+ * Admitted and refused, never approximated: `causal` 1 and `window` 0 (a verify is an unwindowed
+ * causal step, and a window over tree rows would mask by position, not by path); at most 32 nodes
+ * per sequence (one mask each); every mask with the root and the row's own node set and no bit past
+ * the sequence's nodes; root_pos >= 0; a `seqused` reaching the last node's row.
+ * The mask's agreement with the tree's topology is the caller's check (masks_consistent), because
+ * the operand carries the sets and not the parents. */
+int ref_attn_paged_tree(const RadArgs* a, RadStream) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const RadTensor* anc = &a->t[8];
+    if (!anc->data) return RAD_E_INVAL;
+    return ref_attn_paged_impl(a, anc, p_int(a, "root_pos", -1));
 }
 
 /* ------------------------------------------------------------------ attn_dense */

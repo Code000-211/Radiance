@@ -1320,8 +1320,25 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("attn_paged", operand, out);
 }
 
-int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M   = gi(p, n_p, "M", 0);
+/* attn_paged over a candidate tree: attn_paged's operands and one mask a node row, the rows being
+ * `q_len` nodes that follow the committed prefix (root_pos rows of it) in the cache. A mask is a
+ * topology, not a drawable tensor, so the description fills it with the root alone and ref_test
+ * writes its real cases out (see `undrawable`). */
+int ref_attn_paged_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M    = gi(p, n_p, "q_len", 0);
+    const int64_t root = gi(p, n_p, "root_pos", -1);
+    if (root < 0) return RAD_E_UNSUPPORTED;
+    if (operand == 8) {
+        Opd o;
+        o.t_idx({ M }, 0, 1, 0);                        /* ancestors: the root alone */
+        return o.finish("attn_paged_tree", operand, out);
+    }
+    /* Operands 0..7 are attn_paged's, at the same geometry: the nodes are cache rows root_pos.., and
+     * whoever asks for a tree passes a `ctx` that reaches them. */
+    return ref_attn_paged_shape(p, n_p, operand, out);
+}
+
+int ref_attn_dense_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {    const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
     const int64_t gqa = gi(p, n_p, "gqa", 1);
     if (M <= 0 || hd <= 0 || gqa <= 0) return RAD_E_UNSUPPORTED;

@@ -816,6 +816,7 @@ bytes).
 | op | params | operands |
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
+| `attn_paged_tree` | `attn_paged`'s, plus `root_pos` | `attn_paged`'s, plus `ancestors` → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
@@ -838,6 +839,21 @@ length and the total query rows must be a multiple of `n_seq`. Pass it: the sche
 steps (one sequence's prefill chunk beside other sequences' decode rows, each with its own verify
 window) whenever prefill and decode coexist, and those are not uniform. `q_len` is then the batch
 maximum, which selects the band; the per-sequence lengths come from `cu_seqlens` alone.
+
+**`attn_paged_tree`** is one verify step of a candidate tree (`arch/common/rad_tree_candidate.h`)
+over the same paged cache: every query row is a node, the tree's nodes are cache rows
+`root_pos .. root_pos + nodes - 1` (one row a node, so two children of one parent — same depth,
+different token — hold distinct slots), and row `i` attends to the committed prefix (every row
+below `root_pos`) plus exactly the nodes its `ancestors[i]` mask names, itself included. Bit `b`
+of a mask names the node at row `root_pos + b`; the mask's agreement with the tree's parent links
+is the caller's check (`masks_consistent`). `causal` must be 1 and `window` 0: the mask decides
+what is visible, not the position, and a window over node rows would mask by position. `seqused`
+is the total key count including every node row. A mask that drops the root, drops the row's own
+node, or names a node past this step's rows is refused rather than run against the nearest causal
+mask. The row's RoPE position — its depth past the root — comes from the rope stage, not from
+this op. libr4d has no ancestor-masked kernel yet, so a card-side resolve refuses it
+(`sched/tree_dispatch.h`); the reference op is the contract and the oracle such a kernel must
+match.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
