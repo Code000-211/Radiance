@@ -35,12 +35,15 @@ failure looks the same. Read them apart:
   continues; the cycle is counted apart and traced as unpriced. A deployment that prices few shapes
   runs almost entirely on this path, by design: the C2 profile prices 0.5-2.5 % of cycles. Missing
   prices are therefore **not** a start prohibition as long as that baseline is admissible.
-- **The ladder gap ends the run.** Narrower than "unpriced": the deepest offered tier is unpriced,
-  the named baseline would run deeper than that tier, and at least one row is correspondingly
-  untrimmed, so no later cycle of this deployment could price the offered top and the run would draft
-  at a depth the ladder never offers. The controller refuses that cycle (`RAD_E_UNSUPPORTED`),
-  `Scheduler::draft_cost_cycle` latches it so the step path stops drafting, and the engine ends the
-  run through `Engine::fail_loop`; the log names the fix (end the ladder at K, or raise the ceiling).
+- **The ladder gap ends the run.** Narrower than "unpriced": **no offered tier can be priced at all**
+  for this cycle's shape (`!best_p.valid` -- an unpriced top tier alone does not trigger it while a
+  lower offered tier is priceable), the named baseline would run deeper than the deepest offered
+  tier, and at least one row is correspondingly untrimmed, so no later cycle of this deployment
+  could price any offered tier and the run would draft at a depth the ladder never offers. The
+  controller refuses that cycle (`RAD_E_UNSUPPORTED`), `Scheduler::draft_cost_cycle` latches it so
+  the step path stops drafting, and the engine ends the run through `Engine::fail_loop`; the log
+  names the fix: extend the ladder up to the baseline, or set the ceiling to the deepest offered
+  tier -- the operator's call, which is why nothing is learnt into that depth.
 - **A residency drift ends the run as well.** For a profile that is not the no-loan reference, any
   observed move since the profile was bound means every later bracket describes a placement the file
   never measured: the table is deactivated stickily, no fallback is admitted in its place, and the
