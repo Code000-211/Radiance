@@ -14,6 +14,56 @@ either a bucket usable by the rule `estimate()` applies or an explicit `admit_fa
 every estimate takes its named fallback. The sample path only measures: it activates nothing. No
 profile has been generated or measured yet and no M1/M2 or GPU result is claimed here.
 
+## Release notes for this merge (MAIN-6)
+
+Four things a deployment operator has to know, and one thing nobody measured. None of them is a
+performance claim.
+
+**`cost` is explicit, and it refuses rather than degrades.** Under `--draft-policy cost`, a cycle whose
+shape no bucket matches takes the named fallback; when the profile can supply neither a usable bucket
+nor an admitted baseline, the policy fails closed and `Engine::fail_loop` ends the run with its reason
+in the log instead of quietly drafting at a depth it cannot justify. A start whose profile does not
+bind to this runtime -- another placement, another host budget, a fingerprint or execution mismatch --
+is refused at startup, by name, before any request is served. That is the point of naming the policy
+on the start line: the mode cannot change behind the operator's back.
+
+**The deployment start line.** `cost` becomes a deployment's standard by being written on its own
+start line, together with the profile it is meant to use:
+
+```bash
+radiance --model <checkpoint> --tp 2 ... \
+         --draft-policy cost --draft-profile /path/to/draft-profile.json
+```
+
+The way back is the same line with `--draft-policy legacy` (the fixed depth, or `--draft-window
+adaptive`'s per-sequence stop); no other flag changes. Two things this repository does not carry: the
+line itself and the profile file. There is no service unit, no preset and no config file here -- the
+only environment inputs are `RADIANCE_HOME` and `RADIANCE_KERNELS` -- so the start line belongs to the
+deployment and to whoever starts it, and the profile path is the operator's. `kDraftPolicyDefault`
+stays `legacy`: a bare `radiance`, every test and every existing start line are unchanged, and no
+library default is flipped for one deployment. Until someone edits that line, nothing is active.
+
+**One end-to-end path stays uncovered.** A real engine error reaching the HTTP/SSE error response is
+tested only in halves: `server_test` covers a 500 body and a single SSE error event driven by a
+scripted engine failure, and `engine_e2e_test` covers the startup refusals and the streaming paths.
+Neither tree has a case that runs a real engine failure up to the response -- `main` has no
+`fail_status` case either, and the error mapping is unchanged, so this is a gap carried over rather
+than introduced. The merged tree does not close it.
+
+**Builds require ROCm's clang.** `./build.sh` names `/opt/rocm/llvm/bin/clang{,++}` itself and exits
+2 when they are missing, and the `default` CMake preset sets the same pair. That is a repair as much
+as a requirement: `main`'s own tree does not build with the system compiler (`arch/lfm2_bf16` fails at
+`abi/rad_builder.h:391`, "taking address of temporary array"). A build with another compiler is not
+comparable and does not verify a change.
+
+**Benefit gate (MAIN-80): no measured benefit is claimed.** This merge carries the cost policy as an
+opt-in feature and nothing more. The C2 profile prices 0.5-2.5 % of cycles (97.5-99.5 % unpriced, so
+practically the named K3 fallback), and the single C8 run that reported -13.8 % was not reproduced.
+The measurement stand `847a663` also predates the fingerprint fix `11ca8b4` that this branch carries,
+so a bucket measured there does not bind to the merged tree by itself. Whether MAIN-80 grants an
+exception for an opt-in merge without a measured benefit is an **open decision**; nothing in this
+document records one, and this branch does not assume it.
+
 ## The seam
 
 `core/sched/draft_types.h` declares four hooks and the data they exchange:
