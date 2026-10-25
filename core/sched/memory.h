@@ -43,7 +43,17 @@ struct MemArchive {
     MemChain            chain;
     PrefixCache::Pinned pinned;
     uint64_t            made_ns = 0;       /* monotonic */
+    /* ---- on disk (--memory-dir, core/mem/kvarchive.h) ---- */
+    bool                on_disk = false;   /* written, or read back at startup */
+    int                 write_tries = 0;   /* failed writes; three end the attempts */
+    uint64_t            write_after_ns = 0;
 };
+
+/* Where an archive's file lives. An id is [A-Za-z0-9._-] (the server checks), so it is a file
+ * name of its own and never a path. */
+inline std::string archive_path(const std::string& dir, const std::string& id) {
+    return dir + "/" + id + ".kva";
+}
 
 /* What /v1/memory/archive reports about one archive. */
 struct MemArchiveStat {
@@ -53,6 +63,7 @@ struct MemArchiveStat {
     int64_t     pinned_tokens = 0;         /* of those, the whole blocks the cache still held */
     int64_t     snapshot_pos = 0;          /* where a fork resumes; 0 without recurrent state */
     double      age_s = 0;
+    bool        on_disk = false;           /* survives a restart (--memory-dir) */
 };
 
 class MemoryRegistry {

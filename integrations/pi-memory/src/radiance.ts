@@ -30,6 +30,7 @@ export interface ArchiveStat {
     pinned_tokens: number;
     snapshot_tokens: number;
     age_s: number;
+    on_disk?: boolean;      /* written to the server's --memory-dir: survives its restart */
 }
 
 export interface ForkOptions {

@@ -581,6 +581,29 @@ int64_t PrefixCache::deepest_snapshot(const std::vector<int32_t>& tokens,
     return best == ck_by_prefix_.end() ? 0 : best->second.pos;
 }
 
+bool PrefixCache::adopt_entry(const BlockHash& h, const int32_t* block_tokens,
+                              const std::function<bool()>& place) {
+    if (!enabled_ || !tiers_) return false;
+    auto it = map_.find(h);
+    if (it != map_.end()) return same_tokens(it->second, block_tokens);
+    if (!place()) return false;
+    Entry e;
+    /* Off-device: no blocks, and so not on the LRU (the tiers own it until a hit restores it). */
+    e.blocks.assign(groups_.size(), -1);
+    e.tokens.assign(block_tokens, block_tokens + block_size_);
+    e.used_ns = rad_mono_ns();
+    map_.emplace(h, std::move(e));
+    return true;
+}
+
+bool PrefixCache::snapshot_settled(const BlockHash& key, int32_t* slot) const {
+    auto it = ck_by_prefix_.find(key);
+    if (it == ck_by_prefix_.end() || !it->second.valid || it->second.slot < 0 || reserved(key))
+        return false;
+    if (slot) *slot = it->second.slot;
+    return true;
+}
+
 bool PrefixCache::shared_with_live(const Entry& e) const {
     for (size_t g = 0; g < groups_.size(); ++g)
         if (kv_->block_refcount(groups_[g], e.blocks[g]) > 1) return true;

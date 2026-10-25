@@ -11,6 +11,7 @@
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
 #include "mem/kvtier.h"
+#include "mem/kvarchive.h"
 #include "device/device.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <set>
@@ -6273,6 +6275,246 @@ TEST(clearing_the_cache_drops_every_pin) {
     CHECK_EQ(x.f.pc.pinned_blocks(), 0ll);
     CHECK_EQ(x.f.kv.held_blocks(G_FULL), 0ll);
     CHECK_EQ(x.t.arena().used_slots(), 0ll);
+}
+
+
+/* ================================================================== archives on disk */
+
+/* A scratch directory, removed with everything in it. */
+struct TempDir {
+    std::string path;
+    TempDir() {
+        char t[] = "/tmp/rad_kva_XXXXXX";
+        if (mkdtemp(t)) path = t;
+    }
+    ~TempDir() {
+        std::error_code ec;
+        if (!path.empty()) std::filesystem::remove_all(path, ec);
+    }
+};
+
+static KvArchiveHeader kva_header(int64_t n_tokens, int64_t n_entries, int64_t entry,
+                                  int64_t snap) {
+    KvArchiveHeader h;
+    h.id = "pi-a1";
+    h.label = "session-1";
+    h.fingerprint = "radiance test; model 1; tp 1";
+    h.made_unix_ms = 1700000000123ull;
+    h.use_control_vector = true;
+    h.n_tokens = n_tokens;
+    h.n_entries = n_entries;
+    h.entry_bytes = entry;
+    h.snapshot_bytes = snap;
+    h.snapshot_pos = snap > 0 ? 32 : 0;
+    h.snapshot_key = bh(77);
+    return h;
+}
+
+/* Entry i's bytes in the files these tests write. */
+static uint8_t kva_byte(int64_t entry, int64_t at) { return (uint8_t)(entry * 31 + at * 7 + 1); }
+
+static int kva_write_test(const std::string& path, const KvArchiveHeader& h,
+                          const std::vector<int32_t>& toks, const std::vector<BlockHash>& keys,
+                          const std::vector<uint8_t>& snap) {
+    return kva_write(path, h, toks, keys, [&](int64_t first, int64_t n, uint8_t* dst) {
+        for (int64_t i = 0; i < n; ++i)
+            for (int64_t b = 0; b < h.entry_bytes; ++b) dst[i * h.entry_bytes + b] = kva_byte(first + i, b);
+        return true;
+    }, snap.empty() ? nullptr : snap.data());
+}
+
+TEST(an_archive_file_reads_back_what_was_written) {
+    TempDir d;
+    REQUIRE(!d.path.empty());
+    const std::string path = d.path + "/pi-a1.kva";
+    const std::vector<int32_t> toks = tok_run(500, 41);
+    const std::vector<BlockHash> keys = { bh(1), bh(2) };
+    std::vector<uint8_t> snap(200);
+    for (size_t i = 0; i < snap.size(); ++i) snap[i] = (uint8_t)(255 - i);
+    const KvArchiveHeader h = kva_header(41, 2, 96, 200);
+    CHECK_OK(kva_write_test(path, h, toks, keys, snap));
+    CHECK(std::filesystem::exists(path));
+    CHECK(!std::filesystem::exists(path + ".tmp"));
+
+    KvArchiveReader rd;
+    CHECK_OK(rd.open(path));
+    const KvArchiveHeader& g = rd.header();
+    CHECK_EQ(g.id, h.id);
+    CHECK_EQ(g.label, h.label);
+    CHECK_EQ(g.fingerprint, h.fingerprint);
+    CHECK_EQ(g.made_unix_ms, h.made_unix_ms);
+    CHECK(g.use_control_vector);
+    CHECK_EQ(g.snapshot_pos, 32ll);
+    CHECK(g.snapshot_key == bh(77));
+    CHECK(rd.tokens() == toks);
+    CHECK(rd.keys() == keys);
+    CHECK_OK(rd.verify());
+    std::vector<uint8_t> e(96);
+    for (int64_t i = 0; i < 2; ++i) {
+        CHECK_OK(rd.next_entry(e.data()));
+        bool same = true;
+        for (int64_t b = 0; b < 96; ++b) same = same && e[(size_t)b] == kva_byte(i, b);
+        CHECK(same);
+    }
+    CHECK_EQ(rd.next_entry(e.data()), RAD_E_STATE);
+    std::vector<uint8_t> back(200);
+    CHECK_OK(rd.snapshot(back.data()));
+    CHECK(back == snap);
+
+    /* With no snapshot and no entries, still a file: the fork can prefill the chain. */
+    const std::string bare = d.path + "/bare.kva";
+    CHECK_OK(kva_write_test(bare, kva_header(3, 0, 96, 0), tok_run(1, 3), {}, {}));
+    KvArchiveReader rb;
+    CHECK_OK(rb.open(bare));
+    CHECK_OK(rb.verify());
+    CHECK_EQ(rb.header().n_entries, 0ll);
+}
+
+/* A file that is not what was written is never read as an archive: a flipped byte fails the
+ * checksum, a short file fails at open, and a write whose source went away leaves nothing. */
+TEST(a_damaged_short_or_unfinished_archive_file_is_refused) {
+    TempDir d;
+    REQUIRE(!d.path.empty());
+    const std::string path = d.path + "/a.kva";
+    const std::vector<int32_t> toks = tok_run(9, 40);
+    CHECK_OK(kva_write_test(path, kva_header(40, 3, 64, 0), toks, { bh(1), bh(2), bh(3) }, {}));
+    const auto size = std::filesystem::file_size(path);
+    {
+        FILE* f = std::fopen(path.c_str(), "r+b");
+        REQUIRE(f != nullptr);
+        std::fseek(f, (long)size - 16 - 64 - 5, SEEK_SET);     /* inside the last entry */
+        const int c = std::fgetc(f);
+        std::fseek(f, -1, SEEK_CUR);
+        std::fputc(c ^ 0x40, f);
+        std::fclose(f);
+    }
+    KvArchiveReader rd;
+    CHECK_OK(rd.open(path));
+    CHECK_EQ(rd.verify(), RAD_E_FORMAT);
+    rd.close();
+
+    std::filesystem::resize_file(path, size - 1);
+    CHECK_EQ(rd.open(path), RAD_E_FORMAT);
+    {
+        FILE* f = std::fopen((d.path + "/junk.kva").c_str(), "wb");
+        REQUIRE(f != nullptr);
+        std::fputs("not an archive at all", f);
+        std::fclose(f);
+    }
+    CHECK_EQ(rd.open(d.path + "/junk.kva"), RAD_E_FORMAT);
+
+    const std::string gone = d.path + "/gone.kva";
+    const KvArchiveHeader h = kva_header(40, 3, 64, 0);
+    CHECK_EQ(kva_write(gone, h, toks, { bh(1), bh(2), bh(3) },
+                       [](int64_t, int64_t, uint8_t*) { return false; }, nullptr), RAD_E_STATE);
+    CHECK(!std::filesystem::exists(gone));
+    CHECK(!std::filesystem::exists(gone + ".tmp"));
+}
+
+/* The checksum is the same however the bytes are split across calls. */
+TEST(the_archive_checksum_does_not_depend_on_how_the_bytes_arrive) {
+    std::vector<uint8_t> v(1000);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (uint8_t)(i * 13 + 5);
+    KvChecksum whole;
+    whole.add(v.data(), v.size());
+    for (size_t step : { 1, 3, 31, 32, 33, 500 }) {
+        KvChecksum parts;
+        for (size_t at = 0; at < v.size(); at += step) parts.add(v.data() + at, std::min(step, v.size() - at));
+        CHECK_EQ(parts.value(), whole.value());
+    }
+    KvChecksum other;
+    v[999] ^= 1;
+    other.add(v.data(), v.size());
+    CHECK(other.value() != whole.value());
+}
+
+/* An archive is written from host copies only, and read back as off-device entries with host
+ * records: the state a demoted entry is in, which a hit restores as it restores any. */
+TEST(an_entry_read_back_from_disk_is_held_as_a_demoted_one_is) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto a = tok_run(8100, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    const std::vector<BlockHash> hs = chain_of(a);
+    REQUIRE_EQ(hs.size(), 21u);
+    const std::vector<BlockHash> held(hs.begin(), hs.begin() + 20);
+    const int64_t eb = x.t.entry_bytes();
+    std::vector<uint8_t> bytes((size_t)(20 * eb));
+    /* Copies are queued at publish and land later: until then nothing can be written. */
+    CHECK_EQ(x.t.host_copies(held.data(), 20), 0ll);
+    CHECK(!x.t.read_host(held.data(), 20, bytes.data()));
+    CHECK_EQ(copy_now(x.t).size(), 20u);
+    CHECK_EQ(x.t.host_copies(held.data(), 20), 20ll);
+    CHECK(x.t.read_host(held.data(), 20, bytes.data()));
+    for (int64_t i = 0; i < 20 * eb; ++i) bytes[(size_t)i] = (uint8_t)(i * 3);
+
+    /* A server started afresh. */
+    TierFixture y;
+    CHECK_OK(y.build());
+    CHECK(y.f.pc.chain_hashes(a, {}, 20) == held);
+    const int64_t free_before = y.t.free_host_slots();
+    const uint64_t now = rad_mono_ns();
+    for (int64_t b = 0; b < 20; ++b) {
+        const BlockHash& k = held[(size_t)b];
+        CHECK(y.f.pc.adopt_entry(k, a.data() + b * 16, [&] {
+            return y.t.adopt_host(k, bytes.data() + b * eb, b, now);
+        }));
+    }
+    CHECK_EQ(y.t.free_host_slots(), free_before - 20);
+    CHECK_EQ(y.f.pc.size(), 20ll);
+    CHECK_EQ(y.f.pc.resident(), 0ll);
+    CHECK_EQ(y.f.kv.pool_bytes_used(G_FULL), 0ll);
+    CHECK_EQ(y.f.pc.lookup(a, {}).n_attn_tokens, 0);
+    CHECK_EQ(y.f.pc.restorable_from(a, {}).size(), 20u);
+    std::vector<uint8_t> back((size_t)(20 * eb));
+    CHECK(y.t.read_host(held.data(), 20, back.data()));
+    CHECK(back == bytes);
+
+    /* Held already: nothing placed again. Other tokens under the key: refused. */
+    bool placed = false;
+    CHECK(y.f.pc.adopt_entry(held[0], a.data(), [&] { placed = true; return true; }));
+    CHECK(!placed);
+    const auto other = tok_run(1, 16);
+    CHECK(!y.f.pc.adopt_entry(held[0], other.data(), [&] { return true; }));
+    CHECK(!y.t.adopt_host(held[0], bytes.data(), 0, now));
+
+    /* Pinned again, the read-back chain stays through expiry like any archive. */
+    PrefixCache::Pinned p;
+    y.f.pc.pin(a, {}, 336, &p);
+    CHECK_EQ(p.entries.size(), 20u);
+    y.f.pc.expire(rad_mono_ns() + 7200 * SEC, 60 * SEC);
+    CHECK_EQ(y.f.pc.restorable_from(a, {}).size(), 20u);
+    y.f.pc.unpin(p);
+    y.f.pc.expire(rad_mono_ns() + 7200 * SEC, 60 * SEC);
+    CHECK_EQ(y.f.pc.restorable_from(a, {}).size(), 0u);
+}
+
+/* A snapshot is read for writing only once its save has landed and no new save targets it. */
+TEST(a_snapshot_is_settled_only_between_saves) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto a = tok_run(9100, 336);
+    publish(f, 1, a, 320);
+    const std::vector<BlockHash> ha = chain_of(a);
+    f.pc.begin_step();
+    int32_t slot = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 256, ha[15], &slot));
+    CHECK(!f.pc.snapshot_settled(ha[15], nullptr));         /* the save is not committed */
+    /* Committed when the save is issued; that it has landed is the caller's to ensure (the engine
+     * drains the streams before it reads the slot). */
+    f.pc.commit_checkpoint(ha[15]);
+    f.pc.begin_step();
+    int32_t got = -1;
+    CHECK(f.pc.snapshot_settled(ha[15], &got));
+    CHECK_EQ(got, slot);
+    int32_t again = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(2, 256, ha[15], &again));   /* the same key's slot, saved over */
+    CHECK_EQ(again, slot);
+    CHECK(!f.pc.snapshot_settled(ha[15], nullptr));
+    f.pc.begin_step();
+    CHECK(f.pc.snapshot_settled(ha[15], nullptr));
+    CHECK(!f.pc.snapshot_settled(ha[3], nullptr));
 }
 
 RAD_TEST_MAIN()

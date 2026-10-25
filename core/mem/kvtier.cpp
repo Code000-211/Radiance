@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <unordered_set>
 
 namespace rad {
@@ -244,6 +245,54 @@ void IdleTiers::set_pinned(const BlockHash& key, bool on) {
     if (it == recs_.end()) return;
     if (on) unlist(it->second);
     else relist(key, it->second);
+}
+
+/* ------------------------------------------------------------------ archives on disk */
+
+int64_t IdleTiers::host_copies(const BlockHash* keys, int64_t n) const {
+    std::lock_guard lk(mu_);
+    int64_t have = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        auto it = recs_.find(keys[i]);
+        if (it != recs_.end() && !it->second.pending && !it->second.doomed &&
+            it->second.host_slot >= 0)
+            ++have;
+    }
+    return have;
+}
+
+bool IdleTiers::read_host(const BlockHash* keys, int64_t n, uint8_t* dst) const {
+    std::lock_guard lk(mu_);
+    for (int64_t i = 0; i < n; ++i) {
+        auto it = recs_.find(keys[i]);
+        if (it == recs_.end() || it->second.pending || it->second.doomed ||
+            it->second.host_slot < 0)
+            return false;
+        std::memcpy(dst + i * cfg_.entry_bytes, arena_.at(it->second.host_slot),
+                    (size_t)cfg_.entry_bytes);
+    }
+    return true;
+}
+
+bool IdleTiers::adopt_host(const BlockHash& key, const void* src, int64_t depth, uint64_t now_ns) {
+    if (!host_on()) return false;
+    std::lock_guard lk(mu_);
+    if (recs_.count(key)) return false;
+    const int32_t slot = arena_.alloc();
+    if (slot < 0) return false;
+    std::memcpy(arena_.at(slot), src, (size_t)cfg_.entry_bytes);
+    Rec& r = recs_[key];
+    r.tier = KVTier::Host;
+    r.host_slot = slot;
+    r.used_ns = now_ns;
+    r.depth = depth;
+    relist(key, r);
+    return true;
+}
+
+int64_t IdleTiers::free_host_slots() const {
+    std::lock_guard lk(mu_);
+    return host_on() ? arena_.free_slots() : 0;
 }
 
 KVTier IdleTiers::tier_of(const BlockHash& key) const {

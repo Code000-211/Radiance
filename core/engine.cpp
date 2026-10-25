@@ -448,6 +448,7 @@ int Engine::step_loop() {
             }
             tier_tick();
             expire_tick(rad_mono_ns());
+            memory_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
@@ -788,6 +789,7 @@ int Engine::step_loop() {
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
+        memory_tick(now);
         drain_completed();
         sched_.publish(/*idle=*/false);
 
@@ -1591,6 +1593,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
+    /* Archives a previous run wrote, before anything can be admitted or evicted. */
+    if (!gen_ && !embedding_) RAD_TRY(restore_archives());
+
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
@@ -1615,6 +1620,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    /* An archive being written finishes before the tiers it reads from go. */
+    memory_stop();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;

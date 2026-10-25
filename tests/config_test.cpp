@@ -431,7 +431,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
-        { "--memory-archives", { "4" } },
+        { "--memory-archives", { "4" } }, { "--memory-dir", { "/var/lib/radiance/memory" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },

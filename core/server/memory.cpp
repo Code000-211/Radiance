@@ -77,6 +77,7 @@ json archive_json(const IScheduler::ArchiveStat& s) {
     o["pinned_tokens"] = s.pinned_tokens;
     o["snapshot_tokens"] = s.snapshot_pos;
     o["age_s"] = s.age_s;
+    o["on_disk"] = s.on_disk;
     return o;
 }
 

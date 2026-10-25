@@ -225,6 +225,7 @@ public:
         s.pinned_tokens = m.pinned_tokens;
         s.snapshot_pos = m.snapshot_pos;
         s.age_s = m.age_s;
+        s.on_disk = m.on_disk;
         return s;
     }
     int session_chain(const std::string& label, Chain* out) const override {

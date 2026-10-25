@@ -36,6 +36,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -1681,6 +1682,155 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
         CHECK((*r)["completion_probabilities"] == cold["completion_probabilities"]);
     }
     CHECK_EQ(s.stop(), 0);
+}
+
+/* GET `path`: the parsed body, and the status through `status`. */
+json get_json(int port, const std::string& path, int* status = nullptr) {
+    Call c;
+    std::string out;
+    const int st = c.send(port, "GET", path, "") ? c.read(&out) : -1;
+    if (status) *status = st;
+    return json::parse(out, nullptr, false);
+}
+
+/* An archive (/v1/memory/archive) with --memory-dir is written to disk and read back by the next
+ * server: a request over the archived conversation then resumes from the blocks and the snapshot
+ * the file held, and returns what a cold run returns, bit for bit. Deleting the archive deletes
+ * its file. */
+static void archive_restart_case(const std::string& model, bool hybrid);
+TEST(an_archive_survives_a_restart_and_resumes_as_the_cache_did) {
+    REQUIRE(world().ok);
+    archive_restart_case(world().qwen35, /*hybrid=*/true);
+}
+/* Attention only: the file holds blocks and no snapshot. */
+TEST(an_attention_only_archive_survives_a_restart) {
+    REQUIRE(world().ok);
+    archive_restart_case(world().gemma4, /*hybrid=*/false);
+}
+static void archive_restart_case(const std::string& model, bool hybrid) {
+    char tmpl[] = "/tmp/rad_e2e_mem_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    const std::string dir = tmpl;
+    const std::vector<int32_t> head = prompt_ids(21, 260);
+    std::vector<int32_t> more = head;
+    for (int32_t t : prompt_ids(22, 40)) more.push_back(t);
+    json cold;
+    {
+        Server s;
+        REQUIRE(s.start(model, kPlain));
+        cold = post(s.port, "/completion", completion(more, 16, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    /* --prefix-cache-mib: archives are written from the host tier and read back into it. */
+    const std::vector<std::string> args = { "--num-speculative-tokens", "0",
+                                            "--checkpoint-interval", "64",
+                                            "--prefix-cache-mib", "64", "--memory-dir", dir };
+    const std::string file = dir + "/conv-a.kva";
+    {
+        Server s;
+        REQUIRE(s.start(model, args));
+        json b = completion(head, 16);
+        b["session_id"] = "conv";
+        (void)post(s.port, "/completion", b);
+        int st = 0;
+        const json a = post(s.port, "/v1/memory/archive",
+                            json{ { "session_id", "conv" }, { "archive_id", "conv-a" } }, &st);
+        CHECK_EQ(st, 201);
+        CHECK_EQ(a.value("tokens", 0), 276);
+        CHECK_EQ(a.value("snapshot_tokens", 0) > 0, hybrid);
+        /* Written within a tick or two of its blocks' host copies landing. */
+        bool on_disk = false;
+        for (int i = 0; i < 100 && !on_disk; ++i) {
+            on_disk = get_json(s.port, "/v1/memory/archive/conv-a").value("on_disk", false);
+            if (!on_disk) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!on_disk) {
+            const std::string log = s.output();
+            std::string lines;
+            for (size_t at = 0; at < log.size();) {
+                const size_t eol = std::min(log.find('\n', at), log.size());
+                const std::string line = log.substr(at, eol - at);
+                if (line.find("memory") != std::string::npos || line.find("tiers") != std::string::npos ||
+                    line.find("prefix") != std::string::npos)
+                    lines += line + "\n";
+                at = eol + 1;
+            }
+            fprintf(stderr, "    the archive was not written:\n%s\n", lines.c_str());
+        }
+        CHECK(on_disk);
+        CHECK(std::filesystem::exists(file));
+        CHECK_EQ(s.stop(), 0);
+    }
+
+    Server s;
+    REQUIRE(s.start(model, args));
+    CHECK(s.output().find("read back from") != std::string::npos);
+    const json list = get_json(s.port, "/v1/memory/archive");
+    REQUIRE(list.contains("data"));
+    REQUIRE_EQ(list["data"].size(), (size_t)1);
+    const json& row = list["data"][0];
+    CHECK_EQ(row.value("id", ""), std::string("conv-a"));
+    CHECK_EQ(row.value("session_id", ""), std::string("conv"));
+    CHECK(row.value("on_disk", false));
+    CHECK(row.value("pinned_tokens", 0) > 0);
+    CHECK_EQ(row.value("snapshot_tokens", 0) > 0, hybrid);
+
+    const json warm = post(s.port, "/completion", completion(more, 16, 0.0, 0, 3));
+    const int64_t hit = timing(warm, "cache_n");
+    if (tokens_of(warm) != tokens_of(cold)) {
+        const auto tw = tokens_of(warm), tc = tokens_of(cold);
+        size_t at = 0;
+        while (at < tw.size() && at < tc.size() && tw[at] == tc[at]) ++at;
+        fprintf(stderr, "    resumed from the read-back archive (%lld tokens), the reply departs from "
+                "the cold run's at token %zu of %zu\n", (long long)hit, at, tc.size());
+    }
+    if (hit <= 0) fprintf(stderr, "    after the restart the archived head was not hit:\n%s\n",
+                          tail(s.output()).c_str());
+    CHECK(hit > 0);
+    CHECK(hit <= 260);
+    REQUIRE(cold.contains("completion_probabilities"));
+    CHECK(tokens_of(warm) == tokens_of(cold));
+    CHECK(warm["completion_probabilities"] == cold["completion_probabilities"]);
+
+    Call del;
+    std::string body;
+    CHECK(del.send(s.port, "DELETE", "/v1/memory/archive/conv-a", ""));
+    CHECK_EQ(del.read(&body), 200);
+    CHECK(!std::filesystem::exists(file));
+    CHECK_EQ(s.stop(), 0);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+/* A server stopped right after an archive is made writes it on the way out. */
+TEST(an_archive_made_just_before_a_shutdown_is_written_on_the_way_out) {
+    REQUIRE(world().ok);
+    char tmpl[] = "/tmp/rad_e2e_mem_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    const std::string dir = tmpl;
+    const std::vector<std::string> args = { "--num-speculative-tokens", "0", "--prefix-cache-mib",
+                                            "64", "--memory-dir", dir };
+    {
+        Server s;
+        REQUIRE(s.start(world().gemma4, args));
+        json b = completion(prompt_ids(31, 300), 8);
+        b["session_id"] = "late";
+        (void)post(s.port, "/completion", b);
+        int st = 0;
+        (void)post(s.port, "/v1/memory/archive", json{ { "session_id", "late" }, { "archive_id", "late-a" } },
+                   &st);
+        CHECK_EQ(st, 201);
+        CHECK_EQ(s.stop(), 0);
+    }
+    CHECK(std::filesystem::exists(dir + "/late-a.kva"));
+    Server s;
+    REQUIRE(s.start(world().gemma4, args));
+    const json row = get_json(s.port, "/v1/memory/archive/late-a");
+    CHECK(row.value("on_disk", false));
+    CHECK(row.value("pinned_tokens", 0) > 0);
+    CHECK_EQ(s.stop(), 0);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 /* The row a running server's /diagnostics reports for `option`, or null. */

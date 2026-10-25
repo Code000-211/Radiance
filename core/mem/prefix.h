@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -298,6 +299,26 @@ public:
     bool    pinned(const BlockHash& h) const { return pins_.count(h) > 0; }
     bool    snapshot_pinned(const BlockHash& h) const { return ck_pins_.count(h) > 0; }
     int64_t pinned_blocks() const { return (int64_t)pins_.size(); }
+
+    /* ---------------- archives on disk (core/mem/kvarchive.h) ---------------- */
+    /* The chain hashes of the first `n_blocks` whole blocks, as lookup computes them. A file read
+     * back is adopted only if its keys are these: the same tokens under the same adapter salt and
+     * control vector. */
+    std::vector<BlockHash> chain_hashes(const std::vector<int32_t>& tokens,
+                                        const std::vector<MMContentKey>& mm,
+                                        int64_t n_blocks) const {
+        return chain_all(tokens, mm, n_blocks);
+    }
+    /* An entry read back from disk, adopted off-device: `place` gives it its only copy, a host
+     * record (IdleTiers::adopt_host). True when the cache holds the entry afterwards, adopted now
+     * or already held with these tokens (two archives sharing a prefix). */
+    bool adopt_entry(const BlockHash& h, const int32_t* block_tokens,
+                     const std::function<bool()>& place);
+    /* A snapshot whose slot holds its state once the saves issued so far have landed: committed,
+     * and not reserved for another save (reserve_checkpoint hands an existing key's slot back for
+     * a new one). A save is committed when it is issued, so a host reader drains the streams
+     * first (Engine::memory_tick). */
+    bool snapshot_settled(const BlockHash& key, int32_t* slot) const;
 
 
     /* ---------------- the linear half of an idle session ----------------

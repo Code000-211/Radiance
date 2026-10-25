@@ -106,6 +106,9 @@ static const Flag g_flags[] = {
     { "--memory-archives",    "N",      "conversations the memory endpoints may pin at once (default 8):\n"
     "                                    each keeps its cached blocks and one snapshot slot until\n"
     "                                    deleted. 0 refuses every archive" },
+    { "--memory-dir",         "DIR",    "where archives are written so a restart keeps them, and read\n"
+    "                                    back from at startup. Needs --prefix-cache-mib: they are\n"
+    "                                    written from host memory. Default: memory only" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -528,6 +531,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--memory-archives"))       { if (!num(0, 4096, &c->memory_archives)) return RAD_E_INVAL; }
+        else if (S("--memory-dir"))            { if (!(v = need(i))) return RAD_E_INVAL; c->memory_dir = v; }
         else if (S("--lora")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             const char* eq = std::strchr(v, '=');
@@ -1039,6 +1043,7 @@ const ShowRow kShow[] = {
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
     { "--memory-archives",    [](const Config& c) { return num(c.memory_archives); } },
+    { "--memory-dir",         [](const Config& c) { return or_none(c.memory_dir, "memory only"); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

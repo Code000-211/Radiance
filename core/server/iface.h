@@ -269,6 +269,7 @@ public:
         int64_t     pinned_tokens = 0;       /* whole blocks the cache still held when pinned */
         int64_t     snapshot_pos = 0;        /* where a fork resumes; 0 without recurrent state */
         double      age_s = 0;
+        bool        on_disk = false;         /* written to --memory-dir: survives a restart */
     };
     /* RAD_E_NOTFOUND when no request finished under `label`. */
     virtual int     session_chain(const std::string& /*label*/, Chain* /*out*/) const {

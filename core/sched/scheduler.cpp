@@ -9,6 +9,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 
 namespace rad {
@@ -401,9 +402,13 @@ int64_t Scheduler::reset_prefix_cache() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
     const int64_t dropped = pc_->reset();
-    /* The reset dropped every pin (PrefixCache::clear). */
+    /* The reset dropped every pin (PrefixCache::clear), and the archives go with them, on disk
+     * too: a reset is a reset. */
     if (!mem_.archives().empty())
         RAD_INFO("memory: %zu archive(s) dropped with the prefix cache", mem_.archives().size());
+    if (!cfg_.memory_dir.empty())
+        for (const auto& kv : mem_.archives())
+            if (kv.second.on_disk) (void)::unlink(archive_path(cfg_.memory_dir, kv.first).c_str());
     mem_.clear_archives();
     RAD_INFO("prefix cache: reset, %lld entries dropped", (long long)dropped);
     return dropped;
@@ -483,7 +488,81 @@ MemArchiveStat Scheduler::archive_stat(const MemArchive& a, uint64_t now_ns) con
     s.pinned_tokens = cached_tokens(a.pinned);
     s.snapshot_pos = a.pinned.snapshot_pos;
     s.age_s = now_ns > a.made_ns ? (double)(now_ns - a.made_ns) * 1e-9 : 0.0;
+    s.on_disk = a.on_disk;
     return s;
+}
+
+bool Scheduler::archive_to_write(uint64_t now_ns, MemArchive* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cfg_.memory_dir.empty() || !pc_) return false;
+    const MemArchive* best = nullptr;
+    for (auto& kv : mem_.archives()) {
+        MemArchive& a = kv.second;
+        if (a.on_disk || a.write_tries >= 3 || a.write_after_ns > now_ns) continue;
+        if (a.chain.lora_uid != 0 || a.chain.has_media) {
+            RAD_INFO("memory: archive '%s' is kept in memory only: it ran %s", a.id.c_str(),
+                     a.chain.has_media ? "with media, which are not kept"
+                                       : "under an adapter, whose cache keys a restart changes");
+            a.write_tries = 3;
+            continue;
+        }
+        if (!best || a.made_ns < best->made_ns) best = &a;
+    }
+    if (!best) return false;
+    *out = *best;
+    return true;
+}
+
+void Scheduler::archive_written(const std::string& id, bool ok, uint64_t now_ns) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = mem_.archives().find(id);
+    if (it == mem_.archives().end()) {
+        /* Deleted while it was being written. */
+        if (ok && !cfg_.memory_dir.empty()) (void)::unlink(archive_path(cfg_.memory_dir, id).c_str());
+        return;
+    }
+    MemArchive& a = it->second;
+    if (ok) {
+        a.on_disk = true;
+        RAD_INFO("memory: archive '%s' written to %s", id.c_str(),
+                 archive_path(cfg_.memory_dir, id).c_str());
+        return;
+    }
+    ++a.write_tries;
+    a.write_after_ns = now_ns + (uint64_t)a.write_tries * 10ull * 1000000000ull;
+    if (a.write_tries >= 3)
+        RAD_WARN("memory: archive '%s' could not be written to %s after 3 tries; it is kept in "
+                 "memory only and is lost with a restart", id.c_str(), cfg_.memory_dir.c_str());
+}
+
+void Scheduler::archive_defer(const std::string& id, uint64_t until_ns) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = mem_.archives().find(id);
+    if (it != mem_.archives().end()) it->second.write_after_ns = until_ns;
+}
+
+int Scheduler::restore_archive(const std::string& id, const std::string& label, MemChain c,
+                               double age_s, MemArchiveStat* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
+    auto& all = mem_.archives();
+    if (all.count(id)) return RAD_E_STATE;
+    if ((int64_t)all.size() >= cfg_.memory_archives) return RAD_E_FULL;
+    MemArchive a;
+    a.id = id;
+    a.label = label;
+    const uint64_t now = rad_mono_ns();
+    const uint64_t age = age_s > 0 ? (uint64_t)(age_s * 1e9) : 0;
+    a.made_ns = age < now ? now - age : 0;
+    a.on_disk = true;
+    {
+        const Request r = chain_request(c);
+        pc_->pin(r, (int64_t)c.tokens.size(), &a.pinned);
+    }
+    a.chain = std::move(c);
+    if (out) *out = archive_stat(a, now);
+    all.emplace(id, std::move(a));
+    return RAD_OK;
 }
 
 bool Scheduler::archive_chain(const std::string& id, MemChain* out) const {
@@ -510,6 +589,9 @@ int Scheduler::unarchive(const std::string& id) {
     auto it = all.find(id);
     if (it == all.end()) return RAD_E_NOTFOUND;
     if (pc_) pc_->unpin(it->second.pinned);
+    /* A write still running finds the archive gone when it reports and removes its file then. */
+    if (it->second.on_disk && !cfg_.memory_dir.empty())
+        (void)::unlink(archive_path(cfg_.memory_dir, id).c_str());
     RAD_INFO("memory: archive '%s' deleted", id.c_str());
     all.erase(it);
     return RAD_OK;

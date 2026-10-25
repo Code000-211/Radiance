@@ -287,8 +287,25 @@ public:
                      MemArchiveStat* out);
     bool     archive_chain(const std::string& id, MemChain* out) const;
     int      archives(std::vector<MemArchiveStat>* out) const;
-    /* RAD_E_NOTFOUND for an unknown id. */
+    /* RAD_E_NOTFOUND for an unknown id. Its file goes too. */
     int      unarchive(const std::string& id);
+
+    /* ---- archives on disk (--memory-dir; the engine writes and reads them, engine_memory.cpp)
+     *
+     * The oldest archive not yet written whose turn has come, copied out: false when there is
+     * none. An archive under an adapter or with media is never written: an adapter's cache salt
+     * is assigned at load and differs after a restart, and media are not kept. */
+    bool     archive_to_write(uint64_t now_ns, MemArchive* out);
+    /* A write of `id` ended. A failed one is tried again later, three times in all; the file of
+     * an archive deleted while it was written is removed. */
+    void     archive_written(const std::string& id, bool ok, uint64_t now_ns);
+    /* Not ready to be written yet (its blocks' host copies have not all landed): the others
+     * have their turn until `until_ns`. Not a failure. */
+    void     archive_defer(const std::string& id, uint64_t until_ns);
+    /* An archive read back at startup, its entries already adopted: pinned and listed with its
+     * age carried over. RAD_E_FULL at --memory-archives, RAD_E_STATE for an id in use. */
+    int      restore_archive(const std::string& id, const std::string& label, MemChain c,
+                             double age_s, MemArchiveStat* out);
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */

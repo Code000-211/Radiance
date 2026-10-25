@@ -41,8 +41,13 @@ pi -e /path/to/Radiance/integrations/pi-memory/index.ts
 Serve the model with a prefix cache (the default) and, for long sessions, a host tier:
 
 ```sh
-radiance --model m.rad --prefix-cache-mib 32768 --prefix-cache-ttl 7200 --memory-archives 8
+radiance --model m.rad --prefix-cache-mib 32768 --prefix-cache-ttl 7200 --memory-archives 8 \
+         --memory-dir ~/.local/share/radiance/memory
 ```
+
+`--memory-dir` writes each archive to disk and reads it back at the next start, so `memory_ask`
+keeps working across a server restart; without it a restart releases them (their text stays
+searchable either way).
 
 Point Pi at it as an OpenAI-compatible (or Anthropic) provider. The extension tags every request to
 that server with Pi's session id (`session_id`, or `metadata.user_id` on the Anthropic API), which

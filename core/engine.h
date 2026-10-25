@@ -454,6 +454,25 @@ private:
     /* --prefix-cache-ttl, once a second, with or without the tiers (PrefixCache::expire). */
     void expire_tick(uint64_t now_ns);
     uint64_t expire_last_ns_ = 0;
+    /* ---- archives on disk (--memory-dir, engine_memory.cpp, core/mem/kvarchive.h) ----
+     * Read back before the server takes requests; written by a thread of their own once every
+     * pinned block has a host copy, started from the step loop once a second. */
+    int  restore_archives();
+    void memory_tick(uint64_t now_ns);
+    /* One look at the archives: 0 nothing to write, 1 the writer is busy, 2 a write was handed
+     * to it, 3 the oldest was not ready and waits its turn. */
+    int  memory_step(uint64_t now_ns);
+    /* Writes what is ready before the process goes, then stops the writer. */
+    void memory_stop();
+    /* What a file must have been written under to be read back here: the container, plugins,
+     * tensor parallelism, KV dtype and every size. */
+    std::string memory_fingerprint() const;
+    struct MemWriter;
+    std::shared_ptr<MemWriter> mem_writer_;
+    std::string mem_fp_;
+    bool     mem_on_ = false;
+    uint64_t mem_last_ns_ = 0;
+    std::vector<std::string> mem_waiting_warned_;
     /* Issue and land every waiting host copy now. Called under the scheduler's lock by an
      * eviction that would otherwise erase what the copies cover. True when any landed. */
     bool flush_copies();

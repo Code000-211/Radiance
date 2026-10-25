@@ -235,6 +235,7 @@ export class MemoryRuntime {
             const a = held.get(r.id);
             const when = new Date(r.createdAt).toISOString().replace("T", " ").slice(0, 16);
             const state = a ? `pinned, ${a.tokens} tokens, snapshot at ${a.snapshot_tokens}`
+                    + (a.on_disk ? ", on disk" : "")
                 : r.radiance ? "released (text only)" : "text only";
             lines.push(`  ${r.id}  ${when}  ${state}`);
         }

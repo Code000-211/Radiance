@@ -863,6 +863,9 @@ struct Config {
      * blocks and one snapshot slot until deleted, out of what live conversations share. 0
      * refuses every archive. */
     int64_t memory_archives = 8;
+    /* --memory-dir: where archives are written so a restart keeps them, and read back from at
+     * startup. "" keeps them in memory only. */
+    std::string memory_dir;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The

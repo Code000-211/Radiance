@@ -1182,7 +1182,7 @@ VRAM copy. Its VRAM can then be given up at no cost, and is, as soon as somethin
 expert slab's loan, or a request the pool cannot otherwise serve). A conversation that returns
 before that resumes from VRAM; one that returns after is restored from host memory and keeps its host
 copy, so its next turn copies only what that turn added. A full host tier drops its least recently
-used conversations. Nothing is written to a drive.
+used conversations. Nothing is written to a drive, except the archives `--memory-dir` keeps (§5.17).
 
 Every stored conversation expires: one unused for `--prefix-cache-ttl` seconds is removed from
 whichever tier holds it (VRAM blocks to the pool, host slot to the arena, snapshots to the store). A
@@ -1604,6 +1604,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 | `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory, up to N MiB (§4.8) |
 | `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
 | `--memory-archives N` | 8 | conversations `/v1/memory/archive` keeps pinned at once; `0` refuses every archive (§5.17) |
+| `--memory-dir DIR` | none | write archives there and read them back at startup, so a restart keeps them; needs `--prefix-cache-mib` (§5.17) |
 
 **Placement and state**
 
@@ -2824,7 +2825,32 @@ and one snapshot slot (`--checkpoint-slots`), so size those for the archives too
 tier an archive's blocks stay in VRAM, unavailable to running requests until it is deleted (the log
 warns when one is made); with one they move to host memory as soon as VRAM is wanted. A 409 is an id
 already taken, 404 a session no request has finished under, 501 a server without a prefix cache.
-`POST /reset_prefix_cache` drops the archives with everything else, and so does a restart.
+`POST /reset_prefix_cache` drops the archives with everything else, their files included.
+
+**On disk.** Without `--memory-dir` the archives live in memory and a restart loses them. With it,
+each archive is also written to `DIR/ID.kva` and every file there is read back at the next start,
+before the server takes a request:
+
+```sh
+radiance --model m.rad --prefix-cache-mib 32768 --memory-dir /var/lib/radiance/memory
+```
+
+- An archive is written once all its blocks have host copies, which the host tier takes as soon as
+  the request that wrote them finishes; `on_disk` in the archive's JSON turns true then. The bytes
+  come from host memory, never from the card, so `--memory-dir` needs `--prefix-cache-mib`, and
+  the write runs on a thread of its own: the steps do not wait for the disk. The file is the
+  conversation's tokens, its blocks' KV, its snapshot and a checksum, about what the conversation
+  holds in the host tier (14.6 KiB a token on Qwen3.8-Flash-Next at fp8 and TP2) plus one snapshot.
+- Read back, its blocks go to the host tier and its snapshot to a store slot, pinned as before, and
+  the first request over the conversation restores them as it restores any demoted conversation.
+  The newest files are read first, up to `--memory-archives`, while the host tier has room.
+- A file is read back only by the deployment that wrote it: its fingerprint names the container,
+  the plugins, `--tp`, `--kv-cache-dtype`, the block and snapshot sizes and the radiance version,
+  and a file written under any other is left in place with a warning naming both. One whose
+  checksum fails (a torn or damaged file) is set aside as `ID.kva.bad`; a write a crash cut short
+  leaves `ID.kva.tmp`, removed at the next start. An archive under an adapter or with media is
+  kept in memory only, since neither keys the cache the same way after a restart.
+- `DELETE` removes the file with the archive.
 
 Like `/diagnostics`, the memory routes answer only loopback clients without `--api-key` (§6.6): they
 read and keep other clients' conversations.

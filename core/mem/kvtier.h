@@ -193,6 +193,20 @@ public:
      * it is published, and a lost entry recomputed later is still the archive's. */
     void set_pinned(const BlockHash& key, bool on);
 
+    /* ---------------- archives on disk (core/mem/kvarchive.h) ----------------
+     *
+     * An archive is written from host copies, never from VRAM: a key is ready once its record
+     * holds a host slot no job is writing (a clean device record, or a host one). A landed copy
+     * is never written again, so the bytes read here are the entry's. */
+    int64_t host_copies(const BlockHash* keys, int64_t n) const;
+    /* Copies the host copies of keys [0, n) into dst, entry_bytes each, under the lock. False at
+     * the first key that has none (it was recomputed or forgotten since it was counted). */
+    bool    read_host(const BlockHash* keys, int64_t n, uint8_t* dst) const;
+    /* An entry read back from disk: a host record whose only copy is `src`, in a slot of its own.
+     * False when the arena is full or the key already has a record. */
+    bool    adopt_host(const BlockHash& key, const void* src, int64_t depth, uint64_t now_ns);
+    int64_t free_host_slots() const;
+
     /* Called at every site that erases an off-device record (capacity drop, failed promotion,
      * expiry). Without it the cache would keep the entry, resident_off_device would answer false,
      * and the stale block ids would be served as a hit. The cache drops the entry without
