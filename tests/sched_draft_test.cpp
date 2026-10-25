@@ -17,6 +17,7 @@
 #include "sched/scheduler.h"
 #include "sched/draft_cost.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -6291,6 +6292,107 @@ TEST(two_concurrent_boundary_requests_get_one_answer_each) {
             CHECK_EQ(a.samples, 0);
             CHECK_EQ(a.cycles_done, 0);
         }
+}
+
+/* A boundary the step loop has already answered is linearized: the shutdown that follows refuses
+ * new requests and wakes whatever is still waiting, but it must not take back an answer that is
+ * already here. The caller collects the boundary it was promised -- in both interleavings, so the
+ * assertion does not depend on which thread wins. */
+TEST(a_boundary_answered_before_the_shutdown_is_still_collected) {
+    Fixture f;
+    start_recording(f, "sched_boundary_answered_shutdown.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    const int64_t warm = samples_of(f);
+    REQUIRE(warm > 0);
+
+    Scheduler::DraftCalibAck ack;
+    std::thread t([&] { ack = f.sch.request_draft_calib_boundary(60000); });
+    for (int guard = 0; guard < 2000000 && f.sch.draft_calib_epoch() == 1; ++guard) {
+        f.sch.serve_draft_calib_boundary();
+        std::this_thread::yield();
+    }
+    REQUIRE_EQ(f.sch.draft_calib_epoch(), 2u);
+    f.sch.shutdown("test shutdown after an answer", RAD_E_STATE);
+    t.join();
+
+    CHECK_EQ(ack.rc, RAD_OK);
+    CHECK_EQ(ack.epoch, 2u);
+    CHECK_EQ(ack.samples, warm);
+    CHECK(f.sch.draft_costs().buckets().empty());
+}
+
+/* The pairing has to hold for every schedule, not for the one the test happens to get: a boundary
+ * may only be applied together with an answer that reaches the request which asked for it. The
+ * answered-but-uncollected window is where the two used to come apart -- a second caller could be
+ * given the slot, apply a second boundary and take the first request's reply with it -- so the test
+ * hammers that window from four threads and asserts the pairing, not an order. */
+TEST(boundary_answers_and_requests_stay_paired_under_contention) {
+    Fixture f;
+    start_recording(f, "sched_boundary_pairing.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    REQUIRE(f.sch.draft_costs().buckets().size() > 0);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> stop_serving{0};
+    /* A step loop on its own: it serves whenever it has nothing else to do, exactly as
+     * Engine::step_loop's idle branch does, and it is the only place a boundary is applied. */
+    std::thread loop([&] {
+        while (!stop.load()) {
+            f.sch.serve_draft_calib_boundary();
+            std::this_thread::yield();
+        }
+    });
+    const int64_t epoch_at_start = (int64_t)f.sch.draft_calib_epoch();
+    const int kThreads = 4, kRounds = 40;
+    std::vector<Scheduler::DraftCalibAck> acks((size_t)kThreads * kRounds);
+    {
+        std::vector<std::thread> ts;
+        for (int t = 0; t < kThreads; ++t)
+            ts.emplace_back([&, t] {
+                for (int r = 0; r < kRounds; ++r) {
+                    Scheduler::DraftCalibAck& out = acks[(size_t)t * kRounds + r];
+                    /* Generous enough that a request is answered whenever the engine is quiet, and
+                     * short enough that a busy answer does not hold the test up: the timeout is
+                     * the caller's own, never the engine's. */
+                    out = f.sch.request_draft_calib_boundary(20);
+                }
+            });
+        for (std::thread& t : ts) t.join();
+    }
+    stop.store(true);
+    loop.join();
+
+    /* Every boundary that was applied is answered exactly once, and every answer that claims a
+     * boundary names one: the epoch the run ended on minus the one it started from is the number of
+     * successful answers, never more. */
+    int64_t served = 0;
+    int64_t busy = 0;
+    std::vector<int64_t> epochs;
+    for (const Scheduler::DraftCalibAck& k : acks) {
+        if (k.rc == RAD_OK) {
+            ++served;
+            epochs.push_back((int64_t)k.epoch);
+        } else {
+            CHECK_EQ(k.rc, RAD_E_STATE);
+            ++busy;
+            /* "Busy" is a claim about the caller's own request: it dropped nothing. */
+            CHECK_EQ(k.buckets, 0);
+            CHECK_EQ(k.samples, 0);
+            CHECK_EQ(k.cycles_done, 0);
+        }
+    }
+    CHECK_EQ(served + busy, (int64_t)acks.size());
+    /* One epoch per applied boundary: the run ends as many epochs further on as there were
+     * successful answers, and no two callers were handed the same one. */
+    const int64_t end_epoch = (int64_t)f.sch.draft_calib_epoch();
+    CHECK_EQ(end_epoch - epoch_at_start, served);
+    std::sort(epochs.begin(), epochs.end());
+    for (size_t i = 0; i < epochs.size(); ++i) CHECK_EQ(epochs[i], epoch_at_start + 1 + (int64_t)i);
+    CHECK(f.sch.draft_costs().buckets().empty());
 }
 
 /* A request still outstanding when the engine shuts down is refused and woken; it is never applied

@@ -384,6 +384,92 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(big.status, 401);
 }
 
+/* The calibration boundary's whole matrix, over the real transport instead of the router: keyed and
+ * keyless, present and absent credentials, and each of the three answers the handler gives -- 200
+ * (a boundary was taken), 409 (not quiet, nothing dropped) and 501 (not a calibration). The one row
+ * this machine cannot produce is the 403 a *keyless* server gives a remote peer, because every
+ * client here is loopback; that row is proven against the route handler's peer in server_test. */
+TEST(the_calibration_boundary_answers_the_whole_matrix_at_the_route) {
+    const std::string route = "/admin/draft-calib-boundary";
+    const std::string body  = "{}";
+
+    /* Keyed: the gate every state-changing route is under, and the call behind it is the handler's. */
+    {
+        LiveServer s(4, 1, [](ServerOptions& o) { o.api_key = "k"; });
+        REQUIRE(s.srv->port() > 0);
+        CHECK_EQ(::ask(s, post(route, body)).status, 401);
+        CHECK_EQ(::ask(s, post(route, body, "Authorization: Bearer wrong\r\n")).status, 401);
+        CHECK_EQ(::ask(s, post(route, body, "X-Api-Key: wrong\r\n")).status, 401);
+        CHECK_EQ(s.sched.calib_calls, 0);          /* refused before the scheduler is asked */
+
+        const std::string key = "Authorization: Bearer k\r\n";
+        for (const std::string& h : { key, std::string("X-Api-Key: k\r\n") }) {
+            s.sched.calib_ack = server::DraftCalibAck{};
+            CHECK_EQ(::ask(s, post(route, body, h)).status, 501);
+            s.sched.calib_ack.rc      = RAD_E_STATE;
+            s.sched.calib_ack.epoch   = 2;
+            CHECK_EQ(::ask(s, post(route, body, h)).status, 409);
+            s.sched.calib_ack.rc      = RAD_OK;
+            s.sched.calib_ack.epoch   = 2;
+            s.sched.calib_ack.buckets = 3;
+            s.sched.calib_ack.samples = 41;
+            const Reply r = ::ask(s, post(route, body, h));
+            CHECK_EQ(r.status, 200);
+            const json o = json::parse(r.body, nullptr, false);
+            CHECK(o.is_object());
+            CHECK_EQ(o.value("accepted", false), true);
+            CHECK_EQ(o.value("epoch", 0), 2);
+            CHECK_EQ(o.value("buckets_dropped", -1), 3);
+            CHECK_EQ(o.value("samples_dropped", -1), 41);
+            CHECK_EQ(r.header("Content-Type").rfind("application/json", 0), 0u);
+        }
+        CHECK_EQ(s.sched.calib_calls, 6);          /* two headers x three answers */
+    }
+
+    /* Keyless: loopback clients are served the route itself, so the mode decides -- 501 outside a
+     * calibration, 409 while the engine is not quiet, 200 when the fake says the boundary was cut. */
+    {
+        LiveServer s(4, 1);
+        REQUIRE(s.srv->port() > 0);
+        s.sched.calib_ack = server::DraftCalibAck{};
+        CHECK_EQ(::ask(s, post(route, body)).status, 501);
+        s.sched.calib_ack.rc    = RAD_E_STATE;
+        s.sched.calib_ack.epoch = 2;
+        /* Busy is a refusal with a reason, and it is not an error status a retry loop can treat as
+         * "already done": the caller is told nothing was dropped. */
+        const Reply busy = ::ask(s, post(route, body));
+        CHECK_EQ(busy.status, 409);
+        {
+            const json e = json::parse(busy.body, nullptr, false);
+            CHECK(e.is_object());
+            CHECK_EQ(e.value("accepted", true), false);
+            CHECK(!e.value("reason", "").empty());
+        }
+        s.sched.calib_ack.rc      = RAD_OK;
+        s.sched.calib_ack.epoch   = 5;
+        s.sched.calib_ack.buckets = 0;
+        s.sched.calib_ack.samples = 0;
+        const Reply r = ::ask(s, post(route, body));
+        CHECK_EQ(r.status, 200);
+        const json o = json::parse(r.body, nullptr, false);
+        CHECK_EQ(o.value("accepted", false), true);
+        CHECK_EQ(o.value("epoch", 0), 5);
+        CHECK_EQ(o.value("samples_dropped", -1), 0);   /* an empty phase still opens the next one */
+        CHECK_EQ(s.sched.calib_calls, 3);
+    }
+
+    /* The route is a POST: an empty body is a valid request (the call takes no arguments), and the
+     * method it is not is refused before the scheduler. */
+    {
+        LiveServer s(4, 1);
+        REQUIRE(s.srv->port() > 0);
+        s.sched.calib_ack.rc = RAD_OK;
+        CHECK_EQ(::ask(s, post(route, "")).status, 200);
+        CHECK_EQ(::ask(s, get(route)).status, 405);
+        CHECK_EQ(s.sched.calib_calls, 1);
+    }
+}
+
 /* A refusal the transport writes itself on an Anthropic path (the key gate's 401, a body over
  * the limit, a wrong method, an unknown path below /v1/messages) is in Anthropic's envelope, as
  * the handlers' refusals there are; the same refusal elsewhere stays OpenAI's. */

@@ -3198,9 +3198,11 @@ TEST(a_loaded_reference_decides_the_draft_depth_instead_of_the_fallback) {
  * quiet point. The samples the warmup measured must be gone from the export, and what the scored
  * request measured must be in it -- exactly one phase's worth.
  *
- * The boundary is asked for while the engine is idle between the two requests. A 409 means it was
- * still finishing something, which is the documented answer and the harness simply asks again; the
- * retry loop here is the harness's, not the server's. */
+ * The boundary is asked for once, right after the warmup's reply, and that one request has to be
+ * answered: a normally finished request leaves the loop at its idle point with nothing running,
+ * nothing issued ahead, and no open record, so the boundary is served without anybody asking twice.
+ * A 409 here is a failure, not something to retry -- a harness that polls the route would turn "the
+ * engine is not quiet" into a success and would never notice the ordering it is supposed to prove. */
 TEST(a_calibration_boundary_splits_a_real_runs_warmup_from_its_scored_set) {
     tiny::TempDir dir("profile_boundary");
     REQUIRE(dir.ok());
@@ -3230,14 +3232,11 @@ TEST(a_calibration_boundary_splits_a_real_runs_warmup_from_its_scored_set) {
     };
     CHECK_EQ(ask("warmup"), (size_t)8);
 
-    /* One POST: the engine answers at its idle point with the epoch it opens and what it dropped. */
+    /* One POST, no retry: the engine answers at its idle point with the epoch it opens and what it
+     * dropped. */
     json boundary;
     int bstatus = 0;
-    for (int attempt = 0; attempt < 200; ++attempt) {
-        boundary = post(calib.port, "/admin/draft-calib-boundary", json::object(), &bstatus);
-        if (bstatus != 409) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    boundary = post(calib.port, "/admin/draft-calib-boundary", json::object(), &bstatus);
     if (bstatus != 200)
         fprintf(stderr, "    the boundary answered %d: %s\n%s\n", bstatus, boundary.dump().c_str(),
                 tail(calib.output()).c_str());

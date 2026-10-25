@@ -2910,28 +2910,36 @@ Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms)
         }
     }
     std::unique_lock<std::mutex> lk(mu_calib_);
-    if (draft_calib_closed_) {
-        /* The scheduler is shutting down: the answer is terminal, not a boundary to retry. */
-        out.rc = RAD_E_STATE;
-        return out;
-    }
-    if (draft_calib_pending_.load(std::memory_order_relaxed) != 0) {
-        /* One outstanding request, so an answer always belongs to the request that asked. */
+    if (draft_calib_closed_ || draft_calib_slot_.load(std::memory_order_relaxed) != kCalibIdle) {
+        /* Shutting down, or the slot is taken -- either a request the step loop has not answered
+         * yet or an answer its caller has not collected. Busy at once, and never at somebody
+         * else's expense: this caller's answer would have to be this caller's alone. */
         out.rc = RAD_E_STATE;
         return out;
     }
     const uint64_t id = ++draft_calib_next_id_;
-    draft_calib_pending_.store(id, std::memory_order_relaxed);
+    draft_calib_slot_id_ = id;
+    draft_calib_slot_.store(kCalibPending, std::memory_order_relaxed);
     const int ms = timeout_ms < 0 ? 0 : timeout_ms;
     calib_cv_.wait_for(lk, std::chrono::milliseconds(ms), [&] {
-        return draft_calib_served_ == id ||
-               draft_calib_pending_.load(std::memory_order_relaxed) != id;
+        const int st = draft_calib_slot_.load(std::memory_order_relaxed);
+        return st == kCalibIdle || (st == kCalibAnswered && draft_calib_slot_id_ == id);
     });
-    if (draft_calib_served_ == id) return draft_calib_ack_;   /* applied, and this is its answer */
-    /* Withdrawn here, under the lock the application takes: a request whose caller was already
-     * told "nothing was dropped" can never be applied by a later idle point. */
-    if (draft_calib_pending_.load(std::memory_order_relaxed) == id)
-        draft_calib_pending_.store(0, std::memory_order_relaxed);
+    /* Collect, or withdraw -- both under the lock the step loop applies with. An answer that is
+     * already here is this request's, even if it arrived just as the wait expired: the boundary
+     * happened, and reporting it as "busy, nothing dropped" would be a lie. A request that is
+     * still pending is withdrawn here, so a later idle point cannot apply it. */
+    const int st = draft_calib_slot_.load(std::memory_order_relaxed);
+    if (st == kCalibAnswered && draft_calib_slot_id_ == id) {
+        out = draft_calib_ack_;
+        draft_calib_slot_id_ = 0;
+        draft_calib_slot_.store(kCalibIdle, std::memory_order_relaxed);
+        return out;                       /* the slot is free for the next caller */
+    }
+    if (st == kCalibPending && draft_calib_slot_id_ == id) {
+        draft_calib_slot_id_ = 0;
+        draft_calib_slot_.store(kCalibIdle, std::memory_order_relaxed);
+    }
     out.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
     out.rc    = RAD_E_STATE;
     return out;
@@ -2940,16 +2948,21 @@ Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms)
 void Scheduler::draft_calib_close() {
     std::lock_guard<std::mutex> lk(mu_calib_);
     draft_calib_closed_ = true;
-    draft_calib_pending_.store(0, std::memory_order_relaxed);
+    /* A request the step loop has not answered yet is refused -- and woken, so it is not left to
+     * time out. One that *was* answered keeps its answer: it was linearized before the shutdown,
+     * and its caller must still be able to collect the boundary it was promised. */
+    if (draft_calib_slot_.load(std::memory_order_relaxed) == kCalibPending) {
+        draft_calib_slot_id_ = 0;
+        draft_calib_slot_.store(kCalibIdle, std::memory_order_relaxed);
+    }
     calib_cv_.notify_all();
 }
 
 void Scheduler::serve_draft_calib_boundary() {
-    /* The step path's cheap answer: almost always nothing was asked for. */
-    if (draft_calib_pending_.load(std::memory_order_relaxed) == 0) return;
+    /* The step path's cheap answer: almost always nobody asked. */
+    if (draft_calib_slot_.load(std::memory_order_relaxed) != kCalibPending) return;
     std::unique_lock<std::mutex> clk(mu_calib_);
-    const uint64_t id = draft_calib_pending_.load(std::memory_order_relaxed);
-    if (id == 0) return;
+    if (draft_calib_slot_.load(std::memory_order_relaxed) != kCalibPending) return;
     DraftCalibAck ack;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2982,11 +2995,11 @@ void Scheduler::serve_draft_calib_boundary() {
                      (long long)ack.cycles_done, (long long)ack.cycles_dropped);
         }
     }
-    /* Applied and acknowledged before the lock is dropped: the withdraw above takes the same one,
-     * so the two outcomes cannot both happen. */
-    draft_calib_pending_.store(0, std::memory_order_relaxed);
-    draft_calib_served_ = id;
-    draft_calib_ack_    = ack;
+    /* Answered, and the slot stays taken: the caller has not collected its answer yet, and a second
+     * request must neither be given this boundary nor overwrite the reply. The collect below (or a
+     * shutdown that refuses a *pending* request) is the only way out of Answered. */
+    draft_calib_ack_ = ack;
+    draft_calib_slot_.store(kCalibAnswered, std::memory_order_relaxed);
     clk.unlock();
     calib_cv_.notify_all();
 }

@@ -794,17 +794,21 @@ by this call. A `501` means the run is not a calibration at all (started without
 `--draft-profile-out`) -- the same answer `/reset_prefix_cache` gives without a cache. `200` carries
 the recording epoch the boundary opened and what was dropped.
 
-**One request, one answer.** Exactly one boundary request is outstanding at a time: a second caller
-is told `409` at once instead of queueing behind the first, so an answer always belongs to the
-request that asked. A request that waits past its timeout is **withdrawn under the same lock that
-applies it**, so a caller told "nothing was dropped" can never have its boundary applied by a later
-idle point; it asks again if it still wants the cut. Both outcomes are mutually exclusive by
+**One request, one answer.** There is one slot, and it is held from the request until its caller has
+collected the answer. A second caller arriving in between is told `409` at once instead of queueing,
+so an answer always belongs to the request that asked, and a boundary that was already applied is
+never handed to -- or overwritten by -- somebody else. A request that waits past its timeout is
+**withdrawn under the same lock that applies it**, so a caller told "nothing was dropped" can never
+have its boundary applied by a later idle point; it asks again if it still wants the cut. An answer
+that arrives just as the wait expires is this caller's and is returned as a success: the boundary
+happened, and reporting it as "busy" would be a lie. Both outcomes are mutually exclusive by
 construction, not by timing: the step loop applies with `mu_` held nested inside `mu_calib_`, and the
-withdraw, the mutation and the publish all take `mu_calib_`. A scheduler that is shutting down
-closes the boundary first -- before it takes `mu_`, so the two lock orders cannot deadlock -- and
-refuses and wakes whatever is still outstanding: an answer during shutdown is `409`, never a late
-success. The capacity the deployment reserved is kept across the reset (`clear()`, not
-`shrink_to_fit()`), so the scored phase records into memory that is already there.
+withdraw, the mutation and the answer all take `mu_calib_`. A scheduler that is shutting down closes
+the boundary first -- before it takes `mu_`, so the two lock orders cannot deadlock -- refuses and
+wakes a request the step loop has not answered yet, and leaves an answer that is already there
+alone: that answer was linearized before the shutdown and its caller still collects it. The
+capacity the deployment reserved is kept across the reset (`clear()`, not `shrink_to_fit()`), so the
+scored phase records into memory that is already there.
 
 **The epoch.** A run's recording starts in epoch 1; every served boundary opens the next one, and
 the export names the epoch its buckets came from (`--draft-profile-out ...: recording epoch N`). A
@@ -827,8 +831,12 @@ deployment identity have to be logged before a profile measured on it is compare
 unsupported outside a calibration, busy while work is in flight, served at the idle point of a
 finished run (warmup dropped, scored phase's samples equal to one phase's worth, never two), an
 empty calibration, a withdrawn timeout that is never applied later, two concurrent requests (one
-applied, one busy), shutdown with a request outstanding, and the samples-only reset's binding and
-capacity. `engine_e2e_test` runs the real thing: a cost calibration on a tiny model, one warmup
+applied, one busy), shutdown with a request outstanding, an answer that a shutdown arrives on top of
+and that is still collected afterwards, four callers hammering the slot (one epoch per collected
+answer, no answer claiming another request's drops), and the samples-only reset's binding and
+capacity. The route's whole transport matrix -- keyed and keyless, wrong key, `200`/`409`/`501` --
+runs on a real socket in `transport_test`; the `403` a keyless server gives a remote peer is proven
+against the handler's peer in `server_test`, because every client on that socket is loopback. `engine_e2e_test` runs the real thing: a cost calibration on a tiny model, one warmup
 request that finishes on its own `max_tokens`, one `POST`, one scored request, the orderly
 shutdown's export -- and the exported sample count must be the scored request's alone, with the log
 naming `recording epoch 2`.
