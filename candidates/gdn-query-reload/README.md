@@ -244,13 +244,27 @@ The equality is guarded by controls inside the same invocation:
 That run does not cover speed (no timing is part of it), the f16 state cache, the fp8-e4m3 code path,
 the optional conv-bias operand, or any full-model step.
 
-The open measurement, for whoever has a card:
+The open measurement, for whoever has a card. The build is CPU work and takes no GPU window, even
+while another agent is measuring; only the run itself opens both cards, so only the run goes through
+the shared agent test window:
 
 ```sh
-flock -n -x /tmp/radiance-tp2-bench.lock \
+# CPU only, no lock, no status transition:
+cmake --build <build> --target gdn_query_reload gdn_query_reload_compare
+
+# The run takes /tmp/radiance-tp2-bench.lock nonblocking, sets the executing issue to `testing`
+# before it starts, and keeps the lock through the client and its cleanup. Exit 75 = the window is
+# taken, nothing ran, the issue stays ready_for_testing; name the holder, do not retry in a loop.
+python3 scripts/gpu_job.py --issue MAIN-<n> -- \
   <build>/bin/gdn_query_reload_compare --frozen <home>/kernels/libr4d.so \
     --candidate <home>/kernels/gdn_query_reload.so --steps 6 --poison-counters
 ```
+
+`gpu_job.py` and `docs/GPU-COORDINATION.md` are not part of this tree; they live on the
+coordination branch `agent/mika/496236b8c06d` (PR #47, closed without merge on request). A bare
+`flock -n -x /tmp/radiance-tp2-bench.lock` around this command is the legacy form the runner
+replaces: it records no `testing` transition, and around a build it blocks unrelated host tests and
+reviews for the length of somebody else's measurement.
 
 ## Original evidence, and what it does and does not say about this target
 
