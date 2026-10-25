@@ -1226,6 +1226,49 @@ Fix as_signed(Fix f, float shift, bool flip = false) {
     return f;
 }
 
+/* The reader's own guard, and the reason the draw refuses a row it cannot fill: `selb` must ascend
+ * strictly, so a repeated id and a descending list are both refused rather than read (a repeat
+ * would leave the union with a hole the mask cannot express, and the one pass over blocks assumes
+ * ascending order). kf_ordered_fits keeps the draw to that contract; this holds the reader to it,
+ * both ways. */
+int unordered_list_case() {
+    /* One row, a four-wide `selb` row (the width `topk + 1` declares), `nsel` the live count. */
+    auto table = [](std::vector<int32_t> selb, int32_t n) {
+        while (selb.size() < 4) selb.push_back(-1);
+        const int64_t M = 1, tiles = 1, u_max = 4;
+        std::vector<int32_t> tab((size_t)u_max, -1), tlen((size_t)tiles, -1),
+            mask((size_t)u_max, -1), roff((size_t)tiles, -1), ns{ n }, pos{ 7 };
+        RadTensor t[7] = {
+            tens(selb.data(), RAD_I32, { M, 4 }, 4), tens(ns.data(), RAD_I32, { M }),
+            tens(pos.data(), RAD_I32, { M }),        tens(tab.data(), RAD_I32, { tiles, u_max }),
+            tens(tlen.data(), RAD_I32, { tiles }),   tens(mask.data(), RAD_I32, { M, u_max }),
+            tens(roff.data(), RAD_I32, { M }),
+        };
+        RadParam p[6]{};
+        p[0] = { "M", RAD_P_INT, 1 };      p[1] = { "blocks", RAD_P_INT, 8 };
+        p[2] = { "topk", RAD_P_INT, 3 };   p[3] = { "tile", RAD_P_INT, 1 };
+        p[4] = { "ratio", RAD_P_INT, 4 };  p[5] = { "u_max", RAD_P_INT, 4 };
+        RadArgs a{};
+        a.t = t; a.n_t = 7; a.p = p; a.n_p = 6;
+        return rad_ref_qsa_table(&a);
+    };
+    int fails = 0;
+    if (table({ 2, 3, 3, 4 }, 4) != RAD_E_INVAL) {
+        std::printf("FAIL the reference read a repeated block id\n");
+        ++fails;
+    }
+    if (table({ 2, 1, 0 }, 3) != RAD_E_INVAL) {
+        std::printf("FAIL the reference read a descending list\n");
+        ++fails;
+    }
+    /* And an ascending one is read: the guard is a guard, not a refusal of everything. */
+    if (table({ 0, 2 }, 2) != RAD_OK) {
+        std::printf("FAIL the reference refused an ascending list\n");
+        ++fails;
+    }
+    return fails;
+}
+
 }  // namespace
 
 /* No argument: the fixtures above and the branch check. `sweep N`: N fix_random fixtures, about
@@ -1258,6 +1301,7 @@ int main(int argc, char** argv) {
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }
     }
     if (!sweep) fails += shared_table_case();
+    if (!sweep) fails += unordered_list_case();
     if (!sweep) fails += parser_case();
     fails += masked_read_case();
     if (sweep) {

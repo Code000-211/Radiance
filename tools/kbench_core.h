@@ -211,6 +211,17 @@ std::string bench_refusal(const Stats& st, const std::set<std::string>& measured
                           const std::map<std::string, int>& skipped,
                           const std::map<std::string, int>& stale);
 
+/* Why a recorded case is stale, or "" when it can be checked. A case is stale when its recording
+ * cannot be answered: the library it names (`recorded`, the fixture's `oracle` without its version)
+ * serves no host row for the op now and no loaded library declares a reference for it, or that row
+ * no longer describes the recording (`differs`, which non-empty states how). `oracle` is the library
+ * the resolver found -- a substitute reference for another library is not stale, and is reported as
+ * such. A substitute reference is named in `differs` only when it is the recording itself, which is
+ * the point: only the recording's own row is held to the recording. The reason names the library,
+ * because the only action it asks for is re-recording from the one that changed. */
+std::string stale_reason(const std::string& recorded, const std::string& oracle, bool oracle_row,
+                         const std::string& differs);
+
 /* ================================================================== where the time went */
 enum Phase {
     PH_LOAD = 0,     /* plugins and fixture */

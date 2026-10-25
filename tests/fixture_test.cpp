@@ -583,10 +583,11 @@ TEST(the_fallback_index_range_is_the_widest_leading_extent) {
 }
 
 /* A block-order list (`OpdShape::idx_ordered`) is ids inside the block space: a row ascends
- * strictly and stops short of `idx_max`, the next row starts one later so a tile's rows overlap,
- * and a row wider than the space cannot ascend at all -- it would have to leave the space. The
- * shape hooks cap the width (`qsa_table`: `min(topk + 1, blocks)`); this keeps a hand-written
- * fixture from carrying an id past `idx_max`, which the reader would take as a block id. */
+ * strictly and stops short of `idx_max`, and the next row starts one later so a tile's rows overlap.
+ * A row of `w` distinct ids needs a space of `w`; one wider than the space has no ascending draw at
+ * all, so the contract is a refusal (kf_ordered_fits) rather than a repeated id -- every reader of
+ * the op refuses a repeat (ref_qsatable.cpp), and the shape hooks cap the width so a declared case
+ * always fits (`qsa_table`: `min(topk + 1, blocks)`). */
 TEST(an_ordered_list_stays_inside_its_block_space) {
     auto list = [](int64_t rows, int64_t w, int64_t span) {
         KfOperand d;
@@ -610,15 +611,29 @@ TEST(an_ordered_list_stays_inside_its_block_space) {
     const std::vector<float> top = draw_f32({ list(2, 7, 8) }, 0, 2, 0x5252);
     CHECK_EQ(top[7], 1.0f);
     CHECK_EQ(top[13], 7.0f);
-    /* Wider than the space: every entry stays an id the reader can take. */
+
+    /* Every row the space can hold ascends strictly and stays inside it: no duplicate, no id past
+     * the space, whichever width and span a case declares. The reader's refusal is the second line
+     * of defence, not the draw's evidence. */
+    for (int64_t span = 1; span <= 12; ++span)
+        for (int64_t w = 1; w <= span; ++w) {
+            CHECK(kf_ordered_fits(list(1, w, span)));
+            const std::vector<float> v = draw_f32({ list(2, w, span) }, 0, 2, 0x5400 + w);
+            REQUIRE_EQ((int64_t)v.size(), (int64_t)(2 * w));
+            for (int64_t r = 0; r < 2; ++r)
+                for (int64_t j = 0; j < w; ++j) {
+                    const float x = v[(size_t)(r * w + j)];
+                    CHECK(x >= 0.0f && x < (float)span);
+                    if (j) CHECK(x > v[(size_t)(r * w + j - 1)]);
+                }
+        }
+
+    /* Wider than the space is not a case: refused, and left undrawn rather than drawn with the
+     * repeat the reader would have to reject. */
+    CHECK(!kf_ordered_fits(list(2, 10, 8)));
     const std::vector<float> wide = draw_f32({ list(2, 10, 8) }, 0, 2, 0x5353);
     REQUIRE_EQ((int64_t)wide.size(), (int64_t)20);
-    for (int64_t r = 0; r < 2; ++r) {
-        CHECK_EQ(wide[(size_t)(r * 10)], 0.0f);
-        for (int64_t j = 1; j < 10; ++j)
-            CHECK(wide[(size_t)(r * 10 + j)] >= wide[(size_t)(r * 10 + j - 1)]);
-    }
-    for (float v : wide) CHECK(v >= 0.0f && v < 8.0f);
+    for (float v : wide) CHECK_EQ(v, 0.0f);
 }
 
 /* ================================================================== the file */

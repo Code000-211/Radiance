@@ -2724,7 +2724,10 @@ a masked read of it saves.
 - **A row's list is `min(topk + 1, blocks)` wide**, its selection capped by the block space: a list
   cannot carry more entries than there are blocks to select, and the reader takes every entry below
   the row's own count as a block id. `nsel` is drawn at that same width, so the drawn list stays
-  ascending and inside `[0, blocks)`.
+  ascending and inside `[0, blocks)`. The draw will not invent a list it cannot fill: a width past
+  the block space is refused by name rather than drawn with a repeated id (`kf_ordered_fits`,
+  `tools/kfixture.h`), and the reader refuses that repeat (`tests/r4d_emu/test_qsa.cpp`), so the
+  shape hook's cap is the contract, not the safety net.
 - **The partial page is not in the table.** Its block index is `(pos + 1) / ratio` by construction, so
   the bound `b < own` already keeps it out of the union; a reader appends it after filtering, which
   is the page it must read last anyway.
@@ -2757,6 +2760,10 @@ through the row's block table, and appending the row's partial page last.
   the reason, rather than reporting the table alone as green.
 - **`tab` carries block indices, not page ids**, and the cache stride set is separate
   (`kv_sb`/`kv_sh`/`kv_so`/`kv_sd`) so the page layout is the attention group's, not this op's.
+- **`tlen` counts the entries the plane actually holds**, `min(topk, u_max)` for a full selection:
+  a plane narrower than the row's `topk` carries fewer ids, and the count has to name what is there
+  rather than the selection's length. `u_max` is bounded by `tile * topk`, so only a single-row
+  tile (or a caller's narrower plane, which the parser allows) reaches the cap.
 - **The partial page is appended, never read off the table.** Its block index is `(pos + 1) / ratio`
   by position and only when `(pos + 1) % ratio != 0`, which is also the row whose next block may still
   be filling.

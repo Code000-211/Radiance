@@ -524,6 +524,44 @@ TEST(a_time_for_an_unchecked_op_refuses_the_measurement_gate) {
     CHECK(kb::bench_refusal(unchecked, measured, none, none).find("no case") != std::string::npos);
 }
 
+/* The stale decision (kb::stale_reason), which the replay only reaches when a plugin's rows
+ * disappear between recording and replay: that does not happen with the plugin set in this tree, so
+ * the branch is exercised here instead of being left as a read-through. The states are the
+ * resolver's, in the order it can reach them. */
+TEST(a_recorded_library_that_serves_no_reference_row_is_stale_and_is_named) {
+    /* Nothing recorded: `--ref` answers, so no staleness. */
+    CHECK(kb::stale_reason("", "libref", true, "").empty());
+    /* No reference row anywhere: stale, and the message names the library that recorded it, because
+     * the only action it asks for is a re-record from that library. */
+    const std::string gone = kb::stale_reason("libref", "", false, "");
+    CHECK(!gone.empty());
+    CHECK(gone.find("libref") != std::string::npos);
+    CHECK(gone.find("no row for it now") != std::string::npos);
+    CHECK(gone.find("no loaded library declares a reference") != std::string::npos);
+    /* A stale case is a failure under --strict and a note without it, which is the whole difference
+     * the tool makes; a run whose only stale case is this one must not exit 0 under --strict. */
+    kb::Stats st;
+    st.stale = 1;
+    CHECK_EQ(kb::exit_code(st, true), 1);
+    CHECK_EQ(kb::exit_code(st, false), 0);
+    /* The library still declares a host row for the op but the selector now finds none for this
+     * case: stale, and still named. */
+    const std::string dropped = kb::stale_reason("libref", "libref", false, "");
+    CHECK(dropped.find("libref recorded this case and has no row for it now") != std::string::npos);
+    /* A substitute reference from another library is not staleness: the case is compared, and the
+     * substitute is reported where the runs are. */
+    CHECK(kb::stale_reason("libref", "qsatable", true, "").empty());
+    CHECK(kb::stale_reason("libref", "qsatable", false, "").empty());
+    /* The recording's own row exists but describes the output differently: stale, named, and the
+     * reason is carried through -- this is the case a container change produces. */
+    CHECK(kb::stale_reason("libref", "libref", true, "").empty());
+    const std::string moved =
+        kb::stale_reason("libref", "libref", true, "'out': the recording says [8, 512], kbm_add "
+                                                  "says [8, 256]");
+    CHECK(moved.find("libref now describes an output differently") != std::string::npos);
+    CHECK(moved.find("kbm_add") != std::string::npos);
+}
+
 /* ================================================================== where the time went */
 
 TEST(the_phase_line_names_each_phase_and_library) {

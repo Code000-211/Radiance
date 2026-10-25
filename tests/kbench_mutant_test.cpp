@@ -838,7 +838,9 @@ TEST(a_drawn_table_length_never_leaves_the_planes_declared_width) {
 /* The gate's negative half: a case of a timed op that was skipped or went stale withdraws every
  * time of that op and the run ends 1. Keeping the times of the cases that happened to be checked
  * would publish a measurement of part of an op as the op's. --timing-only compares nothing, so it
- * keeps what it timed. */
+ * keeps what it timed. Both halves are stated on the report itself: a withdrawn time is a row with
+ * no number in it, and a kept one is a row with a number -- a row that is simply missing proves
+ * neither, so every row checked here is required to exist. */
 TEST(a_timed_op_with_a_skipped_or_stale_case_publishes_no_time) {
     REQUIRE(env().ok);
     const std::vector<KfCase> all = recorded().cases;
@@ -857,25 +859,90 @@ TEST(a_timed_op_with_a_skipped_or_stale_case_publishes_no_time) {
     CHECK(has(md, "**Device timings withheld:**"));
     const std::vector<std::string> host = speed_row(md, "kbm_add");
     const std::vector<std::string> dev = speed_row(md, "kbm_add_device");
-    CHECK(host.empty() || num(host[6]) < 0);
-    CHECK(dev.empty() || num(dev[5]) < 0);
+    REQUIRE(host.size() >= 14);
+    REQUIRE(dev.size() >= 14);
+    CHECK_EQ(host[5], std::string("-"));      /* device column: a host row has no device time */
+    CHECK_EQ(host[6], std::string("-"));      /* the time the gate took away */
+    CHECK_EQ(dev[5], std::string("-"));
+    CHECK_EQ(dev[6], std::string("-"));
+    CHECK_EQ(host[9], std::string("-"));      /* `n`: no batches survive either */
+    CHECK(has(host[13], "withheld"));
+    CHECK(has(dev[13], "withheld"));
 
-    /* The same op registered as stale: a case whose operand list no longer matches its schema. */
+    /* The same op registered as stale: its row was timed under the case that was checked and its
+     * time is removed just the same -- a stale case of an op withdraws what the checked case of it
+     * measured. A run that only ever reported a missing op would hide exactly this. */
     KfCase stale = all[0];
     stale.opd.pop_back();
     stale.seed ^= 1;
     const std::string sfile = fixture_of("gate_stale.rkb", { all[0], stale });
+    const std::string sreport = env().dir + "/gate_stale.md";
     const Out st = run(env(), "--kernels kbm_ok:libref --no-ref --strict --max-bytes 64 "
-                              "--fixture '" + sfile + "' " + kQuickBench);
+                              "--fixture '" + sfile + "' " + kQuickBench + " --report '" +
+                              sreport + "'");
     CHECK_RUN(st, st.code == 1);
     CHECK_RUN(st, has(st.text, "The measurement gate refused"));
     CHECK_RUN(st, has(st.text, "stale"));
+    const std::string smd = read_text(sreport);
+    CHECK(has(smd, "**Device timings withheld:**"));
+    const std::vector<std::string> shost = speed_row(smd, "kbm_add");
+    REQUIRE(shost.size() >= 14);
+    for (size_t col : { 5u, 6u, 7u, 8u, 9u })   /* time, min, p90, n: every one gone */
+        CHECK_EQ(shost[col], std::string("-"));
+    CHECK(has(shost[13], "withheld"));
 
-    /* A timing-only run has no comparison to lose: it publishes what it timed and stays 0. */
+    /* A timing-only run has no comparison to lose: it publishes what it timed and stays 0. The
+     * device row is required to carry a real number, so the absence above is evidence of the gate
+     * and not of a report that cannot hold a time at all. */
+    const std::string oreport = env().dir + "/gate_only.md";
     const Out only = run(env(), "--kernels kbm_ok:libref --no-ref --max-bytes 64 --fixture '" +
-                                sfile + "' --timing-only " + kQuickBench);
+                                sfile + "' --timing-only " + kQuickBench + " --report '" +
+                                oreport + "'");
     CHECK_RUN(only, only.code == 0);
     CHECK_RUN(only, has(only.text, "timed. Timing only"));
+    const std::string omd = read_text(oreport);
+    CHECK(!has(omd, "**Device timings withheld:**"));
+    const std::vector<std::string> otimed = speed_row(omd, "kbm_add_device");
+    REQUIRE(otimed.size() >= 14);
+    CHECK(num(otimed[5]) > 0);                 /* a time that was actually taken */
+    CHECK(num(otimed[9]) >= 1);                /* and the batches behind it */
+}
+
+/* The gate's negative half in a container pass, which books its skips itself: a container whose
+ * cases are partly over the budget checks and times the rest, and every time it took is withheld --
+ * the checked cases of an op do not stand for the op whose other cases were skipped. Before this
+ * test the container path only ever proved that a refused gate was printed. */
+TEST(a_container_pass_that_skipped_cases_withholds_the_op_times_it_took) {
+    REQUIRE(env().ok);
+    const std::string model = tiny_model();
+    REQUIRE(!model.empty());
+    const std::string report = env().dir + "/container_gate.md";
+    /* 65536 tokens of a 64-wide bf16 activation is 25 MiB per copy, so most cases are skipped by
+     * name against a 1 MiB budget and the smallest ones still run and are timed. */
+    const Out c = run(env(), "-m '" + model + "' --kernels kbm_ok:libref --max-cases 1 "
+                             "--max-tok 65536 --max-bytes 1 " + std::string(kQuickBench) +
+                             " --report '" + report + "'");
+    CHECK_RUN(c, c.code == 1);
+    CHECK_RUN(c, has(c.text, "The measurement gate refused"));
+    CHECK_RUN(c, has(c.text, "were skipped or are stale"));
+    CHECK_RUN(c, has(c.text, "cannot stand for the op"));
+    CHECK_RUN(c, has(c.text, "budget -- raise --max-bytes"));
+    const std::string md = read_text(report);
+    const size_t speed = md.find("## Speed");
+    REQUIRE(speed != std::string::npos);
+    /* Every row of the op is listed with the gate's reason and no number anywhere, so a reader
+     * cannot mistake a withheld op for one that was not run. */
+    int rows = 0;
+    for (size_t at = md.find("| `rmsnorm` |", speed); at != std::string::npos;
+         at = md.find("| `rmsnorm` |", at + 1)) {
+        const size_t eol = md.find('\n', at);
+        const std::string line = md.substr(at, eol - at);
+        /* Every column from `device us` to `MHz` is a dash, `n` included: nothing was kept. */
+        CHECK(has(line, "| - | - | - | - | - | - | - |"));
+        CHECK(has(line, "withheld"));
+        ++rows;
+    }
+    CHECK(rows > 0);
 }
 
 /* Device rows are timed after the checks, host rows where they are checked, each in its own

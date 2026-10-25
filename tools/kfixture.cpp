@@ -511,6 +511,12 @@ void draw_history(int64_t rows, int64_t w, int64_t range, uint64_t seed, float* 
 
 }  /* namespace */
 
+bool kf_ordered_fits(const KfOperand& d) {
+    const int64_t w = d.shape.empty() ? 1 : d.shape.back();
+    const int64_t span = d.idx_max > 0 ? d.idx_max : w;
+    return w > 0 && w <= span;
+}
+
 void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t vocab_rows,
              uint64_t seed, std::vector<uint8_t>* out) {
     const KfOperand& d = opd[k];
@@ -588,20 +594,19 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
          * ascends strictly. The start walks up with the row, so a tile's rows disagree about which
          * blocks they hold and the mask filters what the union carries for the others -- which is
          * the whole point of the table op. It stops short of idx_max so no entry leaves the block
-         * space. */
+         * space, and a row the space cannot hold is left zero: `w` distinct ids need a space of `w`,
+         * and repeating one past the width is a list every reader of the op refuses (see
+         * kf_ordered_fits, which the caller asks before drawing). */
         const int64_t w = d.shape.empty() ? n : d.shape.back();
+        if (!kf_ordered_fits(d)) return;
         const int64_t rows_n = w > 0 ? n / w : 0;
         const int64_t span = d.idx_max > 0 ? d.idx_max : w;
-        /* A row wider than the block space holds no `w` distinct ids inside it: the slots past the
-         * span keep the last id the span has, so no entry is negative or past `idx_max` (the shape
-         * hooks cap the width -- `qsa_table`'s selection against `blocks` -- so this only repairs a
-         * hand-written fixture). */
-        const int64_t start_max = span > w ? span - w : 0;
+        const int64_t start_max = span - w;
         for (int64_t r = 0; r < rows_n; ++r) {
             const int64_t start = std::min<int64_t>(r, start_max);
             for (int64_t j = 0; j < w; ++j) {
                 const int64_t v = start + j;
-                tmp[(size_t)(r * w + j)] = (float)(v < span ? v : span - 1);
+                tmp[(size_t)(r * w + j)] = (float)v;
             }
         }
     } else if (d.is_index && d.idx_cu) {

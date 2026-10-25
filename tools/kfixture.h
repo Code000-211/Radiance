@@ -200,10 +200,19 @@ int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::
  * vocabulary) and reader (which does not) agree. */
 int64_t kf_vocab_rows(const std::vector<KfOperand>& opd);
 
+/* Whether a block-order list (`KfOperand::idx_ordered`) can be drawn at all: a row of `w` slots
+ * must ascend strictly inside the `idx_max` block space, which a row wider than the space cannot
+ * do (some id would have to repeat, and the ops that read the list refuse a repeat). The shape
+ * hooks cap the width -- `qsa_table` against `blocks` -- so only a hand-written fixture reaches
+ * this; a caller that draws the operands skips such a case by name rather than hand a reader a
+ * list it must refuse. */
+bool kf_ordered_fits(const KfOperand& d);
+
 /* Draws operand `k`'s bytes. Large plain operands are drawn on every core: the stream is cut into
  * RAD_FILL_BLOCK blocks seeded by index, so the bytes do not depend on the thread count. A weight
  * table with an encoding goes through kf_draw_table (and an undecodable one comes back zeroed;
- * call kf_draw_table to learn why). */
+ * call kf_draw_table to learn why). An ordered list that does not fit its block space
+ * (kf_ordered_fits) is left zero: a case that cannot be drawn is not drawn as another. */
 void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t vocab_rows,
              uint64_t seed, std::vector<uint8_t>* out);
 

@@ -41,8 +41,10 @@ struct OpdShape {
     /* A list in block order (RAD_OPD_F_IDX_ORDERED): `[rows, width]`, row r holding `start + j` at
      * slot j. `qsa_select` emits a selection sorted by block and the ops that read it refuse
      * anything else, so uniform ids are not a case at all. The width is the block space's: a row
-     * cannot hold more ids than `idx_max` has, so a wider row repeats the last one (the shape hooks
-     * cap it -- `qsa_table`'s selection against `blocks`). */
+     * of `width` distinct ids needs `idx_max >= width`, and a row the space cannot hold is refused
+     * by the draw (kf_ordered_fits) rather than drawn with a repeated id. The shape hooks cap the
+     * width so a declared case always fits (`qsa_table`: `min(topk + 1, blocks)`, `qsa_attn`:
+     * `min(topk, u_max)`). */
     bool                 idx_ordered = false;
     /* Value domain of a non-index operand when normals fall outside it. `beta` is a sigmoid
      * output in (0, 1); `g` is an intra-chunk cumulative sum of log-decays, non-increasing and

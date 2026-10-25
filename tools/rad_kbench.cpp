@@ -1221,24 +1221,17 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
      * on every machine, whichever libraries are under test. No substitute reference either -- the
      * recording's own library dropped the op and no loaded library declares one -- is a stale case,
      * not a case to compare with a tolerance nobody recorded. */
-    if (!rec.empty() && oracle.empty()) {
-        nm_.stale[c.op + "  (" + rec + " recorded this case and has no row for it now, and no "
-                  "loaded library declares a reference for it)"]++;
+    const std::string differs =
+        oracle_row && oracle == rec ? describes_differently(c, schema, oracle_row, oracle_g)
+                                    : std::string();
+    const std::string stale = kb::stale_reason(rec, oracle, oracle_row != nullptr, differs);
+    if (!stale.empty()) {
+        nm_.stale[c.op + "  (" + stale + ")"]++;
         ++st_.stale;
-    } else if (oracle == rec) {
-        if (!oracle_row) {
-            nm_.stale[c.op + "  (" + oracle + " recorded this case and has no row for it "
-                      "now)"]++;
-            ++st_.stale;
-        } else {
-            const std::string why = describes_differently(c, schema, oracle_row, oracle_g);
-            if (!why.empty()) {
-                nm_.stale[c.op + "  (" + oracle + " now describes an output differently from "
-                          "its recording -- " + why + ")"]++;
-                ++st_.stale;
-                return;
-            }
-        }
+        /* A row that now describes the output differently has nothing left to run: the shapes
+         * already disagree. A case with no reference row at all still runs under whatever library
+         * serves it, unchecked, so the gate can name the op as untimed rather than missing. */
+        if (oracle_row && oracle == rec) return;
     }
 
     /* Which libraries run this case, decided before anything is drawn, so a case every library
@@ -1301,8 +1294,7 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
     std::vector<Drawn> in;
     std::string why;
     if (!draw_case(c, &in, &why)) {
-        nm_.skipped[c.op + "  (a weight's planes do not make the operand the reference reads, " +
-                    why + ")"]++;
+        nm_.skipped[c.op + "  (" + why + ")"]++;
         ++st_.skipped;
         return;
     }
@@ -1334,6 +1326,9 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
 
 bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why) {
     PhaseTimer pt(&ph_, kb::PH_DRAW);
+    /* The whole line the skip summary shows for a planes refusal, which is the common one. */
+    const std::string plane_refusal = "a weight's planes do not make the operand the reference "
+                                     "reads, ";
     in->assign(c.opd.size(), Drawn{});
     const int64_t vocab_rows = kf_vocab_rows(c.opd);
     /* The weight kept past the cache's budget is released before anything is drawn unless this
@@ -1349,6 +1344,17 @@ bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why
         const KfOperand& d = c.opd[k];
         Drawn& out = (*in)[k];
         if (d.absent) continue;
+        /* A block-order list wider than its block space has no draw that ascends strictly, and a
+         * reader of the op refuses a repeated id rather than reading one (qa_table's reference,
+         * ref_qsatable.cpp). The shape hooks cap the width, so only a hand-written fixture asks for
+         * it: name the case instead of drawing a list no reader may take. */
+        if (d.idx_ordered && !kf_ordered_fits(d)) {
+            *why = "a block-order list of " + std::to_string(d.shape.empty() ? 1 : d.shape.back()) +
+                   " id(s) does not fit its " +
+                   std::to_string(d.idx_max > 0 ? d.idx_max : d.shape.back()) +
+                   "-id block space";
+            return false;
+        }
         if (d.role == RAD_OPD_WEIGHT) {
             /* Cached: an M sweep requests the same weight at every point, and kf_weight_seed makes
              * those requests identical. */
@@ -1361,7 +1367,7 @@ bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why
             if (d.has_enc) {
                 kf_draw_planes(d, kf_weight_seed(d, k), planes.get());
                 if (kf_planes_logical(d, *planes, bytes.get(), why) != RAD_OK) {
-                    *why = enc_name(d.enc) + ": " + *why;
+                    *why = plane_refusal + enc_name(d.enc) + ": " + *why;
                     return false;
                 }
             } else {
@@ -1390,7 +1396,7 @@ bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why
         if (d.role == RAD_OPD_WTAB && d.has_enc && !d.undrawn) {
             auto bytes = std::make_shared<Bytes>();
             if (kf_draw_table(d, k, bytes.get(), why) != RAD_OK) {
-                *why = enc_name(d.enc) + ": " + *why;
+                *why = plane_refusal + enc_name(d.enc) + ": " + *why;
                 return false;
             }
             out.bytes = bytes;

@@ -428,6 +428,23 @@ std::string bench_refusal(const Stats& st, const std::set<std::string>& measured
                ops.size() == 1 ? "its" : "their");
 }
 
+/* The stale decision, kept out of the replay so it can be held to a case no plugin set here can
+ * build: a library that names itself as the recording and has no host row for the op. The tool
+ * reaches it only when a plugin's rows disappear between recording and replay, which is what makes
+ * it worth stating rather than assuming. */
+std::string stale_reason(const std::string& recorded, const std::string& oracle, bool oracle_row,
+                         const std::string& differs) {
+    if (recorded.empty()) return std::string();   /* no recorded library: `--ref` answers */
+    if (oracle.empty())
+        return recorded + " recorded this case and has no row for it now, and no loaded library "
+                          "declares a reference for it";
+    if (oracle != recorded) return std::string();  /* a substitute, not a stale case */
+    if (!oracle_row) return oracle + " recorded this case and has no row for it now";
+    if (!differs.empty())
+        return oracle + " now describes an output differently from its recording -- " + differs;
+    return std::string();
+}
+
 int exit_code(const Stats& st, bool strict) {
     if (st.failed || st.overrun || st.fuse_failed || st.input_written) return 1;
     if (strict && st.stale) return 1;
