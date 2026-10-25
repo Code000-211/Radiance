@@ -1784,3 +1784,63 @@ TEST(a_rectangular_profile_is_refused_on_a_shrinking_backend_by_name) {
 }
 
 RAD_TEST_MAIN()
+
+/* The samples-only reset is a calibration's phase boundary: what a warmup measured may not price,
+ * widen or seed the set that is scored, and the deployment's binding may not move under it. */
+TEST(the_samples_only_reset_drops_the_samples_and_keeps_the_binding) {
+    DraftCostProfile p;
+    p.fingerprint.model     = "m";
+    p.fingerprint.quant     = "q";
+    p.fingerprint.tp_wire   = "w";
+    p.fingerprint.gpus      = "g";
+    p.fingerprint.kernels   = "k";
+    p.fingerprint.kv_format = "bf16";
+    p.fingerprint.placement = "all_vram";
+    p.fingerprint.tp        = 1;
+    p.fingerprint.basis     = DraftCostBasis::Live;
+    p.fingerprint.arena     = "none";
+    p.fingerprint.live_loan = "flex=0 lend=0";
+    DraftCostBucket b;
+    b.shape.n_rows        = 1;
+    b.shape.verify_k      = 1;
+    b.shape.verify_tokens = 2;
+    b.shape.rows[1]       = 1;
+    b.shape.draft_k       = 1;
+    b.shape.draft_rows[1] = 1;
+    b.shape.drafter       = DraftDrafter::Serial;
+    b.rounds              = 1;
+    b.draft_round_rows[1] = 1;
+    b.draft_rows_total    = 1;
+    b.mean_ms             = 12.0;
+    b.unc_ms              = 1.0;
+    b.n                   = 3;
+    p.buckets.assign(1, b);
+    DraftCostRuntime r;
+    r.fingerprint = p.fingerprint;
+    r.recording   = true;
+
+    DraftCostTable t;
+    CHECK_EQ(t.configure(p, r), RAD_OK);
+    REQUIRE(t.active());
+    t.record_only();
+    t.admit_fallback();
+    REQUIRE(t.records_only());
+    CHECK_EQ(t.buckets().size(), 1u);
+
+    t.reset_samples();
+    /* The samples are gone: nothing can be priced from them any more. */
+    CHECK(t.buckets().empty());
+    CHECK_EQ(t.dropped(), 0);
+    CHECK_EQ(t.ignored(), 0);
+    /* The binding stays: same table, same deployment, same contract. */
+    CHECK(t.active());
+    CHECK(t.records_only());
+    CHECK(t.fallback_admitted());
+    CHECK(t.reason().empty());
+
+    /* clear() is the one that unbinds, and reset_samples is not it. */
+    t.clear();
+    CHECK(!t.active());
+    CHECK(!t.records_only());
+    CHECK(!t.fallback_admitted());
+}

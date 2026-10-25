@@ -771,6 +771,11 @@ int Engine::step_loop() {
                 for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
                 sched_.release_deferred();
             }
+            /* The calibration boundary is answered here and nowhere else: this is the only point
+             * at which the engine holds no step of its own, so a samples-only reset cannot cut
+             * into a cycle that still owes a record. It answers a pending request (or none) and
+             * returns; a non-quiet engine answers busy instead of waiting. */
+            sched_.serve_draft_calib_boundary();
             tier_tick();
             expire_tick(rad_mono_ns());
             (void)loan_tick(/*idle=*/true);
@@ -2164,11 +2169,17 @@ int Engine::export_draft_cost_profile() {
                  "change inside the bracket: a mover move or a staged prefill pass; the "
                  "fingerprint names the plan, not the residency the bracket ran under)",
                  (int)placement);
-    RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s",
+    RAD_INFO("--draft-profile-out '%s': %zu bucket(s), fingerprint %s, execution %s, "
+             "recording epoch %llu (%s)",
              cfg_.draft_profile_out.c_str(), p.buckets.size(),
              draft_calib_runtime_.fingerprint.model.c_str(),
              draft_calib_runtime_.execution == DraftCostExecution::Shrinking ? "shrinking"
-                                                                            : "rectangular");
+                                                                            : "rectangular",
+             (unsigned long long)sched_.draft_calib_epoch(),
+             sched_.draft_calib_epoch() > 1
+                 ? "the samples come from the phase opened by the harness's boundary request; the "
+                   "warmup's were dropped"
+                 : "no boundary was requested, so the run's whole recording is one phase");
     return RAD_OK;
 }
 

@@ -21,8 +21,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "sched_fakes.h"
@@ -6051,4 +6053,149 @@ TEST(the_confidence_window_is_refused_where_it_cannot_decide) {
         CHECK(!f.sch.draft().confidence());
         CHECK(!f.sch.wants_draft_confidence());
     }
+}
+
+/* ================================================================== the calibration boundary */
+
+/* The harness's request is answered by the step loop, so a host test plays that part: ask from a
+ * second thread, serve from this one, exactly as Engine::step_loop's idle branch does. */
+Scheduler::DraftCalibAck ask_boundary(Scheduler& s, int timeout_ms = 5000) {
+    Scheduler::DraftCalibAck ack;
+    std::atomic<bool> done{false};
+    std::thread t([&] { ack = s.request_draft_calib_boundary(timeout_ms); done.store(true); });
+    for (int guard = 0; guard < 1000000 && !done.load(); ++guard) {
+        s.serve_draft_calib_boundary();
+        std::this_thread::yield();
+    }
+    t.join();
+    return ack;
+}
+
+/* Outside a calibration the endpoint answers 501 (RAD_E_UNSUPPORTED) and nothing is touched: the
+ * table is a serving profile, and a phase boundary would be a claim about a measurement nobody is
+ * taking. */
+TEST(the_calibration_boundary_is_unsupported_outside_a_calibration) {
+    Fixture f;
+    f.build();
+    activate_costs(f);
+    CHECK_OK(f.start());
+    CHECK(!f.sch.draft_costs().records_only());
+    const Scheduler::DraftCalibAck a = ask_boundary(f.sch, 200);
+    CHECK_EQ(a.rc, RAD_E_UNSUPPORTED);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+}
+
+/* A live engine is not a pause point: while requests are still being served the boundary is
+ * refused, and nothing the warmup measured is dropped. */
+TEST(the_calibration_boundary_refuses_running_work_and_drops_nothing) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_policy      = DraftPolicyKind::Cost;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_boundary_busy.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    f.sch.draft_costs().record_only();
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known    = true;
+    live.replay          = DraftReplay::None;
+    live.moves_since_bind = 0;
+    f.sch.step_finished(live);
+    /* The cycle's record is still open: it is closed by the *next* cycle's open. */
+    f.sch.flush_draft_observations();
+    const size_t buckets_before = f.sch.draft_costs().buckets().size();
+    REQUIRE(buckets_before > 0);
+
+    const Scheduler::DraftCalibAck busy = ask_boundary(f.sch, 2000);
+    CHECK_EQ(busy.rc, RAD_E_STATE);
+    CHECK_EQ(busy.epoch, 1u);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets_before);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+}
+
+/* The ordered hand-off a recording harness performs: warmup measured, boundary served at a quiet
+ * point, then the scored set -- and nothing of the warmup's samples is left to price, widen or
+ * weight it. `Shortened`/unpriced rows are runtime-only and do not survive either: the table is
+ * empty, not merely re-bucketed. */
+TEST(the_calibration_boundary_opens_the_scored_phase_and_drops_the_warmup) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_policy      = DraftPolicyKind::Cost;
+    f.cfg.draft_profile_out = radtest::tmp_path("sched_boundary_epoch.json");
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    f.sch.draft_costs().record_only();
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    f.prefill(a);
+    f.prefill(b);
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    auto cycle = [&] {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
+        DraftStepEvidence live;
+        live.replay_known     = true;
+        live.replay           = DraftReplay::None;
+        live.moves_since_bind = 0;
+        f.sch.step_finished(live);
+    };
+    cycle();
+
+    /* End the warmup set: close its record, drop the requests, release what they still hold. This
+     * is the engine's own idle sequence (flush, then release_deferred), not a shortcut around it. */
+    f.sch.flush_draft_observations();
+    f.sch.cancel(a);
+    f.sch.cancel(b);
+    f.sch.release_deferred();
+    const size_t warm_buckets = f.sch.draft_costs().buckets().size();
+    REQUIRE(warm_buckets > 0);
+    CHECK(f.sch.draft_cycles_done() > 0);
+
+    const Scheduler::DraftCalibAck ack = ask_boundary(f.sch);
+    CHECK_EQ(ack.rc, RAD_OK);
+    CHECK_EQ(ack.epoch, 2u);
+    CHECK_EQ(ack.buckets, (int64_t)warm_buckets);
+    CHECK(ack.samples > 0);
+    CHECK(ack.cycles_done > 0);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
+
+    /* The samples are gone; the binding is not. */
+    CHECK(f.sch.draft_costs().buckets().empty());
+    CHECK(f.sch.draft_costs().active());
+    CHECK(f.sch.draft_costs().records_only());
+    CHECK(f.sch.draft_costs().fallback_admitted());
+    CHECK_EQ(f.sch.draft_cycles_done(), 0);
+    CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
+
+    /* The scored set is recorded into epoch 2 and only into it. */
+    const uint64_t c = f.submit(180), d = f.submit(190);
+    f.prefill(c);
+    f.prefill(d);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    for (uint64_t id : { c, d }) CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known     = true;
+    live.replay           = DraftReplay::None;
+    live.moves_since_bind = 0;
+    f.sch.step_finished(live);
+    f.sch.flush_draft_observations();
+
+    int64_t scored = 0;
+    for (const DraftCostBucket& x : f.sch.draft_costs().buckets()) scored += x.n;
+    CHECK_EQ(scored, 1);   /* one cycle of the scored phase, none of the warmup's */
 }

@@ -985,6 +985,18 @@ void DraftCostTable::clear() {
     reference_ = false;
 }
 
+/* The samples and their counters go; the binding stays. `capacity_` and `active_` describe the
+ * table the run was configured with, `record_only_`/`reference_`/`fallback_admitted_` what it may
+ * do with a sample, and a phase boundary may not change any of that: it separates two sets of
+ * measurements of the same deployment. */
+void DraftCostTable::reset_samples() {
+    buckets_.clear();
+    buckets_.shrink_to_fit();
+    dropped_ = 0;
+    ignored_ = 0;
+    reference_skipped_ = 0;
+}
+
 int DraftCostTable::configure(const DraftCostProfile& profile, const DraftCostRuntime& runtime,
                               int32_t capacity) {
     clear();

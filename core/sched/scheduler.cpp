@@ -2872,6 +2872,90 @@ void Scheduler::flush_draft_observations() {
     draft_ring_flush();
 }
 
+/* --------------------------------------------------------------- the calibration boundary */
+
+/* Everything that could still deliver a sample into this phase's table. The observation ring is
+ * the one an outside caller cannot see: a record opened by this cycle is closed by the *next*
+ * cycle's open, so a scheduler whose requests have all finished may still owe one. */
+bool Scheduler::draft_calib_quiet_locked() const {
+    if (!running_.empty() || !waiting_.empty()) return false;
+    if (step_open_ || next_open_) return false;
+    if (!serial_.empty() || !block_.empty()) return false;
+    if (n_deferred_ != 0) return false;
+    if (!enc_want_.empty()) return false;
+    if (draft_ring_cur_ != 0) return false;
+    for (int32_t i = 0; i < (int32_t)kDraftRing; ++i)
+        if (draft_ring_[(size_t)i].active) return false;
+    return true;
+}
+
+Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms) {
+    DraftCalibAck early;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        early.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
+        if (!draft_costs_.records_only() && !draft_record_) {
+            early.rc = RAD_E_UNSUPPORTED;
+            return early;
+        }
+    }
+    const uint64_t want = draft_calib_want_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::unique_lock<std::mutex> lk(mu_calib_);
+    calib_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms), [&] {
+        return draft_calib_served_.load(std::memory_order_acquire) >= want;
+    });
+    if (draft_calib_served_.load(std::memory_order_acquire) < want) {
+        /* The step loop did not reach an idle point in time (stopping, or a set that never
+         * finished). Nothing was dropped, so this is a busy answer and not a boundary. */
+        early.rc = RAD_E_STATE;
+        return early;
+    }
+    return draft_calib_ack_;
+}
+
+void Scheduler::serve_draft_calib_boundary() {
+    const uint64_t want = draft_calib_want_.load(std::memory_order_acquire);
+    if (want == draft_calib_served_.load(std::memory_order_relaxed)) return;
+    DraftCalibAck ack;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ack.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
+        if (!draft_costs_.records_only() && !draft_record_) {
+            ack.rc = RAD_E_UNSUPPORTED;
+        } else if (!draft_calib_quiet_locked()) {
+            /* Nothing is dropped and nothing is waited for: the caller's next attempt is a new
+             * request, so a live engine can never be paused by this. */
+            ack.rc = RAD_E_STATE;
+        } else {
+            const std::vector<DraftCostBucket>& bs = draft_costs_.buckets();
+            ack.buckets = (int64_t)bs.size();
+            for (const DraftCostBucket& b : bs) ack.samples += b.n;
+            ack.cycles_done    = draft_cycles_done_;
+            ack.cycles_dropped = draft_cycles_dropped_;
+            draft_costs_.reset_samples();
+            /* The recorder's own counters describe the same samples, so they restart with them;
+             * the predictor's per-slot state is runtime, not a measurement, and stays. */
+            draft_cycles_done_    = 0;
+            draft_cycles_dropped_ = 0;
+            draft_cost_refused_   = 0;
+            draft_cost_warned_    = false;
+            ack.epoch = draft_calib_epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+            ack.rc = RAD_OK;
+            RAD_INFO("draft calibration: epoch %llu opened at a quiet boundary -- dropped %lld "
+                     "bucket(s) / %lld sample(s), %lld cycle(s) recorded, %lld dropped; the "
+                     "binding (identity, capacity, record-only) is unchanged",
+                     (unsigned long long)ack.epoch, (long long)ack.buckets, (long long)ack.samples,
+                     (long long)ack.cycles_done, (long long)ack.cycles_dropped);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_calib_);
+        draft_calib_ack_ = ack;
+    }
+    draft_calib_served_.store(want, std::memory_order_release);
+    calib_cv_.notify_all();
+}
+
 /* A's sample for one resolved cycle. The price is the cost of the distribution that RAN
  * (draft_cost.h): `rounds`/`draft_round_rows` come from what each row executed, the verify window
  * from what each row actually verified. `shape.draft_k`/`draft_rows` stay the plan's -- provenance

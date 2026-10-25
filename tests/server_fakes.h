@@ -720,6 +720,10 @@ struct FakeScheduler : IScheduler {
     int refuse_status = RAD_E_INVAL;
     const char* refuse_why = "the scheduler refused the request";
     server::SchedMetrics m;
+    /* The draft calibration's phase boundary: what this fake answers, and how often it was asked.
+     * Default is a serving deployment's answer (no calibration, so 501). */
+    server::DraftCalibAck calib_ack{};
+    int calib_calls = 0;
 
     std::mutex mu;
     std::vector<uint64_t> submitted;
@@ -745,6 +749,11 @@ struct FakeScheduler : IScheduler {
             ws.swap(workers);
         }
         for (auto& t : ws) if (t.joinable()) t.join();
+    }
+
+    server::DraftCalibAck draft_calib_boundary(int /*timeout_ms*/) override {
+        ++calib_calls;
+        return calib_ack;
     }
 
     uint64_t submit(Request&& r) override {

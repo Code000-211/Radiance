@@ -197,6 +197,11 @@ void Server::register_routes() {
     router_.get ("/get_tokenizer_info",  [this](const HttpRequest& q) { return handle_tokenizer_info(q); });
 
     router_.post("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
+    /* A calibration's phase boundary, for the recording harness. Under the same API-key gate as
+     * every other state-changing route (http.cpp); a deployment without --draft-profile-out
+     * answers 501. */
+    router_.post("/admin/draft-calib-boundary",
+                 [this](const HttpRequest& q) { return handle_draft_calib_boundary(q); });
 
     /* The dashboard, also at `/`, since that is what a person with the host and port types. */
     router_.get ("/",                    [this](const HttpRequest& q) { return handle_dashboard(q); });

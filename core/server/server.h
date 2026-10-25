@@ -319,6 +319,9 @@ private:
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
     json capabilities() const;
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
+    /* The draft calibration's phase boundary (--draft-profile-out): 501 outside a calibration, 409
+     * when the engine was not quiet, 200 with the epoch it opened. */
+    HttpResponse handle_draft_calib_boundary(const HttpRequest& req);
 
     /* ------------------------------------------------------------------ dashboard.cpp */
     HttpResponse handle_dashboard(const HttpRequest& req);

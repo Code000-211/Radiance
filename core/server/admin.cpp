@@ -531,6 +531,54 @@ HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+namespace {
+
+/* How long the HTTP thread waits for the step loop's answer. A calibration's step loop answers an
+ * idle engine in microseconds; this only bounds the case where it has stopped (shutdown, or a set
+ * that never finished), which is a busy answer, not a boundary. */
+constexpr int kDraftCalibBoundaryWaitMs = 5000;
+
+}  /* namespace */
+
+/* ================================================================== /admin/draft-calib-boundary */
+/* The calibration's phase boundary: the harness's one request between the warmup set it throws
+ * away and the set it scores. Not a serving feature -- a deployment started without
+ * --draft-profile-out answers 501, exactly as /reset_prefix_cache does without a cache, because a
+ * 200 would tell the harness that the warmup no longer prices the scored set.
+ *
+ * 409 means the engine was not quiet: nothing was dropped and nothing is waited for, so the caller
+ * decides whether to ask again. It is never a pause point and never aborts work. The wait for the
+ * step loop's answer is bounded (kDraftCalibBoundaryWaitMs) and ends in that same busy answer, so
+ * an engine that has stopped stepping cannot hang the HTTP thread. */
+HttpResponse Server::handle_draft_calib_boundary(const HttpRequest& req) {
+    if (!deps_.sched)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    const DraftCalibAck a = deps_.sched->draft_calib_boundary(kDraftCalibBoundaryWaitMs);
+    if (a.rc == RAD_E_UNSUPPORTED)
+        return error_response(err_not_implemented(
+            "this deployment is not a draft calibration (started without --draft-profile-out), so "
+            "it has no recording phase to bound"), req.peer);
+
+    json o;
+    o["epoch"] = a.epoch;
+    if (a.rc == RAD_E_STATE) {
+        metrics_.observe_http(409);
+        o["accepted"] = false;
+        o["reason"] =
+            "the engine is not quiet (a request is queued or running, a step is open or issued "
+            "ahead, or a cycle still owes its record); nothing was dropped -- ask again once the "
+            "previous set has finished";
+        return HttpResponse::json_body(409, json_dump(o));
+    }
+    metrics_.observe_http(200);
+    o["accepted"] = true;
+    o["buckets_dropped"] = a.buckets;
+    o["samples_dropped"] = a.samples;
+    o["cycles_dropped"] = a.cycles_dropped;
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
 /* ================================================================== /health, /ping */
 /* Not counted in the HTTP status metrics (nor is /metrics): a load balancer probing every second
  * would dominate the 2xx/5xx ratio. */

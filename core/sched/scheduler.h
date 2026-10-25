@@ -20,6 +20,8 @@
 #include "metrics.h"
 
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -501,6 +503,43 @@ public:
      * missing the cycles still held in the observation ring. A pending row is closed as dropped,
      * so this is exactly what shutdown would have recorded, only earlier. */
     void flush_draft_observations();
+
+    /* ---- the calibration phase boundary (--draft-profile-out) ----
+     *
+     * A calibration that scores a later request set may not carry the warmup's samples into it:
+     * the warmup's rows are the same shape and would price, widen and weight the set the run is
+     * scored on. The boundary between them is therefore
+     *   - a *request* from the harness (request_draft_calib_boundary, HTTP thread) answered by the
+     *     step loop at its own idle point (serve_draft_calib_boundary), never from an arbitrary
+     *     thread: only the step loop knows whether a cycle it opened still owes a record;
+     *   - *samples only*: the recording table's samples and their counters go, the binding stays
+     *     (DraftCostTable::reset_samples). The identity, the capacity, the fallback admission, the
+     *     record-only contract and the reference flag are the deployment's, not a phase's;
+     *   - *quiet or refused*: unless nothing is queued or running, no step is open or issued ahead,
+     *     no serial/block snapshot is held, no deferred release is owed, no encode is wanted and
+     *     no observation-ring record can still be reported into, the answer is RAD_E_STATE and
+     *     nothing is dropped. A busy answer aborts no work and waits for nothing: the caller
+     *     decides whether to ask again.
+     * A served boundary also stamps the run's *epoch*, which the export names (Engine): a profile
+     * built across a boundary says which phase its samples came from. */
+    struct DraftCalibAck {
+        int      rc = RAD_E_UNSUPPORTED;   /* RAD_OK, RAD_E_STATE or RAD_E_UNSUPPORTED */
+        uint64_t epoch = 0;                /* the epoch the ack leaves open */
+        int64_t  buckets = 0;              /* buckets the boundary discarded */
+        int64_t  samples = 0;              /* and the rows they held */
+        int64_t  cycles_done = 0;          /* observation-ring counters it cleared */
+        int64_t  cycles_dropped = 0;
+    };
+    /* `timeout_ms` bounds the wait for the step loop's answer; a run whose step loop has stopped
+     * answers RAD_E_STATE on expiry, since nothing dropped. */
+    DraftCalibAck request_draft_calib_boundary(int timeout_ms);
+    /* Called from the step loop, at the point where it holds no work of its own. Cheap when no
+     * boundary was asked for (one relaxed load). */
+    void          serve_draft_calib_boundary();
+    /* The recording epoch the run's samples belong to: 1 until a boundary opens the next one. */
+    uint64_t      draft_calib_epoch() const {
+        return draft_calib_epoch_.load(std::memory_order_relaxed);
+    }
     int64_t               draft_cost_refused() const { return draft_cost_refused_; }
     /* The engine's cumulative residency evidence since the profile was bound, handed in before it
      * opens the next cycle. Same sticky rule step_finished applies inside a bracket: a move the
@@ -797,6 +836,15 @@ private:
     bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
     int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
     bool             draft_cost_warned_ = false;
+    /* The calibration boundary: `want` is bumped by the HTTP thread, `served` by the step loop, so
+     * a request is answered once and never re-served. The ack and the epoch are read under
+     * mu_calib_, which no step-path lock is ever taken under (the step loop takes mu_ first). */
+    std::atomic<uint64_t> draft_calib_want_{0};
+    std::atomic<uint64_t> draft_calib_served_{0};
+    std::atomic<uint64_t> draft_calib_epoch_{1};   /* 1 = the run's first recording phase */
+    mutable std::mutex    mu_calib_;
+    std::condition_variable calib_cv_;
+    DraftCalibAck         draft_calib_ack_{};      /* mu_calib_ */
     /* The run's residency diverged from the one the profile's fingerprint names (sticky): the
      * scheduler's own ticks move units between brackets, where no per-step evidence reaches. Every
      * record opened after the divergence is marked placed, so no cycle measured on the drifted
@@ -904,6 +952,9 @@ private:
     StepPlan plan_;
     StepPlan plan_next_;
     bool     next_open_ = false;
+    /* Whether the samples-only boundary may be applied right now (see the public declaration).
+     * Caller holds mu_. */
+    bool draft_calib_quiet_locked() const;
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
         return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);

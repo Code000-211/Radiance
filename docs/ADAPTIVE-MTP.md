@@ -749,6 +749,56 @@ extent. Such a plan-time cut is visible in `/stats` as `draft_cost.calib_cut` (a
 `why = resources` in the plan), not in the sample flag; "the target buckets were not cut" must be
 read from that counter, not inferred from an absence of `Shortened`.
 
+## The calibration phase boundary (`/admin/draft-calib-boundary`)
+
+A recording run that is scored on a later request set cannot separate the warmup from the scored
+set by restarting: a restart is a new process, a new fingerprint basis to keep in step, and it is
+what the warmup is *for*. It is not a warmup either if the warmup's samples price the set that is
+scored -- and they do, because the samples carry the same shape key. The boundary is therefore an
+explicit phase cut inside one run, taken between two request sets:
+
+1. the harness sends its warmup set and lets every request finish;
+2. it `POST`s `/admin/draft-calib-boundary` once;
+3. it sends the set it will score, then exports.
+
+The endpoint is answered by the step loop, not by the HTTP thread: the request is recorded
+(`Scheduler::request_draft_calib_boundary`) and applied in the engine's idle branch
+(`Scheduler::serve_draft_calib_boundary`), the one point where the engine holds no step of its own.
+The HTTP thread waits for that acknowledgement, bounded; it never waits per token and never for a
+set to finish.
+
+**Samples only.** The boundary drops the recording table's samples and the counters that describe
+them, and keeps the binding: the deployment identity (fingerprint and execution), the capacity, the
+fallback admission, the record-only contract and the reference flag are the deployment's, not a
+phase's. `DraftCostTable::reset_samples` is that operation; `clear()` stays the one that unbinds.
+
+**Quiet, or refused.** The cut is applied only when the scheduler can show that nothing can still
+deliver a sample into the closing phase: no request queued or running, no step open or issued
+ahead (`step_open_`/`next_open_`), no serial or block-draft snapshot held, no deferred release owed,
+no encode wanted, and no observation-ring record that a step could still report into. An
+observation record is closed by the *next* cycle's open, so a scheduler whose requests have all
+finished can still owe one -- which is why the check is not "nothing is running".
+
+If any of those does not hold the answer is `409` with `accepted: false` and **nothing is dropped**;
+the engine neither aborts the work nor waits for quiescence, so a live deployment cannot be paused
+by this call. A `501` means the run is not a calibration at all (started without
+`--draft-profile-out`) -- the same answer `/reset_prefix_cache` gives without a cache. `200` carries
+the recording epoch the boundary opened and what was dropped.
+
+**The epoch.** A run's recording starts in epoch 1; every served boundary opens the next one, and
+the export names the epoch its buckets came from (`--draft-profile-out ...: recording epoch N`). A
+profile built after a boundary therefore says, in the log that accompanies it, that its samples are
+the scored phase's and not the warmup's. The file format is unchanged: `/4` has one bucket set and
+neither a phase nor an epoch field.
+
+**What it does not do.** It does not touch the prefix cache, the KV state, the idle tiers or the
+calibration rotation: a scored request set still starts from whatever the warmup left cached, and
+the rotation continues across the boundary. It is not a GPU sync and takes no device work. Admin
+authentication is the deployment's existing one -- the API-key gate every state-changing route is
+under (`core/server/http.cpp`), and a keyless server answers loopback only. A recorder built with
+this boundary is a new calibration basis: its SHA, binary and deployment identity have to be logged
+before a profile measured on it is compared with any other.
+
 ## Draft profile format, version 4
 
 `core/sched/draft_cost.cpp` (A) reads and validates this; the parser never runs on the step path.

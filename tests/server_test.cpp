@@ -6003,3 +6003,64 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
 }
 
 RAD_TEST_MAIN()
+
+/* ================================================================== /admin/draft-calib-boundary */
+
+/* A deployment that is not a calibration is told so: a 200 would make the harness believe the
+ * warmup it just sent no longer prices the set it is about to score. */
+TEST(draft_calib_boundary_is_501_outside_a_calibration) {
+    Fixture f;
+    HttpResponse r = f.post("/admin/draft-calib-boundary", "");
+    CHECK_EQ(r.status, 501);
+}
+
+/* An engine that is not quiet answers 409 and drops nothing: the boundary is not a pause point,
+ * it is a refused phase cut, and the epoch it names is the one still open. */
+TEST(draft_calib_boundary_reports_busy_without_dropping) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    sched.calib_ack.rc     = RAD_E_STATE;
+    sched.calib_ack.epoch  = 3;
+    sched.calib_ack.buckets = 9;   /* must not be reported as dropped */
+    Deps d;
+    d.sched = &sched;
+    d.tok   = &tok;
+    ServerOptions o;
+    auto srv = std::make_unique<Server>(d, o);
+    HttpRequest q;
+    q.method = "POST";
+    q.path   = "/admin/draft-calib-boundary";
+    HttpResponse r = srv->router().dispatch(q);
+    CHECK_EQ(r.status, 409);
+    CHECK(has(r.body, "\"accepted\":false"));
+    CHECK(has(r.body, "\"epoch\":3"));
+    CHECK(!has(r.body, "buckets_dropped"));
+    CHECK_EQ(sched.calib_calls, 1);
+}
+
+/* A served boundary answers the epoch it opened and what it dropped -- the harness records both
+ * next to the request set it is about to send. */
+TEST(draft_calib_boundary_answers_the_new_epoch_and_what_it_dropped) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    sched.calib_ack.rc              = RAD_OK;
+    sched.calib_ack.epoch           = 2;
+    sched.calib_ack.buckets         = 4;
+    sched.calib_ack.samples         = 11;
+    sched.calib_ack.cycles_dropped  = 1;
+    Deps d;
+    d.sched = &sched;
+    d.tok   = &tok;
+    ServerOptions o;
+    auto srv = std::make_unique<Server>(d, o);
+    HttpRequest q;
+    q.method = "POST";
+    q.path   = "/admin/draft-calib-boundary";
+    HttpResponse r = srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    CHECK(has(r.body, "\"accepted\":true"));
+    CHECK(has(r.body, "\"epoch\":2"));
+    CHECK(has(r.body, "\"buckets_dropped\":4"));
+    CHECK(has(r.body, "\"samples_dropped\":11"));
+    CHECK(has(r.body, "\"cycles_dropped\":1"));
+}

@@ -221,6 +221,14 @@ public:
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
+    DraftCalibAck draft_calib_boundary(int timeout_ms) override {
+        const Scheduler::DraftCalibAck a = s_->request_draft_calib_boundary(timeout_ms);
+        DraftCalibAck o;
+        o.rc = a.rc; o.epoch = a.epoch; o.buckets = a.buckets; o.samples = a.samples;
+        o.cycles_done = a.cycles_done; o.cycles_dropped = a.cycles_dropped;
+        return o;
+    }
+
     /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
      * to "seconds ago" here, so only the monotonic clock is authoritative. */
     TierCounters tier_counters() const override {

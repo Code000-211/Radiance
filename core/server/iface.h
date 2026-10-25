@@ -35,8 +35,7 @@ using json = nlohmann::ordered_json;
  * completion (spec §14), since abandoned generations are routine for agent clients.
  */
 struct SchedMetrics {
-    int64_t waiting = 0;
-    int64_t running = 0;
+    int64_t waiting = 0;    int64_t running = 0;
     int64_t preempted = 0;
     double  kv_util = 0.0;            /* 0..1 of the paged KV pool */
     /* The paged pools in tokens: how much context fits, which kv_util does not say. */
@@ -230,6 +229,19 @@ struct RequestStat {
     double      decode_tps = 0;
 };
 
+/* The draft calibration's phase boundary answer (IScheduler::draft_calib_boundary). `rc` is
+ * RAD_OK (a boundary was applied), RAD_E_STATE (wrong phase: work in flight, nothing dropped) or
+ * RAD_E_UNSUPPORTED (this deployment is not a calibration). `epoch` names the recording phase the
+ * boundary leaves open; a request answered busy keeps the current one. */
+struct DraftCalibAck {
+    int      rc = RAD_E_UNSUPPORTED;
+    uint64_t epoch = 0;
+    int64_t  buckets = 0;
+    int64_t  samples = 0;
+    int64_t  cycles_done = 0;
+    int64_t  cycles_dropped = 0;
+};
+
 class IScheduler {
 public:
     virtual ~IScheduler() = default;
@@ -265,6 +277,14 @@ public:
      * cache's references is safe against a running step (blocks a live sequence holds stay
      * allocated), but it takes the scheduler's lock because a step may be inserting into the map. */
     virtual int64_t reset_prefix_cache() { return RAD_E_UNSUPPORTED; }
+
+    /* The draft calibration's phase boundary: drops the recording table's samples at a quiet step
+     * boundary and opens a new recording epoch, so a harness's warmup request set does not price
+     * the set it scores. `timeout_ms` bounds the wait for the step loop's acknowledgement; an
+     * engine that is not idle answers RAD_E_STATE and drops nothing, and a deployment that is not a
+     * calibration answers RAD_E_UNSUPPORTED. Default: unsupported -- a serving run has no phase
+     * to bound. */
+    virtual DraftCalibAck draft_calib_boundary(int /*timeout_ms*/) { return DraftCalibAck{}; }
 
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }

@@ -299,6 +299,14 @@ public:
     /* No profile: every estimate is invalid. */
     void clear();
 
+    /* Drops every measured sample and the counters that describe them, keeping the binding the
+     * table was configured with: active state and reason, capacity, the fallback admission, the
+     * record-only contract and the reference flag. A calibration's phase boundary uses this
+     * (Scheduler::serve_draft_calib_boundary) so a warmup does not price the set it scores; the
+     * deployment identity may not change under a measurement boundary, so it is not cleared. Not
+     * a substitute for clear(): a serving table keeps its profile. */
+    void reset_samples();
+
     /* The deployment's explicit admission of an empty baseline: it accepts that Cost runs on the
      * policy's named fixed baseline until a cycle has been measured. `active()` alone is not that
      * admission -- a matching profile with no bucket proves the reader ran, not that anyone
