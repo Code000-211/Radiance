@@ -128,9 +128,11 @@ void rad_qsa_attn_keys(const RadQsaAttnCall& c, int64_t row, Visit visit) {
         if (page < 0) continue;
         visit(b, page, 0, c.ratio - 1);
     }
-    /* The partial page, by position: only off a block boundary, and only if the sequence has the
-     * block at all (mid-chunk it does; at the end of the history it does not). */
-    if ((p + 1) % c.ratio != 0 && own < c.blocks) {
+    /* The partial page, by position: only off a block boundary, and only if the sequence's block
+     * table has a row entry for it at all (mid-chunk it does; at the end of the history it does
+     * not). The bound is the table's own width -- the step's `bt_pitch`, which the core stages per
+     * step and which every block a row can name fits in -- and not the block space's `blocks`. */
+    if ((p + 1) % c.ratio != 0 && own < c.bt_pitch) {
         const int64_t page = c.bt[s * c.bt_pitch + own];
         if (page >= 0) visit(own, page, 0, p % c.ratio);
     }

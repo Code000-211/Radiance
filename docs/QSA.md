@@ -175,7 +175,13 @@ block and so cannot be sorted into block order after the fact. A tile's union is
 
 The read is `qsa_attn`, beside it in the same plugin: paged attention over the union that skips the
 entries a row's mask does not hold, maps each block index through that row's block table and appends
-the row's partial page last. Because the emit is one run in block order, the row's list is a
+the row's partial page last. The block table it maps through is the **step's**, not the block space's:
+`core/sched/batch.cpp` stages each group's table at the step's reach ("the pitch is per step, not
+`max_ctx` wide, so decode does not stage megabytes of empty rows"), so a decode step of 8K tokens
+hands over a few hundred entries of a 50000-block space, and the op's bound on a row's block index is
+that row's width, not the space (`rad_qsa_attn_keys`). Reading `blocks` there refused every step of a
+table-arm serve (MAIN-55), because no step ever staged the whole space.
+Because the emit is one run in block order, the row's list is a
 subsequence of the union, so the masked read sums the same keys in the same order and gives the same
 bytes as the row path -- `tests/r4d_emu/test_qsa.cpp` (`masked read:`) runs the same rows through a
 table per row (tile 1) and through the tile's union and requires the two outputs to be equal byte for

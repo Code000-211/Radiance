@@ -162,8 +162,13 @@ int rad_qsa_attn_args(const RadArgs* a, RadQsaAttnCall* out) {
     for (int i = 5; i <= 6; ++i)
         if (a->t[i].rank != 1 || a->t[i].dtype != RAD_I32 || a->t[i].shape[0] < c.M)
             return RAD_E_SHAPE;
-    if (a->t[7].rank != 2 || a->t[7].dtype != RAD_I32) return RAD_E_SHAPE;
-    if (a->t[7].shape[1] < c.blocks) return RAD_E_SHAPE;
+    /* `bt` is the sequence's block table at the width the *step* staged it, not at the block space's
+     * `blocks` (`core/sched/batch.cpp`: "The pitch is per step, not max_ctx wide, so decode does not
+     * stage megabytes of empty rows"). A row names only blocks below its own complete-block count,
+     * which the pitch covers by construction, so the walk is bounded by `bt_pitch`
+     * (`rad_qsa_attn_keys`) rather than by `blocks`: a decode step of 8K tokens stages a few hundred
+     * entries, and demanding the whole block space refused every such step. */
+    if (a->t[7].rank != 2 || a->t[7].dtype != RAD_I32 || a->t[7].shape[1] < 1) return RAD_E_SHAPE;
     /* `cu_seqlens`, one entry per sequence and one past the last, so its width is the sequence
      * count plus one and never the row count. `max_seqs` bounds that capacity; the row count below
      * is the live one, which is what the block table has to cover. */
@@ -171,9 +176,10 @@ int rad_qsa_attn_args(const RadArgs* a, RadQsaAttnCall* out) {
     if (a->t[8].shape[0] < 2 || a->t[8].shape[0] > rad_args_geti_or(a, "max_seqs", 1) + 1)
         return RAD_E_SHAPE;
     c.seqs = a->t[8].shape[0] - 1;
-    /* The block table is `[n_seq][blocks]` for the batch's live sequences. `max_seqs` is the
-     * capacity the caller declared (the architecture declares the chunk's row count, far above
-     * the batch's sequence count), so it must not decide how many rows the table needs. */
+    /* The block table is `[n_seq][bt_pitch]` for the batch's live sequences, the pitch being what
+     * this step staged (below). `max_seqs` is the capacity the caller declared (the architecture
+     * declares the chunk's row count, far above the batch's sequence count), so it must not decide
+     * how many rows the table needs. */
     if (a->t[7].shape[0] < c.seqs) return RAD_E_SHAPE;
     if (a->t[9].rank != 2 || a->t[9].shape[0] != c.M ||
         a->t[9].shape[1] != c.n_head * c.head_dim) return RAD_E_SHAPE;

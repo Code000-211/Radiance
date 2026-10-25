@@ -971,9 +971,10 @@ int parser_case() {
     int rc = rad_qsa_table_launch(&targs, nullptr);
     if (rc != RAD_OK) { std::printf("FAIL parsed: qsa_table returned %d\n", rc); return 1; }
 
-    /* A launch over `rows` rows starting at batch row `off`, with `cu` and the block table whole. */
-    auto attn = [&](int rows, int off, bool with_row0, const int32_t* roffs,
-                   std::vector<uint16_t>& o) -> int {
+    /* A launch over `rows` rows starting at batch row `off`, with `cu` whole and the block table
+     * handed over at `bts`/`btp` -- the width the step staged it at. */
+    auto attn = [&](int rows, int off, bool with_row0, const int32_t* roffs, const int32_t* bts,
+                    int64_t btp, std::vector<uint16_t>& o) -> int {
         o.assign((size_t)(rows * nh * hd), 0);
         const int64_t rt = (rows + tile - 1) / tile;
         RadTensor a[10] = {
@@ -983,7 +984,7 @@ int parser_case() {
             tens(tlen.data() + off / tile, RAD_I32, {rt}),
             tens(mask.data() + (size_t)off * u_max, RAD_I32, {rows, u_max}),
             tens((void*)roffs, RAD_I32, {rows}), tens(pos.data() + off, RAD_I32, {rows}),
-            tens(bt.data(), RAD_I32, {S, blocks}, blocks), tens(cu.data(), RAD_I32, {S + 1}),
+            tens((void*)bts, RAD_I32, {S, btp}, btp), tens(cu.data(), RAD_I32, {S + 1}),
             tens(o.data(), RAD_BF16, {rows, nh * hd}),
         };
         RadParam p[16]{};
@@ -1012,7 +1013,7 @@ int parser_case() {
 
     /* The whole step: the live sequence reads, the dead one does not. */
     std::vector<uint16_t> whole;
-    rc = attn(M, 0, false, roff.data(), whole);
+    rc = attn(M, 0, false, roff.data(), bt.data(), blocks, whole);
     if (rc != RAD_OK) { std::printf("FAIL parsed: the step's launch returned %d\n", rc); return 1; }
     int wrong_seq = 0, empty_live = 0;
     for (int m = 0; m < M; ++m) {
@@ -1033,22 +1034,49 @@ int parser_case() {
     for (auto& v : chunk_roff) v -= (int32_t)((M / 2 / tile) * u_max);
     std::vector<uint16_t> chunk, nochunk;
 
-    rc = attn(M / 2, M / 2, true, chunk_roff.data(), chunk);
+    rc = attn(M / 2, M / 2, true, chunk_roff.data(), bt.data(), blocks, chunk);
     if (rc != RAD_OK) { std::printf("FAIL parsed: the chunked launch returned %d\n", rc); ++fails; }
     else {
         int empty = 0;
         for (int m = 0; m < M / 2; ++m) empty += !nonzero(chunk, m);
         if (empty) { std::printf("FAIL parsed: %d chunk row(s) read nothing with row0\n", empty); ++fails; }
     }
-    rc = attn(M / 2, M / 2, false, chunk_roff.data(), nochunk);
+    rc = attn(M / 2, M / 2, false, chunk_roff.data(), bt.data(), blocks, nochunk);
     if (rc != RAD_OK) { std::printf("FAIL parsed: the chunked launch without row0 returned %d\n", rc); ++fails; }
     else {
         int read = 0;
         for (int m = 0; m < M / 2; ++m) read += nonzero(nochunk, m);
         if (read) { std::printf("FAIL parsed: %d chunk row(s) read sequence 0 without row0\n", read); ++fails; }
     }
+    /* The block table is the step's, not the block space's. `core/sched/batch.cpp` stages each
+     * group's table at this step's reach -- "the pitch is per step, not max_ctx wide, so decode does
+     * not stage megabytes of empty rows" -- while `blocks` is the group's whole capacity: a decode
+     * step of 8K tokens stages a few hundred entries of a 50000-block space. The same rows read off
+     * a table staged at that narrower pitch must read the same bytes, and the op must not refuse the
+     * step over the difference (MAIN-55: every step of the table arm aborted at `M=1` with the band's
+     * geometry, which is the whole reason a serve produced no A/B number). `own` is 30..34 here. */
+    {
+        const int64_t btp = 40;
+        std::vector<int32_t> narrow((size_t)S * btp, -1);
+        for (int64_t b = 0; b < btp; ++b) narrow[(size_t)btp + b] = (int32_t)b;
+        std::vector<uint16_t> o;
+        rc = attn(M, 0, false, roff.data(), narrow.data(), btp, o);
+        if (rc != RAD_OK) {
+            std::printf("FAIL parsed: a table staged at this step's pitch (%lld of %lld blocks) "
+                        "returned %d\n", (long long)btp, (long long)blocks, rc);
+            ++fails;
+        } else if (o != whole) {
+            int bad = 0;
+            for (size_t i = 0; i < o.size(); ++i) bad += o[i] != whole[i];
+            std::printf("FAIL parsed: the step's own block-table pitch reads %d of %zu values "
+                        "differently\n", bad, o.size());
+            ++fails;
+        }
+    }
+
     std::printf("  parsed: %d rows, %d sequences, capacity %d, block table %d row(s): %d row(s) of the "
-                "live sequence read, the chunk reads with row0 and not without\n",
+                "live sequence read, the chunk reads with row0 and not without, the step's own "
+                "block-table pitch reads the same bytes\n",
                 M, S, cap, S, M / 2);
     std::printf("parsed: 1 batch of %d sequences, %d failure(s)\n", S, fails);
     return fails;

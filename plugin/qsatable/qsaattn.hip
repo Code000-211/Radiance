@@ -82,9 +82,10 @@ __device__ void each_key(const RadQsaAttnCall& c, int64_t row, F&& f) {
         for (int64_t t = 0; t < c.ratio; ++t) f(page, t);
     }
     /* The row's partial page, by position, appended last: the page the chunk itself may be filling,
-     * visible up to the row's own token. */
+     * visible up to the row's own token. `own < c.bt_pitch` is the block table's own width -- the
+     * step stages it per step, and every block a row can name fits in it. */
     const int64_t off = (p + 1) % c.ratio;
-    if (off != 0 && own < c.blocks) {
+    if (off != 0 && own < c.bt_pitch) {
         const int64_t page = bts[own];
         if (page >= 0)
             for (int64_t t = 0; t < off; ++t) f(page, t);
