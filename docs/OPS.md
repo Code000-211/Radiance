@@ -2399,8 +2399,10 @@ the backend's host pool (`core/device/aql.cpp` keeps those ranges itself and
 transfer at all. Only when the engine declined to say does the plugin ask the driver. The engine
 also declines when it cannot vouch for the placement it named: a mover republishes a demoted
 weight's pointer, not its site (`core/place/mover.cpp`), so an issue whose pointer differs from the
-one the planner placed carries `RAD_SPACE_UNKNOWN` and the bind lands at `table=unknown` -- the
-measured-0 trap again, one indirection further out. A table the
+one the planner placed carries `RAD_SPACE_UNKNOWN`. Such a table is then classified by the driver
+-- a host pointer reads as `table=host` with real bytes, a device pointer as `table=device` with a
+true zero -- and lands at `table=unknown`/`host_read_bytes=na` only where the driver cannot
+classify the range either. The engine's refusal moves the question, it does not answer it. A table the
 engine placed in VRAM adds misses and no host bytes, which is the truth of that deployment and not
 a dead counter; the dump and the `fini` line say which case it was (`table=host`, `table=device`,
 `table=unknown`). At `unknown` the misses are counted and the byte figure is *not taken*: the dump

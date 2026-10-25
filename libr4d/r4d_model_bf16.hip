@@ -1182,8 +1182,8 @@ static uint32_t ple_cache_sets_from_env(std::string* why_off) {
  * The engine's own placement (RadTensor::space) answers first, because it knows something the
  * driver does not: the backend locks its host pool with hsa_amd_memory_lock_to_pool and keeps the
  * ranges in its own table (core/device/aql.cpp), so hipPointerGetAttributes reports those bytes as
- * an allocation it cannot classify. Only when the engine declined to say (a raw pointer, a KV
- * pool, a weight a mover owns) does this ask the driver. A managed table reads as device: the
+ * an allocation it cannot classify. Only when the engine declined to say (a raw pointer it did not
+ * allocate, a weight a mover relocated) does this ask the driver. A managed table reads as device: the
  * driver migrates it, so its rows are not a transfer this cache can attribute. */
 static int ple_table_host(const void* table, int space) {
     if (space == RAD_SPACE_HOST) return 1;
