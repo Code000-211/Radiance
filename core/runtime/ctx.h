@@ -721,12 +721,18 @@ private:
     /* Profiling. Off by default; when on it adds synchronisations that change the mover's slot
      * supply, so profiled and unprofiled runs are not comparable (spec §16). */
     bool                 profiling_ = false;
-    struct ProfSlot { RadEvent a = nullptr, b = nullptr; int32_t op = 0; uint8_t lane = 0; };
+    struct ProfSlot { RadEvent a = nullptr, b = nullptr; int32_t op = 0; uint8_t lane = 0;
+                      uint8_t phase = 0; };   /* RAD_PHASE_* of the step that issued it */
     std::vector<ProfSlot> prof_ring_;
     size_t                prof_n_ = 0;
     bool                  prof_overflowed_ = false;
     std::vector<double>   prof_ms_;
     std::vector<int64_t>  prof_calls_;
+    /* The same per op, split by the step's phase: a PLE gather at decode is a link read a row
+     * where a prefill chunk's is a stream, and one average over both says nothing about either.
+     * Indexed [phase * ops + op]. */
+    std::vector<double>   prof_ms_ph_;
+    std::vector<int64_t>  prof_calls_ph_;
     /* Rows timed on the host clock rather than by a device event pair. A host row includes page
      * faults and link reads, a device row is kernel time, so the table labels each. */
     std::vector<uint8_t>  prof_host_;
@@ -737,6 +743,10 @@ private:
      * waits (staged copies, the other lane, a host op) and late host issue land here, accounting
      * for wall time the ops' own times do not cover. */
     std::vector<double>   prof_wait_ms_;
+
+    /* The step's phase, RAD_PHASE_*: RadArgs::phase for every launch of this step, so a kernel
+     * that measures per phase reads the phase rather than inferring it from its own row count. */
+    int                  phase_ = RAD_PHASE_PREFILL;
 
     int         step_status_ = RAD_OK;
     std::string step_fail_;

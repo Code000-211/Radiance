@@ -5073,7 +5073,7 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   r4d_rad_embed_lookup_q_init, r4d_rad_embed_lookup_q_fini, r4d_rad_embed_lookup_q,
   nullptr, r4d_rad_layout_embed_q, nullptr,
-  r4d_shape_embed_lookup_q },
+  r4d_shape_embed_lookup_q, nullptr, nullptr, r4d_ple_stats_dump },
 
 { "ple_gate_bf16", "ple_gate", "norm",
   "PLE's dot-product gate, one workgroup a (row, stream) pair",

@@ -36,8 +36,10 @@
  * launch must have taken the gather's entry (emu_last_kernel). A park the case never reached is a
  * dead fixture and fails as such. See docs/OPS.md. */
 #include "rad_abi.h"
+#include "rad_runtime.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
+#include "r4d.h"
 #include "ref_host.h"
 #include "hip/hip_runtime.h"
 
@@ -82,16 +84,20 @@ struct Fx {
     void shape(const std::vector<int32_t>& t) {
         M = (int)t.size();
         tok = t;
-        wte.assign((size_t)n_vocab * kRow, 0);
-        for (int id = 0; id < n_vocab; ++id)
-            for (int j = 0; j < kRow; ++j) wte[(size_t)id * kRow + j] = code_of(id, j);
+        /* Filled once: the cache binds the first table it sees and leaves every other alone, so a
+         * shape that reallocated the table would take the gathers off the cached path. */
+        if (wte.empty()) {
+            wte.assign((size_t)n_vocab * kRow, 0);
+            for (int id = 0; id < n_vocab; ++id)
+                for (int j = 0; j < kRow; ++j) wte[(size_t)id * kRow + j] = code_of(id, j);
+        }
         scb[0] = f2b(0.03125f);
         xbuf.assign((size_t)M * kRow + 16, 0);
         x = (uint16_t*)(((uintptr_t)xbuf.data() + 15) & ~(uintptr_t)15);
     }
     void clear_out() { std::memset(x, 0, (size_t)M * kRow * sizeof(uint16_t)); }
 
-    int launch(void* inst) {
+    int launch(void* inst, int phase = RAD_PHASE_PREFILL) {
         RadTensor t[4]{};
         t[0].data = tok.data(); t[0].dtype = RAD_I32; t[0].rank = 1;
         t[0].shape[0] = M; t[0].stride[0] = 1;
@@ -104,7 +110,7 @@ struct Fx {
         t[3].shape[0] = M; t[3].shape[1] = kRow;
         t[3].stride[0] = kRow; t[3].stride[1] = 1;
         RadArgs a{};
-        a.t = t; a.n_t = 4; a.instance = inst;
+        a.t = t; a.n_t = 4; a.instance = inst; a.phase = phase;
         return r4d_rad_embed_lookup_q(&a, nullptr);
     }
 };
@@ -123,6 +129,29 @@ bool same(const Fx& f, const std::vector<uint16_t>& want, const char* what, int*
         }
     return true;
 }
+
+/* A reading of the cache's counters, so a case asserts what its own launches added: the counters
+ * are a running total over the instance's whole life. */
+struct Snap {
+    unsigned long long hits[3]{}, misses[3]{}, bytes[3]{};
+    static Snap of(void* inst) {
+        Snap s;
+        R4dPleCacheStats c{};
+        if (r4d_ple_stats(inst, &c) != 0) { s.hits[0] = ~0ull; return s; }
+        for (int ph = 0; ph < 3; ++ph) {
+            s.hits[ph] = c.hits[ph]; s.misses[ph] = c.misses[ph]; s.bytes[ph] = c.host_bytes[ph];
+        }
+        return s;
+    }
+    Snap less(const Snap& b) const {   /* what happened between `b` and here */
+        Snap d;
+        for (int ph = 0; ph < 3; ++ph) {
+            d.hits[ph] = hits[ph] - b.hits[ph]; d.misses[ph] = misses[ph] - b.misses[ph];
+            d.bytes[ph] = bytes[ph] - b.bytes[ph];
+        }
+        return d;
+    }
+};
 
 std::vector<uint16_t> oracle(Fx& f) {
     f.clear_out();
@@ -212,6 +241,75 @@ int main() {
     std::printf("ple_cache: forced window %s (entry %s, row %d of %d)\n",
                 ok ? "byte-identical to the uncached path" : "FAILED", emu_last_kernel,
                 bad, f.M);
+
+    /* The counters MAIN-60 needs readable, on the same instance: one set a phase, and the bytes a
+     * miss actually fetched over the link rather than a figure derived from a mover. Each case is
+     * the delta one launch added, against what the cache's state says it must be. The state is
+     * settled here rather than inherited: the forced window above left three of the four ways
+     * holding B/C/D and one holding A, whichever way its second claim chose. So each of B/C/D is
+     * warmed twice first -- the second launch of a row is its hit -- and X, the row no warm launch
+     * has ever published, is the miss.
+     *
+     * The phases come from RadArgs.phase, the step's, so the gather never guesses one. */
+    {
+        for (int id : {B, C, D}) {                 /* settle: the way holds this row, published */
+            f.shape({id});
+            (void)f.launch(cache);
+            f.clear_out();
+            (void)f.launch(cache);
+        }
+        struct Case { const char* name; std::vector<int32_t> tok; int phase;
+                      unsigned long long h[3], m[3], by[3]; };
+        const Case kCases[] = {
+            /* decode, one published row: a hit, no link read */
+            { "decode hit", {B}, RAD_PHASE_DECODE, {0, 1, 0}, {0, 0, 0}, {0, 0, 0} },
+            /* decode, an out-of-range id and a published row: the -1 reads no table and is counted
+             * in neither, so the phase shows the one row that reached the check */
+            { "decode, -1 id", {-1, C}, RAD_PHASE_DECODE, {0, 1, 0}, {0, 0, 0}, {0, 0, 0} },
+            /* mixed, a published row */
+            { "mixed hit", {B}, RAD_PHASE_MIXED, {0, 0, 1}, {0, 0, 0}, {0, 0, 0} },
+            /* prefill, a hit and an uncached row: one 160-byte link read, not two */
+            { "prefill hit+miss", {D, X}, RAD_PHASE_PREFILL, {1, 0, 0}, {1, 0, 0}, {kRow, 0, 0} },
+        };
+        for (const Case& c : kCases) {
+            f.shape(c.tok);
+            const Snap before = Snap::of(cache);
+            if (before.hits[0] == ~0ull) {
+                ++fails;
+                std::printf("  counters: r4d_ple_stats found no cache\n");
+                break;
+            }
+            const int r = f.launch(cache, c.phase);
+            const Snap d = Snap::of(cache).less(before);
+            bool ok = r == RAD_OK;
+            for (int ph = 0; ph < 3; ++ph)
+                ok = ok && d.hits[ph] == c.h[ph] && d.misses[ph] == c.m[ph] &&
+                     d.bytes[ph] == c.by[ph];
+            ++cases;
+            if (!ok) {
+                ++fails;
+                std::printf("  counters: %s (launch %d):", c.name, r);
+                for (int ph = 0; ph < 3; ++ph)
+                    std::printf(" phase %d h/m/b %llu/%llu/%llu want %llu/%llu/%llu", ph,
+                                d.hits[ph], d.misses[ph], d.bytes[ph], c.h[ph], c.m[ph],
+                                c.by[ph]);
+                std::printf("\n");
+            }
+        }
+        /* A launch with no instance takes the uncached path: it must not move the counters. */
+        f.shape({B, C});
+        const Snap before = Snap::of(cache);
+        (void)f.launch(nullptr);
+        const Snap d = Snap::of(cache).less(before);
+        bool ok = true;
+        for (int ph = 0; ph < 3; ++ph)
+            ok = ok && !d.hits[ph] && !d.misses[ph] && !d.bytes[ph];
+        ++cases;
+        if (!ok) {
+            ++fails;
+            std::printf("  counters: the uncached path moved the cache's counters\n");
+        }
+    }
 
     r4d_rad_embed_lookup_q_fini(cache);
     std::printf("ple_cache: %d case(s), %d failure(s)\n", cases, fails);

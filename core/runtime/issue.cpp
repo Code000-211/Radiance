@@ -818,7 +818,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     }
 
     /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. */
-    ip.args.n_t = n_opd;
+    ip.args.n_t   = n_opd;
+    /* The step's phase, so a kernel measures per phase instead of inferring one (RadArgs::phase). */
+    ip.args.phase = phase_;
     p.issued    = true;
     ++n_issues_;
 
@@ -947,9 +949,16 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         const auto t0 = std::chrono::steady_clock::now();
         s = ip.launch(la, cur_stream());
         const auto t1 = std::chrono::steady_clock::now();
-        prof_ms_[(size_t)h] +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        prof_ms_[(size_t)h] += ms;
         prof_calls_[(size_t)h] += 1;
+        if ((size_t)h < prof_host_.size() && phase_ >= 0 && phase_ < 3) {
+            const size_t k = (size_t)phase_ * prof_calls_.size() + (size_t)h;
+            if (k < prof_ms_ph_.size()) {
+                prof_ms_ph_[k] += ms;
+                ++prof_calls_ph_[k];
+            }
+        }
         if ((size_t)h < prof_host_.size()) prof_host_[(size_t)h] = 1;
     } else if (profiling_) {
         /* Spec §16 per-op timing: events around the launch, read by a sync at the end of the
@@ -958,6 +967,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             ProfSlot& ps = prof_ring_[prof_n_++];
             ps.op = (int32_t)h;
             ps.lane = (uint8_t)lane_;
+            ps.phase = (uint8_t)(phase_ >= 0 && phase_ < 3 ? phase_ : 2);
             rad_event_record(ps.a, cur_stream());
             s = ip.launch(la, cur_stream());
             rad_event_record(ps.b, cur_stream());

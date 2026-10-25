@@ -1100,6 +1100,50 @@ TEST(profiling_is_opt_in_and_costs_a_synchronisation) {
     f.ctx.dump_profile();
 }
 
+/* A kernel that keeps counters prints them where the dump has both halves: its numbers and the time
+ * this run measured for its op (RadStatsDumpFn, abi/rad_abi.h). The phase it is handed is the
+ * step's, which is what separates a prefill gather's timing from a decode one; a phase the op never
+ * ran in is -1, so a kernel can print `na` rather than a zero it would read as fast. */
+static double g_stats_ms[3] = { -2.0, -2.0, -2.0 };
+static int    g_stats_calls = 0;
+static int    g_stats_n = -1;
+static void*  g_stats_inst = nullptr;
+
+static int g_stats_anchor = 0;   /* stands in for the instance the plugin's init hands out */
+static void stats_dump(void* inst, const double* ms, int n) {
+    ++g_stats_calls;
+    g_stats_n = n;
+    g_stats_inst = inst;
+    for (int i = 0; i < 3 && i < n; ++i) g_stats_ms[i] = ms[i];
+}
+
+TEST(the_profile_dump_hands_a_kernel_its_own_per_phase_times) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("gemm_nt", "M", { 8192 }, { k_pre }, { "prefill" }, &g_gemm_schema, { w });
+    f.infos.back().stats_dump = stats_dump;
+    f.P.ops[op].bands[0].dom[RAD_DOMAIN_DEVICE].instance = &g_stats_anchor;
+    CHECK_OK(f.start(nullptr, /*profile=*/true));
+
+    g_stats_calls = 0;
+    g_stats_ms[0] = g_stats_ms[1] = g_stats_ms[2] = -2.0;
+    for (int n_tok : { 4, 1 }) {              /* a prefill step, then a decode one */
+        CHECK_OK(f.step(n_tok, 0, [&](Ctx& c) {
+            RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+            CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        }));
+    }
+    f.ctx.dump_profile();
+    CHECK_EQ(g_stats_calls, 1);               /* once an op, not once a phase */
+    CHECK_EQ(g_stats_n, 3);
+    CHECK(g_stats_inst != nullptr);           /* the instance the rows were launched with */
+    CHECK(g_stats_ms[0] >= 0.0);              /* timed in a prefill step... */
+    CHECK(g_stats_ms[1] >= 0.0);              /* ...and in a decode one */
+    CHECK(g_stats_ms[2] == -1.0);             /* and never in a mixed one */
+}
+
 /* The barrier is a condvar over threads in one process, not IPC: ranks share an address space and
  * the batch is shared by pointer (spec §1). It only has to order the release. */
 TEST(rank_barrier_releases_all_ranks) {

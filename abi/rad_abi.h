@@ -17,7 +17,7 @@ extern "C" {
  * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
  * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
  * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 26u
+#define RAD_ABI_VERSION 27u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -56,6 +56,10 @@ typedef struct RadArgs {
     void*            instance;      /* whatever init() returned for this resolved instance */
     int              rank;          /* tensor-parallel rank and world size, for collectives */
     int              world_size;
+    /* The step's phase, one of RAD_PHASE_* (rad_runtime.h), copied from RadBatch::phase for this
+     * launch: a kernel that measures or sizes itself per phase takes it from here rather than
+     * inferring it from the row count or from which op the architecture happened to issue. */
+    int              phase;
 } RadArgs;
 
 /* Read a parameter by key. Inline definitions, because a plugin links only the ABI headers and
@@ -420,6 +424,14 @@ typedef struct RadFuseStep {
 typedef int (*RadFuseFn)(const RadParam* p, int n_p, uint64_t present, int step,
                          RadFuseStep* out);
 
+/* Optional: print this instance's own telemetry, given what the caller measured for the op it
+ * implements. `phase_ms[0..n_phase)` is the caller's timing for this instance's op in a step of
+ * that phase (indexed by RAD_PHASE_*), -1.0 for a phase the op never ran in. A kernel that counts
+ * something prints it here, where its counters and the caller's timing meet in one line; null --
+ * the common case -- keeps nothing and prints nothing. A kernel may also print from its `fini`,
+ * which is the shutdown dump: it has the counters but not the timing. */
+typedef void (*RadStatsDumpFn)(void* instance, const double* phase_ms, int n_phase);
+
 /* ================================================================== kernel rows */
 typedef struct RadKernelInfo {
     const char* name;       /* entry point, unique within the plugin */
@@ -457,11 +469,12 @@ typedef struct RadKernelInfo {
     /* The chain of conventional ops this kernel computes in one launch, or null if it is not a
      * fusion. Non-null also counts in rad-kbench's fusion-claim column.
      *
-     * Keep this field last. Kernel tables are positional aggregate initialisers
+     * Kernel tables are positional aggregate initialisers
      * (`{..., nullptr, nullptr, r4d_rad_embed_lookup, nullptr, ...}`), so a field inserted
      * anywhere else shifts every later initialiser, and since `nullptr` converts to any function
-     * pointer type, part of that shift would still compile. Append new fields after this one. */
+     * pointer type, part of that shift would still compile. Append new fields at the end. */
     RadFuseFn      replaces;
+    RadStatsDumpFn stats_dump;   /* see RadStatsDumpFn: null when the kernel keeps no counters */
 } RadKernelInfo;
 
 /* ================================================================== kernel plugin exports */

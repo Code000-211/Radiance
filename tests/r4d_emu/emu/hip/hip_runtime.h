@@ -184,6 +184,11 @@ inline hipError_t hipMalloc(void** p, size_t n) { *p = std::calloc(n ? n : 1, 1)
 inline hipError_t hipFree(void* p) { std::free(p); return 0; }
 inline hipError_t hipMemset(void* p, int v, size_t n) { std::memset(p, v, n); return 0; }
 inline hipError_t hipMemsetAsync(void* p, int v, size_t n, hipStream_t) { std::memset(p, v, n); return 0; }
+/* Device memory is host memory here, so a copy is one memcpy; the kind is not consulted. */
+inline hipError_t hipMemcpy(void* dst, const void* src, size_t n, hipMemcpyKind) {
+    std::memcpy(dst, src, n);
+    return 0;
+}
 
 struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };

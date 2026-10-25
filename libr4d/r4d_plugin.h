@@ -640,6 +640,9 @@ int r4d_rad_embed_lookup    (const RadArgs*, RadStream);
 int r4d_rad_embed_lookup_q  (const RadArgs*, RadStream);
 int r4d_rad_embed_lookup_q_init(const RadParam*, int, int, int, void** out);
 void r4d_rad_embed_lookup_q_fini(void*);
+/* RadStatsDumpFn (abi/rad_abi.h): the cached gather's per-phase counters beside --profile-ops'
+ * timing of the same op. Declared here with the r4d_*_q entry points it belongs to. */
+void r4d_ple_stats_dump(void*, const double*, int);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);

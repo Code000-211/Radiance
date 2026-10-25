@@ -758,6 +758,8 @@ const RadRouting* Ctx::last_routing(int layer) const {
 int Ctx::bind_profiling() {
     prof_ms_.assign(program_->ops.size(), 0.0);
     prof_calls_.assign(program_->ops.size(), 0);
+    prof_ms_ph_.assign(program_->ops.size() * 3, 0.0);
+    prof_calls_ph_.assign(program_->ops.size() * 3, 0);
     prof_host_.assign(program_->ops.size(), 0);
     prof_join_ms_.assign(program_->ops.size(), 0.0);
     prof_wait_ms_.assign(program_->ops.size(), 0.0);
@@ -802,6 +804,10 @@ void Ctx::profile_collect() {
         if (rad_event_elapsed_ms(s.a, s.b, &ms) < 0) continue;
         prof_ms_[(size_t)s.op]    += (double)ms;
         prof_calls_[(size_t)s.op] += 1;
+        if ((size_t)s.op < program_->ops.size() && s.phase < 3) {
+            prof_ms_ph_[(size_t)s.phase * program_->ops.size() + (size_t)s.op] += (double)ms;
+            ++prof_calls_ph_[(size_t)s.phase * program_->ops.size() + (size_t)s.op];
+        }
         const ProfSlot*& p = prev[s.lane & 1];
         float gap = 0.0f;
         if (p && rad_event_elapsed_ms(p->b, s.a, &gap) >= 0 && gap > 0.0f)
@@ -826,7 +832,9 @@ void Ctx::dump_profile() const {
             "A row marked `host` was timed on the host clock around a host-site launch and\n"
             "includes everything that call waited on -- page faults, link reads. The rest are\n"
             "device event pairs around a kernel. `wait us` is how long, a call, the op's lane\n"
-            "sat idle before it started -- stream waits and issue delays, in no op's time.\n\n"
+            "sat idle before it started -- stream waits and issue delays, in no op's time.\n"
+            "An op issued in more than one phase carries a `phase` line under its row, with the\n"
+            "same columns for the prefill, decode and mixed steps it ran in.\n\n"
             "  %10s %12s %10s %5s %10s %10s  %s\n", rank_, "calls", "total ms", "us/call", "site",
             "join us", "wait us", "op / geometry");
 
@@ -854,10 +862,63 @@ void Ctx::dump_profile() const {
                 prof_ms_[i] * 1000.0 / (double)prof_calls_[i], ho ? "host" : "dev", jbuf,
                 wait * 1000.0 / (double)prof_calls_[i],
                 o.op.c_str(), o.base.str().c_str(), (int)o.index, wname);
+        /* An op issued in more than one phase gets its split on a line of its own: the row above
+         * averages a prefill chunk's call and a decode call, which differ by orders of magnitude
+         * (the PLE gather reads a row over the link at decode, a whole chunk's at prefill). */
+        {
+            const size_t nops = program_->ops.size();
+            int nph = 0;
+            for (int ph = 0; ph < 3; ++ph) nph += prof_calls_ph_[(size_t)ph * nops + i] > 0;
+            static const char* const kPh[3] = { "prefill", "decode", "mixed" };
+            for (int ph = 0; nph > 1 && ph < 3; ++ph) {
+                const size_t k = (size_t)ph * nops + i;
+                if (!prof_calls_ph_[k]) continue;
+                fprintf(stderr, "  %10s %12.3f %10.2f  %s %s\n", "", prof_ms_ph_[k],
+                        prof_ms_ph_[k] * 1000.0 / (double)prof_calls_ph_[k], "phase",
+                        kPh[ph]);
+            }
+        }
         total += prof_ms_[i];
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+
+    /* Plugin telemetry, where a kernel's counters meet the timing this dump measured: a kernel that
+     * keeps counters prints one line a phase through RadStatsDumpFn (abi/rad_abi.h). Nothing is
+     * printed for a kernel that keeps none, so an unprofiled feature costs no output. */
+    {
+        const size_t nops = program_->ops.size();
+        std::vector<const void*> seen;
+        for (size_t i : order) {
+            if (i >= plans_.size()) continue;
+            const OpPlan& op = plans_[i];
+            double ms[3] = { -1.0, -1.0, -1.0 };
+            for (int ph = 0; ph < 3; ++ph) {
+                const size_t k = (size_t)ph * nops + i;
+                if (k < prof_calls_ph_.size() && prof_calls_ph_[k]) ms[ph] = prof_ms_ph_[k];
+            }
+            /* An op's bands x domains hold the plans it was bound to; the first one carrying a
+             * stats hook and an instance speaks for the op (a launch picks one instance). */
+            for (int b = 0; b < op.n_bands; ++b) {
+                for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                    const size_t k = (size_t)op.plan_off + (size_t)b * RAD_N_DOMAINS + (size_t)d;
+                    if (k >= issue_table_.size()) continue;
+                    const IssuePlan&      ip = issue_table_[k];
+                    const RadKernelInfo* ki = ip.row ? ip.row->info : nullptr;
+                    if (!ki || !ki->stats_dump || !ip.args.instance) continue;
+                    if (std::find(seen.begin(), seen.end(), ip.args.instance) != seen.end())
+                        continue;
+                    seen.push_back(ip.args.instance);
+                    fprintf(stderr, "telemetry, op '%s' (%s):\n",
+                            program_->ops[i].op.c_str(), ki->name ? ki->name : "?");
+                    ki->stats_dump(ip.args.instance, ms, 3);
+                    fprintf(stderr, "\n");
+                    b = op.n_bands;   /* this op's counter instance is known: move on */
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /* ================================================================== the step driver */
@@ -1187,6 +1248,7 @@ int Ctx::play_pass(PassTape& t) {
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                th.args.phase = phase_;   /* the replaying step's, not the recording's */
                 rc = th.launch(&th.args, cur_stream());
                 rad_dev_host_wrote();
             }
@@ -1321,6 +1383,7 @@ int Ctx::run_step(const RadBatch* b) {
     sync_residency();
 
     batch_       = b;
+    phase_       = b->phase;
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;

@@ -701,6 +701,18 @@ enum {
     r4d_ple_probe_words     = 11
 };
 int r4d_ple_probe(void* instance, unsigned* ctl);
+// Test hook: the cached gather's telemetry (r4d_model_bf16.hip), per phase: `hits` rows served
+// from the cache's VRAM at 320 B each, `misses` rows read over the link from the pinned table at
+// 160 B each, and `host_bytes` the bytes those missing rows actually fetched from host memory --
+// counted where the gather compares its generation and loads its payload, not taken from a
+// mover's transfers. Index 0 is prefill, 1 decode, 2 mixed (RAD_PHASE_*, abi/rad_runtime.h).
+// Returns 0 and fills *out from the instance's device counters (a running total, not reset), or
+// -1 when the instance holds no cache -- RADIANCE_PLE_VRAM_CACHE_SETS unset or its allocation
+// failed -- where there is nothing to count and every row is read from the table.
+struct R4dPleCacheStats {
+    unsigned long long hits[3], misses[3], host_bytes[3];
+};
+int r4d_ple_stats(void* instance, R4dPleCacheStats* out);
 // The narrow GEMM with r4d_gated_quant_fp8 as its epilogue, for a gate_up projection whose only
 // consumer is that quantiser. `wq` is the [2*nout][K] gate_up plane, gate first; outputs are the
 // quantiser's: `q` E4M3 [M][nout], `s` f32 [M][ceil(nout/128)], and `y` the bf16 silu product or 0.

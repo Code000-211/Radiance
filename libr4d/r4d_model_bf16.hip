@@ -293,13 +293,29 @@ __device__ __forceinline__ bool ple_probe_rewrite(int32_t* __restrict__ tags,
     return true;
 }
 
+/* Per-phase telemetry of the cached gather: what one step's launches read, counted where the
+ * generation compare and the payload loads happen (ple_embed_lookup_q_row below). Indexed by the
+ * step's phase as the host passed it (RadArgs::phase, one of RAD_PHASE_* in abi/rad_runtime.h). */
+constexpr uint32_t kPleStatsPhases = 3;              /* prefill, decode, mixed */
+struct PleCacheStats {
+    unsigned long long hits[kPleStatsPhases];        /* rows served from VRAM, 320 B each */
+    unsigned long long misses[kPleStatsPhases];      /* rows read over the link, 160 B each */
+    unsigned long long host_bytes[kPleStatsPhases];  /* kPleRow per miss: the link traffic */
+};
+
+/* A phase outside RAD_PHASE_PREFILL..MIXED (an unset RadArgs::phase, -1) reads as MIXED: a caller
+ * that did not say which step this is still gets its counters, in the column that claims least. */
+__device__ __forceinline__ uint32_t ple_stats_phase(uint32_t phase) {
+    return phase < kPleStatsPhases ? phase : kPleStatsPhases - 1u;
+}
+
 template <bool Probe>
 __device__ __forceinline__ void ple_embed_lookup_q_row(
     const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
     uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
-    uint32_t* __restrict__ probe) {
+    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase) {
     const uint32_t lane = threadIdx.x, m = blockIdx.x;
 
     if constexpr (Probe) {
@@ -327,6 +343,7 @@ __device__ __forceinline__ void ple_embed_lookup_q_row(
     g = __shfl(g, 0);
 
     uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    bool hit = false;
     if (slot >= 0) {
         if constexpr (Probe) {
             /* The handshake: lane 0 parks here, between the lookup and the payload load, until a
@@ -360,7 +377,6 @@ __device__ __forceinline__ void ple_embed_lookup_q_row(
             v = *(const uint4*)(data + (size_t)slot * (kPleRow * 2u) + (size_t)lane * 16u);
         __threadfence();                   /* every lane's payload load is done before the recheck */
         __syncwarp();
-        bool hit = false;
         if (lane == 0) {
             if constexpr (Probe) {
                 const uint32_t now =
@@ -387,11 +403,28 @@ __device__ __forceinline__ void ple_embed_lookup_q_row(
             }
         }
         hit = __shfl((int)hit, 0) != 0;
+        /* Telemetry, at the decision and at the read site -- so the byte counter is what the row
+         * actually fetched, not a figure derived from a mover's transfers. A hit counts its one
+         * word here, on the way out: it read its 320 bytes from this cache's VRAM (the payload load
+         * above) and never reaches the miss path below. One atomic a row from lane 0, a hit one
+         * word against a 320-byte payload load. */
         if (hit) {
+            if (lane == 0) atomicAdd(stats->hits + ple_stats_phase(phase), 1ull);
             if (lane < kPleLanes) *(uint4*)(dst + (size_t)lane * 8u) = v;
             if (lane == 0) atomicAdd(heat + slot, 1u);
             return;
         }
+    }
+
+    /* The miss half, outside the lookup's `slot >= 0`, because a row with no slot at all is a miss
+     * too: it reads kPleRow bytes over the link from the pinned table (the `wte` load below), so a
+     * miss costs two words -- the counter and the bytes. A row whose id is out of range reads
+     * neither table and is counted in neither, so hits + misses is the rows that reached the check,
+     * not the batch's row count. */
+    if (lane == 0 && keep) {
+        const uint32_t ph = ple_stats_phase(phase);
+        atomicAdd(stats->misses + ph, 1ull);
+        atomicAdd(stats->host_bytes + ph, (unsigned long long)kPleRow);
     }
 
     const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
@@ -431,9 +464,10 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const uint8_t* __restrict__ wte,
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
-    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets) {
+    uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
+    PleCacheStats* __restrict__ stats, uint32_t phase) {
     ple_embed_lookup_q_row<false>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
-                                  heat, data, num_sets, nullptr);
+                                  heat, data, num_sets, nullptr, stats, phase);
 }
 
 /* The test's, not the gather's: the same row with the r4d_ple_probe handshake. No launch outside
@@ -443,9 +477,9 @@ __global__ __launch_bounds__(kPleCacheThreads) void ple_embed_lookup_q_probe_ker
     const void* __restrict__ sc, uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t x_ld,
     int32_t n_vocab, int32_t vocab_off, int32_t* __restrict__ tags, uint32_t* __restrict__ gen,
     uint32_t* __restrict__ heat, uint8_t* __restrict__ data, uint32_t num_sets,
-    uint32_t* __restrict__ probe) {
+    uint32_t* __restrict__ probe, PleCacheStats* __restrict__ stats, uint32_t phase) {
     ple_embed_lookup_q_row<true>(tok, wte, sc, sc_f32, x, x_ld, n_vocab, vocab_off, tags, gen,
-                                 heat, data, num_sets, probe);
+                                 heat, data, num_sets, probe, stats, phase);
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -1094,11 +1128,13 @@ struct PleVramCache {
     uint32_t  sets = 0;
     int       device = -1;
     unsigned* probe = nullptr;   /* r4d_ple_probe's words: this instance's launches take the entry */
+    PleCacheStats* stats = nullptr;   /* the counters below; part of this instance's reservation */
     std::atomic<const void*> table{nullptr};
 };
 
 static void ple_cache_free(PleVramCache* c) {
     if (!c) return;
+    (void)hipFree(c->stats);
     (void)hipFree(c->data);
     (void)hipFree(c->heat);
     (void)hipFree(c->gen);
@@ -1138,22 +1174,46 @@ extern "C" int r4d_rad_embed_lookup_q_init(const RadParam* p, int n_p, int rank,
     const bool got = hipMalloc((void**)&c->tags, ways * sizeof(int32_t)) == hipSuccess &&
                      hipMalloc((void**)&c->gen, ways * sizeof(uint32_t)) == hipSuccess &&
                      hipMalloc((void**)&c->heat, ways * sizeof(uint32_t)) == hipSuccess &&
-                     hipMalloc((void**)&c->data, ways * kPleCacheRowBytes) == hipSuccess;
-    if (!got || hipMemset(c->gen, 0, ways * sizeof(uint32_t)) != hipSuccess) {
+                     hipMalloc((void**)&c->data, ways * kPleCacheRowBytes) == hipSuccess &&
+                     hipMalloc((void**)&c->stats, sizeof(PleCacheStats)) == hipSuccess;
+    if (!got || hipMemset(c->gen, 0, ways * sizeof(uint32_t)) != hipSuccess ||
+        hipMemset(c->stats, 0, sizeof(PleCacheStats)) != hipSuccess) {
         ple_cache_free(c);
         std::fprintf(stderr, "[r4d] ple cache: device %d could not allocate %u sets; the gathers "
                              "read the table as before\n", dev, sets);
         return RAD_OK;
     }
     std::fprintf(stderr, "[r4d] ple cache: device %d holds %u sets x %u ways, %.1f MiB "
-                         "(%zu rows)\n", dev, sets, kPleCacheWays,
-                 (double)(ways * (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0), ways);
+                         "(%zu rows); %llu bytes reserved, %.1f%% of the %u-set cap (%.1f MiB)\n",
+                 dev, sets, kPleCacheWays,
+                 (double)(ways * (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0), ways,
+                 (unsigned long long)(ways * (kPleCacheRowBytes + 12) + sizeof(PleCacheStats)),
+                 100.0 * (double)sets / (double)kPleCacheMaxSets, kPleCacheMaxSets,
+                 (double)((size_t)kPleCacheMaxSets * kPleCacheWays *
+                          (kPleCacheRowBytes + 12)) / (1024.0 * 1024.0));
     if (out) *out = c;
     return RAD_OK;
 }
 
 extern "C" void r4d_rad_embed_lookup_q_fini(void* instance) {
-    ple_cache_free((PleVramCache*)instance);
+    PleVramCache* c = (PleVramCache*)instance;
+    if (!c) return;
+    /* The counters go out here, where the cache they belong to ends: one line a phase that took
+     * any row. A run with RADIANCE_PLE_VRAM_CACHE_SETS unset never got here, and its gather read
+     * every row from the table. */
+    PleCacheStats s{};
+    if (c->stats && hipMemcpy(&s, c->stats, sizeof s, hipMemcpyDeviceToHost) == hipSuccess) {
+        static const char* const kName[kPleStatsPhases] = { "prefill", "decode", "mixed" };
+        for (uint32_t ph = 0; ph < kPleStatsPhases; ++ph) {
+            const unsigned long long rows = s.hits[ph] + s.misses[ph];
+            if (!rows) continue;
+            std::fprintf(stderr, "[r4d] ple cache: %s rows %llu, hits %llu (%.1f%%), misses "
+                                 "%llu, host reads %.2f MiB\n", kName[ph], rows, s.hits[ph],
+                         100.0 * (double)s.hits[ph] / (double)rows, s.misses[ph],
+                         (double)s.host_bytes[ph] / (1024.0 * 1024.0));
+        }
+    }
+    ple_cache_free(c);
 }
 
 /* Test hook, not part of the plugin ABI (r4d.h): the probe words the test's kernel entry uses, and
@@ -1169,6 +1229,52 @@ extern "C" int r4d_ple_probe(void* instance, unsigned* ctl) {
     return 0;
 }
 
+/* Test hook, not part of the plugin ABI (r4d.h): the gather's counters. Fills *out with the
+ * instance's per-phase hits, misses and table bytes and returns 0, or -1 when the instance holds
+ * no cache (env unset, or its allocation failed) -- there are then no counters, and the gathers
+ * read every row from the table. The counters are not reset, so a test reads them as a running
+ * total. */
+extern "C" int r4d_ple_stats(void* instance, R4dPleCacheStats* out) {
+    if (!instance || !out) return -1;
+    PleVramCache* c = (PleVramCache*)instance;
+    if (!c->stats) return -1;
+    PleCacheStats s{};
+    if (hipMemcpy(&s, c->stats, sizeof s, hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    for (uint32_t ph = 0; ph < kPleStatsPhases; ++ph) {
+        out->hits[ph] = s.hits[ph];
+        out->misses[ph] = s.misses[ph];
+        out->host_bytes[ph] = s.host_bytes[ph];
+    }
+    return 0;
+}
+
+/* The on-demand dump (RadStatsDumpFn, abi/rad_abi.h): --profile-ops calls this with the time it
+ * measured for the gather in a step of each phase, so one line a phase carries everything MAIN-60
+ * needs to read -- hits, misses, the rate, the bytes the missing rows actually fetched from host
+ * memory, and the op's own time. Key=value so a runner reads it without a parser. A phase the op
+ * never ran in with counters of its own still prints (a step of it happened after the counters
+ * were last reset); `gather_ms=na` is a phase the caller never timed. */
+extern "C" void r4d_ple_stats_dump(void* instance, const double* phase_ms, int n_phase) {
+    R4dPleCacheStats s{};
+    if (r4d_ple_stats(instance, &s) != 0) {
+        std::fprintf(stderr, "    ple_cache: no counters (the cache is off: every row was read "
+                             "from the table)\n");
+        return;
+    }
+    static const char* const kName[kPleStatsPhases] = { "prefill", "decode", "mixed" };
+    for (uint32_t ph = 0; ph < kPleStatsPhases; ++ph) {
+        const unsigned long long rows = s.hits[ph] + s.misses[ph];
+        char ms[32] = "na";
+        if (phase_ms && (int)ph < n_phase && phase_ms[ph] >= 0.0)
+            std::snprintf(ms, sizeof ms, "%.3f", phase_ms[ph]);
+        if (!rows && !std::strcmp(ms, "na")) continue;
+        std::fprintf(stderr, "    ple_cache phase=%s hits=%llu misses=%llu hit_rate=%.4f "
+                             "host_read_bytes=%llu gather_ms=%s\n",
+                     kName[ph], s.hits[ph], s.misses[ph],
+                     rows ? (double)s.hits[ph] / (double)rows : 0.0, s.host_bytes[ph], ms);
+    }
+}
+
 /* True when this launch may use `c` for `table`: the first table seen binds the instance, and any
  * other leaves the cache alone. */
 static bool ple_cache_binds(PleVramCache* c, const void* table) {
@@ -1182,16 +1288,16 @@ static bool ple_cache_binds(PleVramCache* c, const void* table) {
 static int embed_lookup_q_cached_emit(const int32_t* tok, const uint8_t* wte, const void* sc,
                                       bool sc_f32, uint16_t* x, long long M, int32_t n_vocab,
                                       int32_t vocab_off, long long x_ld, PleVramCache* c,
-                                      RadStream stream) {
+                                      uint32_t phase, RadStream stream) {
     if (c->probe)                          /* a test attached its words: its own entry, same row */
         return R4D_EMIT(stream, (ple_embed_lookup_q_probe_kernel), dim3((uint32_t)M),
                         dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                         (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                        c->sets, c->probe) == RAD_OK ? 0 : -4;
+                        c->sets, c->probe, c->stats, phase) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (ple_embed_lookup_q_kernel), dim3((uint32_t)M),
                     dim3(kPleCacheThreads), 0, tok, wte, sc, (uint32_t)(sc_f32 ? 1u : 0u), x,
                     (uint32_t)x_ld, n_vocab, vocab_off, c->tags, c->gen, c->heat, c->data,
-                    c->sets) == RAD_OK ? 0 : -4;
+                    c->sets, c->stats, phase) == RAD_OK ? 0 : -4;
 }
 
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
@@ -1711,7 +1817,8 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
         return embed_lookup_q_cached_emit((const int32_t*)r4d_addr(tok), (const uint8_t*)r4d_addr(wte),
                                           sc ? (const void*)r4d_addr(sc) : nullptr,
                                           sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
-                                          (int)n_vocab, (int)voff, x_ld, cache, stream) == 0
+                                          (int)n_vocab, (int)voff, x_ld, cache,
+                                          a->phase < 0 ? 2u : (uint32_t)a->phase, stream) == 0
                    ? RAD_OK : RAD_E_DEVICE;
 
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,

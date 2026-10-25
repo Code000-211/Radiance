@@ -514,6 +514,7 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
     RadArgs a = hip.args;
     a.t   = o.ht;
     a.n_t = n_opd;
+    a.phase = phase_;   /* the reference is launched per issue too, so it sees the step's phase */
     o.scratch.assign((size_t)(a.scratch_bytes > 0 ? a.scratch_bytes : 0), 0);
     a.scratch = o.scratch.empty() ? nullptr : o.scratch.data();
 
