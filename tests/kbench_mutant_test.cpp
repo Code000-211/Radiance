@@ -81,11 +81,13 @@ Out run(const Env& e, const std::string& args) {
          if (!_ok) std::fprintf(stderr, "    exit %d\n%s\n", (o).code, (o).text.c_str()); } \
     while (0)
 
-/* One case of `op` at `g`, its operands described by libref's hook for it. */
-bool describe(Registry& reg, const std::string& op, const Geometry& g, uint64_t seed, int64_t M,
-              KfCase* c) {
+/* One case of `op` at `g`, its operands described by `lib`'s hook for it: libref's, or the plugin
+ * that implements an op libref does not have (plugin/qsatable's `ref_qsa_table`), whose description
+ * is what a fixture of that op must carry. */
+bool describe_lib(Registry& reg, const std::string& lib, const std::string& op, const Geometry& g,
+                  uint64_t seed, int64_t M, KfCase* c) {
     const RadOpSchema* schema = reg.schema(op);
-    const KernelRow* row = reg.select_in("libref", op, g, RAD_DOMAIN_HOST);
+    const KernelRow* row = reg.select_in(lib, op, g, RAD_DOMAIN_HOST);
     if (!schema || !row) return false;
     std::vector<OpdShape> sh;
     if (rad_operand_shapes_hook(row->info, g, schema->n_operands, &sh) < 0) return false;
@@ -115,6 +117,7 @@ bool describe(Registry& reg, const std::string& op, const Geometry& g, uint64_t 
         d.idx_cu = sh[k].idx_cu;
         d.idx_prefix = sh[k].idx_prefix;
         d.idx_history = sh[k].idx_history;
+        d.idx_ordered = sh[k].idx_ordered;
         d.idx_max = sh[k].idx_max;
         d.idx_const = sh[k].idx_const;
         if ((d.role == RAD_OPD_WEIGHT || d.role == RAD_OPD_WTAB) && !d.absent) {
@@ -132,6 +135,11 @@ bool describe(Registry& reg, const std::string& op, const Geometry& g, uint64_t 
     return true;
 }
 
+bool describe(Registry& reg, const std::string& op, const Geometry& g, uint64_t seed, int64_t M,
+              KfCase* c) {
+    return describe_lib(reg, "libref", op, g, seed, M, c);
+}
+
 Env build_env() {
     Env e;
     e.dir = radtest::tmpdir();
@@ -145,6 +153,10 @@ Env build_env() {
         const std::string so = std::string(RAD_PLUGIN_DIR) + "/testkernels/kbmut/kbm_" + m + ".so";
         if (::symlink(so.c_str(), (e.home + "/kernels/kbm_" + m + ".so").c_str()) != 0) return e;
     }
+    /* plugin/qsatable: the ops libref does not implement, each with the host reference beside it. */
+    const std::string qsa = std::string(RAD_PLUGIN_DIR) + "/kernels/qsatable.so";
+    if (::symlink(qsa.c_str(), (e.home + "/kernels/qsatable.so").c_str()) != 0 && errno != EEXIST)
+        return e;
     const std::string arch = std::string(RAD_PLUGIN_DIR) + "/testarch/kbench/radtest_kbarch.so";
     if (::symlink(arch.c_str(), (e.home + "/architectures/radtest_kbarch.so").c_str()) != 0)
         return e;
@@ -423,6 +435,106 @@ TEST(a_case_no_library_under_test_serves_is_named) {
                              "'");
     CHECK_RUN(o, o.code == 0);
     CHECK_RUN(o, has(o.text, "no library under test has a row for it"));
+}
+
+/* An op libref does not implement (qsa_table, qsa_attn) has its definition in the plugin that ships
+ * the reference beside the kernel, so a case of it must be answered by that row -- not skipped as
+ * having no oracle -- and the ops must replay as checked. Named by the row's own reference flag,
+ * which is how the tool finds it without knowing a plugin's name.
+ *
+ * Before this, every such case read "no libref kernel: no oracle exists for it" and a run reported
+ * hundreds of skips with nothing checked, which a speed gate then read as a green run. */
+TEST(the_table_ops_are_answered_by_their_plugins_reference_and_replay_checked) {
+    REQUIRE(env().ok);
+    Registry reg;
+    REQUIRE(reg.load_plugin(std::string(RAD_PLUGIN_DIR) + "/kernels/qsatable.so", 0) >= 0);
+    KfCase c;
+    Geometry g;
+    g.set_i("M", 4); g.set_i("blocks", 64); g.set_i("topk", 8); g.set_i("tile", 16);
+    g.set_i("ratio", 4); g.set_i("u_max", 64);
+    REQUIRE(describe_lib(reg, "qsatable", "qsa_table", g, 201, 4, &c));
+    /* `selb` is a block-order list and `pos` its row's place: the law the op needs, carried by the
+     * fixture so the replay draws the same operand. */
+    REQUIRE(c.opd.size() == 7);
+    CHECK(c.opd[0].is_index && c.opd[0].idx_ordered);
+    CHECK_EQ(c.opd[0].idx_max, (int64_t)64);
+    CHECK_EQ(c.opd[1].idx_const, (int64_t)9);
+    CHECK_EQ(c.opd[2].idx_const, (int64_t)31);
+
+    KfCase a;
+    Geometry ag;
+    ag.set_i("M", 4); ag.set_i("n_head", 4); ag.set_i("head_dim", 64); ag.set_i("gqa", 1);
+    ag.set_i("block_size", 4); ag.set_i("ratio", 4); ag.set_i("tile", 16); ag.set_i("topk", 4);
+    ag.set_i("blocks", 64); ag.set_i("max_seqs", 2); ag.set_i("u_max", 16);
+    ag.set_s("q_dtype", "f32"); ag.set_s("kv_dtype", "f32");
+    /* The reader's own case: the table the op produced is a block-order list too, and `bt` is the
+     * staged block table (bt_pitch wide) the row path indexes with the step's pitch. */
+    REQUIRE(describe_lib(reg, "qsatable", "qsa_attn", ag, 202, 4, &a));
+    REQUIRE(a.opd.size() == 10);
+    CHECK(a.opd[2].is_index && a.opd[2].idx_ordered);
+    CHECK(a.opd[6].idx_const == 16);              /* pos: the last token of a full page */
+
+    Kfixture base;
+    base.source = "kbench_mutant_test";
+    base.oracle = "libref";
+    base.cases.push_back(c);
+    base.cases.push_back(a);
+    const std::string bpath = env().dir + "/qsa_base.rkb";
+    REQUIRE_EQ(base.save(bpath), RAD_OK);
+
+    /* Recording takes the answer from the plugin's host reference, though the fixture names libref:
+     * libref has no row for the op at all. */
+    const std::string fx = env().dir + "/qsa.rkb";
+    const Out rec = run(env(), "--kernels libref:qsatable --max-bytes 64 --rerecord '" + fx +
+                                 "' --fixture '" + bpath + "'");
+    CHECK_RUN(rec, rec.code == 0 && has(rec.text, "recorded 2 case(s)"));
+
+    /* Replaying it is a check, not a skip: the row runs and its answers are compared exactly (it is
+     * the oracle of its own op). libref stays loaded as the run's reference and has no row for the
+     * op, which is what used to leave the case unserved. */
+    const Out o = run(env(), "--kernels qsatable:libref --strict --max-bytes 64 --fixture '" + fx +
+                             "'");
+    CHECK_RUN(o, o.code == 0);
+    CHECK_RUN(o, has(o.text, "2 checked, 2 passed, 0 failed, 0 skipped, 0 diverged, 0 capped"));
+    CHECK_RUN(o, !has(o.text, "no oracle"));
+    CHECK_RUN(o, !has(o.text, "stale"));
+
+    /* And the gate refuses a --bench run that timed nothing: a table of no measurements is not a
+     * table of zeroes. */
+    const Out gate = run(env(), "--kernels libref --bench --fixture '" + fx + "'");
+    CHECK_RUN(gate, gate.code == 1);
+    CHECK_RUN(gate, has(gate.text, "The measurement gate refused"));
+}
+
+/* The other half of the gate: a run that checked every case it timed keeps its times. Without this
+ * a gate that refuses everything would look like it works. */
+TEST(a_checked_and_timed_run_publishes_its_times_and_passes_the_gate) {
+    REQUIRE(env().ok);
+    Registry reg;
+    REQUIRE(reg.load_plugin(std::string(RAD_PLUGIN_DIR) + "/kernels/libref.so", 0) >= 0);
+    auto softmax_case = [&](int64_t M, uint64_t seed, KfCase* c) {
+        Geometry g;
+        g.set_i("M", M); g.set_i("n", 16); g.set_s("dtype", "f32");
+        return describe(reg, "softmax", g, seed, M, c);
+    };
+    KfCase small, big;
+    REQUIRE(softmax_case(2, 11, &small));
+    REQUIRE(softmax_case(4096, 12, &big));
+    Kfixture base;
+    base.source = "kbench_mutant_test";
+    base.oracle = "libref";
+    base.cases = { small, big };
+    REQUIRE_EQ(base.save(env().dir + "/gate_base.rkb"), RAD_OK);
+    const std::string fx = env().dir + "/gate.rkb";
+    const Out rec = run(env(), "--kernels libref --max-bytes 1000000 --rerecord '" + fx +
+                                 "' --fixture '" + env().dir + "/gate_base.rkb'");
+    CHECK_RUN(rec, rec.code == 0 && has(rec.text, "recorded 2 case(s)"));
+
+    const Out o = run(env(), "--kernels libref --bench --no-cache --fixture '" + fx + "'");
+    CHECK_RUN(o, o.code == 0);
+    CHECK_RUN(o, has(o.text, "2 case(s) timed"));
+    CHECK_RUN(o, !has(o.text, "The measurement gate refused"));
+    CHECK_RUN(o, has(o.text, "2 checked, 2 passed, 0 failed, 0 skipped"));
 }
 
 /* A fixture whose operand count no longer matches the schema checks nothing; --strict (the ctests)

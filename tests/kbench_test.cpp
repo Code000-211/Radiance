@@ -486,6 +486,36 @@ TEST(an_overrun_a_fusion_mismatch_or_a_written_input_fails_the_run) {
     CHECK_EQ(kb::exit_code(s6, false), 1);
 }
 
+/* The measurement gate (kb::bench_refusal): a time printed for an op whose cases were skipped is a
+ * time for something nobody checked, which is how a run that checked nothing came to be read as a
+ * speed result. An op is named only when the run has a time for it -- a skip of an op that was
+ * never timed costs nothing -- and a run with no timed op at all refuses too, since a table of
+ * nothing is not a table of zeroes. */
+TEST(a_time_for_an_unchecked_op_refuses_the_measurement_gate) {
+    kb::Stats st;
+    st.checked = 12;
+    const std::set<std::string> measured = { "add", "qsa_table" };
+    const std::map<std::string, int> none;
+    CHECK(kb::bench_refusal(st, measured, none, none).empty());
+    /* Both ops were timed and checked. */
+    std::map<std::string, int> skipped = { { "mul  (no libref kernel: no oracle exists for it)", 40 },
+                                           { "qsa_table  (no libref kernel: no oracle exists for "
+                                             "it)", 520 } };
+    const std::string why = kb::bench_refusal(st, measured, skipped, none);
+    CHECK(!why.empty());
+    CHECK(why.find("qsa_table") != std::string::npos);
+    CHECK(why.find("520") != std::string::npos);
+    CHECK(why.find("mul") == std::string::npos);   /* skipped, but no time was reported for it */
+    /* A stale case under a timed op is the same gap as a skipped one. */
+    std::map<std::string, int> stale = { { "add  (libref now describes an output differently from "
+                                           "its recording)", 1 } };
+    const std::string bad = kb::bench_refusal(st, measured, none, stale);
+    CHECK(bad.find("add") != std::string::npos);
+    CHECK(kb::bench_refusal(st, {}, none, none).find("no op of this run") != std::string::npos);
+    kb::Stats unchecked;
+    CHECK(kb::bench_refusal(unchecked, measured, none, none).find("no case") != std::string::npos);
+}
+
 /* ================================================================== where the time went */
 
 TEST(the_phase_line_names_each_phase_and_library) {

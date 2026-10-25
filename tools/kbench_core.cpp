@@ -81,6 +81,11 @@ const std::vector<TolRow> g_tol = {
     { "attn_",        "bf16",     2e-2 },
     { "attn_",        "f32",      1e-4 },
     { "attn_",        "*",        3e-2 },
+    /* The table is ids, counts and offsets, compared exactly; the masked read is attention over the
+     * same pages in the same order, so it takes attention's tolerance. */
+    { "qsa_table",    "*",        0.0  },
+    { "qsa_attn",     "bf16",     2e-2 },
+    { "qsa_attn",     "*",        3e-2 },
     /* Elementwise and norms: one pass, so anything but a rounding difference is a bug. */
     { "rmsnorm",      "bf16",     4e-3 },
     { "rmsnorm",      "f32",      1e-6 },
@@ -393,6 +398,35 @@ Overrun scan_margins(const uint8_t* lo, const uint8_t* hi, int64_t red_bytes, ui
 }
 
 /* ================================================================== what a run found */
+std::string bench_refusal(const Stats& st, const std::set<std::string>& measured,
+                          const std::map<std::string, int>& skipped,
+                          const std::map<std::string, int>& stale) {
+    if (measured.empty())
+        return "no op of this run has a time to report (nothing was checked, or --timing-only was "
+               "left off and every case was skipped)";
+    if (st.checked == 0) return "no case of this run was checked against a reference";
+    /* A gap line is named `op  (why)`; the op is what the gate can attribute it to. */
+    auto op_of = [](const std::string& key) {
+        const size_t at = key.find("  ");
+        return at == std::string::npos ? key : key.substr(0, at);
+    };
+    std::set<std::string> ops;
+    int n = 0;
+    for (const std::map<std::string, int>* m : { &skipped, &stale })
+        for (const auto& [key, count] : *m) {
+            const std::string op = op_of(key);
+            if (!measured.count(op)) continue;
+            ops.insert(op);
+            n += count;
+        }
+    if (ops.empty()) return std::string();
+    std::string names;
+    for (const std::string& o : ops) names += (names.empty() ? "" : ", ") + o;
+    return fmt("%d case(s) of %s were skipped or are stale, so %s not fully checked and %s time "
+               "cannot stand for the op", n, names.c_str(), ops.size() == 1 ? "it is" : "they are",
+               ops.size() == 1 ? "its" : "their");
+}
+
 int exit_code(const Stats& st, bool strict) {
     if (st.failed || st.overrun || st.fuse_failed || st.input_written) return 1;
     if (strict && st.stale) return 1;
@@ -602,8 +636,10 @@ bool timing_input(const KfOperand& d, const Geometry& g, uint64_t seed, std::vec
     if (d.role != RAD_OPD_IN || !d.is_index || d.absent || d.shape.empty()) return false;
     const int64_t n = rad_numel(d.shape);
     if (n <= 0) return false;
+    /* `plain` is the uniform draw from a range, which is what the branches below mirror: an operand
+     * drawn under another law has no variant to make. */
     const bool plain = !d.idx_unique && !d.idx_cu && !d.idx_prefix && !d.idx_history &&
-                       d.idx_const < 0;
+                       !d.idx_ordered && d.idx_const < 0;
     long long ne = 0, M = 0;
     g.get_i("n_expert", &ne);
     g.get_i("M", &M);

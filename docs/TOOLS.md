@@ -463,7 +463,9 @@ a monotone log-decay, a routing histogram, a sampler's parameter rows as request
 history that repeats itself), and the recording keeps the law, so a replay draws what was
 recorded. The sampler's two laws need format version 6: a sampler case in an older recording
 draws its rows as numbers, on which the mask, DRY and XTC stages do nothing and the penalties act
-on an eighth of the rows.
+on an eighth of the rows. The block-order law (`RAD_OPD_F_IDX_ORDERED`: the ascending list a
+selection or a shared table holds) needs version 7 -- slot j of a row holds `start + j`, and a
+reader handed a list that does not ascend refuses the case.
 
 `--rerecord FILE` writes the replayed fixtures' cases again with the reference's current answers
 in the current format, each case keeping the laws it was recorded with. `--record-rows FILE`
@@ -486,6 +488,11 @@ a weight's shape needs a container, and is listed.
   reference id's is accepted.
 - A case whose reference and output are both identically zero checked nothing: it is counted as
   vacuous, not passed.
+- A `--bench` time is published only for an op every case of which was checked: one case of it
+  skipped or stale withdraws the whole table and the run exits 1 ("The measurement gate
+  refused"), because a speed for an op nobody showed to be right is not a speed, and a run that
+  timed nothing refuses too. `--timing-only` measures unchecked launches on purpose and never
+  asks; the report says what was withheld and why.
 - A failure, a red-zone overrun, a fusion that differs from its chain, and a host kernel that
   wrote into an input it was handed all exit 1. Under `--strict` so does a stale fixture: an
   operand count or schema that moved, or a case the reference no longer serves or now describes

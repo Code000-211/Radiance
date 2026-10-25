@@ -201,6 +201,16 @@ struct Stats {
  * kernel that wrote its input, and under `strict` a stale fixture. 0 otherwise. */
 int exit_code(const Stats& st, bool strict);
 
+/* Why a `--bench` run may not report its times, or "" when it may: every op the run has a time for
+ * must have been checked. A case of that op that was skipped or is stale leaves the op unchecked,
+ * and a time for an unchecked op is a time for something nobody has shown to be right -- which is
+ * why the gate refuses instead of printing it. `measured` names the ops a time would be reported
+ * for; the gaps are the pass's own named skips and stale cases (their keys are `op  (why)`). A
+ * --timing-only run measures unchecked launches on purpose and never asks. */
+std::string bench_refusal(const Stats& st, const std::set<std::string>& measured,
+                          const std::map<std::string, int>& skipped,
+                          const std::map<std::string, int>& stale);
+
 /* ================================================================== where the time went */
 enum Phase {
     PH_LOAD = 0,     /* plugins and fixture */

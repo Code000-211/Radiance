@@ -102,6 +102,30 @@ struct BenchInfo {
     bool        footprint_flag = false;   /* --bench-flush set it */
 };
 
+/* The measurement gate, both passes: an op whose cases were skipped or are stale was not checked,
+ * and a time for an unchecked op is a time for something nobody has shown to be right -- so the run
+ * reports none of its times at all rather than publish a number it cannot stand behind
+ * (kb::bench_refusal). Returns why it refused, "" when the times stand; on refusal every row's time
+ * is cleared and the reason is left in `bench`, which the report prints above the speed table. */
+std::string gate_times(std::vector<Row>* rows, const std::map<std::string, int>& skipped,
+                       const std::map<std::string, int>& stale, const Stats& st, bool timing_only,
+                       BenchInfo* bench) {
+    if (!bench || timing_only) return std::string();
+    std::set<std::string> measured;
+    for (const Row& r : *rows)
+        if (r.us >= 0) measured.insert(r.op);
+    const std::string why = kb::bench_refusal(st, measured, skipped, stale);
+    if (why.empty()) return std::string();
+    for (Row& r : *rows)
+        if (r.us >= 0) {
+            r.us = r.us_min = r.us_p90 = r.us_ci = -1;
+            r.us_n = 0;
+            r.tnote = "withheld: " + why;
+        }
+    bench->withheld = why;
+    return why;
+}
+
 /* One library's summary. Completeness comes from its row tables in the registry, not from the run
  * (which only covers what this container declares), measured against every op any loaded plugin
  * declares a schema for (§2.3). Correctness and speed are folded in from the run. */
@@ -967,9 +991,12 @@ private:
     void replay_case(size_t fi, const KfCase& c);
     bool draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why);
     void run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
-                 const std::vector<Drawn>& in, uint64_t input_hash, const Run& run);
+                 const std::vector<Drawn>& in, uint64_t input_hash, const Run& run,
+                 const std::string& oracle);
     bool lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
                  const Drawn& d, Bytes* laid, RadTensor* desc);
+    std::string oracle_of(const std::string& recorded, const std::string& op, const Geometry& g,
+                          const Registry::RowFilter& accept) const;
     int  record_case(const KfCase& base, KfCase* out, std::string* why);
     int  rerecord();
     int  record_rows();
@@ -1138,6 +1165,24 @@ std::string describes_differently(const KfCase& c, const RadOpSchema* schema, co
     return std::string();
 }
 
+/* The library whose host row answers `op` at `g` for a case a fixture attributes to `recorded`: the
+ * recording library when it still has such a row, else a loaded kernel library that declares one of
+ * its own as a reference (`rad_kernel_reference`, per row). Found by that declaration, never by
+ * name: `libref` covers the ops the engine shares, and a plugin that implements an op of its own
+ * ships its definition beside the kernel (`plugin/qsatable`'s `ref_qsa_table`). "" when no loaded
+ * library answers it. */
+std::string Replay::oracle_of(const std::string& recorded, const std::string& op, const Geometry& g,
+                              const Registry::RowFilter& accept) const {
+    if (recorded.empty()) return std::string();
+    if (!rows_for_case(*reg_, recorded, op, g, RAD_DOMAIN_HOST, accept, false).empty()) return recorded;
+    for (const Plugin& p : reg_->plugins()) {
+        if (p.kind != RAD_PLUGIN_KERNEL || p.name == recorded) continue;
+        const std::vector<Run> rr = rows_for_case(*reg_, p.name, op, g, RAD_DOMAIN_HOST, accept, false);
+        if (!rr.empty() && rr[0].row->reference) return p.name;
+    }
+    return std::string();
+}
+
 void Replay::replay_case(size_t fi, const KfCase& c) {
     const Kfixture& fx = fx_[fi];
     const RadOpSchema* schema = reg_->schema(c.op);
@@ -1159,19 +1204,22 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
     const Geometry g = case_geometry(c);
     const Registry::RowFilter accept = weight_filter(c, schema);
 
-    /* The reference must still serve and describe what it recorded; otherwise the case is stale
+    /* Which library answers this case. `libref` has no `qsa_table`: the plugin that implements an
+     * op beside its own host reference answers it (oracle_of). */
+    const std::string rec = oracle_name(fx);
+    const std::string oracle = rec.empty() ? ref_name_ : oracle_of(rec, c.op, g, accept);
+    /* That reference must still serve and describe what it recorded; otherwise the case is stale
      * on every machine, whichever libraries are under test. */
-    if (oracle_name(fx) == ref_name_) {
-        std::vector<Run> rr = rows_for_case(*reg_, ref_name_, c.op, g, RAD_DOMAIN_HOST, accept,
-                                            false);
+    if (oracle == rec) {
+        std::vector<Run> rr = rows_for_case(*reg_, oracle, c.op, g, RAD_DOMAIN_HOST, accept, false);
         if (rr.empty()) {
-            nm_.stale[c.op + "  (" + ref_name_ + " recorded this case and has no row for it "
+            nm_.stale[c.op + "  (" + oracle + " recorded this case and has no row for it "
                       "now)"]++;
             ++st_.stale;
         } else {
             const std::string why = describes_differently(c, schema, rr[0].row, rr[0].g);
             if (!why.empty()) {
-                nm_.stale[c.op + "  (" + ref_name_ + " now describes an output differently from "
+                nm_.stale[c.op + "  (" + oracle + " now describes an output differently from "
                           "its recording -- " + why + ")"]++;
                 ++st_.stale;
                 return;
@@ -1267,7 +1315,7 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
             input_hash = kb::hash_combine(input_hash, d.fp);
         }
     }
-    for (const Run& r : runs) run_one(fi, c, schema, in, input_hash, r);
+    for (const Run& r : runs) run_one(fi, c, schema, in, input_hash, r, oracle);
 }
 
 bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why) {
@@ -1395,15 +1443,16 @@ bool Replay::lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const
 }
 
 void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
-                     const std::vector<Drawn>& in, uint64_t input_hash, const Run& run) {
+                     const std::vector<Drawn>& in, uint64_t input_hash, const Run& run,
+                     const std::string& oracle) {
     const size_t n_opd = c.opd.size();
     const KernelRow* row = run.row;
     const std::string& lib = run.lib;
     const int dom = run.dom;
     const Geometry& g = run.g;
-    /* The recording's own library is held to its answers exactly, unless this row reads a weight's
-     * planes where the recording read their decoded tensor (lays_out_weight). */
-    const bool exact = lib == oracle_name(fx_[fi]) && !lays_out_weight(row, g, c);
+    /* The library whose answer this case's recording holds is held to it exactly, unless this row
+     * reads a weight's planes where the recording read their decoded tensor (lays_out_weight). */
+    const bool exact = !oracle.empty() && lib == oracle && !lays_out_weight(row, g, c);
     auto role_of = [&](size_t k) { return schema->operands[k].role; };
     auto written = [&](size_t k) { return role_of(k) == RAD_OPD_OUT || role_of(k) == RAD_OPD_INOUT; };
     auto name_of = [&](size_t k) {
@@ -1792,9 +1841,16 @@ int Replay::record_case(const KfCase& base, KfCase* out, std::string* why) {
     }
     const Geometry g = case_geometry(base);
     const Registry::RowFilter accept = weight_filter(base, schema);
-    std::vector<Run> rr = rows_for_case(*reg_, ref_name_, base.op, g, RAD_DOMAIN_HOST, accept,
-                                        false);
-    if (rr.empty()) { *why = ref_name_ + " has no host row for it"; return RAD_E_NOKERNEL; }
+    /* The library whose host row answers this op: the reference, or the plugin that ships its own
+     * definition of an op libref does not implement (oracle_of). */
+    const std::string oracle = oracle_of(ref_name_, base.op, g, accept);
+    std::vector<Run> rr = oracle.empty() ? std::vector<Run>()
+                                         : rows_for_case(*reg_, oracle, base.op, g, RAD_DOMAIN_HOST,
+                                                         accept, false);
+    if (rr.empty()) {
+        *why = (oracle.empty() ? ref_name_ : oracle) + " has no host row for it";
+        return RAD_E_NOKERNEL;
+    }
     const Run& run = rr[0];
     if (kb::case_bytes(base.opd) < 0 || kb::case_bytes(base.opd) > o_.max_case_bytes) {
         *why = "over the --max-bytes budget";
@@ -1832,7 +1888,7 @@ int Replay::record_case(const KfCase& base, KfCase* out, std::string* why) {
         const double sec =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - l0).count();
         ph_.add(kb::PH_LAUNCH, sec);
-        ph_.launch_by_lib[ref_name_] += sec;
+        ph_.launch_by_lib[oracle] += sec;
         if (s < 0) {
             *why = std::string(run.row->info->name) + " refused it: " + rad_strerror(s);
             return s;
@@ -1949,14 +2005,17 @@ int Replay::record_rows() {
                     last = "no case of its op can be moved into its constraints";
                     continue;
                 }
-                std::vector<Run> rr = rows_for_case(*reg_, ref_name_, base.op, g,
-                                                    RAD_DOMAIN_HOST, weight_filter(base, schema),
-                                                    false);
-                if (rr.empty()) { last = ref_name_ + " has no row there"; continue; }
+                const std::string oracle = oracle_of(ref_name_, base.op, g,
+                                                     weight_filter(base, schema));
+                std::vector<Run> rr = oracle.empty()
+                    ? std::vector<Run>()
+                    : rows_for_case(*reg_, oracle, base.op, g, RAD_DOMAIN_HOST,
+                                    weight_filter(base, schema), false);
+                if (rr.empty()) { last = oracle + " has no row there"; continue; }
                 std::vector<OpdShape> sh;
                 if (rad_operand_shapes_hook(rr[0].row->info, g, schema->n_operands, &sh) < 0 ||
                     sh.size() != base.opd.size()) {
-                    last = ref_name_ + " cannot describe its operands from the parameters alone";
+                    last = oracle + " cannot describe its operands from the parameters alone";
                     continue;
                 }
                 KfCase c;
@@ -1982,6 +2041,7 @@ int Replay::record_rows() {
                     d.idx_cu = sh[k].idx_cu;
                     d.idx_prefix = sh[k].idx_prefix;
                     d.idx_history = sh[k].idx_history;
+                    d.idx_ordered = sh[k].idx_ordered;
                     d.idx_max = sh[k].idx_max;
                     d.idx_const = sh[k].idx_const;
                     d.fill_chunk = sh[k].fill_chunk;
@@ -2048,8 +2108,12 @@ int Replay::finish() {
     timer_.reset();
     for (auto& [k2, d] : dcache_) if (d.base) rad_dev_free(d.base, RAD_MEM_DEVICE);
     dcache_.clear();
+    const std::string refused =
+        gate_times(&rows_, nm_.skipped, nm_.stale, st_, o_.timing_only, o_.bench ? &bench : nullptr);
 
     print_summary(st_, o_.timing_only, nm_);
+    if (!refused.empty())
+        std::printf("The measurement gate refused: %s\n", refused.c_str());
     print_row_coverage(census(*reg_, ref_name_), rows_);
 
     /* The ratchet: per fixture and library under test, the rows a replay reaches must not
@@ -2119,7 +2183,7 @@ int Replay::finish() {
     std::printf("%s\n", kb::phase_line(ph_, std::chrono::duration<double>(
                                                 std::chrono::steady_clock::now() - t0_)
                                                 .count()).c_str());
-    if (lost) return 1;
+    if (lost || !refused.empty()) return 1;
     return kb::exit_code(st_, o_.strict);
 }
 
@@ -2554,7 +2618,17 @@ int main(int argc, char** argv) {
     /* The oracle's host row for an op, found by scanning rows; selection would return the kernel
      * under test. */
     auto ref_for = [&](const std::string& op, const Geometry& g) -> const KernelRow* {
-        return reg.select_in(ref_name, op, g, RAD_DOMAIN_HOST);
+        if (const KernelRow* r = reg.select_in(ref_name, op, g, RAD_DOMAIN_HOST)) return r;
+        /* An op the reference does not implement: a loaded kernel library's own host row, if it
+         * declares it a reference, is the definition (`plugin/qsatable`'s `ref_qsa_table`). Named by
+         * that declaration, never by plugin name; without one the op has no oracle and is not
+         * checked. */
+        for (const Plugin& p : reg.plugins()) {
+            if (p.kind != RAD_PLUGIN_KERNEL) continue;
+            const KernelRow* r = reg.select_in(p.name, op, g, RAD_DOMAIN_HOST);
+            if (r && r->reference) return r;
+        }
+        return nullptr;
     };
 
     std::printf("rad-kbench %s\n", model.c_str());
@@ -2685,11 +2759,6 @@ int main(int argc, char** argv) {
             for (int dom = 0; dom < RAD_N_DOMAINS; ++dom) {
                 const Resolved& r = o.bands[b].dom[dom];
                 if (!r || !r.row || !r.row->info || !r.row->info->launch) continue;
-                /* Checking ref against itself proves nothing and costs a lot at 151K vocab, so a
-                 * point the reference resolved is visited only to record it. */
-                const bool record_only = r.row->plugin == ref_name;
-                if (record_only && (!recording || point_recorded)) continue;
-                const bool record_here = recording && !point_recorded;
                 /* `r.geom` is the selector's resolution (band upper bound plus tuned axes). The
                  * point's M goes into a copy that everything downstream reads (shape hooks, launch
                  * params, report, cap key), so params and operand sizes agree. The tuned axes still
@@ -2698,7 +2767,14 @@ int main(int argc, char** argv) {
                 Geometry g = r.geom;
                 if (!o.ranged_key.empty()) g.set_i(o.ranged_key, M);
 
+                /* Checking the reference against itself proves nothing and costs a lot at 151K
+                 * vocab, so a point the reference resolved is visited only to record it. Same for a
+                 * plugin's own host reference, which is the oracle of an op libref does not serve. */
                 const KernelRow* oracle = ref_for(o.op, g);
+                const bool record_only = oracle && r.row->plugin == oracle->plugin;
+                if (record_only && (!recording || point_recorded)) continue;
+                const bool record_here = recording && !point_recorded;
+
                 /* Without an oracle, a fused kernel that declares `replaces` is still checked,
                  * byte for byte against its own plugin's chain. A timing-only run times device
                  * kernels only; one without an oracle uses its own operand description. */
@@ -2816,6 +2892,7 @@ int main(int argc, char** argv) {
                     d.idx_cu     = sh[k].idx_cu;
                     d.idx_prefix = sh[k].idx_prefix;
                     d.idx_history = sh[k].idx_history;
+                    d.idx_ordered = sh[k].idx_ordered;
                     d.idx_max    = sh[k].idx_max;
                     d.idx_const  = sh[k].idx_const;
                     d.fill_chunk = sh[k].fill_chunk;
@@ -3654,7 +3731,12 @@ int main(int argc, char** argv) {
     BenchInfo binfo;
     if (bench) binfo = finish_timing(timer.get(), report_rows, host_footprint, topts.footprint >= 0);
     timer.reset();
+    const std::map<std::string, int> no_stale;   /* a container pass has no fixture to be stale */
+    const std::string refused = gate_times(&report_rows, skipped_ops, no_stale, st, timing_only,
+                                           bench ? &binfo : nullptr);
     print_summary(st, timing_only, nm);
+    if (!refused.empty())
+        std::printf("The measurement gate refused: %s\n", refused.c_str());
     print_row_coverage(census(reg, ref_name), report_rows);
     if (st.failed == 0 && st.checked > 0)
         std::printf("every resolved kernel agrees with %s on this container's bytes\n",
@@ -3689,7 +3771,8 @@ int main(int argc, char** argv) {
     std::printf("%s\n", kb::phase_line(ph, std::chrono::duration<double>(
                                                std::chrono::steady_clock::now() - pass_t0)
                                                .count()).c_str());
-    /* An overrun or a fusion that differs from its chain is a failure as much as a wrong
-     * number. */
+    /* An overrun, a fusion that differs from its chain, or a measurement gate that refused is a
+     * failure as much as a wrong number. */
+    if (!refused.empty()) return 1;
     return kb::exit_code(st, false);
 }
