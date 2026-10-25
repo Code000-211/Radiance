@@ -1832,6 +1832,9 @@ TEST(the_samples_only_reset_drops_the_samples_and_keeps_the_binding) {
     CHECK(t.buckets().empty());
     CHECK_EQ(t.dropped(), 0);
     CHECK_EQ(t.ignored(), 0);
+    /* The capacity the deployment reserved survives, so the scored phase records into memory that
+     * is already there instead of growing the table on the step path. */
+    CHECK(t.buckets().capacity() >= (size_t)kDraftCostDefaultBuckets);
     /* The binding stays: same table, same deployment, same contract. */
     CHECK(t.active());
     CHECK(t.records_only());

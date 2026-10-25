@@ -617,6 +617,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 void Scheduler::fini() {
     /* A scheduler torn down without shutdown() still owes its last completed cycle to the
      * predictor. No-op when shutdown() already flushed. */
+    draft_calib_close();
     draft_ring_flush();
     for (auto& s : reqs_)
         if (s && s->req && (s->running || s->pending_free)) kv_->free_sequence(s->req->id);
@@ -1184,6 +1185,10 @@ void Scheduler::release_deferred() {
 }
 
 void Scheduler::shutdown(const char* reason, int status) {
+    /* Before mu_: a boundary being applied holds mu_calib_ and wants mu_, so taking mu_ first here
+     * would deadlock against it. A request already applied is acknowledged; this only refuses the
+     * ones still outstanding. */
+    draft_calib_close();
     std::lock_guard<std::mutex> lk(mu_);
     closed_ = true;
     closed_reason_ = reason ? reason : "the engine has stopped";
@@ -2551,8 +2556,13 @@ void Scheduler::draft_cost_cycle(bool direct_step) {
         /* The plan the next step's verify and this cycle's publications belong to; copied now,
          * because the controller reuses its two plan slots. */
         const DraftPlan* p = draft_.plan();
-        draft_ring_cur_ = p->cycle_id;
         draft_ring_open(*p);
+        /* Only a plan that produced a record owns the cursor. An empty planning point opens none
+         * (draft_ring_open refuses n_seq == 0), and the previous cycle was already closed at the
+         * top of this function; a cursor left naming a recordless cycle would make every later
+         * idle step look like it owes an observation, and the calibration boundary could never be
+         * served. */
+        if (draft_ring_cycle(p->cycle_id)) draft_ring_cur_ = p->cycle_id;
         /* An empty planning point: every step opens a cycle, and a pure prefill or idle step has
          * no decode rows to plan over, so the controller issues the valid K0 plan for an empty
          * view. It is neither a decision nor a measurement -- no ring record, no bracket, no
@@ -2890,32 +2900,56 @@ bool Scheduler::draft_calib_quiet_locked() const {
 }
 
 Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms) {
-    DraftCalibAck early;
+    DraftCalibAck out;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        early.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
+        out.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
         if (!draft_costs_.records_only() && !draft_record_) {
-            early.rc = RAD_E_UNSUPPORTED;
-            return early;
+            out.rc = RAD_E_UNSUPPORTED;
+            return out;
         }
     }
-    const uint64_t want = draft_calib_want_.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::unique_lock<std::mutex> lk(mu_calib_);
-    calib_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms), [&] {
-        return draft_calib_served_.load(std::memory_order_acquire) >= want;
-    });
-    if (draft_calib_served_.load(std::memory_order_acquire) < want) {
-        /* The step loop did not reach an idle point in time (stopping, or a set that never
-         * finished). Nothing was dropped, so this is a busy answer and not a boundary. */
-        early.rc = RAD_E_STATE;
-        return early;
+    if (draft_calib_closed_) {
+        /* The scheduler is shutting down: the answer is terminal, not a boundary to retry. */
+        out.rc = RAD_E_STATE;
+        return out;
     }
-    return draft_calib_ack_;
+    if (draft_calib_pending_.load(std::memory_order_relaxed) != 0) {
+        /* One outstanding request, so an answer always belongs to the request that asked. */
+        out.rc = RAD_E_STATE;
+        return out;
+    }
+    const uint64_t id = ++draft_calib_next_id_;
+    draft_calib_pending_.store(id, std::memory_order_relaxed);
+    const int ms = timeout_ms < 0 ? 0 : timeout_ms;
+    calib_cv_.wait_for(lk, std::chrono::milliseconds(ms), [&] {
+        return draft_calib_served_ == id ||
+               draft_calib_pending_.load(std::memory_order_relaxed) != id;
+    });
+    if (draft_calib_served_ == id) return draft_calib_ack_;   /* applied, and this is its answer */
+    /* Withdrawn here, under the lock the application takes: a request whose caller was already
+     * told "nothing was dropped" can never be applied by a later idle point. */
+    if (draft_calib_pending_.load(std::memory_order_relaxed) == id)
+        draft_calib_pending_.store(0, std::memory_order_relaxed);
+    out.epoch = draft_calib_epoch_.load(std::memory_order_relaxed);
+    out.rc    = RAD_E_STATE;
+    return out;
+}
+
+void Scheduler::draft_calib_close() {
+    std::lock_guard<std::mutex> lk(mu_calib_);
+    draft_calib_closed_ = true;
+    draft_calib_pending_.store(0, std::memory_order_relaxed);
+    calib_cv_.notify_all();
 }
 
 void Scheduler::serve_draft_calib_boundary() {
-    const uint64_t want = draft_calib_want_.load(std::memory_order_acquire);
-    if (want == draft_calib_served_.load(std::memory_order_relaxed)) return;
+    /* The step path's cheap answer: almost always nothing was asked for. */
+    if (draft_calib_pending_.load(std::memory_order_relaxed) == 0) return;
+    std::unique_lock<std::mutex> clk(mu_calib_);
+    const uint64_t id = draft_calib_pending_.load(std::memory_order_relaxed);
+    if (id == 0) return;
     DraftCalibAck ack;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2948,11 +2982,12 @@ void Scheduler::serve_draft_calib_boundary() {
                      (long long)ack.cycles_done, (long long)ack.cycles_dropped);
         }
     }
-    {
-        std::lock_guard<std::mutex> lk(mu_calib_);
-        draft_calib_ack_ = ack;
-    }
-    draft_calib_served_.store(want, std::memory_order_release);
+    /* Applied and acknowledged before the lock is dropped: the withdraw above takes the same one,
+     * so the two outcomes cannot both happen. */
+    draft_calib_pending_.store(0, std::memory_order_relaxed);
+    draft_calib_served_ = id;
+    draft_calib_ack_    = ack;
+    clk.unlock();
     calib_cv_.notify_all();
 }
 

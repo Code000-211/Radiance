@@ -767,6 +767,15 @@ The endpoint is answered by the step loop, not by the HTTP thread: the request i
 The HTTP thread waits for that acknowledgement, bounded; it never waits per token and never for a
 set to finish.
 
+Reaching that point takes one thing from the recorder itself: an idle planning point must leave
+**no** observation cursor behind. The ring closes a cycle's record at the *next* cycle's open, so a
+planning point that issues nothing still opens one -- and a cursor set for a recordless cycle would
+make every later idle step look like it owed an observation, which is a boundary that can never be
+served. The cursor is therefore set only for a plan that produced a record
+(`Scheduler::draft_cost_cycle`). A run that reaches its idle point with its requests normally
+finished -- their own `max_tokens` or EOG, no cancellation -- is quiet and can be cut; a run whose
+request is still in flight is not, and answers `409` until it is.
+
 **Samples only.** The boundary drops the recording table's samples and the counters that describe
 them, and keeps the binding: the deployment identity (fingerprint and execution), the capacity, the
 fallback admission, the record-only contract and the reference flag are the deployment's, not a
@@ -785,6 +794,18 @@ by this call. A `501` means the run is not a calibration at all (started without
 `--draft-profile-out`) -- the same answer `/reset_prefix_cache` gives without a cache. `200` carries
 the recording epoch the boundary opened and what was dropped.
 
+**One request, one answer.** Exactly one boundary request is outstanding at a time: a second caller
+is told `409` at once instead of queueing behind the first, so an answer always belongs to the
+request that asked. A request that waits past its timeout is **withdrawn under the same lock that
+applies it**, so a caller told "nothing was dropped" can never have its boundary applied by a later
+idle point; it asks again if it still wants the cut. Both outcomes are mutually exclusive by
+construction, not by timing: the step loop applies with `mu_` held nested inside `mu_calib_`, and the
+withdraw, the mutation and the publish all take `mu_calib_`. A scheduler that is shutting down
+closes the boundary first -- before it takes `mu_`, so the two lock orders cannot deadlock -- and
+refuses and wakes whatever is still outstanding: an answer during shutdown is `409`, never a late
+success. The capacity the deployment reserved is kept across the reset (`clear()`, not
+`shrink_to_fit()`), so the scored phase records into memory that is already there.
+
 **The epoch.** A run's recording starts in epoch 1; every served boundary opens the next one, and
 the export names the epoch its buckets came from (`--draft-profile-out ...: recording epoch N`). A
 profile built after a boundary therefore says, in the log that accompanies it, that its samples are
@@ -795,9 +816,22 @@ neither a phase nor an epoch field.
 calibration rotation: a scored request set still starts from whatever the warmup left cached, and
 the rotation continues across the boundary. It is not a GPU sync and takes no device work. Admin
 authentication is the deployment's existing one -- the API-key gate every state-changing route is
-under (`core/server/http.cpp`), and a keyless server answers loopback only. A recorder built with
-this boundary is a new calibration basis: its SHA, binary and deployment identity have to be logged
-before a profile measured on it is compared with any other.
+under (`core/server/http.cpp`) -- and, like the runtime-LoRA and `/diagnostics` routes, the boundary
+narrows a **keyless** server to its loopback clients (`Server::handle_draft_calib_boundary`): a
+phase cut destroys the measurement the run is taking, so a remote caller without a key gets `403`,
+and it gets that before the mode is looked at, so it learns nothing about whether this deployment is
+calibrating. A recorder built with this boundary is a new calibration basis: its SHA, binary and
+deployment identity have to be logged before a profile measured on it is compared with any other.
+
+**What is covered by tests.** The scheduler-level fixture drives the ordering without the engine:
+unsupported outside a calibration, busy while work is in flight, served at the idle point of a
+finished run (warmup dropped, scored phase's samples equal to one phase's worth, never two), an
+empty calibration, a withdrawn timeout that is never applied later, two concurrent requests (one
+applied, one busy), shutdown with a request outstanding, and the samples-only reset's binding and
+capacity. `engine_e2e_test` runs the real thing: a cost calibration on a tiny model, one warmup
+request that finishes on its own `max_tokens`, one `POST`, one scored request, the orderly
+shutdown's export -- and the exported sample count must be the scored request's alone, with the log
+naming `recording epoch 2`.
 
 ## Draft profile format, version 4
 

@@ -3190,4 +3190,84 @@ TEST(a_loaded_reference_decides_the_draft_depth_instead_of_the_fallback) {
     CHECK_EQ(reader.stop(), 0);
 }
 
+/* The calibration phase boundary on the real engine loop -- warmup, one POST, scored set -- with
+ * no cancel and no manual flush anywhere. This is the ordering a recording harness performs, and it
+ * exercised two things a scheduler-level fixture cannot: that the idle branch of Engine::step_loop
+ * is the point the boundary is served at, and that a *normally finished* request (its own
+ * max_tokens reached, the sequence closed by the scheduler, no cancellation) leaves the loop at a
+ * quiet point. The samples the warmup measured must be gone from the export, and what the scored
+ * request measured must be in it -- exactly one phase's worth.
+ *
+ * The boundary is asked for while the engine is idle between the two requests. A 409 means it was
+ * still finishing something, which is the documented answer and the harness simply asks again; the
+ * retry loop here is the harness's, not the server's. */
+TEST(a_calibration_boundary_splits_a_real_runs_warmup_from_its_scored_set) {
+    tiny::TempDir dir("profile_boundary");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "profile.json";
+
+    Server calib;
+    REQUIRE(calib.start(dir.path, { "--num-speculative-tokens", "2",
+                                    "--draft-depth-tiers", "0,2",
+                                    "--draft-window", "fixed",
+                                    "--draft-policy", "cost",
+                                    "--draft-profile-out", out,
+                                    "--no-prefix-cache" }));
+
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    auto ask = [&](const char* what) {
+        int status = 0;
+        std::string why;
+        const json reply = post(calib.port, "/completion", completion(prompt, 8), &status, &why);
+        if (status != 200)
+            fprintf(stderr, "    the %s request failed: %s\n%s\n", what, why.c_str(),
+                    tail(calib.output()).c_str());
+        CHECK_EQ(status, 200);
+        return tokens_of(reply).size();
+    };
+    CHECK_EQ(ask("warmup"), (size_t)8);
+
+    /* One POST: the engine answers at its idle point with the epoch it opens and what it dropped. */
+    json boundary;
+    int bstatus = 0;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        boundary = post(calib.port, "/admin/draft-calib-boundary", json::object(), &bstatus);
+        if (bstatus != 409) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (bstatus != 200)
+        fprintf(stderr, "    the boundary answered %d: %s\n%s\n", bstatus, boundary.dump().c_str(),
+                tail(calib.output()).c_str());
+    REQUIRE_EQ(bstatus, 200);
+    CHECK_EQ(boundary.value("accepted", false), true);
+    CHECK_EQ(boundary.value("epoch", 0), 2);
+    const int64_t warm_samples = boundary.value("samples_dropped", -1);
+    CHECK(warm_samples > 0);
+
+    CHECK_EQ(ask("scored"), (size_t)8);
+
+    const int calib_exit = calib.stop();
+    const std::string calib_log = calib.output();
+    if (calib_exit != 0)
+        fprintf(stderr, "    the run exited %d:\n%s\n", calib_exit, tail(calib_log).c_str());
+    REQUIRE_EQ(calib_exit, 0);
+    /* The export names the phase its samples belong to, so the file is not mistaken for a
+     * measurement taken across the cut. */
+    CHECK(calib_log.find("recording epoch 2") != std::string::npos);
+
+    const json profile = json::parse(tiny::read_text(out), nullptr, false);
+    REQUIRE(profile.is_object());
+    const json buckets = profile.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    REQUIRE(!buckets.empty());
+    int64_t exported = 0;
+    for (const json& b : buckets) exported += b.value("time_ms", json::object()).value("n", 0);
+    /* One request's worth -- the scored one -- and not the warmup's samples on top of it. */
+    CHECK(exported > 0);
+    CHECK_EQ(exported, warm_samples);
+}
+
 RAD_TEST_MAIN()

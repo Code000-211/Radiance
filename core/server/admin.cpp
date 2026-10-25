@@ -553,6 +553,17 @@ constexpr int kDraftCalibBoundaryWaitMs = 5000;
 HttpResponse Server::handle_draft_calib_boundary(const HttpRequest& req) {
     if (!deps_.sched)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    /* A phase cut destroys the measurement this run is taking, so a keyless server hands it to this
+     * machine only -- the rule the runtime-LoRA and /diagnostics routes already apply. Checked
+     * before the mode, so a remote caller learns nothing about the deployment. */
+    if (opt_.api_key.empty() && !req.peer_is_loopback()) {
+        ApiError e;
+        e.status  = 403;
+        e.type    = "permission_error";
+        e.message = "without --api-key, a calibration boundary is taken only from a loopback "
+                    "client; start the server with --api-key to cut a phase from elsewhere";
+        return error_response(e, req.peer);
+    }
 
     const DraftCalibAck a = deps_.sched->draft_calib_boundary(kDraftCalibBoundaryWaitMs);
     if (a.rc == RAD_E_UNSUPPORTED)

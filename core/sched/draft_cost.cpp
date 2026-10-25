@@ -990,8 +990,10 @@ void DraftCostTable::clear() {
  * do with a sample, and a phase boundary may not change any of that: it separates two sets of
  * measurements of the same deployment. */
 void DraftCostTable::reset_samples() {
+    /* clear(), not shrink_to_fit(): the capacity configure() reserved is the deployment's, and the
+     * scored phase records into it without allocating on the step path. clear() keeps it and
+     * destroys what the bucket types own. */
     buckets_.clear();
-    buckets_.shrink_to_fit();
     dropped_ = 0;
     ignored_ = 0;
     reference_skipped_ = 0;

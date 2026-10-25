@@ -6014,6 +6014,43 @@ TEST(draft_calib_boundary_is_501_outside_a_calibration) {
     CHECK_EQ(r.status, 501);
 }
 
+/* A boundary destroys the measurement a run is taking, so a keyless server hands it to this
+ * machine only -- the rule /diagnostics already applies. The key gate itself lives in the
+ * transport (tests/transport_test.cpp); this is the route's own narrowing. A keyed server accepts
+ * the request from anywhere, and the narrowing is checked before the mode, so a remote caller
+ * learns nothing about whether this deployment is calibrating. */
+TEST(draft_calib_boundary_without_a_key_is_loopback_only) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    sched.calib_ack.rc    = RAD_OK;
+    sched.calib_ack.epoch = 2;
+    Deps d;
+    d.sched = &sched;
+    d.tok   = &tok;
+    ServerOptions o;
+    Server srv(d, o);
+    auto from = [](Server& s, const char* peer) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path   = "/admin/draft-calib-boundary";
+        q.peer   = peer;
+        return s.router().dispatch(q).status;
+    };
+    CHECK_EQ(from(srv, "127.0.0.1:50122"), 200);
+    CHECK_EQ(from(srv, "[::1]:50122"), 200);
+    CHECK_EQ(from(srv, ""), 200);                     /* in-process */
+    CHECK_EQ(from(srv, "192.168.1.20:50122"), 403);
+    CHECK_EQ(from(srv, "fe80::1:50122"), 403);
+    sched.calib_ack.rc = RAD_E_UNSUPPORTED;           /* outside a calibration: still 403 */
+    CHECK_EQ(from(srv, "192.168.1.20:50122"), 403);
+    CHECK_EQ(from(srv, "127.0.0.1:50122"), 501);
+
+    ServerOptions keyed_options = o;
+    keyed_options.api_key       = "k";
+    Server keyed(d, keyed_options);
+    CHECK_EQ(from(keyed, "192.168.1.20:50122"), 501); /* access holds; the mode refuses */
+}
+
 /* An engine that is not quiet answers 409 and drops nothing: the boundary is not a pause point,
  * it is a refused phase cut, and the epoch it names is the one still open. */
 TEST(draft_calib_boundary_reports_busy_without_dropping) {

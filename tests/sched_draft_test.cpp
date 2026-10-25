@@ -6071,6 +6071,50 @@ Scheduler::DraftCalibAck ask_boundary(Scheduler& s, int timeout_ms = 5000) {
     return ack;
 }
 
+/* One iteration of Engine::step_loop's idle branch, as far as the recorder sees it: the scheduler
+ * plans (and so closes the previous cycle's record), then the step loop releases what a finished
+ * request deferred and serves a pending boundary. No cancel, no manual flush: the point of the
+ * ordering is that a normally finished request reaches this state by itself. */
+void idle_step(Fixture& f, bool serve = true) {
+    CHECK(f.sch.step() == nullptr);
+    if (f.sch.has_deferred()) f.sch.release_deferred();
+    if (serve) f.sch.serve_draft_calib_boundary();
+}
+
+/* A calibration run, with the policy and the recorder a `--draft-profile-out` start sets up. */
+void start_recording(Fixture& f, const char* out) {
+    f.build();
+    f.cfg.n_spec            = 6;
+    f.cfg.draft_policy      = DraftPolicyKind::Cost;
+    f.cfg.draft_profile_out = radtest::tmp_path(out);
+    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth    = 6;
+    activate_costs(f);
+    f.sch.draft_costs().record_only();
+    CHECK_OK(f.start());
+}
+
+/* One measured cycle with the serial drafter, finished with the EOG a real request ends on: the
+ * requests leave the running set by completing, not by being cancelled. */
+void cycle_to_eog(Fixture& f, const std::vector<uint64_t>& ids) {
+    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
+    for (uint64_t id : ids) f.prefill(id);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(11, /*eos=*/1));
+    for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, six, 6));
+    DraftStepEvidence live;
+    live.replay_known     = true;
+    live.replay           = DraftReplay::None;
+    live.moves_since_bind = 0;
+    f.sch.step_finished(live);
+}
+
+int64_t samples_of(Fixture& f) {
+    int64_t n = 0;
+    for (const DraftCostBucket& b : f.sch.draft_costs().buckets()) n += b.n;
+    return n;
+}
+
 /* Outside a calibration the endpoint answers 501 (RAD_E_UNSUPPORTED) and nothing is touched: the
  * table is a serving profile, and a phase boundary would be a claim about a measurement nobody is
  * taking. */
@@ -6089,15 +6133,7 @@ TEST(the_calibration_boundary_is_unsupported_outside_a_calibration) {
  * refused, and nothing the warmup measured is dropped. */
 TEST(the_calibration_boundary_refuses_running_work_and_drops_nothing) {
     Fixture f;
-    f.build();
-    f.cfg.n_spec            = 6;
-    f.cfg.draft_policy      = DraftPolicyKind::Cost;
-    f.cfg.draft_profile_out = radtest::tmp_path("sched_boundary_busy.json");
-    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
-    f.prog.drafter.depth    = 6;
-    activate_costs(f);
-    f.sch.draft_costs().record_only();
-    CHECK_OK(f.start());
+    start_recording(f, "sched_boundary_busy.json");
 
     const uint64_t a = f.submit(160), b = f.submit(170);
     f.prefill(a);
@@ -6107,70 +6143,39 @@ TEST(the_calibration_boundary_refuses_running_work_and_drops_nothing) {
     f.commit_plain(11);
     for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
     DraftStepEvidence live;
-    live.replay_known    = true;
-    live.replay          = DraftReplay::None;
+    live.replay_known     = true;
+    live.replay           = DraftReplay::None;
     live.moves_since_bind = 0;
     f.sch.step_finished(live);
-    /* The cycle's record is still open: it is closed by the *next* cycle's open. */
-    f.sch.flush_draft_observations();
-    const size_t buckets_before = f.sch.draft_costs().buckets().size();
-    REQUIRE(buckets_before > 0);
 
     const Scheduler::DraftCalibAck busy = ask_boundary(f.sch, 2000);
     CHECK_EQ(busy.rc, RAD_E_STATE);
     CHECK_EQ(busy.epoch, 1u);
-    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets_before);
+    CHECK_EQ(busy.buckets, 0);
+    CHECK_EQ(busy.samples, 0);
     CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
 }
 
-/* The ordered hand-off a recording harness performs: warmup measured, boundary served at a quiet
- * point, then the scored set -- and nothing of the warmup's samples is left to price, widen or
- * weight it. `Shortened`/unpriced rows are runtime-only and do not survive either: the table is
- * empty, not merely re-bucketed. */
-TEST(the_calibration_boundary_opens_the_scored_phase_and_drops_the_warmup) {
+/* The ordering the harness performs, on the engine's own path: the warmup's requests finish on
+ * their EOG, the step loop reaches its idle point, and the boundary is served *there* -- no cancel,
+ * no manual flush. Two things had to be true for this to be reachable at all: an idle planning
+ * point must leave no cursor behind (else the idle point looks busy forever), and the warmup's
+ * samples must be gone afterwards while the binding stays. */
+TEST(the_calibration_boundary_is_served_at_the_idle_point_of_a_finished_run) {
     Fixture f;
-    f.build();
-    f.cfg.n_spec            = 6;
-    f.cfg.draft_policy      = DraftPolicyKind::Cost;
-    f.cfg.draft_profile_out = radtest::tmp_path("sched_boundary_epoch.json");
-    f.prog.drafter.kind     = RAD_DRAFT_SERIAL;
-    f.prog.drafter.depth    = 6;
-    activate_costs(f);
-    f.sch.draft_costs().record_only();
-    CHECK_OK(f.start());
+    start_recording(f, "sched_boundary_epoch.json");
 
     const uint64_t a = f.submit(160), b = f.submit(170);
-    f.prefill(a);
-    f.prefill(b);
-    int32_t six[6] = { 21, 22, 23, 24, 25, 26 };
-    auto cycle = [&] {
-        REQUIRE(f.sch.step() != nullptr);
-        f.commit_plain(11);
-        for (uint64_t id : { a, b }) CHECK_OK(f.sch.set_draft(id, six, 6));
-        DraftStepEvidence live;
-        live.replay_known     = true;
-        live.replay           = DraftReplay::None;
-        live.moves_since_bind = 0;
-        f.sch.step_finished(live);
-    };
-    cycle();
-
-    /* End the warmup set: close its record, drop the requests, release what they still hold. This
-     * is the engine's own idle sequence (flush, then release_deferred), not a shortcut around it. */
-    f.sch.flush_draft_observations();
-    f.sch.cancel(a);
-    f.sch.cancel(b);
-    f.sch.release_deferred();
-    const size_t warm_buckets = f.sch.draft_costs().buckets().size();
-    REQUIRE(warm_buckets > 0);
-    CHECK(f.sch.draft_cycles_done() > 0);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);   /* the idle planning point that closes the cycle's record */
+    CHECK(f.sch.draft_costs().buckets().size() > 0);
+    const int64_t warm = samples_of(f);
 
     const Scheduler::DraftCalibAck ack = ask_boundary(f.sch);
     CHECK_EQ(ack.rc, RAD_OK);
     CHECK_EQ(ack.epoch, 2u);
-    CHECK_EQ(ack.buckets, (int64_t)warm_buckets);
-    CHECK(ack.samples > 0);
-    CHECK(ack.cycles_done > 0);
+    CHECK_EQ(ack.samples, warm);
+    CHECK(ack.buckets > 0);
     CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
 
     /* The samples are gone; the binding is not. */
@@ -6181,21 +6186,138 @@ TEST(the_calibration_boundary_opens_the_scored_phase_and_drops_the_warmup) {
     CHECK_EQ(f.sch.draft_cycles_done(), 0);
     CHECK_EQ(f.sch.draft_cycles_dropped(), 0);
 
-    /* The scored set is recorded into epoch 2 and only into it. */
+    /* The scored set is recorded into epoch 2 and only into it: the same request shape again gives
+     * the same measurement, not the warmup's plus its own. */
     const uint64_t c = f.submit(180), d = f.submit(190);
-    f.prefill(c);
-    f.prefill(d);
-    REQUIRE(f.sch.step() != nullptr);
-    f.commit_plain(11);
-    for (uint64_t id : { c, d }) CHECK_OK(f.sch.set_draft(id, six, 6));
-    DraftStepEvidence live;
-    live.replay_known     = true;
-    live.replay           = DraftReplay::None;
-    live.moves_since_bind = 0;
-    f.sch.step_finished(live);
-    f.sch.flush_draft_observations();
+    cycle_to_eog(f, { c, d });
+    idle_step(f, /*serve=*/false);
+    const int64_t scored = samples_of(f);
+    CHECK(scored > 0);
+    CHECK_EQ(scored, warm);
 
-    int64_t scored = 0;
-    for (const DraftCostBucket& x : f.sch.draft_costs().buckets()) scored += x.n;
-    CHECK_EQ(scored, 1);   /* one cycle of the scored phase, none of the warmup's */
+    const Scheduler::DraftCalibAck again = ask_boundary(f.sch);
+    CHECK_EQ(again.rc, RAD_OK);
+    CHECK_EQ(again.epoch, 3u);
+    CHECK_EQ(again.samples, scored);
+    CHECK_EQ(again.samples, warm);   /* one phase's worth, never two */
+}
+
+/* A calibration that measured nothing can still take the boundary: the harness may start the
+ * scored set without a warmup, and an empty table must not be a 409. */
+TEST(an_empty_calibration_takes_the_boundary_and_names_the_new_epoch) {
+    Fixture f;
+    start_recording(f, "sched_boundary_empty.json");
+    idle_step(f, /*serve=*/false);
+
+    const Scheduler::DraftCalibAck ack = ask_boundary(f.sch);
+    CHECK_EQ(ack.rc, RAD_OK);
+    CHECK_EQ(ack.epoch, 2u);
+    CHECK_EQ(ack.buckets, 0);
+    CHECK_EQ(ack.samples, 0);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
+    CHECK(f.sch.draft_costs().records_only());
+    CHECK(f.sch.draft_costs().buckets().empty());
+}
+
+/* A timed-out request is withdrawn, not deferred: the boundary it asked for never happens later,
+ * so the "nothing was dropped" answer it received stays true. */
+TEST(a_timed_out_boundary_is_never_applied_afterwards) {
+    Fixture f;
+    start_recording(f, "sched_boundary_timeout.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    const size_t buckets_before = f.sch.draft_costs().buckets().size();
+    REQUIRE(buckets_before > 0);
+
+    /* Asked while nothing serves it, so it expires and is withdrawn. */
+    const Scheduler::DraftCalibAck late = f.sch.request_draft_calib_boundary(0);
+    CHECK_EQ(late.rc, RAD_E_STATE);
+    /* The next idle point of the step loop must not apply it. */
+    idle_step(f, /*serve=*/true);
+    idle_step(f, /*serve=*/true);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets_before);
+
+    /* A fresh request is its own, and is served. */
+    const Scheduler::DraftCalibAck ack = ask_boundary(f.sch);
+    CHECK_EQ(ack.rc, RAD_OK);
+    CHECK_EQ(ack.epoch, 2u);
+    CHECK_EQ(ack.buckets, (int64_t)buckets_before);
+}
+
+/* Two harnesses asking at once: one boundary is applied, and the answer to each request belongs to
+ * that request -- the second is told busy at once instead of queueing behind the first. */
+TEST(two_concurrent_boundary_requests_get_one_answer_each) {
+    Fixture f;
+    start_recording(f, "sched_boundary_race.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    REQUIRE(f.sch.draft_costs().buckets().size() > 0);
+
+    Scheduler::DraftCalibAck one, two;
+    std::atomic<int> finished{0};
+    std::thread t1([&] {
+        one = f.sch.request_draft_calib_boundary(400);
+        finished.fetch_add(1);
+    });
+    std::thread t2([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        two = f.sch.request_draft_calib_boundary(400);
+        finished.fetch_add(1);
+    });
+    /* Serve the first phase only. Whatever the interleaving, a request that arrives after that
+     * boundary has no serving point left, so it waits out its own timeout and is withdrawn: exactly
+     * one request is applied and the second is told busy -- never a second boundary. */
+    for (int guard = 0; guard < 1000000 && finished.load() < 2; ++guard) {
+        if (f.sch.draft_calib_epoch() == 1) f.sch.serve_draft_calib_boundary();
+        std::this_thread::yield();
+    }
+    t1.join();
+    t2.join();
+    REQUIRE_EQ(finished.load(), 2);
+
+    const int served = (one.rc == RAD_OK ? 1 : 0) + (two.rc == RAD_OK ? 1 : 0);
+    const int busy   = (one.rc == RAD_E_STATE ? 1 : 0) + (two.rc == RAD_E_STATE ? 1 : 0);
+    CHECK_EQ(served, 1);
+    CHECK_EQ(busy, 1);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 2u);
+    /* The busy answer names the epoch that is open when it is given -- which, if the first request
+     * was already applied, is the new one -- but it claims no boundary: it dropped nothing. */
+    for (const Scheduler::DraftCalibAck& a : { one, two })
+        if (a.rc != RAD_OK) {
+            CHECK_EQ(a.buckets, 0);
+            CHECK_EQ(a.samples, 0);
+            CHECK_EQ(a.cycles_done, 0);
+        }
+}
+
+/* A request still outstanding when the engine shuts down is refused and woken; it is never applied
+ * after the fact and never reported as a success. Both interleavings are acceptable answers, so the
+ * test is deterministic without a clock: either the request registers and shutdown withdraws it, or
+ * shutdown comes first and the request finds the boundary closed. */
+TEST(a_boundary_outstanding_at_shutdown_is_refused_and_woken) {
+    Fixture f;
+    start_recording(f, "sched_boundary_shutdown.json");
+    const uint64_t a = f.submit(160), b = f.submit(170);
+    cycle_to_eog(f, { a, b });
+    idle_step(f, /*serve=*/false);
+    const size_t buckets_before = f.sch.draft_costs().buckets().size();
+
+    Scheduler::DraftCalibAck ack;
+    std::atomic<bool> done{false};
+    std::thread t([&] {
+        ack = f.sch.request_draft_calib_boundary(60000);
+        done.store(true);
+    });
+    f.sch.shutdown("test shutdown", RAD_E_STATE);
+    for (int guard = 0; guard < 1000000 && !done.load(); ++guard) std::this_thread::yield();
+    t.join();
+    REQUIRE(done.load());
+
+    CHECK_EQ(ack.rc, RAD_E_STATE);
+    CHECK_EQ(ack.epoch, 1u);
+    CHECK_EQ(f.sch.draft_calib_epoch(), 1u);
+    CHECK_EQ(f.sch.draft_costs().buckets().size(), buckets_before);
 }

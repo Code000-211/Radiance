@@ -520,6 +520,11 @@ public:
      *     no observation-ring record can still be reported into, the answer is RAD_E_STATE and
      *     nothing is dropped. A busy answer aborts no work and waits for nothing: the caller
      *     decides whether to ask again.
+     *   - *one request, one answer*: exactly one boundary may be outstanding; a second caller is
+     *     answered busy at once instead of queueing, so an answer always belongs to the request
+     *     that asked. A request that timed out is withdrawn under the same lock that applies it, so
+     *     an expired request is never applied afterwards -- "nothing was dropped" is a durable
+     *     contract, not a snapshot. Shutdown refuses any request still outstanding and wakes it.
      * A served boundary also stamps the run's *epoch*, which the export names (Engine): a profile
      * built across a boundary says which phase its samples came from. */
     struct DraftCalibAck {
@@ -836,11 +841,18 @@ private:
     bool             draft_predict_refused_ = false;  /* the refusal warning was already logged */
     int64_t          draft_cost_refused_ = 0;     /* samples observe() did not take */
     bool             draft_cost_warned_ = false;
-    /* The calibration boundary: `want` is bumped by the HTTP thread, `served` by the step loop, so
-     * a request is answered once and never re-served. The ack and the epoch are read under
-     * mu_calib_, which no step-path lock is ever taken under (the step loop takes mu_ first). */
-    std::atomic<uint64_t> draft_calib_want_{0};
-    std::atomic<uint64_t> draft_calib_served_{0};
+    /* The calibration boundary's one outstanding request. Every transition happens under
+     * mu_calib_: `pending` is the id the step loop may still serve (0 = none), `served` the id it
+     * last applied. The step loop applies with mu_ held *nested inside* mu_calib_, so the mutation,
+     * the acknowledge and a caller's withdraw are mutually exclusive and a timeout cannot return
+     * "busy" for a boundary that is then applied anyway. Only serve_'s cheap first read is unlocked
+     * (hence the atomic): `pending` is 0 on the step path almost always. mu_calib_ is therefore
+     * never taken while mu_ is held -- Scheduler::shutdown closes the boundary before it takes mu_
+     * -- and a step-path lock is never taken above it. */
+    std::atomic<uint64_t> draft_calib_pending_{0};  /* mu_calib_: the outstanding id */
+    uint64_t              draft_calib_next_id_ = 0; /* mu_calib_ */
+    uint64_t              draft_calib_served_ = 0;  /* mu_calib_: the id last applied */
+    bool                  draft_calib_closed_ = false; /* mu_calib_: shutdown refuses */
     std::atomic<uint64_t> draft_calib_epoch_{1};   /* 1 = the run's first recording phase */
     mutable std::mutex    mu_calib_;
     std::condition_variable calib_cv_;
@@ -955,6 +967,9 @@ private:
     /* Whether the samples-only boundary may be applied right now (see the public declaration).
      * Caller holds mu_. */
     bool draft_calib_quiet_locked() const;
+    /* Shutdown: refuse whatever is still outstanding and wake its caller. Takes mu_calib_ alone, so
+     * it must run before mu_ is taken. */
+    void draft_calib_close();
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
         return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);

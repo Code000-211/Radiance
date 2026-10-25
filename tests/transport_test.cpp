@@ -373,6 +373,8 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(ask(get("/metrics")).status, 401);
     CHECK_EQ(ask(get("/stats")).status, 401);
     CHECK_EQ(ask(post("/tokenize", R"({"prompt":"a"})")).status, 401);
+    /* The calibration boundary is an admin route like the others: no key, no reach. */
+    CHECK_EQ(ask(post("/admin/draft-calib-boundary", "{}")).status, 401);
     CHECK_EQ(ask(post("/tokenize", R"({"prompt":"a"})", "Authorization: Bearer k\r\n")).status, 200);
     CHECK_EQ(ask("OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
                  "Access-Control-Request-Headers: authorization\r\n\r\n").status, 204);
