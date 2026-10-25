@@ -409,9 +409,18 @@ public:
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when
-     * --busy-prefill-chunk is off, or when auto has nothing to reserve. */
+     * --busy-prefill-chunk is off, or when auto has nothing to reserve. `time_cap` is
+     * --mixed-time-budget's cap in tokens (-1: off or not measurable yet), which replaces the
+     * token share. */
     int64_t busy_cap(int64_t n_computed, int64_t n_target, int64_t budget, int64_t reserve,
-                     bool shared = false, bool rows_only = false) const;
+                     bool shared = false, bool rows_only = false,
+                     int64_t time_cap = -1) const;
+
+    /* Visible for tests: --mixed-time-budget K as a token cap, from the measured prefill rate and
+     * decode step time: K decode steps' worth of chunk time. -1 when the mode is off or no
+     * measurement exists, so the step is planned as without it; 0 when the cap is under one
+     * quantum (the caller falls back to --prefill-interleave). */
+    static int64_t mixed_time_cap(const Config& cfg, const SchedMetrics& m, int64_t quantum);
 
 private:
     Program*      prog_ = nullptr;
@@ -676,12 +685,23 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
+    /* The same, for a slot anywhere in running_ (--prefill-growth-guard picks its victim by
+     * invested work, not by arrival). */
+    void preempt_slot(int32_t slot);
+    /* --prefill-growth-guard: the running request a step gives up when one cannot grow -- the
+     * least invested work first, a prefill before a decode at equal work, later arrival last.
+     * Skips what this step already planned (its entry is in plan_). -1 when nothing is left. */
+    int32_t preempt_victim() const;
+    /* --prefill-growth-guard: the token count a chunk starting at `keep_from` may grow to from
+     * the free blocks, keeping `n_dec` decoding rows `dec_row_tok` tokens each. INT64_MAX when
+     * no paged group reports its free list. */
+    int64_t prefill_growth_limit(int64_t keep_from, int64_t n_dec, int64_t dec_row_tok) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
-    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0, int64_t time_cap = -1);
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
     /* A step's prefill entries while step() moves its decode entries first; reserved at init,

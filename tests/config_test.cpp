@@ -384,6 +384,24 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
 }
 
+/* --mixed-time-budget is a count of decode steps' worth of chunk time, off by default (the token
+ * share); --prefill-growth-guard is a switch, off by default. */
+TEST(mixed_time_budget_takes_a_non_negative_number_and_the_growth_guard_is_a_switch) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.mixed_time_budget, 0.0);
+    CHECK(!d.prefill_growth_guard);
+    Config c;
+    CHECK_EQ(parse({ "--mixed-time-budget", "1.5" }, &c), RAD_OK);
+    CHECK_EQ(c.mixed_time_budget, 1.5);
+    CHECK_EQ(parse({ "--mixed-time-budget", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.mixed_time_budget, 0.0);
+    CHECK_EQ(parse({ "--mixed-time-budget", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--mixed-time-budget", "high" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-growth-guard" }, &c), RAD_OK);
+    CHECK(c.prefill_growth_guard);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -424,6 +442,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--mixed-time-budget", { "4" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },

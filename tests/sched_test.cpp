@@ -1016,6 +1016,43 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
 }
 
+/* --prefill-growth-guard: a chunk grows only into the blocks the decoding rows do not need this
+ * step, so a long prefill waiting on the pool never takes a decoder's block. Without the guard the
+ * chunk takes what the step's share allows, the pool runs dry and the decode row behind the
+ * prefill -- the latest arrival, and running_ 's back -- is preempted and re-prefilled by
+ * recompute, which is more prefill, not less. */
+static void growth_guard_run(bool guard, int64_t* preemptions, int64_t* b_live_steps) {
+    Fixture f;
+    /* The pool holds the 3500-token prompt's 219 blocks and the decoder's 7, and no more: the
+     * third request would not fit either, so the chunk and the decoder compete for the last of
+     * it, which is the squeeze a serving deployment runs in. */
+    f.build(/*blocks=*/222, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096);
+    f.cfg.prefill_growth_guard = guard;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3500, 64);          /* the long prefill, arrives first */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const uint64_t b = f.submit(100, 64);           /* a decoder beside it */
+    for (int k = 0; k < 24; ++k) {
+        if (!f.sch.step()) break;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == b) ++*b_live_steps;
+        f.commit_plain(11);
+    }
+    *preemptions = f.sch.metrics().preemptions;
+    CHECK(f.sch.find(a) != nullptr);                /* the prefill itself was never evicted */
+}
+
+TEST(a_growing_chunk_does_not_preempt_a_decoder) {
+    int64_t preemptions = 0, b_steps = 0;
+    growth_guard_run(/*guard=*/false, &preemptions, &b_steps);
+    CHECK(preemptions > 0);        /* the bug this mode closes */
+    preemptions = 0, b_steps = 0;
+    growth_guard_run(/*guard=*/true, &preemptions, &b_steps);
+    CHECK_EQ(preemptions, 0);
+    CHECK_EQ(b_steps, 24);         /* the decoder ran every step of the window */
+}
+
 /* ================================================================== the step batch */
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     Fixture f;
@@ -1907,6 +1944,116 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
     CHECK(f.sch.step() != nullptr);
     for (const StepEntry& e : f.sch.plan().e)
         if (e.seq == a) CHECK_EQ(e.n_tokens, 128);
+}
+
+/* ================================================================== a time budget for a chunk */
+/* --mixed-time-budget K: a chunk sharing a step is capped by time, not by a token share -- at most
+ * K decode steps' worth, from the two measured rates. Until both exist the mode changes nothing,
+ * which is what keeps the control path at this SHA unchanged. */
+TEST(mixed_time_cap_is_k_decode_steps_of_chunk_time) {
+    Config cfg;
+    SchedMetrics m;
+    cfg.mixed_time_budget = 2.0;
+    CHECK_EQ(Scheduler::mixed_time_cap(cfg, m, 64), -1);     /* nothing measured yet */
+    m.steps_decode = 1;
+    m.step_ns_decode = 40'000'000;                          /* one decode step: 40 ms */
+    m.prefill_tps = 2000.0f;                                /* chunk rate: 2000 tokens/s */
+    /* 2 * 0.04 s * 2000 tok/s = 160 tokens, floored to the quantum */
+    CHECK_EQ(Scheduler::mixed_time_cap(cfg, m, 64), 128);
+    cfg.mixed_time_budget = 0.7;                            /* 28 ms: 56 tokens, under a quantum */
+    CHECK_EQ(Scheduler::mixed_time_cap(cfg, m, 64), 0);
+    cfg.mixed_time_budget = 0.0;
+    CHECK_EQ(Scheduler::mixed_time_cap(cfg, m, 64), -1);
+}
+
+/* The cap replaces the token share, and under the stager's smallest pass it cannot be honoured: the
+ * chunk keeps the whole step and step() holds the next ones to decode rows (the fallback below). */
+TEST(a_time_budget_replaces_the_share_and_yields_to_the_stager_floor) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = 2048;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);            /* the floor: 1024 tokens */
+    /* a cap above the floor is the cap */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272, false, false, /*time_cap=*/1600), 1600);
+    /* a cap under the floor: the whole step, the fallback step() arms */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272, false, false, /*time_cap=*/160), 2048);
+    /* nothing else in the step: no cap, as without it */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 0, false, false, /*time_cap=*/160), 2048);
+    /* -1: the token share, unchanged */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272, false, false, /*time_cap=*/-1), 1024);
+}
+
+/* Until both rates are measured the mode plans exactly as off: same chunks, no capped step, no
+ * held step. The control path is the one a run without the flag takes. */
+TEST(mixed_time_budget_without_a_measurement_plans_as_off) {
+    std::vector<int32_t> plans[2];
+    int64_t capped[2] = { 0, 0 }, held[2] = { 0, 0 };
+    for (int m = 0; m < 2; ++m) {
+        Fixture f;
+        share_fixture(f, -1);
+        f.cfg.mixed_time_budget = m == 0 ? 0.0 : 2.0;
+        CHECK_OK(f.start());
+        f.submit(3500, 64);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        f.submit(100, 64);                  /* decodes beside the continuing chunk */
+        for (int k = 0; k < 4; ++k) {
+            CHECK(f.sch.step() != nullptr);
+            for (const StepEntry& e : f.sch.plan().e) plans[m].push_back(e.n_tokens);
+            f.commit_plain(12);
+        }
+        capped[m] = f.sch.metrics().prefill_chunks_capped;
+        held[m] = f.sch.metrics().steps_held;
+    }
+    CHECK(plans[0] == plans[1]);
+    CHECK_EQ(capped[0], capped[1]);
+    CHECK_EQ(held[0], held[1]);
+}
+
+/* Measured and under the stager's smallest pass: the step keeps its whole chunk -- the fallback
+ * cannot cap it without the synchronous expert reads the floor exists to avoid -- and the steps
+ * after it carry decode rows only, exactly as --prefill-interleave does. The rates come from
+ * step_finished, which only the engine (and these tests) call. */
+TEST(a_measured_budget_under_the_stager_pass_falls_back_to_interleaving) {
+    Fixture f;
+    share_fixture(f, -1);
+    f.cfg.mixed_time_budget = 2.0;
+    f.sch.set_stage_rows(1 << 20);          /* no measured cap can reach the floor */
+    CHECK_OK(f.start());
+    const uint64_t b = f.submit(100, 512);  /* a decoder first: a pure decode step times one */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.step_finished();
+    CHECK(f.sch.step() != nullptr);         /* DECODE alone: steps_decode and step_ns_decode */
+    f.commit_plain(11);
+    f.sch.step_finished();
+    REQUIRE_EQ(Scheduler::mixed_time_cap(f.cfg, f.sch.metrics(), 64) < (1 << 20), true);
+    REQUIRE(f.sch.metrics().prefill_tps > 0.0f);
+
+    const uint64_t a = f.submit(3500, 64);  /* a chunk beside the decoder */
+    CHECK(f.sch.step() != nullptr);
+    /* The chunk takes the step, as without a cap... */
+    bool chunk = false, decodes = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq == a && e.is_prefill) chunk = true;
+        if (e.seq == b && !e.is_prefill) decodes = true;
+    }
+    CHECK(chunk);
+    CHECK(decodes);
+    f.commit_plain(12);
+    /* ...and the next one carries the decoder only, admitting nothing. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].seq, b);
+    CHECK(!f.sch.plan().e[0].is_prefill);
+    CHECK_EQ(f.sch.metrics().steps_held, 1);
+    /* The hold is spent: the chunk is back in the step after it. */
+    f.commit_plain(12);
+    CHECK(f.sch.step() != nullptr);
+    bool back = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == a && e.is_prefill) back = true;
+    CHECK(back);
 }
 
 /* ================================================================== decode-only steps between chunks */

@@ -758,6 +758,16 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    /* --mixed-time-budget F: cap a prefill chunk sharing a step by time instead of by a token
+     * share -- at most F decode steps' worth, from SchedMetrics::prefill_tps and
+     * step_ns_decode / steps_decode. Under the prefill stager's smallest pass no cap can be
+     * honoured; the step keeps its chunk and Scheduler::step holds the next ones to decode rows,
+     * the --prefill-interleave fallback. 0 = off (the control path). */
+    double  mixed_time_budget = 0.0;
+    /* --prefill-growth-guard: a prefill chunk grows only into the KV blocks the decoding rows do
+     * not need this step and never preempts a running sequence; a decode row short of a block
+     * preempts the least invested request instead of the latest arrival. */
+    bool    prefill_growth_guard = false;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the

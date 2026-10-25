@@ -1020,6 +1020,27 @@ short of the boundary and the next step finishes it. A prompt with nothing besid
 `off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
 under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
 
+**Cap a chunk by time, not by a token share: `--mixed-time-budget K`** (default 0, off). The eighth
+of the budget above is a share of *tokens*, and at 2048 tokens a step a chunk runs about 0.75 s
+while a decode step is 40 ms: a decoding stream falls far below its rate beside it. With
+`--mixed-time-budget K` a shared chunk is instead held to K decode steps' worth of chunk time, from
+the measured prefill rate and decode step time (`prefill_tps`, `step_ns_decode / steps_decode`), so
+K = 1 aims at a chunk no longer than one decode step. The mode is inert until both rates have been
+measured, so it plans exactly as off on the first steps of a run; a mixed step is not a decode
+sample (the chunk dominates its time), so the measurement comes from the decode-only steps a
+running deployment already has. Under the prefill stager's
+smallest pass no cap can be honoured -- the floor above exists because a shorter step reads every
+routed layer's experts synchronously -- so that step keeps its whole chunk and the next ones carry
+decode rows only, the `--prefill-interleave` fallback (counted as `steps_held`).
+
+**`--prefill-growth-guard`** (default off). A chunk growing into the KV pool takes blocks a decoding
+sequence needs for its next token; the row then finds the pool dry, the latest arrival is preempted
+by recompute and re-prefilled, and the prefill load grows by the work the chunk was meant to avoid.
+With the flag a chunk grows only into the blocks the decoding rows do not need this step, and a
+prefill never preempts: it takes what is left beyond that reserve or waits a step. A decode row
+short of a block preempts the least invested running request (by tokens computed, prefill before
+decode at a tie) instead of the latest arrival.
+
 **Check the prefix cache after changing the chunk.** The larger arena shrinks the KV pool (here
 516,864 to 499,920 pool tokens, 3.3%), and §4.3's cliff is sharp. With two ~180K sessions (first
 turns back to back, then the first session's second turn), a 512 chunk took 137.7 s, 130.0 s and
@@ -1570,6 +1591,8 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
+| `--mixed-time-budget K` | 0 (off) | cap a chunk sharing a step at K decode steps' worth of chunk time, from the measured rates, instead of a token share; under the stager's pass the next steps carry decode rows only (§4.5) |
+| `--prefill-growth-guard` | off | a chunk grows only into the KV blocks decode rows do not need and never preempts; a short decode row preempts the least invested request (§4.5) |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
 | `--rope-scaling SPEC` | the checkpoint's | `yarn:FACTOR[:ORIG]`: static YaRN over the container's own rotary keys, no reconvert; `none` takes a checkpoint's YaRN off ([YARN.md](YARN.md)) |
@@ -2881,7 +2904,7 @@ there is none.
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
-| `engine_steps_held_total` | decode-only steps `--prefill-interleave` ran between chunks (§4.5) |
+| `engine_steps_held_total` | decode-only steps `--prefill-interleave` (or `--mixed-time-budget`'s fallback) ran between chunks (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
