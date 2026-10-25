@@ -251,6 +251,42 @@ public:
         bool host_on = false;
     };
     virtual TierCounters tier_counters() const { return TierCounters{}; }
+
+    /* ---------------------------------------------------------------- memory
+     *
+     * Conversations by label and the archives pinned from them (core/sched/memory.h), for the
+     * /v1/memory endpoints. The defaults keep nothing, and those endpoints answer 501. */
+    struct Chain {
+        std::vector<int32_t> tokens;         /* prompt ++ output, as the model saw them */
+        uint64_t lora_uid = 0;               /* the keys its blocks were cached under */
+        bool     use_control_vector = false;
+        bool     has_media = false;          /* placeholders a fork cannot fill; refused */
+    };
+    struct ArchiveStat {
+        std::string id;
+        std::string label;
+        int64_t     tokens = 0;
+        int64_t     pinned_tokens = 0;       /* whole blocks the cache still held when pinned */
+        int64_t     snapshot_pos = 0;        /* where a fork resumes; 0 without recurrent state */
+        double      age_s = 0;
+    };
+    /* RAD_E_NOTFOUND when no request finished under `label`. */
+    virtual int     session_chain(const std::string& /*label*/, Chain* /*out*/) const {
+        return RAD_E_UNSUPPORTED;
+    }
+    /* Where a snapshot is owed before archiving `c`; 0 when none is (Scheduler::snapshot_owed). */
+    virtual int64_t snapshot_owed(const Chain& /*c*/) const { return 0; }
+    /* RAD_E_STATE for an id in use, RAD_E_FULL at --memory-archives. */
+    virtual int     archive(const std::string& /*id*/, const std::string& /*label*/,
+                            const Chain& /*c*/, ArchiveStat* /*out*/) {
+        return RAD_E_UNSUPPORTED;
+    }
+    /* RAD_E_NOTFOUND for an unknown id. */
+    virtual int     archive_chain(const std::string& /*id*/, Chain* /*out*/) const {
+        return RAD_E_UNSUPPORTED;
+    }
+    virtual int     archives(std::vector<ArchiveStat>* /*out*/) const { return RAD_E_UNSUPPORTED; }
+    virtual int     unarchive(const std::string& /*id*/) { return RAD_E_UNSUPPORTED; }
 };
 
 /* ================================================================== text frontend

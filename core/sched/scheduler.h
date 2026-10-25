@@ -14,6 +14,7 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "memory.h"
 #include "metrics.h"
 
 #include <chrono>
@@ -267,8 +268,27 @@ public:
 
     /* Drop every prefix-cache entry; returns how many, or RAD_E_UNSUPPORTED without a prefix
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
-     * their own block references). See IScheduler::reset_prefix_cache. */
+     * their own block references). See IScheduler::reset_prefix_cache. Archives go with it. */
     int64_t  reset_prefix_cache();
+
+    /* ---------------------------------------------------------- memory (core/sched/memory.h)
+     *
+     * For the memory endpoints, from HTTP threads; each takes the step lock. */
+    /* The tokens of the last request that finished under `label`; false when none is known. */
+    bool     session_chain(const std::string& label, MemChain* out) const;
+    /* The position a snapshot is still owed at before `c` is archived: the chain's end on the
+     * chunk quantum, when the deepest snapshot on it lies below that. 0 when none is owed, or
+     * the model's hits need none. The caller runs a request over the chain with
+     * Request::checkpoint_at there, then archives. */
+    int64_t  snapshot_owed(const MemChain& c) const;
+    /* Pin `c` under `id` (PrefixCache::pin). RAD_E_STATE for an id in use, RAD_E_FULL at
+     * --memory-archives, RAD_E_UNSUPPORTED without a prefix cache. */
+    int      archive(const std::string& id, const std::string& label, MemChain c,
+                     MemArchiveStat* out);
+    bool     archive_chain(const std::string& id, MemChain* out) const;
+    int      archives(std::vector<MemArchiveStat>* out) const;
+    /* RAD_E_NOTFOUND for an unknown id. */
+    int      unarchive(const std::string& id);
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
@@ -515,6 +535,12 @@ private:
     std::vector<int32_t> running_;
     std::vector<int32_t> waiting_;
     std::vector<uint64_t> completed_;
+
+    /* Labelled conversations and their archives (memory.h). mu_ held. */
+    MemoryRegistry mem_;
+    /* Tokens of the whole blocks an archive pinned; mu_ held. */
+    int64_t        cached_tokens(const PrefixCache::Pinned& p) const;
+    MemArchiveStat archive_stat(const MemArchive& a, uint64_t now_ns) const;
 
     /* Requests whose release waits on something that still refers to them (a deferred reap or a
      * deferred free). A count, so the sweeps cost nothing on the steps where there are none. */

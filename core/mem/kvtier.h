@@ -62,6 +62,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -183,6 +184,14 @@ public:
     /* The key was forgotten while its job was out, or is unknown. The engine checks this before
      * touching a finished job's blocks, which may now belong to another sequence. */
     bool doomed(const BlockHash& key) const;
+
+    /* ---------------- archives ----------------
+     *
+     * A pinned record stays off the host list, so it is never a capacity drop's victim and never
+     * expires (PrefixCache::pin). The cache counts pins and calls this when a key's pin starts or
+     * ends. A key may be pinned before its record exists: the tiers learn of an entry only when
+     * it is published, and a lost entry recomputed later is still the archive's. */
+    void set_pinned(const BlockHash& key, bool on);
 
     /* Called at every site that erases an off-device record (capacity drop, failed promotion,
      * expiry). Without it the cache would keep the entry, resident_off_device would answer false,
@@ -361,6 +370,8 @@ private:
     Config   cfg_;
     HostArena arena_;
     std::unordered_map<BlockHash, Rec, BlockHashHash> recs_;
+    /* Keys an archive pins (set_pinned); relist() skips them. */
+    std::unordered_set<BlockHash, BlockHashHash> pinned_;
     /* Host-only records by value, begin() least valuable (LruOrder). Keyed by the clock, not
      * arrival order: a record arrives when its VRAM copy goes, which says nothing about its last
      * use. */

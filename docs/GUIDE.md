@@ -1603,6 +1603,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 |---|---|---|
 | `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory, up to N MiB (§4.8) |
 | `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
+| `--memory-archives N` | 8 | conversations `/v1/memory/archive` keeps pinned at once; `0` refuses every archive (§5.17) |
 
 **Placement and state**
 
@@ -1744,6 +1745,7 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `GET /metrics` | Prometheus |
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
 | `GET /get_tokenizer_info` | the tokeniser's configuration |
+| `POST /v1/memory/fork`, `POST`/`GET /v1/memory/archive`, `GET`/`DELETE /v1/memory/archive/:id` | questions asked of a cached conversation, and conversations pinned in the cache so they can be asked later; for agents that compact (§5.17) |
 | `POST /reset_prefix_cache` | drop every cached prefix |
 | `GET /` or `/dashboard` | the web dashboard |
 | `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
@@ -2762,6 +2764,71 @@ The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 
 Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
 `--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
 
+### 5.17 Conversation memory: `/v1/memory`
+
+An agent that compacts its context replaces old turns with a summary and stops sending them. The
+prefix cache still holds the conversation as it was, and these routes make use of it: a question can
+be asked of the whole conversation at the cost of the question alone, and the conversation can be
+pinned so it stays askable after the agent has moved on. `integrations/pi-memory` is an extension
+for the Pi coding agent built on them.
+
+A conversation is found by the name its client gave it: OpenRouter's `session_id` on a chat,
+completion or Responses request, or Anthropic's `metadata.user_id`. The engine keeps the tokens of
+the last request that finished under each name (its prompt and its reply, for the 64 most recently
+used names), so the conversation is replayed exactly as the model saw it, whatever the template.
+
+**Fork.** Each question is appended as a user turn after the conversation and answered; the
+conversation itself comes from the cache, so the prefill is the question's few hundred tokens.
+
+```sh
+curl -s localhost:8000/v1/memory/fork -H 'Content-Type: application/json' -d '{
+  "source": {"session": "my-agent-session"},
+  "questions": ["Summarise the decisions made so far.", "Which files were changed?"],
+  "max_tokens": 2048, "thinking_token_budget": 512
+}' | jq '.answers[] | {question, content}'
+```
+
+- `source` is `{"session": ID}` or `{"archive": ID}`; `questions` holds 1 to 16 non-empty strings.
+- The sampling fields of a chat request apply (`max_tokens`, `temperature`, `thinking_token_budget`,
+  `chat_template_kwargs`, ...); `messages`, `stream`, `n` and tools do not. `max_tokens` is bounded
+  by the context the conversation leaves; one that leaves none is a 400 `context_length_exceeded`.
+- `checkpoint_at_end: true` writes a linear-state snapshot at the conversation's end with the first
+  question, so a hybrid model's later forks, and an archive, resume there instead of from the last
+  snapshot the conversation happened to leave. The other questions run after it and reuse it.
+- The answer is `{"object": "memory.fork", "source_tokens", "answers": [{"index", "question",
+  "content", "reasoning_content", "finish_reason"}], "usage"}`, `usage.prompt_tokens_details.cached_tokens`
+  saying how much of the conversation was served from the cache. A conversation that ran under an
+  adapter (§4.9.1) is forked under the adapter the fork names, with a `warning` when it names none.
+- A conversation with images or audio is refused (422): the cache holds their placeholders, not the
+  media.
+
+**Archive.** `POST /v1/memory/archive {"session_id": ID, "archive_id": NAME}` pins the conversation:
+its cached blocks are kept through eviction, trimming and `--prefix-cache-ttl`, and so is its deepest
+snapshot, through the snapshot store's own eviction. A pinned block may still leave VRAM once its
+host copy has landed (§4.8), since that loses nothing; the host copy is then never dropped. On a
+hybrid model whose conversation has no snapshot at its end, the archive first writes one (a
+one-token request over the cached conversation). `archive_id` is 1 to 128 of `A-Z a-z 0-9 - _ .`,
+or one is made up; the answer (201) is `{"id", "session_id", "tokens", "pinned_tokens",
+"snapshot_tokens", "age_s"}`. An archive is then a fork `source` of its own, whatever the session
+does next.
+
+| | |
+|---|---|
+| `GET /v1/memory/archive` | every archive (`{"object": "list", "data": [...]}`) |
+| `GET /v1/memory/archive/:id` | one archive, or 404 |
+| `DELETE /v1/memory/archive/:id` | unpin it; the conversation is then an ordinary cached one again and expires as they do |
+
+`--memory-archives N` (default 8) bounds how many are kept: past it, a new archive is refused
+with 507 until one is deleted. Each holds its conversation's blocks (VRAM or `--prefix-cache-mib`)
+and one snapshot slot (`--checkpoint-slots`), so size those for the archives too. Without a host
+tier an archive's blocks stay in VRAM, unavailable to running requests until it is deleted (the log
+warns when one is made); with one they move to host memory as soon as VRAM is wanted. A 409 is an id
+already taken, 404 a session no request has finished under, 501 a server without a prefix cache.
+`POST /reset_prefix_cache` drops the archives with everything else, and so does a restart.
+
+Like `/diagnostics`, the memory routes answer only loopback clients without `--api-key` (§6.6): they
+read and keep other clients' conversations.
+
 ## 6. Operation
 
 ### 6.1 The dashboard
@@ -2944,6 +3011,8 @@ and sends it on every data fetch.
 Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
 the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
 server with `--api-key`.
+
+The same holds for `/v1/memory` (§5.17), which reads any named conversation back and keeps it.
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:

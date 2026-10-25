@@ -266,6 +266,39 @@ public:
      * reservations (KVManager::reserve_block) become cache-held references. */
     int rebind(const BlockHash& key, const std::vector<int32_t>& blocks);
 
+    /* ---------------- archives ----------------
+     *
+     * A pinned chain survives every way the cache lets go of an entry: LRU eviction, trim and
+     * --prefix-cache-ttl expiry, and its snapshot survives retention and the store's LRU too. The
+     * memory endpoints pin the chain a conversation had when its client compacted it, so a later
+     * question can still fork it (core/sched/memory.h).
+     *
+     * A pinned entry may still leave VRAM once its host copy has landed, since that loses nothing,
+     * and the tiers never drop a pinned host copy (IdleTiers::set_pinned). Only the deepest
+     * snapshot is pinned, not the chain's whole ladder: one is all a fork resumes from, and the
+     * store is shared with every live conversation.
+     *
+     * Pins count, so two archives of one chain share its entries and each releases only its own.
+     * A pin is keyed by hash, not by entry: an entry the tiers lost and a later request recomputed
+     * is pinned again. clear() drops every pin with everything else. */
+    struct Pinned {
+        std::vector<BlockHash> entries;   /* the chain's blocks from position 0, as pinned */
+        BlockHash snapshot;               /* the deepest valid snapshot among them, if any */
+        int64_t   snapshot_pos = 0;       /* 0 when there is none */
+    };
+    /* Pins the whole blocks of the first `n_tokens` of `tokens` that the cache holds, up to the
+     * first miss, and the deepest valid snapshot within them. */
+    void pin(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+             int64_t n_tokens, Pinned* out);
+    /* Releases exactly what pin() reported. */
+    void unpin(const Pinned& p);
+    /* The deepest valid snapshot on this chain within the blocks the cache holds, 0 if none. */
+    int64_t deepest_snapshot(const std::vector<int32_t>& tokens,
+                             const std::vector<MMContentKey>& mm, int64_t n_tokens) const;
+    bool    pinned(const BlockHash& h) const { return pins_.count(h) > 0; }
+    bool    snapshot_pinned(const BlockHash& h) const { return ck_pins_.count(h) > 0; }
+    int64_t pinned_blocks() const { return (int64_t)pins_.size(); }
+
 
     /* ---------------- the linear half of an idle session ----------------
      *
@@ -375,6 +408,11 @@ private:
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
+    /* The deepest valid snapshot at or below `limit` tokens on the chain `hs`, or end(). */
+    std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
+    deepest_on(const std::vector<BlockHash>& hs, int64_t limit) const;
+    /* How many of the chain's first blocks the cache holds, in VRAM or off it. */
+    int64_t held_prefix(const std::vector<BlockHash>& hs, const std::vector<int32_t>& tokens) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
     /* A live sequence also holds one of this entry's blocks, so releasing it frees nothing. */
     bool shared_with_live(const Entry& e) const;
@@ -433,6 +471,12 @@ private:
         return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
     mutable uint64_t clock_ = 0;
+    /* Archive pins (pin()), counted: entries by chain hash, and snapshots by the same key their
+     * Ckpt is indexed under. */
+    std::unordered_map<BlockHash, int32_t, BlockHashHash> pins_;
+    std::unordered_map<BlockHash, int32_t, BlockHashHash> ck_pins_;
+    /* Moves a key's pin count by `delta` and tells the tiers when it starts or stops. */
+    void pin_entry(const BlockHash& h, int delta);
     std::unique_ptr<CheckpointPolicy> policy_;
     mutable Stats stats_;
     std::string report_;

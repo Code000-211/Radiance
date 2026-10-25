@@ -6103,4 +6103,176 @@ TEST(a_tier_transfer_gives_back_every_event_and_device_byte) {
     CHECK_EQ(vram1, vram0);
 }
 
+/* ================================================================== archives (PrefixCache::pin) */
+
+/* An archived chain is the one thing the cache keeps against every way it lets go: with no tier to
+ * demote to, LRU eviction, the reserve's trim and expiry all pass it by, and it hits as before.
+ * Unpinned, it goes like any other. */
+TEST(an_archived_chain_outlives_eviction_trim_and_expiry) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    const auto a = tok_run(7600, 336), b = tok_run(9600, 336);
+    publish(f, 1, a, 320);
+    f.kv.free_sequence(1);
+    publish(f, 2, b, 320);
+    f.kv.free_sequence(2);
+
+    PrefixCache::Pinned p;
+    f.pc.pin(a, {}, 336, &p);
+    CHECK_EQ(p.entries.size(), 20u);                  /* the whole blocks the cache holds */
+    CHECK_EQ(p.snapshot_pos, 0ll);                    /* no recurrent state */
+    CHECK_EQ(f.pc.pinned_blocks(), 20ll);
+
+    CHECK_EQ(f.pc.evict_lru(100), 20ll);              /* b's twenty, not a's */
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 0);
+    CHECK_EQ(f.pc.trim(100), 0ll);
+    const uint64_t later = rad_mono_ns() + 3600 * SEC;
+    CHECK_EQ(f.pc.expire(later, 60 * SEC), 0ll);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 320);
+
+    f.pc.unpin(p);
+    CHECK_EQ(f.pc.pinned_blocks(), 0ll);
+    CHECK_EQ(f.pc.evict_lru(100), 20ll);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 0);
+}
+
+/* Pins count: two archives of one chain each release only their own, and a chain shorter than
+ * what was asked pins what the cache holds, from position 0 to the first miss. */
+TEST(two_archives_of_one_chain_each_release_their_own_pin) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    auto a = tok_run(7600, 336);
+    publish(f, 1, a, 160);                            /* ten blocks of a */
+    f.kv.free_sequence(1);
+    PrefixCache::Pinned p1, p2;
+    f.pc.pin(a, {}, 336, &p1);
+    f.pc.pin(a, {}, 160, &p2);
+    CHECK_EQ(p1.entries.size(), 10u);
+    CHECK_EQ(p2.entries.size(), 10u);
+    f.pc.unpin(p1);
+    CHECK_EQ(f.pc.evict_lru(100), 0ll);               /* p2 still holds them */
+    f.pc.unpin(p2);
+    CHECK_EQ(f.pc.evict_lru(100), 10ll);
+    /* A chain that misses at its first block pins nothing. */
+    PrefixCache::Pinned none;
+    f.pc.pin(a, {}, 336, &none);
+    CHECK(none.entries.empty());
+    f.pc.unpin(none);
+}
+
+/* On a hybrid model an archive pins the deepest snapshot on its chain and no other. That one
+ * survives retention and the full store's LRU, which take the chain's shallower ones and other
+ * sessions' instead; a fork of the archive resumes there. */
+TEST(an_archive_keeps_its_deepest_snapshot_through_retention_and_the_store_s_lru) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto a = tok_run(7000, 336), b = tok_run(17000, 336);
+    publish(f, 1, a, 320);
+    f.kv.free_sequence(1);
+    const std::vector<BlockHash> ha = chain_of(a), hb = chain_of(b);
+    f.pc.begin_step();
+    ckpt_at(f, 1, ha, 128);
+    f.pc.begin_step();
+    ckpt_at(f, 1, ha, 256);
+    CHECK_EQ(f.pc.deepest_snapshot(a, {}, 336), 256ll);
+
+    PrefixCache::Pinned p;
+    f.pc.pin(a, {}, 336, &p);
+    CHECK_EQ(p.snapshot_pos, 256ll);
+    CHECK(f.pc.snapshot_pinned(ha[256 / 16 - 1]));
+    CHECK(!f.pc.snapshot_pinned(ha[128 / 16 - 1]));
+
+    /* Another conversation fills the store and keeps reserving: its own snapshots and a's
+     * shallower one go, a's pinned one stays. */
+    for (int64_t pos : { 64, 128, 192, 256, 320 }) {
+        f.pc.begin_step();
+        int32_t s = -1;
+        CHECK_OK(f.pc.reserve_checkpoint(2, pos, hb[(size_t)(pos / 16 - 1)], &s));
+        f.pc.commit_checkpoint(hb[(size_t)(pos / 16 - 1)]);
+    }
+    f.pc.begin_step();
+    CHECK_EQ(f.pc.lookup(a, {}).n_linear_tokens, 256);
+    CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 256 }));
+
+    /* Nor does expiry take it. */
+    f.pc.begin_step();
+    f.pc.expire(rad_mono_ns() + 3600 * SEC, 60 * SEC);
+    f.pc.begin_step();
+    CHECK_EQ(f.pc.deepest_snapshot(a, {}, 336), 256ll);
+
+    /* Unpinned, it has a TTL from the last time expiry passed over it, then goes. */
+    f.pc.unpin(p);
+    f.pc.begin_step();
+    f.pc.expire(rad_mono_ns() + 3600 * SEC, 60 * SEC);
+    CHECK_EQ(f.pc.deepest_snapshot(a, {}, 336), 256ll);
+    f.pc.begin_step();
+    f.pc.expire(rad_mono_ns() + 7200 * SEC, 60 * SEC);
+    CHECK_EQ(f.pc.deepest_snapshot(a, {}, 336), 0ll);
+}
+
+/* With the tiers on, a pinned entry may leave VRAM once its host copy has landed, since that loses
+ * nothing; the host copy is then never a capacity victim and never expires. */
+TEST(a_pinned_entry_may_leave_vram_but_its_host_copy_stays) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto a = tok_run(7600, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    PrefixCache::Pinned p;
+    x.f.pc.pin(a, {}, 336, &p);
+    CHECK_EQ(copy_now(x.t).size(), 20u);
+    CHECK_EQ(x.f.pc.drop_clean(), 20);                /* out of VRAM, copies kept */
+    CHECK_EQ(x.f.pc.restorable_from(a, {}).size(), 20u);
+    std::vector<BlockHash> old;
+    x.t.expired(rad_mono_ns() + 3600 * SEC, 1024, &old);
+    CHECK(old.empty());                               /* not on the host list at all */
+    CHECK_EQ(x.f.pc.expire(rad_mono_ns() + 3600 * SEC, 60 * SEC), 0ll);
+    CHECK_EQ(x.f.pc.restorable_from(a, {}).size(), 20u);
+
+    x.f.pc.unpin(p);
+    old.clear();
+    x.t.expired(rad_mono_ns() + 3600 * SEC, 1024, &old);
+    CHECK_EQ(old.size(), 20u);                        /* listed again once released */
+}
+
+/* The arena's capacity drop takes the least recently used host entry that no archive pins. */
+TEST(a_full_arena_passes_over_a_pinned_host_entry) {
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(2048, 1024)));
+    t.note_used(bh(1), {11}, 5 * SEC);
+    t.note_used(bh(2), {12}, 1 * SEC);                /* the least recently used */
+    CHECK_EQ(copy_now(t).size(), 2u);
+    drop_now(t, bh(1));
+    drop_now(t, bh(2));
+    t.set_pinned(bh(2), true);
+    t.note_used(bh(3), {13}, 6 * SEC);
+    CHECK_EQ(copy_now(t).size(), 0u);
+    std::vector<TierJob> room;
+    t.plan(16, &room);
+    REQUIRE_EQ(room.size(), 1u);
+    CHECK(room[0].key == bh(1));
+    t.report(room[0], true);
+    CHECK(t.resident_off_device(bh(2)));
+    t.set_pinned(bh(2), false);
+    std::vector<BlockHash> old;
+    t.expired(10 * SEC, 16, &old);
+    CHECK(std::find(old.begin(), old.end(), bh(2)) != old.end());
+}
+
+/* A reset drops archives with everything else. */
+TEST(clearing_the_cache_drops_every_pin) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto a = tok_run(7600, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    PrefixCache::Pinned p;
+    x.f.pc.pin(a, {}, 336, &p);
+    CHECK_EQ(x.f.pc.pinned_blocks(), 20ll);
+    x.f.pc.clear();
+    CHECK_EQ(x.f.pc.pinned_blocks(), 0ll);
+    CHECK_EQ(x.f.kv.held_blocks(G_FULL), 0ll);
+    CHECK_EQ(x.t.arena().used_slots(), 0ll);
+}
+
 RAD_TEST_MAIN()

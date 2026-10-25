@@ -5950,4 +5950,272 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
     CHECK_EQ(r.rig.srv->router().call("GET", "/health").status, 200);
 }
 
+/* ================================================================== /v1/memory */
+
+/* A scheduler that keeps conversations by label and pins archives of them, as core/sched/memory.h
+ * does, in maps. The fake template renders "<role>content" and the fake tokenizer reads bytes, so
+ * a conversation's tokens are its text. */
+struct MemoryScheduler : FakeScheduler {
+    std::map<std::string, Chain> chains;
+    std::map<std::string, Chain> kept;
+    std::map<std::string, ArchiveStat> archived;
+    int64_t owed = 0;          /* what snapshot_owed answers, until an archive is taken */
+    int64_t limit = 8;
+
+    static Chain chain_of(const std::string& text) {
+        Chain c;
+        for (unsigned char ch : text) c.tokens.push_back((int32_t)ch);
+        return c;
+    }
+    int session_chain(const std::string& label, Chain* out) const override {
+        auto it = chains.find(label);
+        if (it == chains.end()) return RAD_E_NOTFOUND;
+        *out = it->second;
+        return RAD_OK;
+    }
+    int64_t snapshot_owed(const Chain&) const override { return owed; }
+    int archive(const std::string& id, const std::string& label, const Chain& c,
+                ArchiveStat* out) override {
+        if (archived.count(id)) return RAD_E_STATE;
+        if ((int64_t)archived.size() >= limit) return RAD_E_FULL;
+        ArchiveStat s;
+        s.id = id;
+        s.label = label;
+        s.tokens = (int64_t)c.tokens.size();
+        s.pinned_tokens = s.tokens / 4 * 4;
+        s.snapshot_pos = owed;
+        archived[id] = s;
+        kept[id] = c;
+        owed = 0;
+        if (out) *out = s;
+        return RAD_OK;
+    }
+    int archive_chain(const std::string& id, Chain* out) const override {
+        auto it = kept.find(id);
+        if (it == kept.end()) return RAD_E_NOTFOUND;
+        *out = it->second;
+        return RAD_OK;
+    }
+    int archives(std::vector<ArchiveStat>* out) const override {
+        out->clear();
+        for (const auto& kv : archived) out->push_back(kv.second);
+        return (int)out->size();
+    }
+    int unarchive(const std::string& id) override {
+        if (!archived.erase(id)) return RAD_E_NOTFOUND;
+        kept.erase(id);
+        return RAD_OK;
+    }
+};
+
+/* The server with the memory scheduler in place of the plain fake. */
+struct MemFixture {
+    MemoryScheduler ms;
+    Fixture f;
+    explicit MemFixture(int64_t max_ctx = 0)
+        : f(Fixture::Tweak{ [this, max_ctx](ServerOptions& o, Deps& d) {
+              d.sched = &ms;
+              o.max_ctx = max_ctx;
+          } }) {}
+    ~MemFixture() {
+        ms.join_all();
+        ms.check_reaped();
+    }
+    std::string prompt_text(size_t i) {
+        std::lock_guard<std::mutex> lk(ms.mu);
+        std::string s;
+        for (int32_t t : ms.prompts[i]) s += (char)t;
+        return s;
+    }
+};
+
+/* A fork replays the conversation's own tokens and adds the question as the template renders a
+ * user turn after an assistant one, so the prompt is the cached chain plus a few tokens. It is
+ * not a turn of the conversation: it carries no session label. */
+TEST(a_fork_replays_the_session_s_tokens_and_appends_the_question_as_a_turn) {
+    MemFixture m;
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi<assistant>hello");
+    HttpResponse r = m.f.post("/v1/memory/fork",
+                              R"({"source":{"session":"s1"},"questions":["why?"]})");
+    REQUIRE_EQ(r.status, 200);
+    const json j = json::parse(r.body);
+    CHECK_EQ(j["object"].get<std::string>(), std::string("memory.fork"));
+    CHECK_EQ(j["source_tokens"].get<int64_t>(), (int64_t)24);
+    REQUIRE_EQ(j["answers"].size(), 1u);
+    CHECK_EQ(j["answers"][0]["question"].get<std::string>(), std::string("why?"));
+    CHECK_EQ(j["answers"][0]["content"].get<std::string>(), std::string("hello"));
+    m.ms.join_all();
+    CHECK_EQ(m.prompt_text(0), std::string("<user>hi<assistant>hello<user>why?<assistant>"));
+    std::lock_guard<std::mutex> lk(m.ms.mu);
+    CHECK(m.ms.last_label.empty());
+    CHECK_EQ(m.ms.seen[0].checkpoint_at, (int64_t)0);
+}
+
+/* A conversation that ended on the turn's closer already holds the suffix's first token; the
+ * fork does not repeat it. In the fake's byte vocabulary the closer is the '<' that opens the next
+ * turn. */
+TEST(a_fork_does_not_repeat_the_closer_the_conversation_ended_on) {
+    MemFixture m;
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi<assistant>hello<");
+    REQUIRE_EQ(m.f.post("/v1/memory/fork",
+                        R"({"source":{"session":"s1"},"questions":["why?"]})").status, 200);
+    m.ms.join_all();
+    CHECK_EQ(m.prompt_text(0), std::string("<user>hi<assistant>hello<user>why?<assistant>"));
+}
+
+/* With checkpoint_at_end the first question writes the snapshot at the conversation's end and runs
+ * alone; the others follow and resume from it. */
+TEST(a_fork_at_the_end_writes_its_snapshot_with_the_first_question) {
+    MemFixture m;
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi<assistant>hello");
+    HttpResponse r = m.f.post("/v1/memory/fork",
+                              R"({"source":{"session":"s1"},"questions":["a?","b?","c?"],)"
+                              R"("checkpoint_at_end":true})");
+    REQUIRE_EQ(r.status, 200);
+    const json j = json::parse(r.body);
+    REQUIRE_EQ(j["answers"].size(), 3u);
+    CHECK_EQ(j["answers"][2]["question"].get<std::string>(), std::string("c?"));
+    m.ms.join_all();
+    std::lock_guard<std::mutex> lk(m.ms.mu);
+    REQUIRE_EQ(m.ms.seen.size(), 3u);
+    CHECK_EQ(m.ms.seen[0].checkpoint_at, (int64_t)24);
+    CHECK_EQ(m.ms.seen[1].checkpoint_at, (int64_t)0);
+    CHECK_EQ(m.ms.seen[2].checkpoint_at, (int64_t)0);
+}
+
+TEST(a_fork_says_what_it_cannot_fork) {
+    MemFixture m;
+    HttpResponse r = m.f.post("/v1/memory/fork",
+                              R"({"source":{"session":"nobody"},"questions":["why?"]})");
+    CHECK_EQ(r.status, 404);
+    CHECK(r.body.find("session_id") != std::string::npos);
+    CHECK_EQ(m.f.post("/v1/memory/fork", R"({"source":{"archive":"x"},"questions":["q"]})").status,
+             404);
+    CHECK_EQ(m.f.post("/v1/memory/fork", R"({"questions":["q"]})").status, 400);
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi");
+    CHECK_EQ(m.f.post("/v1/memory/fork", R"({"source":{"session":"s1"},"questions":[]})").status,
+             400);
+    CHECK_EQ(m.f.post("/v1/memory/fork", R"({"source":{"session":"s1"},"questions":[""]})").status,
+             400);
+    /* Media placeholders mean nothing without the media, which a fork does not have. */
+    m.ms.chains["pic"] = MemoryScheduler::chain_of("<user>look");
+    m.ms.chains["pic"].has_media = true;
+    CHECK_EQ(m.f.post("/v1/memory/fork",
+                      R"({"source":{"session":"pic"},"questions":["what?"]})").status, 422);
+}
+
+/* A label is kept cut to 128 bytes; the id a client sends is looked up cut the same way. */
+TEST(a_session_id_longer_than_a_label_finds_the_conversation_it_named) {
+    MemFixture m;
+    const std::string sid(200, 's');
+    m.ms.chains[sid.substr(0, 128)] = MemoryScheduler::chain_of("<user>hi<assistant>hello");
+    REQUIRE_EQ(m.f.post("/v1/memory/fork",
+                        R"({"source":{"session":")" + sid + R"("},"questions":["why?"]})").status, 200);
+    m.ms.join_all();
+    CHECK_EQ(m.f.post("/v1/memory/archive",
+                      R"({"session_id":")" + sid + R"(","archive_id":"long"})").status, 201);
+}
+
+/* The fork's max_tokens is bounded by the context the real prompt leaves, not the stand-in's; a
+ * conversation that leaves none is refused as a context overflow. */
+TEST(a_fork_s_max_tokens_is_bounded_by_the_context_its_prompt_leaves) {
+    MemFixture m(/*max_ctx=*/64);
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi<assistant>hello");   /* 24 */
+    REQUIRE_EQ(m.f.post("/v1/memory/fork",
+                        R"({"source":{"session":"s1"},"questions":["why?"],"max_tokens":500})")
+                   .status, 200);
+    m.ms.join_all();
+    {
+        std::lock_guard<std::mutex> lk(m.ms.mu);
+        CHECK_EQ(m.ms.last_max_tokens, (int32_t)(64 - 45));
+    }
+    m.ms.chains["long"] = MemoryScheduler::chain_of(std::string(80, 'x'));
+    HttpResponse r = m.f.post("/v1/memory/fork",
+                              R"({"source":{"session":"long"},"questions":["why?"]})");
+    CHECK_EQ(r.status, 400);
+    CHECK(r.body.find("context_length_exceeded") != std::string::npos);
+}
+
+/* Archiving writes the snapshot a fork resumes from when one is owed (a request over the chain,
+ * one discarded token), pins the conversation, and the archive is then a source of its own. */
+TEST(an_archive_is_written_listed_forked_and_deleted) {
+    MemFixture m;
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi<assistant>hello");
+    m.ms.owed = 16;
+    HttpResponse r = m.f.post("/v1/memory/archive", R"({"session_id":"s1","archive_id":"a1"})");
+    REQUIRE_EQ(r.status, 201);
+    json j = json::parse(r.body);
+    CHECK_EQ(j["id"].get<std::string>(), std::string("a1"));
+    CHECK_EQ(j["session_id"].get<std::string>(), std::string("s1"));
+    CHECK_EQ(j["tokens"].get<int64_t>(), (int64_t)24);
+    CHECK_EQ(j["snapshot_tokens"].get<int64_t>(), (int64_t)16);
+    m.ms.join_all();
+    {
+        std::lock_guard<std::mutex> lk(m.ms.mu);
+        REQUIRE_EQ(m.ms.seen.size(), 1u);
+        CHECK_EQ(m.ms.seen[0].checkpoint_at, (int64_t)16);
+        CHECK_EQ(m.ms.seen[0].max_tokens, (int32_t)1);
+        CHECK(m.ms.seen[0].session_label.empty());
+    }
+    CHECK_EQ(m.prompt_text(0), std::string("<user>hi<assistant>hello"));
+
+    /* Nothing owed now: a second archive submits nothing. An id in use is a conflict. */
+    CHECK_EQ(m.f.post("/v1/memory/archive", R"({"session_id":"s1","archive_id":"a1"})").status,
+             409);
+    r = m.f.post("/v1/memory/archive", R"({"session_id":"s1"})");
+    REQUIRE_EQ(r.status, 201);
+    const std::string minted = json::parse(r.body)["id"].get<std::string>();
+    CHECK(minted.rfind("arc_", 0) == 0);
+    {
+        std::lock_guard<std::mutex> lk(m.ms.mu);
+        CHECK_EQ(m.ms.seen.size(), 1u);
+    }
+    CHECK_EQ(m.f.post("/v1/memory/archive", R"({"session_id":"s1","archive_id":"a b"})").status,
+             400);
+    CHECK_EQ(m.f.post("/v1/memory/archive", R"({"session_id":"nobody"})").status, 404);
+
+    r = m.f.get("/v1/memory/archive");
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body)["data"].size(), 2u);
+    CHECK_EQ(m.f.get("/v1/memory/archive/a1").status, 200);
+    CHECK_EQ(m.f.get("/v1/memory/archive/zz").status, 404);
+
+    /* The session moves on; the archive keeps what it was. */
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>summary");
+    REQUIRE_EQ(m.f.post("/v1/memory/fork",
+                        R"({"source":{"archive":"a1"},"questions":["why?"]})").status, 200);
+    m.ms.join_all();
+    CHECK_EQ(m.prompt_text(1), std::string("<user>hi<assistant>hello<user>why?<assistant>"));
+
+    CHECK_EQ(m.f.srv->router().call("DELETE", "/v1/memory/archive/a1").status, 200);
+    CHECK_EQ(m.f.srv->router().call("DELETE", "/v1/memory/archive/a1").status, 404);
+    CHECK_EQ(json::parse(m.f.get("/v1/memory/archive").body)["data"].size(), 1u);
+
+    /* At --memory-archives the next is refused until one goes. */
+    m.ms.limit = 1;
+    CHECK_EQ(m.f.post("/v1/memory/archive", R"({"session_id":"s1"})").status, 507);
+}
+
+/* They read other clients' conversations: a keyless server answers loopback clients only. A
+ * scheduler that keeps no memory answers 501. */
+TEST(the_memory_routes_answer_loopback_only_without_a_key_and_501_without_memory) {
+    MemFixture m;
+    m.ms.chains["s1"] = MemoryScheduler::chain_of("<user>hi");
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/memory/fork";
+    q.peer = "10.0.0.2:5555";
+    q.body = R"({"source":{"session":"s1"},"questions":["why?"]})";
+    CHECK_EQ(m.f.srv->router().dispatch(q).status, 403);
+    q.method = "GET";
+    q.path = "/v1/memory/archive";
+    q.body.clear();
+    CHECK_EQ(m.f.srv->router().dispatch(q).status, 403);
+
+    Fixture plain;
+    CHECK_EQ(plain.post("/v1/memory/fork",
+                        R"({"source":{"session":"s1"},"questions":["why?"]})").status, 501);
+    CHECK_EQ(plain.get("/v1/memory/archive").status, 501);
+}
+
 RAD_TEST_MAIN()

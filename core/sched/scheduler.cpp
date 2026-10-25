@@ -401,8 +401,118 @@ int64_t Scheduler::reset_prefix_cache() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
     const int64_t dropped = pc_->reset();
+    /* The reset dropped every pin (PrefixCache::clear). */
+    if (!mem_.archives().empty())
+        RAD_INFO("memory: %zu archive(s) dropped with the prefix cache", mem_.archives().size());
+    mem_.clear_archives();
     RAD_INFO("prefix cache: reset, %lld entries dropped", (long long)dropped);
     return dropped;
+}
+
+/* ------------------------------------------------------------------ memory (memory.h) */
+
+/* A request over the chain, keyed as its blocks were: the prefix cache reads the adapter and the
+ * control vector from the request (media_keys). */
+static Request chain_request(const MemChain& c) {
+    Request r;
+    r.prompt = c.tokens;
+    r.lora_uid = c.lora_uid;
+    r.sp.use_control_vector = c.use_control_vector;
+    return r;
+}
+
+bool Scheduler::session_chain(const std::string& label, MemChain* out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const MemChain* c = mem_.chain(label);
+    if (!c) return false;
+    *out = *c;
+    return true;
+}
+
+int64_t Scheduler::snapshot_owed(const MemChain& c) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache || !geo_.checkpoints() || geo_.quantum <= 0) return 0;
+    const int64_t end = (int64_t)c.tokens.size() / geo_.quantum * geo_.quantum;
+    if (end <= 0) return 0;
+    const Request r = chain_request(c);
+    return pc_->deepest_snapshot(r, (int64_t)c.tokens.size()) >= end ? 0 : end;
+}
+
+int Scheduler::archive(const std::string& id, const std::string& label, MemChain c,
+                       MemArchiveStat* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
+    auto& all = mem_.archives();
+    if (all.count(id)) return RAD_E_STATE;
+    if ((int64_t)all.size() >= cfg_.memory_archives) return RAD_E_FULL;
+    MemArchive a;
+    a.id = id;
+    a.label = label;
+    a.made_ns = rad_mono_ns();
+    {
+        const Request r = chain_request(c);
+        pc_->pin(r, (int64_t)c.tokens.size(), &a.pinned);
+    }
+    a.chain = std::move(c);
+    RAD_INFO("memory: archive '%s'%s%s: %zu tokens, %lld of them pinned in the cache, snapshot "
+             "at %lld", id.c_str(), label.empty() ? "" : " of session ", label.c_str(),
+             a.chain.tokens.size(), (long long)cached_tokens(a.pinned),
+             (long long)a.pinned.snapshot_pos);
+    /* Pinned blocks leave VRAM only for a host copy; with no host tier they stay, unavailable to
+     * running requests until the archive is deleted. */
+    if (cfg_.prefix_cache_mib <= 0 && !a.pinned.entries.empty())
+        RAD_WARN("memory: archive '%s' keeps %lld tokens of KV in VRAM: without a host tier "
+                 "(--prefix-cache-mib) pinned blocks cannot leave it", id.c_str(),
+                 (long long)cached_tokens(a.pinned));
+    if (out) *out = archive_stat(a, a.made_ns);
+    all.emplace(id, std::move(a));
+    return RAD_OK;
+}
+
+int64_t Scheduler::cached_tokens(const PrefixCache::Pinned& p) const {
+    const std::vector<int32_t>& cg = pc_->cached_groups();
+    if (cg.empty()) return 0;
+    return (int64_t)p.entries.size() * kvgeom_.g[(size_t)cg[0]].block_size;
+}
+
+MemArchiveStat Scheduler::archive_stat(const MemArchive& a, uint64_t now_ns) const {
+    MemArchiveStat s;
+    s.id = a.id;
+    s.label = a.label;
+    s.tokens = (int64_t)a.chain.tokens.size();
+    s.pinned_tokens = cached_tokens(a.pinned);
+    s.snapshot_pos = a.pinned.snapshot_pos;
+    s.age_s = now_ns > a.made_ns ? (double)(now_ns - a.made_ns) * 1e-9 : 0.0;
+    return s;
+}
+
+bool Scheduler::archive_chain(const std::string& id, MemChain* out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = mem_.archives().find(id);
+    if (it == mem_.archives().end()) return false;
+    *out = it->second.chain;
+    return true;
+}
+
+int Scheduler::archives(std::vector<MemArchiveStat>* out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    out->clear();
+    const uint64_t now = rad_mono_ns();
+    for (const auto& kv : mem_.archives()) out->push_back(archive_stat(kv.second, now));
+    std::sort(out->begin(), out->end(),
+              [](const MemArchiveStat& a, const MemArchiveStat& b) { return a.age_s > b.age_s; });
+    return (int)out->size();
+}
+
+int Scheduler::unarchive(const std::string& id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto& all = mem_.archives();
+    auto it = all.find(id);
+    if (it == all.end()) return RAD_E_NOTFOUND;
+    if (pc_) pc_->unpin(it->second.pinned);
+    RAD_INFO("memory: archive '%s' deleted", id.c_str());
+    all.erase(it);
+    return RAD_OK;
 }
 
 void Scheduler::trim_prefix_cache() {
@@ -447,6 +557,20 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     }
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
+
+    /* The conversation's tokens as the model saw them, for a later fork (memory.h). A finished
+     * request only: a cancelled or failed one is not what its client continues from. */
+    if (st == ReqState::Finished && !s.req->session_label.empty()) {
+        MemChain c;
+        c.tokens.reserve(s.req->prompt.size() + s.req->output.size());
+        c.tokens.insert(c.tokens.end(), s.req->prompt.begin(), s.req->prompt.end());
+        c.tokens.insert(c.tokens.end(), s.req->output.begin(), s.req->output.end());
+        c.lora_uid = s.req->lora_uid;
+        c.use_control_vector = s.req->sp.use_control_vector;
+        c.has_media = s.req->media != nullptr;
+        c.updated_ns = rad_mono_ns();
+        mem_.note(s.req->session_label, std::move(c));
+    }
     /* Fold what the draft head did on this text into the next text's starting estimate, once:
      * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {

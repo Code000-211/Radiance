@@ -200,6 +200,62 @@ public:
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
+    /* ---- memory: core/sched/memory.h's types, copied across the interface */
+    static Chain chain_of(const MemChain& m) {
+        Chain c;
+        c.tokens = m.tokens;
+        c.lora_uid = m.lora_uid;
+        c.use_control_vector = m.use_control_vector;
+        c.has_media = m.has_media;
+        return c;
+    }
+    static MemChain mem_chain(const Chain& c) {
+        MemChain m;
+        m.tokens = c.tokens;
+        m.lora_uid = c.lora_uid;
+        m.use_control_vector = c.use_control_vector;
+        m.has_media = c.has_media;
+        return m;
+    }
+    static ArchiveStat stat_of(const MemArchiveStat& m) {
+        ArchiveStat s;
+        s.id = m.id;
+        s.label = m.label;
+        s.tokens = m.tokens;
+        s.pinned_tokens = m.pinned_tokens;
+        s.snapshot_pos = m.snapshot_pos;
+        s.age_s = m.age_s;
+        return s;
+    }
+    int session_chain(const std::string& label, Chain* out) const override {
+        MemChain m;
+        if (!s_->session_chain(label, &m)) return RAD_E_NOTFOUND;
+        *out = chain_of(m);
+        return RAD_OK;
+    }
+    int64_t snapshot_owed(const Chain& c) const override { return s_->snapshot_owed(mem_chain(c)); }
+    int archive(const std::string& id, const std::string& label, const Chain& c,
+                ArchiveStat* out) override {
+        MemArchiveStat m;
+        const int rc = s_->archive(id, label, mem_chain(c), &m);
+        if (rc >= 0 && out) *out = stat_of(m);
+        return rc;
+    }
+    int archive_chain(const std::string& id, Chain* out) const override {
+        MemChain m;
+        if (!s_->archive_chain(id, &m)) return RAD_E_NOTFOUND;
+        *out = chain_of(m);
+        return RAD_OK;
+    }
+    int archives(std::vector<ArchiveStat>* out) const override {
+        std::vector<MemArchiveStat> v;
+        s_->archives(&v);
+        out->clear();
+        for (const MemArchiveStat& m : v) out->push_back(stat_of(m));
+        return (int)out->size();
+    }
+    int unarchive(const std::string& id) override { return s_->unarchive(id); }
+
     /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
      * to "seconds ago" here, so only the monotonic clock is authoritative. */
     TierCounters tier_counters() const override {

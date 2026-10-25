@@ -68,6 +68,7 @@ void IdleTiers::close() {
 
 void IdleTiers::reset() {
     recs_.clear();
+    pinned_.clear();
     sessions_.clear();
     roots_.clear();
     host_lru_.clear();
@@ -100,7 +101,7 @@ void IdleTiers::touch(const BlockHash& key, Rec& r, uint64_t now_ns) {
 }
 
 void IdleTiers::relist(const BlockHash& key, Rec& r) {
-    if (r.pending || r.tier == KVTier::Device || r.listed) return;
+    if (r.pending || r.tier == KVTier::Device || r.listed || pinned_.count(key)) return;
     r.it = host_lru_.emplace_hint(host_lru_.end(), LruKey{ r.used_ns, r.depth }, key);
     r.listed = true;
 }
@@ -233,6 +234,16 @@ void IdleTiers::forget(const BlockHash& key) {
     unlist(r);
     free_host(r);
     recs_.erase(it);
+}
+
+void IdleTiers::set_pinned(const BlockHash& key, bool on) {
+    std::lock_guard lk(mu_);
+    if (on) pinned_.insert(key);
+    else pinned_.erase(key);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return;
+    if (on) unlist(it->second);
+    else relist(key, it->second);
 }
 
 KVTier IdleTiers::tier_of(const BlockHash& key) const {

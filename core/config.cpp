@@ -103,6 +103,9 @@ static const Flag g_flags[] = {
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
+    { "--memory-archives",    "N",      "conversations the memory endpoints may pin at once (default 8):\n"
+    "                                    each keeps its cached blocks and one snapshot slot until\n"
+    "                                    deleted. 0 refuses every archive" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -524,6 +527,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
+        else if (S("--memory-archives"))       { if (!num(0, 4096, &c->memory_archives)) return RAD_E_INVAL; }
         else if (S("--lora")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             const char* eq = std::strchr(v, '=');
@@ -1034,6 +1038,7 @@ const ShowRow kShow[] = {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--memory-archives",    [](const Config& c) { return num(c.memory_archives); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

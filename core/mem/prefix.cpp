@@ -241,6 +241,34 @@ std::vector<BlockHash> PrefixCache::chain_all(const std::vector<int32_t>& tokens
     return hs;
 }
 
+/* Checkpoints sit on the interval or at a prompt's tail (Scheduler::plan_chunk), i.e. on any block
+ * boundary, so iterate the snapshots (a few hundred) rather than the block positions (tens of
+ * thousands); a snapshot is on this chain when its key equals the chain hash at its position. */
+std::unordered_map<BlockHash, PrefixCache::Ckpt, BlockHashHash>::iterator
+PrefixCache::deepest_on(const std::vector<BlockHash>& hs, int64_t limit) const {
+    auto best = ck_by_prefix_.end();
+    for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+        const Ckpt& c = it->second;
+        if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit || c.pos % block_size_ != 0)
+            continue;
+        if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
+        if (c.pos / block_size_ > (int64_t)hs.size()) continue;
+        if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
+        best = it;
+    }
+    return best;
+}
+
+int64_t PrefixCache::held_prefix(const std::vector<BlockHash>& hs,
+                                 const std::vector<int32_t>& tokens) const {
+    int64_t b = 0;
+    for (; b < (int64_t)hs.size(); ++b) {
+        auto it = map_.find(hs[(size_t)b]);
+        if (it == map_.end() || !same_tokens(it->second, tokens.data() + b * block_size_)) break;
+    }
+    return b;
+}
+
 void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
     auto it = map_.find(h);
     if (it == map_.end() || !it->second.in_lru) return;
@@ -274,23 +302,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     /* Back a full hit off by one block so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
-    /* Deepest valid snapshot at or below `limit` on this chain. Checkpoints sit on the interval or
-     * at a prompt's tail (Scheduler::plan_chunk), i.e. on any block boundary, so iterate the
-     * snapshots (a few hundred) rather than the block positions (tens of thousands); a snapshot is
-     * on this chain when its key equals the chain hash at its position. */
-    auto deepest = [&](int64_t limit) {
-        auto best = ck_by_prefix_.end();
-        for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
-            const Ckpt& c = it->second;
-            if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit ||
-                c.pos % block_size_ != 0)
-                continue;
-            if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
-            if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
-            best = it;
-        }
-        return best;
-    };
+    auto deepest = [&](int64_t limit) { return deepest_on(hs, limit); };
     /* Tokens a hit of `m` blocks lets a sequence skip: all of them, or with recurrent state only
      * up to the deepest checkpoint (Scheduler::admit_one resumes there). */
     auto reusable = [&](int64_t m) -> int64_t {
@@ -516,6 +528,59 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ archives */
+
+void PrefixCache::pin_entry(const BlockHash& h, int delta) {
+    auto it = pins_.find(h);
+    if (it == pins_.end()) {
+        if (delta <= 0) return;
+        pins_.emplace(h, delta);
+        if (tiers_) tiers_->set_pinned(h, true);
+        return;
+    }
+    it->second += delta;
+    if (it->second > 0) return;
+    pins_.erase(it);
+    if (tiers_) tiers_->set_pinned(h, false);
+}
+
+void PrefixCache::pin(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                      int64_t n_tokens, Pinned* out) {
+    *out = Pinned{};
+    if (!enabled_ || tokens.empty() || n_tokens <= 0) return;
+    if (n_tokens > (int64_t)tokens.size()) n_tokens = (int64_t)tokens.size();
+    std::vector<BlockHash> hs = chain_all(tokens, mm, n_tokens / block_size_);
+    hs.resize((size_t)held_prefix(hs, tokens));
+    for (const BlockHash& h : hs) pin_entry(h, +1);
+    if (has_linear_) {
+        const auto best = deepest_on(hs, (int64_t)hs.size() * block_size_);
+        if (best != ck_by_prefix_.end()) {
+            out->snapshot = best->first;
+            out->snapshot_pos = best->second.pos;
+            ++ck_pins_[best->first];
+        }
+    }
+    out->entries = std::move(hs);
+}
+
+void PrefixCache::unpin(const Pinned& p) {
+    for (const BlockHash& h : p.entries) pin_entry(h, -1);
+    if (p.snapshot_pos <= 0) return;
+    auto it = ck_pins_.find(p.snapshot);
+    if (it != ck_pins_.end() && --it->second <= 0) ck_pins_.erase(it);
+}
+
+int64_t PrefixCache::deepest_snapshot(const std::vector<int32_t>& tokens,
+                                      const std::vector<MMContentKey>& mm,
+                                      int64_t n_tokens) const {
+    if (!enabled_ || !has_linear_ || tokens.empty() || n_tokens <= 0) return 0;
+    if (n_tokens > (int64_t)tokens.size()) n_tokens = (int64_t)tokens.size();
+    std::vector<BlockHash> hs = chain_all(tokens, mm, n_tokens / block_size_);
+    hs.resize((size_t)held_prefix(hs, tokens));
+    const auto best = deepest_on(hs, (int64_t)hs.size() * block_size_);
+    return best == ck_by_prefix_.end() ? 0 : best->second.pos;
+}
+
 bool PrefixCache::shared_with_live(const Entry& e) const {
     for (size_t g = 0; g < groups_.size(); ++g)
         if (kv_->block_refcount(groups_[g], e.blocks[g]) > 1) return true;
@@ -544,7 +609,9 @@ int64_t PrefixCache::evict_lru(int64_t n) {
         auto it = map_.find(h);
         if (it == map_.end()) { lru_.pop_front(); continue; }
         Entry& e = it->second;
-        if (shared_with_live(e)) {
+        /* An archive's entry with no host copy yet would be lost, not demoted: kept like a
+         * shared one. One whose copy has landed leaves VRAM below, as any other. */
+        if (shared_with_live(e) || (pins_.count(h) && !(tiers_ && tiers_->droppable(h)))) {
             lru_.splice(lru_.end(), lru_, lru_.begin());
             e.used_ns = now;
             continue;
@@ -581,7 +648,8 @@ int64_t PrefixCache::trim(int64_t n_blocks) {
         auto m = map_.find(h);
         if (m == map_.end()) { it = lru_.erase(it); continue; }
         Entry& e = m->second;
-        if (shared_with_live(e)) {
+        /* With no tier to demote to, an archive's entry could only be erased. */
+        if (shared_with_live(e) || (!keep && pins_.count(h))) {
             /* In use: to the back, as in evict_lru. */
             auto next = std::next(it);
             lru_.splice(lru_.end(), lru_, it);
@@ -660,6 +728,11 @@ void PrefixCache::clear() {
     map_.clear();
     lru_.clear();
     drop_wait_.clear();
+    /* Archives go with it: the scheduler forgets them in the same reset. */
+    if (tiers_)
+        for (const auto& p : pins_) tiers_->set_pinned(p.first, false);
+    pins_.clear();
+    ck_pins_.clear();
 }
 
 std::vector<BlockHash> PrefixCache::lru_order() const {
@@ -711,6 +784,8 @@ int64_t PrefixCache::retain(uint64_t session) {
     int64_t freed = 0;
     for (const auto& a : all) {
         if (std::binary_search(keep.begin(), keep.end(), a.first)) { kept.push_back(a.second); continue; }
+        /* An archive's snapshot is outside any session's ladder. */
+        if (ck_pins_.count(a.second)) { kept.push_back(a.second); continue; }
         /* Keep one handed out this step or reserved and not yet committed regardless of policy:
          * its admission restores from the slot ahead of the step, or the step's save lands in it. */
         if (handed(a.second) || reserved(a.second)) { kept.push_back(a.second); continue; }
@@ -779,7 +854,8 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
              * the anchor every turn resumes from is used each turn. */
             const Ckpt* victim = nullptr;
             for (const auto& kvp : ck_by_prefix_) {
-                if (handed(kvp.first) || reserved(kvp.first)) continue;
+                if (handed(kvp.first) || reserved(kvp.first) || ck_pins_.count(kvp.first))
+                    continue;
                 if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
             }
             if (!victim) {
@@ -896,13 +972,20 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
     int64_t n = 0;
 
     /* ---- in VRAM: the LRU is in clock order, so stop at the first entry kept. A block a running
-     * sequence also holds stays allocated; that sequence republishes it when it ends. */
-    while (!lru_.empty()) {
+     * sequence also holds stays allocated; that sequence republishes it when it ends. An
+     * archive's entry is kept and goes to the back, stamped as in evict_lru, so the list stays in
+     * clock order and the next pass does not walk it again. */
+    for (int64_t seen = (int64_t)lru_.size(); !lru_.empty() && seen > 0; --seen) {
         const BlockHash h = lru_.front();
         auto it = map_.find(h);
         if (it == map_.end()) { lru_.pop_front(); continue; }
         Entry& e = it->second;
         if (e.used_ns >= cutoff) break;
+        if (pins_.count(h)) {
+            lru_.splice(lru_.end(), lru_, lru_.begin());
+            e.used_ns = now_ns;
+            continue;
+        }
         lru_.pop_front();
         e.in_lru = false;
         release_blocks(e);
@@ -917,6 +1000,8 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
         std::vector<BlockHash> keys;
         tiers_->expired(cutoff, (size_t)-1, &keys);
         for (const BlockHash& h : keys) {
+            /* The tiers list no pinned record (IdleTiers::set_pinned); this only guards that. */
+            if (pins_.count(h)) continue;
             tiers_->forget(h);
             auto it = map_.find(h);
             if (it == map_.end() || it->second.in_lru) continue;
@@ -930,7 +1015,8 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
     std::vector<BlockHash> gone;
     for (const auto& kvp : ck_by_prefix_) {
         const Ckpt& c = kvp.second;
-        if (!c.valid || handed(kvp.first) || reserved(kvp.first)) continue;
+        if (!c.valid || handed(kvp.first) || reserved(kvp.first) || ck_pins_.count(kvp.first))
+            continue;
         auto e = map_.find(kvp.first);
         const uint64_t used = std::max(c.used_ns, e == map_.end() ? 0 : e->second.used_ns);
         if (used < cutoff) gone.push_back(kvp.first);

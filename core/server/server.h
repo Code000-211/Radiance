@@ -267,6 +267,18 @@ private:
     HttpResponse serve(const HttpRequest& req, OaiRequest& r);
     json native_result(const OaiRequest& r, const Generation& g, const std::string& content);
 
+    /* ------------------------------------------------------------------ memory.cpp
+     * Forks of a conversation the cache holds, and archives that keep one past its client's
+     * compaction (core/sched/memory.h). */
+    HttpResponse handle_memory_fork(const HttpRequest& req);
+    HttpResponse handle_memory_archive_create(const HttpRequest& req);
+    HttpResponse handle_memory_archive_list(const HttpRequest& req);
+    HttpResponse handle_memory_archive_get(const HttpRequest& req);
+    HttpResponse handle_memory_archive_delete(const HttpRequest& req);
+    /* The refusal every memory route shares: no engine, or a keyless server and a peer that is
+     * not on loopback (these routes read other clients' conversations). */
+    std::optional<HttpResponse> memory_refusal(const HttpRequest& req);
+
     /* ------------------------------------------------------------------ images.cpp */
     HttpResponse handle_images(const HttpRequest& req, bool edit);
 

@@ -427,16 +427,6 @@ std::string str_or(const json& o, const char* k, const std::string& def = std::s
     return it != o.end() && it->is_string() ? it->get<std::string>() : def;
 }
 
-/* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
- * because the label is serialised into JSON. */
-std::string session_label_of(const std::string& s) {
-    constexpr size_t kMax = 128;
-    if (s.size() <= kMax) return s;
-    size_t cut = kMax;
-    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
-    return s.substr(0, cut);
-}
-
 /* One field under several spellings (OpenAI's, vLLM's, llama.cpp's), read as a number (double)
  * or a 32-bit integer (int64_t). Any may be sent; two that disagree are refused, since no reading
  * order could be what the caller meant. */
@@ -466,6 +456,16 @@ bool get_any(const json& b, std::initializer_list<const char*> keys, T* out, boo
 }
 
 }  /* namespace */
+
+/* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
+ * because the label is serialised into JSON. */
+std::string session_label_of(const std::string& s) {
+    constexpr size_t kMax = 128;
+    if (s.size() <= kMax) return s;
+    size_t cut = kMax;
+    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
+    return s.substr(0, cut);
+}
 
 KeyPolicy request_key_policy() {
     KeyPolicy p;

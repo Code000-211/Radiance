@@ -859,6 +859,10 @@ struct Config {
     /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
+    /* Archives the memory endpoints may pin at once (core/sched/memory.h). Each keeps a chain's
+     * blocks and one snapshot slot until deleted, out of what live conversations share. 0
+     * refuses every archive. */
+    int64_t memory_archives = 8;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The

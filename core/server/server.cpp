@@ -204,6 +204,15 @@ void Server::register_routes() {
     router_.get ("/stats",               [this](const HttpRequest& q) { return handle_stats(q); });
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
+
+    /* Forks and archives of stored conversations (memory.cpp). */
+    router_.post("/v1/memory/fork",      [this](const HttpRequest& q) { return handle_memory_fork(q); });
+    router_.post("/v1/memory/archive",   [this](const HttpRequest& q) { return handle_memory_archive_create(q); });
+    router_.get ("/v1/memory/archive",   [this](const HttpRequest& q) { return handle_memory_archive_list(q); });
+    router_.get ("/v1/memory/archive/:id",
+                 [this](const HttpRequest& q) { return handle_memory_archive_get(q); });
+    router_.add ("DELETE", "/v1/memory/archive/:id",
+                 [this](const HttpRequest& q) { return handle_memory_archive_delete(q); });
     /* The control vector's switch, for the dashboard's Model view and for automation: a
      * deployment with no vector found answers 404 here. */
     router_.get ("/admin/control-vector",
@@ -519,6 +528,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             rq.priority = r.priority;
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;
+            rq.checkpoint_at = r.prompts[p].checkpoint_at;
             rq.session_label = r.session_label;
             rq.lora_slot = lora_slot;
             rq.lora_uid = lora_uid;

@@ -71,6 +71,9 @@ struct PromptInput {
     std::string          text;    /* the rendered prompt; needed for `echo` and for the logs */
     /* The media parts, processed and placed; null for a text prompt (Request::media). */
     std::shared_ptr<mm::PromptMedia> media;
+    /* Where a snapshot is wanted on the way (Request::checkpoint_at); 0 for none. Set only by
+     * the memory fork, at the end of the conversation it continues. */
+    int64_t              checkpoint_at = 0;
 };
 
 struct OaiRequest {
@@ -268,6 +271,10 @@ ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, in
  * sets the field's default, so an accepted default is always servable. A field with no bounds
  * takes any value. */
 bool sampler_value_ok(const char* field, double v, std::string* why);
+
+/* A conversation's label (OpenRouter's session_id, Anthropic's metadata.user_id) as the engine keeps
+ * it: at most 128 bytes, cut at a UTF-8 character boundary. A lookup by label cuts the same way. */
+std::string session_label_of(const std::string& s);
 
 struct OaiDeps {
     ITokenizer*       tok = nullptr;

@@ -189,6 +189,17 @@ struct IPrefixCache {
     /* The reserved state is now in its slot. Reservation happens at planning, before the step
      * computes the state, so lookup does not offer the slot until this is called. */
     virtual void commit_checkpoint(const Request& r, int64_t pos) = 0;
+
+    /* Archives (PrefixCache::pin): keep the chain of the first `n_tokens` of r.prompt, and its
+     * deepest snapshot, through eviction, expiry and retention. Keyed like a lookup of r, so an
+     * adapter or control vector the chain was computed under is part of it. The defaults pin
+     * nothing, for a cache that keeps no archives. */
+    virtual void pin(const Request&, int64_t, PrefixCache::Pinned* out) {
+        *out = PrefixCache::Pinned{};
+    }
+    virtual void unpin(const PrefixCache::Pinned&) {}
+    /* The deepest snapshot a lookup of r would resume from within its first `n_tokens`. */
+    virtual int64_t deepest_snapshot(const Request&, int64_t) const { return 0; }
 };
 
 /* ------------------------------------------------------------------ block geometry */
@@ -419,6 +430,16 @@ struct PCBinding final : IPrefixCache {
 
     void commit_checkpoint(const Request& r, int64_t pos) override {
         m->commit_checkpoint(prefix_hash(r, pos));
+    }
+
+    void pin(const Request& r, int64_t n_tokens, PrefixCache::Pinned* out) override {
+        media_keys(r, &mm_, salt_id);
+        m->pin(r.prompt, mm_, n_tokens, out);
+    }
+    void unpin(const PrefixCache::Pinned& p) override { m->unpin(p); }
+    int64_t deepest_snapshot(const Request& r, int64_t n_tokens) const override {
+        media_keys(r, &mm_, salt_id);
+        return m->deepest_snapshot(r.prompt, mm_, n_tokens);
     }
 
 private:
