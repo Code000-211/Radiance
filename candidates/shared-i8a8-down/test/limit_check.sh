@@ -83,8 +83,35 @@ sleep 1
 alive "$(pidof_ "$gc4")" && bad "grandchild $(pidof_ "$gc4") survived the signal" \
     || ok "grandchild gone with the group"
 
-# 5. Nothing of this run is left.
-say "5. own children afterwards"
+# 6. The combined case: the child itself ends on TERM, but the hanger it started ignores TERM.
+#    That is the shape run.sh's own children have -- cc1 and ld under clang++, a grandchild under a
+#    hanger -- and it is the one case neither 3 (the whole group ignores TERM, timeout escalates)
+#    nor 4 (one signal, no escalation) covers: here the TERM does reach the child, the child dies
+#    of it, and the grandchild survives unless bounded_kill escalates to KILL.
+say "6. red: child ends on TERM, grandchild ignores TERM"
+cat > "$T/polite.sh" <<'EOF'
+sh -c 'trap "" TERM; while :; do :; done' &
+echo $! > "$1"
+wait
+EOF
+gc6=$T/gc6.pid
+( . "$HERE/bounded.sh"; trap 'bounded_kill' INT TERM HUP
+  bounded 60 sh "$T/polite.sh" "$gc6" ) &
+hp=$!
+sleep 2
+if alive "$(pidof_ "$gc6")"; then ok "grandchild $(pidof_ "$gc6") is up and ignores TERM"
+else bad "grandchild never started"; fi
+kill -TERM "$hp" 2>/dev/null
+wait "$hp"
+rc=$?
+if [ "$rc" -eq 143 ] || [ "$rc" -eq 124 ]; then ok "child ended with $rc"
+else bad "child status $rc"; fi
+sleep 1
+if alive "$(pidof_ "$gc6")"; then bad "grandchild $(pidof_ "$gc6") survived the cleanup"
+else ok "grandchild removed by the KILL escalation"; fi
+
+# 7. Nothing of this run is left.
+say "7. own children afterwards"
 left=$(ps -eo pid=,args= | grep -F "$T/hang.sh" | grep -v grep || true)
 [ -z "$left" ] && ok "no hanger left" || bad "still running: $left"
 

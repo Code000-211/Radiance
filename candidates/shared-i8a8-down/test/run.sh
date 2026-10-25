@@ -16,8 +16,8 @@
 # and ROCR_VISIBLE_DEVICES emptied: HIP initialises without a device, a launch that got past the
 # body's refusals would fail instead of running, and no KFD context is claimed.
 #
-# NO CHILD OUTLIVES ITS STEP. Every command below -- the three clang++ steps, the link, nm, and the
-# two test runs -- goes through bounded(), which gives it its own session and a hard limit, and the
+# NO CHILD OUTLIVES ITS STEP. Every command below -- the four clang++ steps, the link, the two nm
+# pipelines, and the two test runs -- goes through bounded(), which gives it its own session and a hard limit, and the
 # harness traps INT/TERM/HUP into bounded_kill. A child that hangs keeps whatever context it did
 # claim, and a leaked KFD context is not free on this host: it holds 150+ MB that the measured VRAM
 # budget then misses by (tests/kbench_mutant_test.cpp and tests/oot_plugins.sh hide devices the
@@ -57,18 +57,23 @@ bounded "$BUILD_LIMIT" \
          -L"$ROCMLIB/lib" -lamdhip64 -ldl
 
 # The export set is the ABI's, and the DSO carries no undefined symbol from libr4d: the layout
-# hooks are compiled in, not linked out.
-exports=$(nm -D --defined-only "$D/shared_i8a8_down.so" | awk '$2 == "T" { print $3 }' | sort)
+# hooks are compiled in, not linked out. Both nm pipelines are bounded like every other step: a
+# toolchain stuck on a malformed object hangs here as well.
+bounded "$BUILD_LIMIT" sh -c 'nm -D --defined-only "$1" | awk '\''$2 == "T" { print $3 }'\'' | sort \
+                              > "$2"' \
+    sh "$D/shared_i8a8_down.so" "$D/exports.txt"
+exports=$(cat "$D/exports.txt")
 want=$(printf '%s\n' rad_kernel_at rad_kernel_concurrent rad_kernel_count rad_kernel_schema_at \
                        rad_kernel_schema_count rad_plugin_abi_version rad_plugin_info | sort)
 [ "$exports" = "$want" ] || { echo "FAIL: exported symbols differ from the ABI's set:" >&2
                               echo "$exports" >&2; exit 1; }
-if nm -D -u "$D/shared_i8a8_down.so" | grep -q r4d_; then
+if bounded "$BUILD_LIMIT" sh -c 'nm -D -u "$1" | grep -q r4d_' sh "$D/shared_i8a8_down.so"; then
   echo "FAIL: the DSO has an undefined libr4d symbol" >&2; exit 1
 fi
 echo "exports: the ABI's set, nothing from libr4d"
 
-"$CLANG" -std=c++17 -O1 -Wall -Wextra -I"$S/abi" \
+bounded "$BUILD_LIMIT" \
+    "$CLANG" -std=c++17 -O1 -Wall -Wextra -I"$S/abi" \
          "$S/candidates/shared-i8a8-down/test/si8_test.cpp" -o "$D/si8_test" -ldl
 
 echo

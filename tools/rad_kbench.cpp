@@ -1913,9 +1913,42 @@ int Replay::rerecord() {
  * tuned point or dtype never runs. For every row of every library under test, this moves an
  * existing case of the row's op into the row's constraints (kb::satisfy_constraints) and records
  * the reference's answer there. Only cases whose operand shapes the reference can describe from the
- * parameters alone, and whose weights keep their shapes, are moved: a weight of another shape would
- * need an encoding the base case does not carry. Replay the result with --all-rows, since a row
+ * parameters alone are moved. A weight of another shape takes the encoding its own row's
+ * description implies (derive_enc), where that is readable; the rest are listed with the reason.
+ * Replay the result with --all-rows, since a row
  * a higher-priority row shadows is reached only that way. No container and no card are needed. */
+/* The affine encoding a row's own description of a weight implies, where the base case's is of
+ * another shape than the row states: codes at the weight's declared dtype, a scale at the next
+ * operand's, one block per `group` of K. That is what a container declares for the formats the
+ * geometry alone states (libref/ref_shapes.cpp, gemm_q_shape: i8a8 is [N][K] codes against [N][K/
+ * group] bf16), and the plane extents follow from the weight's [rows, cols] as a container's do
+ * (rad_enc_plane_dims). Nothing is invented beyond that: the row states its own operands, so a
+ * shape or dtype this derivation cannot read leaves the case out, and a case whose bytes the row
+ * then refuses is reported with the row's reason instead of being recorded. */
+bool derive_enc(std::vector<KfOperand>* opd, size_t k, const Geometry& g) {
+    KfOperand& d = (*opd)[k];
+    if (d.role != RAD_OPD_WEIGHT || d.shape.size() != 2 || d.absent) return false;
+    long long group = 0;
+    if (!g.get_i("group", &group) || group <= 0) return false;
+    if (k + 1 >= opd->size()) return false;
+    const KfOperand& s = (*opd)[k + 1];
+    if (s.role != RAD_OPD_WEIGHT || s.absent) return false;
+    const int64_t rows = d.shape[0], cols = d.shape[1];
+    if (rows <= 0 || cols <= 0) return false;
+    /* The scale is the next operand: one value per (row, group of K), and nothing else. */
+    if (s.dtype == RAD_I8 || s.shape.size() != 2 || s.shape[0] != rows ||
+        s.shape[1] != (cols + group - 1) / group)
+        return false;
+    d.has_enc = true;
+    d.enc = rad_enc_affine(d.dtype, s.dtype, 1, group);
+    d.sel = { 0, 1 };
+    d.sel_rows.assign(2, 0);
+    d.sel_cols.assign(2, 0);
+    for (size_t j = 0; j < 2; ++j)
+        rad_enc_plane_dims(&d.enc.plane[d.sel[j]], rows, cols, &d.sel_rows[j], &d.sel_cols[j]);
+    return rad_enc_valid(&d.enc) != 0;
+}
+
 int Replay::record_rows() {
     Kfixture out;
     out.oracle = ref_name_;
@@ -1985,17 +2018,28 @@ int Replay::record_rows() {
                     d.idx_max = sh[k].idx_max;
                     d.idx_const = sh[k].idx_const;
                     d.fill_chunk = sh[k].fill_chunk;
-                    if (d.role == RAD_OPD_WEIGHT || d.role == RAD_OPD_WTAB) {
-                        if (d.absent != b.absent || d.dtype != b.dtype || d.shape != b.shape) {
-                            weights_kept = false;
-                            break;
-                        }
+                }
+                /* Weights second: derive_enc reads the scale operand beside the codes, which the
+                 * loop above has only just filled. */
+                for (size_t k = 0; k < sh.size(); ++k) {
+                    KfOperand& d = c.opd[k];
+                    if (d.role != RAD_OPD_WEIGHT && d.role != RAD_OPD_WTAB) continue;
+                    const KfOperand& b = base.opd[k];
+                    if (d.absent == b.absent && d.dtype == b.dtype && d.shape == b.shape) {
                         d.has_enc = b.has_enc;
                         d.enc = b.enc;
                         d.sel = b.sel;
                         d.sel_rows = b.sel_rows;
                         d.sel_cols = b.sel_cols;
+                        continue;
                     }
+                    if (!derive_enc(&c.opd, k, g)) {
+                        weights_kept = false;
+                        break;
+                    }
+                    /* Its scale plane is the next operand, which keeps its plain draw: a tensor
+                     * of the declared [N][K/group] reads as those scale values. */
+                    ++k;
                 }
                 if (!weights_kept) {
                     last = "its geometry changes a weight's shape";

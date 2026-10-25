@@ -130,11 +130,15 @@ struct Call {
     }
 };
 
-/* The independent signed-int reference: int32 per 128-K group, FP32 fold, one BF16 rounding. */
+/* The independent signed-int reference: int32 per 128-K group, FP32 fold, one BF16 rounding.
+ * `expected`, when asked for, receives the reference's own BF16 answer per element, so the host
+ * self-check can run a known-good output through the same verdict. */
 size_t reference(const std::vector<uint8_t>& y, const std::vector<int8_t>& a,
                  const std::vector<float>& asc, const std::vector<int8_t>& w,
-                 const std::vector<uint16_t>& wsc, int m, int n, int k) {
+                 const std::vector<uint16_t>& wsc, int m, int n, int k,
+                 std::vector<uint16_t>* expected = nullptr) {
     size_t bad = 0;
+    if (expected) expected->assign((size_t)m * n, 0);
     for (int i = 0; i < m; ++i)
         for (int c = 0; c < n; ++c) {
             float acc = 0;
@@ -145,19 +149,87 @@ size_t reference(const std::vector<uint8_t>& y, const std::vector<int8_t>& a,
                 acc += (float)dot * (asc[(size_t)i * (k / G) + g] * bf(wsc[(size_t)c * (k / G) + g]));
             }
             uint16_t got; std::memcpy(&got, y.data() + 2 * ((size_t)i * n + c), 2);
-            const uint16_t want = to_bf(acc);
+            if (expected) (*expected)[(size_t)i * n + c] = to_bf(acc);
+            /* A non-finite answer is an error, not a large error: `fabs(nan - acc) > ulp` is
+             * false, so a NaN output would otherwise pass every comparison below. */
+            if (!std::isfinite(bf(got)) || !std::isfinite(acc)) { ++bad; continue; }
             /* One BF16 rounding interval, plus the FP32 group-fold discrepancy a reordered sum
              * may produce. Not a gate tolerance: this harness' own reporting bound. */
             const double ulp = std::ldexp(1.0, std::ilogb(std::max(std::fabs(acc), 1e-30f)) - 8);
             if (std::fabs((double)bf(got) - acc) > 4 * ulp) ++bad;
-            (void)want;
         }
     return bad;
+}
+
+/* One (mode, M) case's verdict: the candidate's bytes against the frozen row's, and the frozen
+ * row's against the independent integer reference. Both are failures. A pair of rows that agree
+ * on the same wrong answer passes the first and must fail the second, which is why a reference
+ * deviation cannot stay a printed number only. */
+int judge(const std::vector<uint8_t>& bf_out, const std::vector<uint8_t>& bc_out,
+          const std::vector<int8_t>& a, const std::vector<float>& asc,
+          const std::vector<int8_t>& w, const std::vector<uint16_t>& wsc, int m, int n, int k) {
+    size_t diff = 0, first = 0;
+    double worst = 0;
+    for (size_t i = 0; i < bc_out.size() / 2; ++i) {
+        uint16_t u, v;
+        std::memcpy(&u, bf_out.data() + 2 * i, 2);
+        std::memcpy(&v, bc_out.data() + 2 * i, 2);
+        if (u != v) { if (!diff) first = i; ++diff; }
+        worst = std::max(worst, std::fabs((double)bf(u) - bf(v)));
+    }
+    const size_t ref_bad = reference(bf_out, a, asc, w, wsc, m, n, k);
+    std::printf("M=%d bytes=%zu frozen_vs_candidate_diffs=%zu first=%ld max_abs=%.9g "
+                "frozen_vs_int_reference_bad=%zu\n",
+                m, bf_out.size(), diff, diff ? (long)first : -1L, worst, ref_bad);
+    return (diff ? 1 : 0) + (ref_bad ? 1 : 0);
+}
+/* Host only, and deliberately before the first HIP call: the regression for the case this file
+ * used to pass. Two rows that agree on the same wrong bytes pass the row-to-row comparison, so
+ * the reference check is the only thing that can fail the run -- and it must. The third leg is
+ * the control: the same two rows agreeing on the reference's own answer have to be accepted, or
+ * "always fails" would satisfy this check.
+ *
+ *   compare.hip --self-check
+ */
+int self_check() {
+    const int m = 1;
+    std::vector<int8_t> a((size_t)K, 1), w((size_t)N * K, 1);
+    std::vector<float> asc((size_t)(K / G), 1.0f);
+    std::vector<uint16_t> wsc((size_t)N * (K / G), to_bf(1.0f));
+    std::vector<uint16_t> expected;
+    std::vector<uint8_t> probe((size_t)m * N * 2, 0);
+    reference(probe, a, asc, w, wsc, m, N, K, &expected);
+
+    /* One output value for every element: the inputs above are constant, so the reference is too. */
+    auto same = [&](uint16_t v) {
+        std::vector<uint8_t> b((size_t)m * N * 2);
+        for (size_t i = 0; i < (size_t)m * N; ++i) std::memcpy(b.data() + 2 * i, &v, 2);
+        return b;
+    };
+    struct Leg { const char* what; uint16_t v; bool want_fail; };
+    const Leg legs[] = {
+        { "both rows zero, reference is 384",            0x0000, true  },
+        { "both rows NaN",                              0x7fc0, true  },
+        { "both rows the reference's own answer",        expected[0], false },
+    };
+    int fails = 0;
+    for (const Leg& l : legs) {
+        const std::vector<uint8_t> y = same(l.v);
+        const int bad = judge(y, y, a, asc, w, wsc, m, N, K);
+        const bool got = bad != 0;
+        std::printf("self_check %-40s -> %s (verdict %s)\n", l.what,
+                    got ? "FAIL" : "ok", got == l.want_fail ? "as expected" : "WRONG");
+        if (got != l.want_fail) ++fails;
+    }
+    std::printf("RESULT: %s\n", fails ? "SELF-CHECK FAILED" : "SELF-CHECK OK");
+    return fails ? 1 : 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "--self-check")) return self_check();
+
     const char* frozen_path = argc > 1 ? argv[1] : "libr4d.so";
     const char* cand_path   = argc > 2 ? argv[2] : "shared_i8a8_down.so";
 
@@ -235,21 +307,7 @@ int main(int argc, char** argv) {
                   std::string("launch refused: frozen=") + std::to_string(rf) +
                   " candidate=" + std::to_string(rc));
 
-            const auto bf_out = yf.get(), bc_out = yc.get();
-            size_t diff = 0, first = 0;
-            double worst = 0;
-            for (size_t i = 0; i < bc_out.size() / 2; ++i) {
-                uint16_t u, v;
-                std::memcpy(&u, bf_out.data() + 2 * i, 2);
-                std::memcpy(&v, bc_out.data() + 2 * i, 2);
-                if (u != v) { if (!diff) first = i; ++diff; }
-                worst = std::max(worst, std::fabs((double)bf(u) - bf(v)));
-            }
-            const size_t ref_bad = reference(bf_out, a, asc, w, wsc, m, N, K);
-            std::printf("M=%d bytes=%zu frozen_vs_candidate_diffs=%zu first=%ld max_abs=%.9g "
-                        "frozen_vs_int_reference_bad=%zu\n",
-                        m, bf_out.size(), diff, diff ? (long)first : -1L, worst, ref_bad);
-            if (diff) ++fails;
+            fails += judge(yf.get(), yc.get(), a, asc, w, wsc, m, N, K);
         }
     }
 

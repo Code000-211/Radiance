@@ -28,9 +28,15 @@ _cur=0
 
 bounded() {
     _seconds=$1; shift
+    _what=$1
     setsid -w timeout -k "$GRACE" "$_seconds" "$@" & _cur=$!
-    wait "$_cur"; _status=$?
+    _status=0
+    wait "$_cur" || _status=$?   # the caller's set -e must not swallow the status line below
     _cur=0
+    # Say so, rather than leaving a silent 124/137: the step and its whole group are gone by here.
+    if [ "$_status" -eq 124 ] || [ "$_status" -eq 137 ]; then
+        echo "bounded: '$_what' and its group hit the ${_seconds}s limit (status $_status)" >&2
+    fi
     return $_status
 }
 

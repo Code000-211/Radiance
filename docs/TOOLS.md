@@ -469,8 +469,11 @@ on an eighth of the rows.
 in the current format, each case keeping the laws it was recorded with. `--record-rows FILE`
 moves the fixtures' cases into the constraints of every row of the libraries under test (another
 band, tuned point or dtype) and records the reference there, described afresh: a fixture that
-reaches rows no container selects, to replay with `--all-rows`. A row whose geometry would change
-a weight's shape needs a container, and is listed.
+reaches rows no container selects, to replay with `--all-rows`. A weight whose shape the row states
+differently takes the affine encoding that description implies -- codes at the weight's dtype, a
+scale at the next operand's, one block per `group` of K, which is what a container declares for the
+formats the geometry states. A row whose weight that cannot describe needs a container, and is
+listed.
 
 ### Verdicts
 
