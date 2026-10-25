@@ -832,10 +832,12 @@ deployment identity have to be logged before a profile measured on it is compare
 
 **What is covered by tests.** The interleavings are *forced*, not sampled: a test installs a probe
 (`Scheduler::set_draft_calib_probe`) that parks a caller of the boundary at the two points the slot
-contract is about -- registered but unanswered, and answered but uncollected -- and the probe is
-called with no scheduler lock held, so the test asks, answers and closes from its own thread while
-the caller stands still. No sleep, no spinning, no contention, and nothing decides at a probe
-point: the slot is re-read under `mu_calib_` afterwards. Covered that way: the first caller is
+contract is about -- registered but unanswered, and answered but uncollected. The lock is dropped
+around those two calls only when a probe is installed, and then neither `mu_` nor `mu_calib_` is
+held, so the test asks, answers and closes from its own thread while the caller stands still; with
+no probe installed a request's lock hold is the one it had before the probe existed. No sleep, no
+spinning, no contention, and nothing decides at a probe point: the slot is re-read under `mu_calib_`
+afterwards. Covered that way: the first caller is
 answered while still uncollected, the second finds the slot taken and its epoch, the first then
 collects its own boundary and only then does the second get a boundary of its own; a close while a
 request is pending refuses it, wakes it, and no later idle point applies it; a close on top of an

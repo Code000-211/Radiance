@@ -553,10 +553,12 @@ public:
     void          draft_calib_close();
     /* Where a caller of request_draft_calib_boundary can be parked by a test: "pending" once its
      * request is in the slot and the step loop has not answered it, "answered" when the answer is
-     * here and not collected yet, "settled" when the wait ended without one. Called with no
-     * scheduler lock held -- neither mu_ nor mu_calib_ -- so a probe may call back into the
-     * boundary, and decided at neither point but re-read under the lock afterwards. Unset in a
-     * deployment; the cost when unset is one empty-function check per request. */
+     * here and not collected yet, "settled" when the wait ended without one. Reached only when a
+     * probe is set, and only then is mu_calib_ dropped around the call -- neither mu_ nor
+     * mu_calib_ is held while the test's code runs, so a probe may call back into the boundary.
+     * Neither point decides anything: the slot is re-read under the lock afterwards. Unset in a
+     * deployment, and unset costs one empty std::function check per request; with a probe set the
+     * lock hold of a request is the two short gaps around the two calls, nothing else. */
     using DraftCalibProbe = std::function<void(const char*)>;
     /* Install before the run starts, and only from a test: the interleavings this makes reachable
      * are exactly the two the slot contract is about. */

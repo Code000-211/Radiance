@@ -2922,13 +2922,17 @@ Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms)
     draft_calib_slot_.store(kCalibPending, std::memory_order_relaxed);
     const int ms = timeout_ms < 0 ? 0 : timeout_ms;
     const DraftCalibProbe probe = draft_calib_probe_;
-    /* The two points a test parks a caller at are outside mu_calib_ on purpose: the state "asked,
-     * not answered" and "answered, not collected" is then a state to stand in instead of a race to
-     * win, and a probe may call back into the boundary without deadlocking. Nothing is decided at
-     * either point -- the slot is re-read under the lock below. */
-    lk.unlock();
-    if (probe) probe("pending");
-    lk.lock();
+    /* The two points a test parks a caller at are reached only when a test installed a probe; without
+     * one the lock is not dropped here at all, so the hold stays exactly what it was before the probe
+     * existed. With one, the points are outside mu_calib_ on purpose: the state "asked, not answered"
+     * and "answered, not collected" is then a state to stand in instead of a race to win, and a probe
+     * may call back into the boundary without deadlocking. Nothing is decided at either point -- the
+     * slot is re-read under the lock afterwards. */
+    if (probe) {
+        lk.unlock();
+        probe("pending");
+        lk.lock();
+    }
     calib_cv_.wait_for(lk, std::chrono::milliseconds(ms), [&] {
         const int st = draft_calib_slot_.load(std::memory_order_relaxed);
         return st == kCalibIdle || (st == kCalibAnswered && draft_calib_slot_id_ == id);
@@ -2937,11 +2941,13 @@ Scheduler::DraftCalibAck Scheduler::request_draft_calib_boundary(int timeout_ms)
      * already here is this request's, even if it arrived just as the wait expired: the boundary
      * happened, and reporting it as "busy, nothing dropped" would be a lie. A request that is
      * still pending is withdrawn here, so a later idle point cannot apply it. */
-    const int st0 = draft_calib_slot_.load(std::memory_order_relaxed);
-    const uint64_t id0 = draft_calib_slot_id_;
-    lk.unlock();
-    if (probe) probe(st0 == kCalibAnswered && id0 == id ? "answered" : "settled");
-    lk.lock();
+    if (probe) {
+        const int      st0 = draft_calib_slot_.load(std::memory_order_relaxed);
+        const uint64_t id0 = draft_calib_slot_id_;
+        lk.unlock();
+        probe(st0 == kCalibAnswered && id0 == id ? "answered" : "settled");
+        lk.lock();
+    }
     const int st = draft_calib_slot_.load(std::memory_order_relaxed);
     if (st == kCalibAnswered && draft_calib_slot_id_ == id) {
         out = draft_calib_ack_;
