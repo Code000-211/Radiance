@@ -107,6 +107,50 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     double  draft_depth_adaptive = 0.0;
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
+    /* The cost policy's observation ledger (rad::SchedMetrics::draft_obs_*), cumulative over the
+     * server's lifetime like every source counter -- there is no reset. The first three count
+     * observation ROWS -- one per delivered request/sequence row of a cycle, not one per token
+     * position: a wider verify window adds labels inside a row, not rows, so only more delivered
+     * rows raise these -- and the cycle counter counts whole CYCLES dropped before delivery. The
+     * cost-observation counter has its own unit again: one per valid observation handed to an
+     * inactive table, which is neither a row nor a dropped cycle. The units are not a sum. */
+    int64_t draft_obs_rows_attempted = 0;
+    int64_t draft_obs_rows_applied = 0;
+    int64_t draft_obs_rows_skipped = 0;
+    int64_t draft_obs_cycles_discarded = 0;
+    int64_t draft_cost_observations_inactive = 0;
+    /* The cost policy's plan ledger (rad::SchedMetrics::draft_cost_*): cycles opened, how they
+     * ended -- priced, the named fallback, a forced calibration depth, an empty planning point, or
+     * no plan at all; they sum to `draft_cost_cycles` -- and the last plan's depth, replay
+     * candidate, source and fallback reason. `last_*` describe the last plan **with rows**
+     * (`last_rows`), so an idle or prefill step never overwrites the last real decision; a valid
+     * all-K0 plan is one of them (`last_k == 0` with `last_rows > 0`). `last_replay`,
+     * `last_source` and `last_fallback` are the names draft_types.h spells them by, never
+     * numbers. */
+    int64_t draft_cost_cycles = 0;
+    int64_t draft_cost_priced = 0;
+    int64_t draft_cost_fallback = 0;
+    int64_t draft_cost_no_plan = 0;
+    /* Planning points with no request rows: every step opens a cycle, and a pure prefill or idle
+     * step has nothing to plan over. Not a decision, not a measurement (rad::SchedMetrics). */
+    int64_t draft_cost_empty = 0;
+    int64_t draft_cost_last_k = 0;
+    int64_t draft_cost_last_replay = 0;
+    int64_t draft_cost_last_source = 0;
+    int64_t draft_cost_last_fallback = 0;
+    int64_t draft_cost_last_rows = 0;
+    /* The last issued Cost plan's priced-tier count: how many of the ladder's depths had a price
+     * when it was chosen, so "both depths compared" is distinguishable from "only the deepest
+     * was priced" (rad::SchedMetrics::draft_cost_tiers_priced). A search metric: a later resource
+     * cut or re-price does not change it. 0 unless the last plan with rows was Cost: an empty
+     * planning point leaves the last plan's ledger alone. */
+    int64_t draft_cost_tiers_priced = 0;
+    /* Forced calibration plans, and of them the ones a plan-time resource cut touched
+     * (rad::SchedMetrics::draft_calib_forced / draft_calib_cut). Not cost decisions. */
+    int64_t draft_cost_calibration = 0;
+    int64_t draft_cost_calibration_cut = 0;
+    /* Cycles a no-loan reference table refused to absorb (rad::SchedMetrics::draft_ref_skipped). */
+    int64_t draft_cost_reference_skipped = 0;
     int64_t preemptions = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step

@@ -260,6 +260,92 @@ struct Fixture {
 
 /* ================================================================== tests */
 
+/* A step's evidence is the answer its own pass gave, frozen in run_step. The draft passes that
+ * follow it share its step number and never arm the stager, so they must leave the trunk pass's
+ * record alone; the next step replaces it, which is why the engine keys its record by step number
+ * instead of reading "the last pass" after the join. */
+TEST(the_step_evidence_belongs_to_its_own_pass_and_not_to_a_later_one) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op     op = f.add_op("gemm_nt", "M", { 64 }, { k_m64 }, { "m64" },
+                             &g_gemm_schema, { w });
+    CHECK_OK(f.start());
+
+    /* Arms for a trunk pass whose batch asks for it and for nothing else: a draft pass returns
+     * early in every stager (runtime/stager.h), so it cannot legitimately change this answer. */
+    struct Armer final : rad::OpStager {
+        bool want = false;
+        bool begin_pass(const RadBatch* b) override { return want && b->draft_pass == 0; }
+        int  before_op(rad_op, RadStream, bool* resync) override {
+            *resync = false;
+            return RAD_OK;
+        }
+        int  end_pass(RadStream) override { return RAD_OK; }
+    } armer;
+    f.ctx.set_stager(&armer);
+
+    armer.want = true;
+    CHECK_OK(f.step(64, 7, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, 64));
+    }));
+    Ctx::StepEvidence ev = f.ctx.last_step_evidence();
+    CHECK_EQ(ev.step, 7);
+    CHECK(ev.staged);   /* the stager armed this pass */
+    /* No tape on the host backend: the class is the measured None, not an unknown one. */
+    CHECK_EQ((int)ev.tape, (int)Ctx::kStepTapeNone);
+
+    /* The step's own draft round: same step number, a pass the stager never arms for. If it wrote
+     * the record, `staged` would read false for a step that was staged. */
+    f.batch.draft_pass = 2;
+    CHECK_OK(f.ctx.run_step(&f.batch));
+    ev = f.ctx.last_step_evidence();
+    CHECK_EQ(ev.step, 7);
+    CHECK(ev.staged);
+
+    /* The next step's pass (on the card, issued ahead of this one's collection): the record is that
+     * step's, and the engine's keyed lookup never mistakes it for the previous step's. */
+    armer.want = false;
+    f.batch.draft_pass = 0;
+    CHECK_OK(f.step(1, 8, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, 1));
+    }));
+    ev = f.ctx.last_step_evidence();
+    CHECK_EQ(ev.step, 8);
+    CHECK(!ev.staged);
+}
+
+/* A step's bracket holds its draft passes, so its replay class is the strongest any pass in it
+ * took (Rank::note_evidence merges the trunk record with Ctx::last_pass_tape). A recording or
+ * audited draft pass must not leave its bracket filed under Play: the cost policy keeps such a
+ * bracket out of the Play bucket.
+ *
+ * The host backend has no tape (only the AQL one defines tape_begin), so this is the aggregation
+ * rule alone. That a real Play/Record/Audit pass reaches it stays the missing proof; nothing on
+ * the host produces those classes. */
+TEST(the_steps_replay_class_covers_every_pass_in_its_bracket) {
+    using T = rad::Ctx;
+    const uint8_t all[] = { T::kStepTapeNone, T::kStepTapePlay, T::kStepTapeRecord,
+                            T::kStepTapeAudit };
+    auto strength = [](uint8_t t) {
+        return t == T::kStepTapeRecord ? 3 : t == T::kStepTapeAudit ? 2
+             : t == T::kStepTapePlay   ? 1 : 0;
+    };
+    for (uint8_t a : all)
+        for (uint8_t b : all) {
+            const uint8_t want = strength(a) >= strength(b) ? a : b;
+            CHECK_EQ((int)T::merge_tape(a, b), (int)want);
+        }
+
+    /* The case the trunk-only record got wrong: a Play trunk with a drafting Record pass. */
+    CHECK_EQ((int)T::merge_tape(T::kStepTapePlay, T::kStepTapeRecord), (int)T::kStepTapeRecord);
+    /* And the direction the trunk alone already caught: an audited trunk stays audited. */
+    CHECK_EQ((int)T::merge_tape(T::kStepTapeAudit, T::kStepTapePlay), (int)T::kStepTapeAudit);
+}
+
 /* Bucket boundaries are the constraint values and a band is inclusive at its upper bound (spec
  * §2.2). Off by one here means a prefill kernel running at M=1, a loss invisible in the output. */
 TEST(bucket_table_indexes_at_band_boundaries) {

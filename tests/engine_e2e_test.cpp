@@ -22,6 +22,7 @@
 #include "rad_test.h"
 #include "tiny_golden.h"
 #include "tiny_model.h"
+#include "tiny_moe.h"
 
 #include "mm/media.h"
 #include "server/oai.h"
@@ -32,6 +33,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <cerrno>
 #include <condition_variable>
@@ -163,6 +165,59 @@ std::string tail(const std::string& log, int n = 12) {
     size_t at = log.size();
     for (int i = 0; i <= n && at != std::string::npos && at > 0; ++i) at = log.rfind('\n', at - 1);
     return at == std::string::npos || at >= log.size() ? log : log.substr(at + 1);
+}
+
+/* One line of the scheduler's per-request cost ledger:
+ *   draft policy: req <id> over <cycles> cost cycle(s), <unpriced> without a priced candidate;
+ *   priced tiers per cycle <tier>:<n> ...
+ * Parsed, not searched: the claim below is about the request it names, so the line has to be
+ * picked by its id rather than by whichever line happens to hold the substring. */
+struct CostLine {
+    bool found = false;
+    int  id = 0;
+    int  cycles = 0;
+    int  unpriced = 0;
+    int  binned = 0;
+    int  bins[8] = {};
+};
+CostLine parse_cost_line(const std::string& log) {
+    CostLine r;
+    size_t at = log.find("draft policy: req ");
+    if (at == std::string::npos) return r;
+    const char* p = log.c_str() + at + strlen("draft policy: req ");
+    char* end = nullptr;
+    r.id = (int)strtol(p, &end, 10);
+    p = strstr(end, " over ");
+    if (!p) return r;
+    r.cycles = (int)strtol(p + strlen(" over "), &end, 10);
+    p = strstr(end, ", ");
+    if (!p) return r;
+    r.unpriced = (int)strtol(p + 2, &end, 10);
+    p = strstr(end, "priced tiers per cycle ");
+    if (!p) return r;
+    p += strlen("priced tiers per cycle ");
+    for (;;) {
+        const int bin = (int)strtol(p, &end, 10);
+        if (end == p || *end != ':') break;
+        p = end + 1;
+        const int n = (int)strtol(p, &end, 10);
+        if (end == p) break;
+        if (bin >= 0 && bin < 8) { r.bins[bin] = n; r.binned += n; }
+        p = end;
+        if (*p != ' ') break;
+        ++p;
+    }
+    r.found = true;
+    return r;
+}
+
+/* Every ledger line the run wrote, one per request. */
+std::vector<CostLine> cost_lines(const std::string& log) {
+    std::vector<CostLine> out;
+    const std::string tag = "draft policy: req ";
+    for (size_t at = log.find(tag); at != std::string::npos; at = log.find(tag, at + tag.size()))
+        out.push_back(parse_cost_line(log.substr(at)));
+    return out;
 }
 
 #define REQUIRE_RAN(r)                                                                  \
@@ -479,6 +534,12 @@ struct Server {
 struct Call {
     int fd = -1;
     std::string why;
+    /* A read that makes no progress for this long fails instead of blocking (0 = wait forever),
+     * and `timed_out` says it did. A stream must end on its own, so the case that watches one
+     * gives up here rather than hanging the suite. */
+    int timeout_s = 0;
+    bool timed_out = false;
+    std::string head;   /* the response head, lowercased, once one arrived */
     bool fail(const char* what) {
         why = std::string(what) + ": " + std::strerror(errno);
         return false;
@@ -491,6 +552,11 @@ struct Call {
         a.sin_port = htons((uint16_t)port);
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(fd, (sockaddr*)&a, sizeof a) != 0) return fail("connect");
+        if (timeout_s > 0) {
+            timeval tv{};
+            tv.tv_sec = timeout_s;
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        }
         std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
                           "Connection: close\r\nContent-Type: application/json\r\n" +
                           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -509,6 +575,7 @@ struct Call {
         for (;;) {
             const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
             if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) timed_out = true;
             if (n < 0) err = errno;
             if (n <= 0) break;
             raw.append(buf, (size_t)n);
@@ -522,9 +589,10 @@ struct Call {
                        : std::string("closed it"));
             return -1;
         }
-        std::string head = raw.substr(0, h), rest = raw.substr(h + 4);
-        for (char& c : head) c = (char)std::tolower((unsigned char)c);
-        if (head.find("transfer-encoding: chunked") != std::string::npos) {
+        std::string hd = raw.substr(0, h), rest = raw.substr(h + 4);
+        for (char& c : hd) c = (char)std::tolower((unsigned char)c);
+        head = hd;
+        if (hd.find("transfer-encoding: chunked") != std::string::npos) {
             std::string out;
             for (size_t at = 0;;) {
                 const size_t eol = rest.find("\r\n", at);
@@ -552,6 +620,55 @@ json post(int port, const std::string& path, const json& body, int* status = nul
     return json::parse(out, nullptr, false);
 }
 
+/* One streamed `/v1/completions` request, read to the end of its stream. `timed_out` says the
+ * server left the stream open rather than ending it. */
+struct Streamed {
+    int status = -1;
+    bool timed_out = false;
+    std::string head;   /* the response head, lowercased */
+    std::string body;   /* the decoded chunked body */
+    std::string why;
+};
+
+Streamed stream_completion(int port, const std::vector<int32_t>& prompt, int n, double temp,
+                           int64_t seed) {
+    json b = { { "prompt", prompt }, { "max_tokens", n }, { "temperature", temp },
+               { "ignore_eos", true }, { "stream", true } };
+    if (seed) b["seed"] = seed;
+    Streamed s;
+    Call c;
+    c.timeout_s = 60;
+    s.status = c.send(port, "POST", "/v1/completions", b.dump()) ? c.read(&s.body) : -1;
+    s.head = c.head;
+    s.timed_out = c.timed_out;
+    s.why = c.why;
+    return s;
+}
+
+/* The `data:` payloads of an event stream, and whether every event was framed as one. */
+std::vector<std::string> stream_payloads(const std::string& body, bool* framed) {
+    std::vector<std::string> out;
+    *framed = true;
+    for (size_t i = 0; i < body.size();) {
+        const size_t end = body.find("\n\n", i);
+        if (end == std::string::npos || body.compare(i, 6, "data: ") != 0) {
+            *framed = false;
+            break;
+        }
+        out.push_back(body.substr(i + 6, end - i - 6));
+        i = end + 2;
+    }
+    return out;
+}
+
+/* A running server's /stats document (a GET route; `post` would be refused), or null. */
+json stats(int port) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/stats", "") || c.read(&out) != 200) return json();
+    return json::parse(out, nullptr, false);
+}
+
 /* A counter from /metrics, or -1. */
 double metric(int port, const std::string& name) {
     Call c;
@@ -566,6 +683,20 @@ double metric(int port, const std::string& name) {
         return std::atof(out.c_str() + sp + 1);
     }
     return -1;
+}
+
+/* How many draft positions the run evaluated, or -1: /metrics exports one
+ * radiance:draft_position_reached_total line per position the engine drafted to, so the line count
+ * is the deepest verify window the run executed. */
+int draft_positions(int port) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/metrics", "") || c.read(&out) != 200) return -1;
+    const std::string tag = "radiance:draft_position_reached_total{";
+    int n = 0;
+    for (size_t at = 0; (at = out.find(tag, at)) != std::string::npos; at += tag.size())
+        if (at == 0 || out[at - 1] == '\n') ++n;
+    return n;
 }
 
 /* A completion of `n` tokens from token ids: greedy unless `temp` is set, end-of-text ignored so
@@ -1787,6 +1918,476 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
     CHECK_EQ(spec.stop(), 0);
 }
 
+/* --draft-profile-out end to end: a cost serving run with a serial assistant head measures the
+ * draft cycles one real request runs -- the start cycle included -- exports them on the orderly
+ * SIGTERM shutdown, and a fresh start of the same deployment -- which derives its own runtime
+ * identity -- binds the file and prices its own request from it. Nothing here writes a bucket by
+ * hand: the reader, the writer and the recording ring have their own fixtures (engine_profile_test,
+ * sched_draft_test); this case proves that the numbers in the file came out of this run, and that a
+ * reloaded deployment decides with them.
+ *
+ * The calibration runs the Cost policy with a record-only table: it issues the named fallback at
+ * its ceiling (2), because it has no prices to decide with, and that is exactly the baseline it
+ * measures. The ladder is cut to 0,2 for it: a tier above the ceiling is refused by the planner, and
+ * the default ladder ends at 6. This is the only way to file the start cycle: under Cost a cycle
+ * prices the verify window the previous plan published, and a request's first cycle has nothing to
+ * verify, so its shape is keyed verify_k = 0 -- a cycle legacy drafting, which verifies what it
+ * drafts in the same step, never executes.
+ *
+ * The reload runs a ceiling of 6 but offers tiers 0,2: the deepest plan of its batch must be the
+ * one the profile prices. With the default ladder the deepest tier would be 6, which the file
+ * cannot price, and Stage 1's coverage rule would take the named baseline at the executable depth
+ * (6) rather than let the priced 2 win -- a missing measurement is not a price advantage. So the
+ * reload's first cycle finds the measured start bucket (verify_k = 0 at draft_k = 2) and takes it;
+ * every later cycle verifies the 2-token window it published, which the calibration also measured.
+ * Nothing can name 2 but the loaded profile -- the fallback would draft 6 -- so the executed window
+ * is the proof. The export lists one position per drafted slot, so the priced depth 2 is two of
+ * them and the fallback would be six. */
+TEST(a_serving_run_exports_the_cycles_a_request_measured_and_a_second_run_binds_them) {
+    /* A calibration run needs its own checkpoint (the assistant head lives in draft/), and the
+     * shared World has none with a drafter. */
+    tiny::TempDir dir("profile_out");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "profile.json";
+
+    Server calib;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile-out", out };
+        REQUIRE(calib.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json reply = post(calib.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the request failed: %s\n%s\n", why.c_str(),
+                tail(calib.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
+
+    /* SIGTERM is the orderly shutdown: the request drains, serve() returns RAD_OK and the export
+     * runs after the step threads joined. A run that cannot price a bucket from its own cycles
+     * fails the export here, with the reason in the log. */
+    const int calib_exit = calib.stop();
+    const std::string calib_log = calib.output();
+    if (calib_exit != 0)
+        fprintf(stderr, "    the calibration run exited %d:\n%s\n", calib_exit,
+                tail(calib_log).c_str());
+    REQUIRE_EQ(calib_exit, 0);
+    CHECK(calib_log.find("bucket(s), fingerprint") != std::string::npos);
+
+    const json profile = json::parse(tiny::read_text(out), nullptr, false);
+    REQUIRE(profile.is_object());
+    const json buckets = profile.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    REQUIRE(!buckets.empty());
+    /* One bucket the table may price from: no disturbing flag (ahead is not one) and a positive
+     * mean over at least one measurement -- the rule the export and estimate() share. */
+    bool usable = false;
+    for (const json& b : buckets) {
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        usable = usable || (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
+    }
+    CHECK(usable);
+
+    /* The reload. A fresh process derives the identity from the same deployment and must bind the
+     * file; the log names the match. */
+    Server cost;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "6",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile", out };
+        REQUIRE(cost.start(dir.path, a));
+    }
+    const std::string cost_log = cost.output();
+    if (cost_log.find("buckets match this deployment") == std::string::npos)
+        fprintf(stderr, "    the second run did not bind the profile:\n%s\n", tail(cost_log).c_str());
+    CHECK(cost_log.find("buckets match this deployment") != std::string::npos);
+    CHECK(cost_log.find("is not used for this deployment") == std::string::npos);
+
+    /* The start cycle the reload's first plan has to price was measured: nothing preceded it, so
+     * its shape is keyed verify_k = 0 with verify_tokens = 1 and history_tokens = 1, at the depth
+     * the calibration drafted. A reload from a file without it cannot price its first cycle at
+     * all. */
+    bool first_cycle_known = false;
+    for (const json& b : buckets) {
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0) continue;
+        first_cycle_known = true;
+        CHECK_EQ(shape.value("verify_tokens", -1), 1);
+        CHECK_EQ(shape.value("history_tokens", -1), 1);
+        CHECK_EQ(shape.value("draft_k", -1), 2);
+    }
+    CHECK(first_cycle_known);
+
+    /* The reload serves a real request and decides on it. Its first cycle finds the start bucket
+     * (verify_k = 0 at draft_k = 2) and every later cycle verifies the window that plan published,
+     * which the calibration measured too. Only the loaded profile can name a depth of 2: the
+     * fallback would draft the ceiling, 6. The exported positions are the deepest window the run
+     * drafted, so two of them (0, 1) is the priced depth and six would be the fallback. */
+    const json served = post(cost.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the second run failed the request: %s\n%s\n", why.c_str(),
+                tail(cost.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+    const int positions = draft_positions(cost.port);
+    if (positions != 2)
+        fprintf(stderr, "    the reloaded run drafted %d positions, not the priced depth 2 "
+                        "(6 positions = the fallback ceiling):\n%s\n",
+                positions, tail(cost.output()).c_str());
+    CHECK_EQ(positions, 2);
+    CHECK_EQ(cost.stop(), 0);
+}
+
+/* A serving run whose reference profile cannot price a shape, through the writer -> file -> reader
+ * path with a real no-loan reference. The writer calibrates with --draft-reference (both lenders
+ * off); the file says `basis: "no-loan"` and carries no live loan. The reader binds it with
+ * --draft-profile and may price only the exact shapes the writer measured -- a reference is
+ * Measured-only.
+ *
+ * The ladder's top is K2 while the executable depth is K6, so a shape the reference does not hold
+ * has no priceable plan. What the cycle drafts then is the named baseline -- the ladder's middle
+ * tier by default, which here is the ladder's own top, K2: an offered depth, so the sample it
+ * learns is queryable by this ladder later. The same deployment with `--draft-fallback-k 6` names a
+ * depth the ladder never offers and is refused at startup instead, where the operator can read it.
+ *
+ * Two requests per run: the first has a shape the reference did not measure (it is Sampled, the
+ * writer measured Greedy), the second does not. Both are served, at the priced depth and at the
+ * baseline respectively -- and the per-request ledger says which of the two cycles was which. */
+TEST(a_serving_run_drafts_the_ladders_middle_for_a_shape_the_reference_cannot_price) {
+    tiny::TempDir dir("ref_gap");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "reference.json";
+
+    /* The writer: a real reference export, and it serves normally (a calibration records, it does
+     * not price its own cycles, so it drafts the named baseline at K2 and learns). */
+    Server writer;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile-out", out,
+                                             "--draft-reference" };
+        REQUIRE(writer.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt, 24), &status, &why);
+    if (status != 200)
+        fprintf(stderr, "    the reference writer failed the request: %s\n%s\n", why.c_str(),
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the reference writer exited %d:\n%s\n", writer_exit,
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+
+    const json profile = json::parse(tiny::read_text(out), nullptr, false);
+    REQUIRE(profile.is_object());
+    const json fp = profile.value("fingerprint", json::object());
+    CHECK_EQ(fp.value("basis", std::string()), std::string("no-loan"));
+    CHECK(!fp.contains("live_loan"));      /* a no-loan reference names no loan */
+    REQUIRE(!profile.value("buckets", json::array()).empty());
+
+    /* The ladder's top is K2 and the baseline is left at its default, which is the ladder's own
+     * middle tier (K2) -- an offered depth. */
+    {
+        Server reader;
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-profile", out };
+        REQUIRE(reader.start(dir.path, args));
+        const std::string bound = reader.output();
+        if (bound.find("basis no-loan") == std::string::npos)
+            fprintf(stderr, "    the reader did not bind the reference:\n%s\n", tail(bound).c_str());
+        CHECK(bound.find("basis no-loan") != std::string::npos);
+
+        /* The priced request: the writer measured this shape, so the run drafts the ladder's top
+         * -- two positions, not six. */
+        const json served = post(reader.port, "/completion", completion(prompt, 24), &status, &why);
+        if (status != 200)
+            fprintf(stderr, "    the priced request failed: %s\n%s\n", why.c_str(),
+                    tail(reader.output()).c_str());
+        REQUIRE_EQ(status, 200);
+        REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+        CHECK_EQ(draft_positions(reader.port), 2);
+
+        /* The unmeasured one: Sampled, and the reference measured Greedy. Nothing prices it, so the
+         * cycle drafts the baseline -- K2, an offered depth -- and the request is served. Under the
+         * old ceiling baseline this same request killed the run. */
+        const json unpriced =
+            post(reader.port, "/completion", completion(prompt, 24, 0.7, 7), &status, &why);
+        if (status != 200)
+            fprintf(stderr, "    the unpriced request was not served (%d: %s):\n%s\n", status,
+                    why.c_str(), tail(reader.output()).c_str());
+        CHECK_EQ(status, 200);
+        CHECK_EQ(tokens_of(unpriced).size(), (size_t)24);
+        CHECK_EQ(draft_positions(reader.port), 2);   /* still the ladder's top, not six */
+        CHECK_EQ(reader.stop(), 0);                  /* the run did not stop on the unpriced cycle */
+
+        /* Both requests ended in a ledger line, one line each, and the lines are read by id: the
+         * unpriced request is the later of the two, and its own line -- not a substring of the
+         * log -- must say that every cycle it took part in priced no tier at all. That is the
+         * counter the chosen depth cannot tell apart from a decision. */
+        const std::string log = reader.output();
+        const std::vector<CostLine> lines = cost_lines(log);
+        if (lines.size() != 2)
+            fprintf(stderr, "    %zu ledger line(s) for two requests:\n%s\n", lines.size(),
+                    tail(log, 30).c_str());
+        REQUIRE_EQ(lines.size(), (size_t)2);
+        for (const CostLine& l : lines) {
+            CHECK(l.found);
+            CHECK(l.cycles > 0);
+            CHECK(l.unpriced >= 0);
+            CHECK(l.unpriced <= l.cycles);
+            /* The line's own arithmetic: every cycle is counted once in a bin, and a cycle with no
+             * priced tier is one of the zero-tier ones. */
+            CHECK_EQ(l.binned, l.cycles);
+            CHECK_EQ(l.bins[0], l.unpriced);
+        }
+        const CostLine& priced   = lines[0].id < lines[1].id ? lines[0] : lines[1];
+        const CostLine& unprice  = lines[0].id < lines[1].id ? lines[1] : lines[0];
+        CHECK(priced.id != unprice.id);
+        CHECK(unprice.unpriced == unprice.cycles);      /* nothing priced, every cycle */
+        CHECK(unprice.bins[0] == unprice.cycles);
+        CHECK(priced.unpriced < priced.cycles);         /* the measured shape priced somewhere */
+        CHECK(priced.bins[0] < priced.cycles);
+        CHECK(log.find("deepest offered tier K2") == std::string::npos);   /* no gap refused */
+    }
+
+    /* The depth the ladder never offers, named by name: refused at startup, before a request is
+     * admitted, instead of after the first unpriceable shape hours into a serving run. */
+    {
+        Server reader;
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-fallback-k", "6",
+                                                "--draft-profile", out };
+        const bool started = reader.start(dir.path, args);
+        const std::string log = reader.output();
+        if (started)
+            fprintf(stderr, "    the baseline above the ladder was accepted:\n%s\n", tail(log).c_str());
+        CHECK(!started);
+        CHECK(log.find("the draft baseline K6 is above the ladder's top tier K2") !=
+              std::string::npos);
+    }
+
+    /* A profile written for another deployment -- here the same one with one fingerprint field
+     * changed -- is refused at startup too, before a request is admitted: `configure` keeps the
+     * table inactive and names the field that differs. That is why this cannot carry an HTTP-facing
+     * seam: there is no request, no cycle and no response to fail. */
+    {
+        json stale = profile;
+        stale["fingerprint"]["kernels"] = "another-kernel-set";
+        const std::string stale_path = dir / "stale.json";
+        REQUIRE(tiny::write_text(stale_path, stale.dump(2)));
+        Server reader;
+        const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                                "--draft-depth-tiers", "0,2",
+                                                "--draft-window", "fixed",
+                                                "--draft-policy", "cost",
+                                                "--draft-profile", stale_path };
+        const bool started = reader.start(dir.path, args);
+        const std::string log = reader.output();
+        if (started)
+            fprintf(stderr, "    the foreign profile was accepted:\n%s\n", tail(log).c_str());
+        CHECK(!started);
+        CHECK(log.find("profile fingerprint differs: kernels") != std::string::npos);
+    }
+}
+
+/* The same two cycles on the streaming path: `stream: true` commits 200 and the event-stream
+ * headers before the first token, so what a client gets there is decided per request. A priced
+ * request and an unmeasured one are both served whole, framed, and end in exactly one terminator
+ * with no error event -- the baseline cycle is not a failure. (A stream the engine really fails, and
+ * the failure event it ends in, is server_test.cpp's `a_failed_stream_ends_in_its_apis_own_failure`;
+ * a baseline cycle no longer produces one, so there is nothing to trigger it here.) */
+TEST(a_streaming_run_serves_the_ladder_middle_for_a_shape_the_reference_cannot_price) {
+    tiny::TempDir dir("ref_gap_stream");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.assistant = true;
+    REQUIRE(tiny::write_gemma4(dir.path, s));
+    const std::string out = dir / "reference.json";
+
+    Server writer;
+    {
+        const std::vector<std::string> a = { "--num-speculative-tokens", "2",
+                                             "--draft-depth-tiers", "0,2",
+                                             "--draft-window", "fixed",
+                                             "--draft-policy", "cost",
+                                             "--draft-profile-out", out,
+                                             "--draft-reference" };
+        REQUIRE(writer.start(dir.path, a));
+    }
+    const std::vector<int32_t> prompt = prompt_ids(9, 64);
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt, 24), &status, &why);
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the reference writer exited %d:\n%s\n", writer_exit,
+                tail(writer.output()).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+
+    Server reader;
+    const std::vector<std::string> args = { "--num-speculative-tokens", "6",
+                                            "--draft-depth-tiers", "0,2",
+                                            "--draft-window", "fixed",
+                                            "--draft-policy", "cost",
+                                            "--draft-profile", out };
+    REQUIRE(reader.start(dir.path, args));
+
+    /* What a stream served whole has to look like: the committed 200 and event-stream headers, well
+     * framed events, no error event, and the terminator last. */
+    auto check_served_stream = [](const Streamed& r, const char* which) {
+        if (r.timed_out)
+            fprintf(stderr, "    the %s stream never ended: no progress for 60 s\n", which);
+        CHECK(!r.timed_out);
+        if (r.status != 200)
+            fprintf(stderr, "    the %s stream was answered with status %d (%s)\n", which, r.status,
+                    r.why.c_str());
+        CHECK_EQ(r.status, 200);
+        CHECK(r.head.find("content-type: text/event-stream") != std::string::npos);
+
+        bool framed = true;
+        const std::vector<std::string> payloads = stream_payloads(r.body, &framed);
+        if (!framed)
+            fprintf(stderr, "    the %s stream is not well framed:\n%s\n", which, r.body.c_str());
+        CHECK(framed);
+
+        int errors = 0;
+        bool finished = false;
+        for (const std::string& p : payloads) {
+            if (p == "[DONE]") continue;
+            const json j = json::parse(p, nullptr, false);
+            if (!j.is_object()) { framed = false; continue; }
+            if (j.contains("error")) { ++errors; continue; }
+            if (!j.contains("choices") || j["choices"].empty()) continue;
+            const json& f = j["choices"][0]["finish_reason"];
+            if (f.is_string() && (f.get<std::string>() == "stop" ||
+                                  f.get<std::string>() == "length"))
+                finished = true;
+        }
+        CHECK(framed);
+        CHECK_EQ(errors, 0);
+        CHECK(finished);                     /* the stream says how it ended */
+        CHECK(!payloads.empty() && payloads.back() == "[DONE]");
+        CHECK(payloads.size() >= 2);
+    };
+
+    /* The priced request, then the unmeasured one: both served, both at the ladder's top. */
+    check_served_stream(stream_completion(reader.port, prompt, 24, 0.0, 0), "priced");
+    CHECK_EQ(draft_positions(reader.port), 2);
+    check_served_stream(stream_completion(reader.port, prompt, 24, 0.7, 7), "unpriced");
+    CHECK_EQ(draft_positions(reader.port), 2);   /* the baseline, not the ceiling */
+
+    const std::string log = reader.output();
+    CHECK(log.find("without a priced candidate") != std::string::npos);
+    CHECK(log.find("deepest offered tier K2") == std::string::npos);
+    const int reader_exit = reader.stop();
+    if (reader_exit != 0)
+        fprintf(stderr, "    the reading run exited %d:\n%s\n", reader_exit, tail(log).c_str());
+    CHECK_EQ(reader_exit, 0);
+}
+
+/* The start path's lender registration, on a model that can lend at all. A model that can lend
+ * needs conditional units: only MoE experts are RAD_ACCESS_CONDITIONAL. Conditional units can also
+ * be resident and movable (core/place/planner.cpp sets `mu.movable` on the resident fill too), but
+ * for lending the pinned ones count here: `Mover::lend_from` carves slots only for HostPinned,
+ * movable units (core/place/mover.cpp). tests/tiny_moe.h adds that routed arm to the dense Gemma4
+ * trunk; the device is sized so that not every expert fits and --host-pool-mib holds the rest, so
+ * the start has slots to offer.
+ *
+ * Observed where it acts, not through the export and not through a loan a request holds: `/stats`
+ * reports the mover's own count (experts.flex_capacity, Mover::count_flex) and the startup line
+ * names the slots it carved. Both are facts about the registration this start made.
+ *
+ * The reference twin that would show the same start registering nothing does not run today, so
+ * this case pins the precondition it needs: --draft-reference requires --draft-profile-out
+ * (core/engine.cpp:1922), which requires a serial draft head (core/engine.cpp:1951). gemma4 -- the
+ * only plugin these tiny checkpoints can reach that declares conditional experts -- has a DFlash
+ * block drafter at most (arch/common/rad_gemma4_dflash.h:628), and the plugin that carries the
+ * serial assistant head refuses any checkpoint with experts
+ * (arch/gemma4_bf16/gemma4_bf16.cpp:1632). An arch that is both routed and serial-drafted exists
+ * (qwen35moe_fp8's MTP, qwen4exp_fp8, glm5next), but no tiny fixture writes one. The discriminating
+ * pair stays open until a deployment is both. */
+TEST(the_live_start_offers_its_experts_a_positive_loan) {
+    tiny::TempDir dir("moe");
+    REQUIRE(dir.ok());
+    tiny::Gemma4 s;
+    s.layers          = 2;
+    s.hidden          = 128;
+    s.heads           = 4;
+    s.kv_heads        = 2;
+    s.head_dim        = 32;
+    s.ffn             = 256;
+    s.global_head_dim = 64;
+    s.global_kv_heads = 1;
+    s.window          = 32;
+    s.vocab           = 320;
+    s.ctx             = 4096;
+    REQUIRE(tiny::write_gemma4_moe(dir.path, s, /*experts*/ 8, /*top_k*/ 2, /*moe_ffn*/ 1024));
+
+    /* 4096 tokens of context so one layer's stripe of the full-attention group (1 MiB) can hold an
+     * expert slot (768 KiB); a shorter context leaves a stripe no slot fits in, and the start
+     * would offer nothing even though the model can lend. */
+    const std::vector<std::string> args = { "--placement", "expert_tiered",
+                                            "--host-pool-mib", "96",
+                                            "--gpu-headroom-mib", "0",
+                                            "--max-model-len", "4096",
+                                            "--max-num-seqs", "1",
+                                            "--max-num-batched-tokens", "32",
+                                            "--no-prefix-cache" };
+    Server live;
+    REQUIRE(live.start(dir.path, args, device_env(32)));
+    const json st = stats(live.port);
+    const int live_exit = live.stop();
+    const std::string log = live.output();
+    REQUIRE(st.is_object() && st.contains("experts"));
+    const json& e = st["experts"];
+
+    /* The model is one that can lend: movable conditional experts, some of them in the pinned
+     * pool, with the heat engine on. */
+    CHECK_EQ(e.value("heat", false), true);
+    CHECK(e.value("movable", 0) > 0);
+    int pinned = 0;
+    for (const json& t : e.value("tiers", json::array()))
+        if (t.value("name", "") == "pinned") pinned = t.value("units", 0);
+    CHECK(pinned > 0);
+
+    /* The registration: the cache's two lendable stripes offer one expert slot each, and the start
+     * says so. A run that carved nothing reports 0 here and "nothing is lent" in its log. */
+    CHECK_EQ(e.value("flex_capacity", -1.0), 2.0 * 768.0 * 1024.0);
+    CHECK(log.find("is lent to the experts while no request holds it") != std::string::npos);
+    CHECK_EQ(live_exit, 0);
+}
+
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones
  * over the whole prompt. Each decoded position's probabilities must be what a cold prefill of the
  * prompt and the tokens before it gives: exactly where both paths compute each row the same way
@@ -2027,6 +2628,566 @@ TEST(an_unconverted_qwen_image_pipeline_serves_the_containers_picture) {
     const Picture conv = generate(q.bf16, { "libavx" }, false, 7, 3);
     REQUIRE(!direct.rgba.empty() && !conv.rgba.empty());
     CHECK(direct.png == conv.png);
+}
+
+/* The reference basis end to end, on the only plugin a tiny checkpoint can reach that declares
+ * both a routed feed-forward and a serial drafter (tests/tiny_moe.h: write_qwen35_moe;
+ * arch/qwen35moe_fp8 with its `mtp.` head).
+ *
+ * Three starts on the same checkpoint, placement and batch flags:
+ *   live       the start-time lender carves slots out of the KV cache and offers them to the
+ *              experts ("N slots can be lent out of the KV cache ..."); /stats reports that
+ *              capacity. It runs the default (legacy) draft policy.
+ *   reference  adds `--draft-reference --draft-policy cost --draft-profile-out`: both lenders stay
+ *              off -- "nothing is lent: it is all the cache's" -- one real request records a draft
+ *              cycle, and the run writes the profile. The export refuses a reference that lent
+ *              anything (core/engine.cpp:2008-2022), so a file that exists is the proof the two
+ *              starts really differed.
+ *   cost       loads that file in normal operation (`--draft-policy cost --draft-profile`), the
+ *              way a serving deployment would: the run binds it, lends for real, and serves a
+ *              request. The bind is also the live placement comparison -- a table refuses any
+ *              fingerprint or execution difference -- so the log's no-loan binding line says the
+ *              file was measured on exactly this deployment.
+ *
+ * This deployment has no activation-arena level: the plugin answers a sizing declare, but a level
+ * is only planned above 256 rows and the budget here is 64. So `arena` is "none" in the file --
+ * the name for a deployment with no level, not a missing field, and not a statement about the KV
+ * loan. The loan is the separate `live_loan` field,
+ * which a no-loan reference omits by construction; `placement` names the plan it was derived
+ * under.
+ *
+ * The depth the reload chooses is not proof of the profile decision here: the loan moves experts
+ * inside the request, the calibration leaves every cycle after such a move out, and the fallback
+ * runs at the same ceiling anyway. The case after this one makes that decision observable on a
+ * plan with nothing movable. */
+TEST(the_reference_basis_is_measured_on_a_model_that_can_lend) {
+    tiny::TempDir dir("qmoe_ref");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    /* A whole 128-column block per head: without the GPU's fused `gate_quant_fp8` the fp8 gated
+     * attention falls back to sigmoid + mul + the activation quantiser, and the block declares
+     * that fallback only where a head is whole 128-blocks wide
+     * (arch/common/rad_block_attn_gated_fp8.h: gate_pair). */
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    /* A card that cannot hold the expert plane beside the cache: the tiered placement keeps the
+     * routed units in the pinned host pool, which is exactly the state the KV lender serves. A
+     * card the whole plane fits on lends nothing, so the size is part of the case. 64 batched
+     * tokens is the chunk this geometry's gdn_conv_prep needs. */
+    const std::vector<std::string> common = { "--num-speculative-tokens", "2",
+                                              "--placement", "expert_tiered",
+                                              "--host-pool-mib", "96",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+
+    /* ---- the live twin: the cache lends what no request holds ---- */
+    Server live;
+    REQUIRE(live.start(dir.path, common, device_env(32)));
+    const json st = stats(live.port);
+    const int live_exit = live.stop();
+    const std::string live_log = live.output();
+    CHECK_EQ(live_exit, 0);
+    CHECK(live_log.find("slots can be lent out of the KV cache") != std::string::npos);
+    CHECK(live_log.find("is lent to the experts while no request holds it") != std::string::npos);
+    CHECK(live_log.find("nothing is lent: it is all the cache's") == std::string::npos);
+    REQUIRE(st.is_object() && st.contains("experts"));
+    CHECK(st["experts"].value("flex_capacity", -1.0) > 0.0);
+
+    /* ---- the reference twin: both lenders off, one request, the profile written ---- */
+    const std::string profile = dir.path + "/reference.json";
+    std::vector<std::string> ref = common;
+    ref.insert(ref.end(), { "--draft-reference", "--draft-policy", "cost", "--draft-profile-out",
+                            profile });
+    Server basis;
+    REQUIRE(basis.start(dir.path, ref, device_env(32)));
+    int status = 0;
+    std::string why;
+    const json reply =
+        post(basis.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(reply).size() != 24)
+        fprintf(stderr, "    the reference run's request answered status %d (%s): %s\n", status,
+                why.c_str(), reply.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
+    const int ref_exit = basis.stop();
+    const std::string ref_log = basis.output();
+    CHECK_EQ(ref_exit, 0);
+    CHECK(ref_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const std::string body = tiny::read_text(profile);
+    REQUIRE(!body.empty());
+    const json p = json::parse(body, nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", ""), std::string("no-loan"));
+    /* The identity the file is bound to: the arch id the loader resolved, the deployment's
+     * parallelism and wire, the card, the kernel set, the KV format, and the resolved plan (not
+     * the flag -- `placement` is strategy, budgets and a digest of the residency). */
+    CHECK_EQ(fp.value("model", ""), std::string("qwen35moe"));
+    CHECK_EQ(fp.value("quant", ""), std::string("fp8_e4m3"));
+    CHECK_EQ(fp.value("tp", -1), 1);
+    CHECK_EQ(fp.value("tp_wire", ""), std::string("n/a"));
+    CHECK(!fp.value("gpus", "").empty());
+    CHECK(fp.value("kernels", "").find("qwen35moe") != std::string::npos);
+    CHECK_EQ(fp.value("kv_format", ""), std::string("bf16"));
+    const std::string placement = fp.value("placement", "");
+    CHECK(placement.rfind("expert_tiered ", 0) == 0);
+    CHECK(placement.find("dyn=1") != std::string::npos);
+    /* No level plan in this plugin: "none" is the identity the file records. It is not the loan --
+     * that is `live_loan`, which a no-loan reference omits by construction. */
+    CHECK_EQ(fp.value("arena", ""), std::string("none"));
+    CHECK(!fp.contains("live_loan"));
+    /* A serial head runs one dependent pass a token, so every cycle is a shrinking round. */
+    CHECK_EQ(p.value("execution", ""), std::string("shrinking"));
+
+    /* The bucket the reload's first plan prices: the exact start shape -- verify_k 0, one token of
+     * verify and history, at the depth the calibration runs (the ceiling, K2) -- and it has to be
+     * usable by the rule estimate() shares with the export: no disturbing flag (`ahead` is not
+     * one), a positive mean and at least one measurement. A verify_k = 0 row is also an ordinary
+     * decode step that drafted nothing, so the shape is matched field by field; a bucket that is
+     * not this start is not failed here, it is simply not the one the policy looks up. */
+    const json buckets = p.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    REQUIRE(!buckets.empty());
+    bool start_priced = false;
+    for (const json& b : buckets) {
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0 || shape.value("verify_tokens", -1) != 1 ||
+            shape.value("history_tokens", -1) != 1 || shape.value("draft_k", -1) != 2 ||
+            shape.value("drafter", std::string()) != std::string("serial"))
+            continue;
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        const bool usable = clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1;
+        if (!usable)
+            fprintf(stderr, "    the start bucket is not usable: %s\n", b.dump().c_str());
+        start_priced = start_priced || usable;
+    }
+    if (!start_priced)
+        fprintf(stderr, "    the exported profile holds no usable start bucket:\n%s\n",
+                buckets.dump().c_str());
+    CHECK(start_priced);
+
+    /* ---- the cost twin: normal operation, the exported file bound, a real request ---- */
+    std::vector<std::string> cost = common;
+    cost.insert(cost.end(), { "--draft-policy", "cost", "--draft-profile", profile });
+    Server run;
+    REQUIRE(run.start(dir.path, cost, device_env(32)));
+    const std::string run_log = run.output();
+    /* The no-loan file loading on a serving run that lends: the engine's own comparison of the
+     * fingerprint and the execution. The other branch is the refusal. */
+    if (run_log.find("basis no-loan -- an optimisation basis") == std::string::npos)
+        fprintf(stderr, "    the cost run did not bind the profile:\n%s\n", tail(run_log).c_str());
+    CHECK(run_log.find("basis no-loan -- an optimisation basis") != std::string::npos);
+    CHECK(run_log.find("is not used for this deployment") == std::string::npos);
+    CHECK(run_log.find("slots can be lent out of the KV cache") != std::string::npos);
+    CHECK(run_log.find("nothing is lent: it is all the cache's") == std::string::npos);
+
+    const json served =
+        post(run.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(served).size() != 24)
+        fprintf(stderr, "    the cost run's request answered status %d (%s): %s\n", status,
+                why.c_str(), served.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+
+    /* Real borrowing, not the offer: `flex_bytes` is what the lent slots hold, `flex_capacity`
+     * what the loan offers. The start placement's fill runs before the first step and leaves only
+     * the working reserve and turnover slots free, so a positive `flex_bytes` is the plan's own
+     * residency living in memory borrowed from the KV cache.
+     *
+     * Only the held bytes are asserted. `flex_capacity` is the *current* offer (target minus
+     * first), while `flex_bytes` counts every held slot from its first index, and
+     * SlotPool::set_target keeps held slots alive when a target shrinks: a correct lend can hold
+     * more than it currently offers, so `flex_capacity >= flex_bytes` is not an invariant. */
+    const json rst = stats(run.port);
+    const int run_exit = run.stop();
+    CHECK_EQ(run_exit, 0);
+    REQUIRE(rst.is_object() && rst.contains("experts"));
+    if (!(rst["experts"].value("flex_bytes", 0.0) > 0.0))
+        fprintf(stderr, "    the cost run lent nothing (experts: %s)\n",
+                rst["experts"].dump().c_str());
+    CHECK(rst["experts"].value("flex_bytes", 0.0) > 0.0);
+}
+
+/* The activation arena's levels, and the identity they hand a profile.
+ *
+ * A level is the plugin declaring its graph again at a smaller step (RadBuildCtx::shape_probe);
+ * Engine::probe_arena_levels keeps the answers plan_level accepts and records their rows in the
+ * profile's identity. Until this plugin declared that it can answer one, every identity this tree
+ * wrote said `arena "none"` -- the case above, and the depth case below, still do at 64 batched
+ * tokens. A level needs a budget above 256 rows: `lo` is the smallest power of two at or above
+ * max_seqs * (1 + n_spec), never below 256, and the levels are lo, 4 * lo, ... under max_tok. At
+ * 512 that is one level, 256.
+ *
+ * Three starts on the same checkpoint and the same tiered deployment as the case above:
+ *   wide      512 batched tokens, a no-loan reference with the profile out: the levels exist, the
+ *             identity names them, and nothing is lent while the file is measured.
+ *   reload    the same 512 budget in normal operation, loading that file: the arena identity is
+ *             part of the fingerprint, so this bind is the file's level set matching a live one,
+ *             and a completion then has its batches prepared at the level it names (/stats
+ *             publishes the level chosen for the last prepared batch).
+ *   control   the same file with one field changed -- `arena` set to "none", the identity of a
+ *             deployment with no level plan -- loaded on the same deployment. Every earlier field
+ *             of the fingerprint still matches, so the refusal names the arena level set and
+ *             nothing else. No fingerprint exception is granted here; the refusal is the point.
+ *
+ * The 64-token case above is the other half of the control: it runs this same deployment at a
+ * budget with no level and its file says `arena "none"`, so the levels at 512 are the budget's
+ * doing and not a constant of the plugin. */
+TEST(the_arena_levels_are_part_of_the_identity_a_profile_binds) {
+    tiny::TempDir dir("qmoe_arena");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    const std::vector<std::string> common = { "--num-speculative-tokens", "2",
+                                              "--placement", "expert_tiered",
+                                              "--host-pool-mib", "96",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+    auto at_budget = [&](int64_t tok) {
+        std::vector<std::string> a = common;
+        for (size_t i = 0; i + 1 < a.size(); ++i)
+            if (a[i] == "--max-num-batched-tokens") a[i + 1] = std::to_string(tok);
+        return a;
+    };
+
+    /* ---- wide: the reference records the level set in the identity ---- */
+    const std::string profile = dir.path + "/arena-reference.json";
+    std::vector<std::string> ref = at_budget(512);
+    ref.insert(ref.end(), { "--draft-reference", "--draft-policy", "cost", "--draft-profile-out",
+                            profile });
+    Server basis;
+    REQUIRE(basis.start(dir.path, ref, device_env(32)));
+    int status = 0;
+    std::string why;
+    const json reply =
+        post(basis.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(reply).size() != 24)
+        fprintf(stderr, "    the 512 reference answered status %d (%s): %s\n", status,
+                why.c_str(), reply.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(reply).size(), (size_t)24);
+    const int ref_exit = basis.stop();
+    const std::string ref_log = basis.output();
+    CHECK_EQ(ref_exit, 0);
+    CHECK(ref_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+    /* The engine says which level it kept, and it is the 256-row one; a refused level warns here
+     * instead ("no level for 256-token steps"), and the identity below would say "none". */
+    if (ref_log.find("while steps are at most 256 tokens") == std::string::npos)
+        fprintf(stderr, "    no arena level was recorded:\n%s\n", tail(ref_log).c_str());
+    CHECK(ref_log.find("activation arena: reference calibration -- levels") != std::string::npos);
+    CHECK(ref_log.find("while steps are at most 256 tokens") != std::string::npos);
+    CHECK(ref_log.find("no level for 256-token steps") == std::string::npos);
+
+    const std::string body = tiny::read_text(profile);
+    REQUIRE(!body.empty());
+    const json p = json::parse(body, nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", ""), std::string("no-loan"));
+    CHECK_EQ(fp.value("model", ""), std::string("qwen35moe"));
+    /* The level set, largest step first: the plan's own budget and the level below it. */
+    if (fp.value("arena", "") != std::string("512,256"))
+        fprintf(stderr, "    the identity's arena is '%s'\n", fp.value("arena", "").c_str());
+    CHECK_EQ(fp.value("arena", ""), std::string("512,256"));
+    CHECK(fp.value("placement", "").rfind("expert_tiered ", 0) == 0);
+    CHECK(fp.value("placement", "").find("dyn=1") != std::string::npos);
+    /* Nothing was lent, so nothing drifted: the start cycle the levels were measured under is
+     * still the plan the fingerprint names. */
+    bool start_priced = false;
+    for (const json& b : p.value("buckets", json::array())) {
+        const json shape = b.value("shape", json::object());
+        if (shape.value("verify_k", -1) != 0 || shape.value("verify_tokens", -1) != 1 ||
+            shape.value("history_tokens", -1) != 1 || shape.value("draft_k", -1) != 2 ||
+            shape.value("drafter", std::string()) != std::string("serial"))
+            continue;
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        start_priced = start_priced ||
+                       (clean && t.value("mean", 0.0) > 0.0 && t.value("n", 0) >= 1);
+    }
+    CHECK(start_priced);
+
+    /* ---- reload: a live 512 run binds the file, arena included, and serves a request ---- */
+    std::vector<std::string> live = at_budget(512);
+    live.insert(live.end(), { "--draft-policy", "cost", "--draft-profile", profile });
+    Server run;
+    REQUIRE(run.start(dir.path, live, device_env(32)));
+    const std::string run_log = run.output();
+    if (run_log.find("basis no-loan -- an optimisation basis") == std::string::npos)
+        fprintf(stderr, "    the 512 reload did not bind the profile:\n%s\n",
+                tail(run_log).c_str());
+    CHECK(run_log.find("basis no-loan -- an optimisation basis") != std::string::npos);
+    CHECK(run_log.find("is not used for this deployment") == std::string::npos);
+    CHECK(run_log.find("while steps are at most 256 tokens") != std::string::npos);
+
+    /* Before any request: no batch has been prepared, so the snapshot publishes 0 rows -- "nothing
+     * prepared yet" -- and index 0. That index is the nominal 0 of an empty choice, not a level
+     * the engine picked, and the rows/index pairing asserted after the completion does not apply
+     * here. */
+    const json fresh = stats(run.port);
+    REQUIRE(fresh.is_object() && fresh.contains("arena"));
+    if (fresh["arena"].value("level_rows", -1.0) != 0.0 ||
+        fresh["arena"].value("level", -1) != 0)
+        fprintf(stderr, "    the idle engine published %s\n", fresh["arena"].dump().c_str());
+    CHECK_EQ(fresh["arena"].value("level_rows", -1.0), 0.0);
+    CHECK_EQ(fresh["arena"].value("level", -1), 0);
+
+    /* A real completion, so the levels are exercised and not only bound: the prompt and every
+     * decode step of it are far under 256 tokens, so the engine chooses the 256-row level for
+     * every batch of it and may lend the arena above that level to the slab. /stats publishes
+     * that choice (Engine::arena_step, LiveSnapshot) as the level index and that level's
+     * capacity -- the step size it serves, not the batch's token count and not a step known to
+     * have finished on the card. A batch that had needed the full plan would have published 512
+     * at index 0. */
+    int status_live = 0;
+    std::string why_live;
+    const json live_reply = post(run.port, "/completion", completion(prompt_ids(7, 24), 24),
+                                 &status_live, &why_live);
+    if (status_live != 200 || tokens_of(live_reply).size() != 24)
+        fprintf(stderr, "    the 512 reload answered status %d (%s): %s\n", status_live,
+                why_live.c_str(), live_reply.dump().c_str());
+    REQUIRE_EQ(status_live, 200);
+    REQUIRE_EQ(tokens_of(live_reply).size(), (size_t)24);
+    const json rst = stats(run.port);
+    REQUIRE(rst.is_object() && rst.contains("arena"));
+    const json& ar = rst["arena"];
+    /* The level set this deployment declares, largest step first, and the pair the snapshot
+     * published for the batch it is about: the rows are exactly the capacity of the level index
+     * they are published with, so the two always belong to one batch. */
+    REQUIRE_EQ(ar["levels"].size(), (size_t)2);
+    CHECK_EQ(ar["levels"][0].get<int64_t>(), (int64_t)512);
+    CHECK_EQ(ar["levels"][1].get<int64_t>(), (int64_t)256);
+    const int lvl = ar.value("level", -1);
+    REQUIRE(lvl >= 0 && lvl < 2);
+    CHECK_EQ(ar["level_rows"].get<int64_t>(), ar["levels"][lvl].get<int64_t>());
+    if (ar.value("level_rows", 0.0) != 256.0)
+        fprintf(stderr, "    the reload's last prepared batch was prepared at %s\n",
+                ar.dump().c_str());
+    CHECK_EQ(ar.value("level_rows", 0.0), 256.0);
+    CHECK_EQ(lvl, 1);
+    CHECK_EQ(run.stop(), 0);
+
+    /* ---- control: the same file, one field changed to a different level set ---- */
+    json doctored = p;
+    doctored["fingerprint"]["arena"] = "none";
+    const std::string other = dir.path + "/arena-none.json";
+    REQUIRE(tiny::write_text(other, doctored.dump(2)));
+    std::vector<std::string> mismatch = at_budget(512);
+    /* The legacy policy: under `cost` a refused table is a refused start by design
+     * (Scheduler::init), which would stop the process before the refusal could be read. The bind
+     * and its reason are the same code either way. */
+    mismatch.insert(mismatch.end(), { "--draft-profile", other });
+    Server small;
+    REQUIRE(small.start(dir.path, mismatch, device_env(32)));
+    const std::string small_log = small.output();
+    /* The deployment is the one the file was measured on; the arena level set is the only field
+     * that differs, so the refusal has to name it (and nothing before it in the comparison). */
+    if (small_log.find("is not used for this deployment") == std::string::npos)
+        fprintf(stderr, "    the changed level set was not refused:\n%s\n", tail(small_log).c_str());
+    CHECK(small_log.find("is not used for this deployment") != std::string::npos);
+    CHECK(small_log.find("arena profile=\"none\" runtime=\"512,256\"") != std::string::npos);
+    CHECK(small_log.find("basis no-loan -- an optimisation basis") == std::string::npos);
+    CHECK_EQ(small.stop(), 0);
+}
+
+
+/* The depth decision, told apart from the fallback: a reload whose head can execute six positions
+ * and whose ladder ends at two.
+ *
+ * The case above cannot carry this proof. Its tiered plan moves experts during the request, and
+ * the calibration marks every cycle after a move `placed` and leaves it out (Scheduler::
+ * draft_drift_note, core/sched/scheduler.cpp:2802-2827), so the exported file keeps the start
+ * cycle and the reload could not price a second one. Here nothing is movable: `all_vram` gives
+ * every unit `movable = false` (core/place/planner.cpp:523-531), HeatStats disables itself and the
+ * mover never runs (core/place/heat.cpp:126-138), so the same reference measures every shape the
+ * request executes and nothing drifts.
+ *
+ * The runs share the checkpoint, placement and batch flags; only the ceiling and the ladder
+ * differ, and neither is part of the fingerprint. The first calibration runs the named baseline at
+ * the head's own depth (K2) and writes it. The second runs it at six, so the fallback depth is an
+ * alternative this deployment really executes -- not a CLI number above the one it uses. The
+ * reload's head can execute K6 and its ladder offers only K2; a cycle the loaded profile cannot
+ * price is refused rather than drafted at K6 (core/sched/draft_policy.cpp:316-335). So a served
+ * 24-token answer that drafted two positions is the profile's decision: the same request drafts
+ * six when the baseline names that depth. */
+TEST(a_loaded_reference_decides_the_draft_depth_instead_of_the_fallback) {
+    tiny::TempDir dir("qmoe_depth");
+    REQUIRE(dir.ok());
+    tiny::Qwen35Moe m;     /* the checkpoint the case above builds */
+    m.trunk.layers      = 2;
+    m.trunk.hidden      = 128;
+    m.trunk.heads       = 4;
+    m.trunk.kv_heads    = 1;
+    m.trunk.head_dim    = 128;
+    m.trunk.ffn         = 128;
+    m.trunk.interval    = 2;
+    m.trunk.lin_k_heads = 2;
+    m.trunk.lin_k_dim   = 64;
+    m.trunk.lin_v_heads = 4;
+    m.trunk.lin_v_dim   = 32;
+    m.trunk.conv        = 4;
+    m.trunk.vocab       = 320;
+    m.trunk.ctx         = 4096;
+    REQUIRE(tiny::write_qwen35_moe(dir.path, m));
+
+    const std::string profile = dir.path + "/reference.json";
+    /* A card the whole plane fits on: nothing is pinned in the host pool, so there is no slot to
+     * lend and no heat move to invalidate the start placement. */
+    const std::vector<std::string> common = { "--placement", "all_vram",
+                                              "--gpu-headroom-mib", "0",
+                                              "--max-model-len", "4096",
+                                              "--max-num-seqs", "4",
+                                              "--max-num-batched-tokens", "64",
+                                              "--no-prefix-cache" };
+
+    std::vector<std::string> calib = common;
+    calib.insert(calib.end(), { "--num-speculative-tokens", "2", "--draft-reference",
+                                "--draft-policy", "cost", "--draft-profile-out", profile });
+    Server writer;
+    REQUIRE(writer.start(dir.path, calib, device_env(128)));
+    int status = 0;
+    std::string why;
+    const json wrote = post(writer.port, "/completion", completion(prompt_ids(7, 24), 24), &status,
+                            &why);
+    if (status != 200 || tokens_of(wrote).size() != 24)
+        fprintf(stderr, "    the depth calibration's request answered status %d (%s): %s\n", status,
+                why.c_str(), wrote.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(wrote).size(), (size_t)24);
+    const int writer_exit = writer.stop();
+    const std::string writer_log = writer.output();
+    if (writer_exit != 0)
+        fprintf(stderr, "    the depth calibration exited %d:\n%s\n", writer_exit,
+                tail(writer_log).c_str());
+    REQUIRE_EQ(writer_exit, 0);
+    CHECK(writer_log.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const json p = json::parse(tiny::read_text(profile), nullptr, false);
+    REQUIRE(p.is_object());
+    const json& fp = p["fingerprint"];
+    CHECK_EQ(fp.value("basis", std::string()), std::string("no-loan"));
+    CHECK(fp.value("placement", std::string()).rfind("all_vram ", 0) == 0);
+    /* The whole request is in the file: the start shape (verify_k 0) and the shape every later
+     * cycle verifies (verify_k 2), both at the depth the calibration ran. This is the coverage the
+     * lending case's file cannot hold. */
+    const json buckets = p.value("buckets", json::array());
+    REQUIRE(buckets.is_array());
+    bool start = false, decode = false;
+    for (const json& b : buckets) {
+        bool clean = true;
+        for (const json& f : b.value("flags", json::array())) clean = clean && f == "ahead";
+        const json t = b.value("time_ms", json::object());
+        if (!clean || !(t.value("mean", 0.0) > 0.0) || t.value("n", 0) < 1) continue;
+        const json shape = b.value("shape", json::object());
+        if (shape.value("drafter", std::string()) != std::string("serial")) continue;
+        const int verify_k = shape.value("verify_k", -1);
+        start = start || (verify_k == 0 && shape.value("verify_tokens", -1) == 1 &&
+                          shape.value("history_tokens", -1) == 1 &&
+                          shape.value("draft_k", -1) == 2);
+        decode = decode || (verify_k == 2 && shape.value("draft_k", -1) == 2);
+    }
+    if (!start || !decode)
+        fprintf(stderr, "    the reference does not cover the request (start %d, K2 %d):\n%s\n",
+                (int)start, (int)decode, buckets.dump().c_str());
+    CHECK(start);
+    CHECK(decode);
+
+    /* The alternative the reload does not take, run: the same checkpoint, request and deployment
+     * at the head's own depth. Six positions execute here, so the reload's two are the profile's
+     * price and not the head's limit. */
+    std::vector<std::string> baseline = common;
+    baseline.insert(baseline.end(), { "--num-speculative-tokens", "6", "--draft-reference",
+                                      "--draft-policy", "cost", "--draft-profile-out",
+                                      dir.path + "/baseline6.json" });
+    Server six;
+    REQUIRE(six.start(dir.path, baseline, device_env(128)));
+    const json alt = post(six.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(alt).size() != 24)
+        fprintf(stderr, "    the K6 baseline's request answered status %d (%s): %s\n", status,
+                why.c_str(), alt.dump().c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(alt).size(), (size_t)24);
+    const int alt_positions = draft_positions(six.port);
+    if (alt_positions != 6)
+        fprintf(stderr, "    the K6 baseline drafted %d positions, not six:\n%s\n", alt_positions,
+                tail(six.output()).c_str());
+    CHECK_EQ(alt_positions, 6);
+    CHECK_EQ(six.stop(), 0);
+
+    /* The reload. Six is the head's executable depth and the named baseline; two is the only tier
+     * the ladder offers, and what the profile prices. One tier, not 0,2: with a shallower plan in
+     * the search, the ladder could decide on its own evidence instead of the file's depth. */
+    std::vector<std::string> reload = common;
+    reload.insert(reload.end(), { "--num-speculative-tokens", "6", "--draft-depth-tiers", "2",
+                                  "--draft-policy", "cost", "--draft-profile", profile });
+    Server reader;
+    REQUIRE(reader.start(dir.path, reload, device_env(128)));
+    const std::string bind = reader.output();
+    /* A no-loan reference binds under its own rule, not the live profile's match message. */
+    if (bind.find("basis no-loan -- an optimisation basis") == std::string::npos)
+        fprintf(stderr, "    the reload did not bind the profile:\n%s\n", tail(bind).c_str());
+    CHECK(bind.find("basis no-loan -- an optimisation basis") != std::string::npos);
+    CHECK(bind.find("is not used for this deployment") == std::string::npos);
+    CHECK(bind.find("nothing is lent: it is all the cache's") != std::string::npos);
+
+    const json served =
+        post(reader.port, "/completion", completion(prompt_ids(7, 24), 24), &status, &why);
+    if (status != 200 || tokens_of(served).size() != 24)
+        fprintf(stderr, "    the reload's request answered status %d (%s): %s\n%s\n", status,
+                why.c_str(), served.dump().c_str(), tail(reader.output()).c_str());
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(served).size(), (size_t)24);
+
+    /* /metrics exports one `draft_position_reached_total` line per position the run drafted to:
+     * the deepest verify window it executed. Two is the priced depth; six would be the named
+     * baseline, and a cycle the file could not price would have been refused before reaching
+     * either. */
+    const int positions = draft_positions(reader.port);
+    if (positions != 2)
+        fprintf(stderr, "    the reload drafted %d positions, not the priced depth 2 "
+                        "(6 positions = the fallback ceiling):\n%s\n",
+                positions, tail(reader.output()).c_str());
+    CHECK_EQ(positions, 2);
+    CHECK_EQ(reader.stop(), 0);
 }
 
 RAD_TEST_MAIN()

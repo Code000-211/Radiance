@@ -135,6 +135,75 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* The cost policy's delivery ledger, cumulative. `RAD_OK` from the predictor is not evidence
+     * that a cycle taught anything: every row can be skipped by a recycled (req_id, slot_gen) and
+     * the call still succeeds -- and a cycle that never completed is never delivered at all. So
+     * the three row outcomes are counted apart, plus the cycles that were dropped instead of
+     * delivered (incomplete, evicted, or refused by the predictor). All zero while Cost is off. */
+    int64_t draft_obs_attempted = 0;   /* request/sequence rows of deliverable cycles offered to
+                                        * the predictor: one per row, not per token position */
+    int64_t draft_obs_applied = 0;     /* rows that applied a learning update (at least one
+                                        * position's state moved; not a promise the estimate
+                                        * changed numerically) */
+    int64_t draft_obs_skipped = 0;     /* rows that taught nothing */
+    int64_t draft_obs_discarded = 0;   /* cycles not delivered: incomplete or refused */
+    /* Valid observations handed to an inactive cost table: the deployment is observing, not
+     * learning. Zero while a profile is installed, so "nothing was absorbed" and "nothing was
+     * offered" cannot be read as the same fact. */
+    int64_t draft_obs_inactive = 0;
+    /* The cost policy's plan ledger, cumulative: cycles it opened, how they ended (`priced` --
+     * `source` Cost -- `fallback` for the named baseline, `calib_forced` for a forced calibration
+     * depth, `empty` for a planning point with no request rows, `no_plan` for a cycle the policy
+     * opened and could not plan at all), plus what the last plan asked for and why.
+     * `priced + fallback + calib_forced + empty + no_plan == cycles` holds for every run: a cycle
+     * counted without one of the five would be one whose end nothing names.
+     *
+     * `empty` is not a decision. Every step opens a cycle, and a pure prefill or idle step has no
+     * decode rows to plan over, so the controller issues the valid K0 plan for an empty view. That
+     * plan has nothing to measure (no ring record, no sample) and must not read as "the policy
+     * chose the fallback" -- the very same run also issues real fallbacks. The counter separates
+     * the two.
+     *
+     * `draft_cost_last_replay` is the *candidate* the plan declared (DraftReplay as a number), not
+     * what ran -- the bracket's own state is reported by `passes` and keys its sample.
+     * `draft_cost_last_*` describe the last plan **with rows**, so an idle or prefill step cannot
+     * overwrite the last real decision. They stay 0 until such a plan is issued, and a valid
+     * all-K0 plan is one: `last_k == 0` with `last_rows > 0` is a decision to draft nothing, not
+     * an empty ledger. */
+    int64_t draft_cost_cycles = 0;
+    int64_t draft_cost_priced = 0;
+    int64_t draft_cost_fallback = 0;
+    int64_t draft_cost_no_plan = 0;
+    int64_t draft_cost_empty = 0;
+    int64_t draft_cost_last_k = 0;
+    int64_t draft_cost_last_replay = 0;
+    int64_t draft_cost_last_source = 0;   /* DraftPlanSource of the last plan with rows */
+    int64_t draft_cost_last_fallback = 0; /* DraftFallback of the last plan with rows */
+    int64_t draft_cost_last_rows = 0;     /* n_seq of the last plan with rows */
+    /* The last issued Cost plan's priced-tier count: the deepest offered tier plus every
+     * shallower one the model priced, whether or not it won (0 when the last plan was not a Cost
+     * decision). "Both depths were compared" is not visible from `priced` alone -- Stage 1 issues
+     * a Cost plan at the deep tier even when only that tier had a price. A **search** metric, not
+     * an output one: the resource cut and the re-price that follow the search change what is
+     * issued, not what was weighed, so this count is not the issued depth (`draft_cost_last_k`)
+     * and does not change when a cut reprices the plan. Like the `last_*` scalars, an empty
+     * planning point does not touch it. */
+    int64_t draft_cost_tiers_priced = 0;
+    /* Calibration plans (`--draft-calib-k`, DraftPlanSource::Calibration) with rows, cumulative:
+     * forced measurements, never a decision, so `priced`/`fallback` stay 0 for them. A forced plan
+     * over an empty view is an `empty` planning point, not one of these: it has no depth to
+     * measure, and only a plan with rows advances the sequence. */
+    int64_t draft_calib_forced = 0;
+    /* Forced plans that a plan-time resource cut touched (a row's remaining output, the token
+     * budget or the pool): not kDraftSampleShortened, which is the bracket stopping below the
+     * plan, but the "no cut in the target buckets" claim has to be measurable somewhere. Counted
+     * per cycle, once, however many rows the cut marked. */
+    int64_t draft_calib_cut = 0;
+    /* Cycles observed against a loaded reference (DraftCostBasis::NoLoan) and therefore not
+     * absorbed: the table is immutable, so the count is the only trace the measurement left. Zero
+     * while the table learns, so "nothing reached the reference" and "the reference refused
+     * nothing" cannot be read as the same fact. */
+    int64_t draft_ref_skipped = 0;
 };
 
 

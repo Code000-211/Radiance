@@ -435,6 +435,14 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
+        { "--draft-policy", { "cost" } }, { "--draft-depth-tiers", { "0,2" } },
+        { "--draft-hysteresis", { "both" } },
+        { "--draft-fallback-k", { "3" } },
+        { "--draft-confidence-rule", { "1.25,0,2" } },
+        { "--draft-confidence-fallback", { "3" } },
+        { "--draft-calib-k", { "3,2,2,3" } },
+        { "--draft-profile", { "/p.json" } },
+        { "--draft-profile-out", { "/out.json" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -708,10 +716,10 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
-/* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
+/* --draft-window takes exactly three names; the default is kDraftWindowDefault, which the help text
  * also states. Whether the window can adapt (a serial drafter, depth above zero) is decided by the
  * scheduler with the program in hand, not the parser. */
-TEST(the_draft_window_is_fixed_or_adaptive) {
+TEST(the_draft_window_is_fixed_adaptive_or_confidence) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.draft_window == kDraftWindowDefault);
@@ -723,11 +731,158 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window", "adaptive", "--num-speculative-tokens", "6" }, &c), RAD_OK);
     CHECK(c.draft_window == DraftWindow::Adaptive);
     CHECK_EQ(c.n_spec, 6);
-    for (const char* bad : { "Adaptive", "auto", "dynamic", "1", "" })
+    CHECK_EQ(parse({ "--draft-window", "confidence" }, &c), RAD_OK);
+    CHECK(c.draft_window == DraftWindow::Confidence);
+    for (const char* bad : { "Adaptive", "auto", "dynamic", "1", "", "Confidence", "lag" })
         CHECK_EQ(parse({ "--draft-window", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+    CHECK_EQ(std::string(draft_window_name(DraftWindow::Confidence)), std::string("confidence"));
+}
+
+/* --draft-confidence-rule is SCALE,OFFSET,FLOOR: two numbers and a whole floor of at least 1. The
+ * default is the cross-validated rule; that it needs --draft-window confidence, and the floor
+ * against the ceiling, are the scheduler's checks. */
+TEST(the_draft_confidence_rule_is_scale_offset_and_floor) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_NEAR(d.draft_conf_scale, 1.25, 1e-6);
+    CHECK_NEAR(d.draft_conf_offset, 0.0, 1e-6);
+    CHECK_EQ(d.draft_conf_floor, 2);
+    CHECK(!d.draft_conf_rule_set);
+    Config c;
+    CHECK_EQ(parse({ "--draft-confidence-rule", "1.5,-0.5,1" }, &c), RAD_OK);
+    CHECK_NEAR(c.draft_conf_scale, 1.5, 1e-6);
+    CHECK_NEAR(c.draft_conf_offset, -0.5, 1e-6);
+    CHECK_EQ(c.draft_conf_floor, 1);
+    CHECK(c.draft_conf_rule_set);
+    for (const char* bad : { "1.25,0", "1.25,0,2,3", "a,0,2", "1,b,2", "1,0,2.5", "1,0,0", "-1,0,2",
+                             "", ",,", "1,,2" }) {
+        Config e;
+        CHECK_EQ(parse({ "--draft-confidence-rule", bad }, &e), RAD_E_INVAL);
+    }
+    CHECK_EQ(parse({ "--draft-confidence-rule" }, &c), RAD_E_INVAL);
+
+    /* --draft-confidence-fallback N: 3 by default, 0 the ceiling; the ceiling itself is the
+     * scheduler's check. */
+    CHECK_EQ(d.draft_conf_fallback, 3);
+    CHECK(!d.draft_conf_fallback_set);
+    CHECK_EQ(parse({ "--draft-confidence-fallback", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_conf_fallback, 0);
+    CHECK(c.draft_conf_fallback_set);
+    for (const char* bad : { "-1", "3.5", "x", "" }) {
+        Config e;
+        CHECK_EQ(parse({ "--draft-confidence-fallback", bad }, &e), RAD_E_INVAL);
+    }
+}
+
+/* --draft-policy takes exactly two names. Whether the deployment can run the cost policy (a serial
+ * drafter, a positive ceiling) is decided by the scheduler with the program in hand. */
+TEST(the_draft_policy_is_legacy_or_cost) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.draft_policy == kDraftPolicyDefault);
+    Config c;
+    CHECK_EQ(parse({ "--draft-policy", "cost" }, &c), RAD_OK);
+    CHECK(c.draft_policy == DraftPolicyKind::Cost);
+    CHECK_EQ(parse({ "--draft-policy", "legacy" }, &c), RAD_OK);
+    CHECK(c.draft_policy == DraftPolicyKind::Legacy);
+    for (const char* bad : { "Cost", "auto", "adaptive", "1", "" })
+        CHECK_EQ(parse({ "--draft-policy", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-policy" }, &c), RAD_E_INVAL);
+    CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Cost)), std::string("cost"));
+    CHECK_EQ(std::string(draft_policy_name(DraftPolicyKind::Legacy)), std::string("legacy"));
+}
+
+/* --draft-hysteresis names which depth moves wait for the hold: raise (the default) or both.
+ * That it needs the cost policy is the scheduler's check, where the policy is known. */
+TEST(the_draft_hysteresis_is_raise_or_both) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_hold_reductions);
+    Config c;
+    CHECK_EQ(parse({ "--draft-hysteresis", "both" }, &c), RAD_OK);
+    CHECK(c.draft_hold_reductions);
+    CHECK_EQ(parse({ "--draft-hysteresis", "raise" }, &c), RAD_OK);
+    CHECK(!c.draft_hold_reductions);
+    for (const char* bad : { "Both", "symmetric", "down", "1", "" })
+        CHECK_EQ(parse({ "--draft-hysteresis", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-hysteresis" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-fallback-k: the depth the cost policy runs when it can price no candidate at all.
+ * -1 is "the ladder's middle tier", which only the scheduler can resolve (it knows the trimmed
+ * ladder); an out-of-range value is refused here, and everything that needs the executable head
+ * depth stays with the scheduler. */
+TEST(the_draft_fallback_depth_is_a_non_negative_k) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_fallback_k, -1);
+    Config c;
+    CHECK_EQ(parse({ "--draft-fallback-k", "3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_fallback_k, 3);
+    CHECK_EQ(parse({ "--draft-fallback-k", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_fallback_k, 0);
+    for (const char* bad : { "-1", "1.5", "k3", "" })
+        CHECK_EQ(parse({ "--draft-fallback-k", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-fallback-k" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-depth-tiers is the cost policy's ladder: ascending, unique, at most kDraftMaxTiers.
+ * "<= ceiling" needs the ceiling, which auto resolves after the container is open, so that check
+ * stays with the planner. */
+TEST(the_draft_depth_tiers_are_an_ascending_unique_list) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_n_tiers, 5);
+    CHECK_EQ(d.draft_tiers[0], 0);
+    CHECK_EQ(d.draft_tiers[4], 6);
+    Config c;
+    CHECK_EQ(parse({ "--draft-depth-tiers", "0,2" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_n_tiers, 2);
+    CHECK_EQ(c.draft_tiers[1], 2);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "1,3,3" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "4,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "0,,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "-1,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers", "high" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-depth-tiers" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-calib-k is a sequence, not a ladder: order and duplicates are what it is for, so the
+ * parser checks only the count and the values. Whether each depth is one the effective ladder
+ * offers is DraftPlanner::configure's check at startup, where the trimmed ladder is known. */
+TEST(the_calibration_sequence_keeps_its_order_and_its_duplicates) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.draft_calib_n, 0);
+    Config c;
+    CHECK_EQ(parse({ "--draft-calib-k", "3,2,2,3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_n, 4);
+    CHECK_EQ(c.draft_calib_k[0], 3);
+    CHECK_EQ(c.draft_calib_k[1], 2);
+    CHECK_EQ(c.draft_calib_k[2], 2);
+    CHECK_EQ(c.draft_calib_k[3], 3);
+    CHECK_EQ(parse({ "--draft-calib-k", "0,6,0" }, &c), RAD_OK);   /* unsorted, repeated */
+    CHECK_EQ(c.draft_calib_n, 3);
+    CHECK_EQ(parse({ "--draft-calib-k", "3" }, &c), RAD_E_INVAL);  /* a depth is not a sequence */
+    CHECK_EQ(parse({ "--draft-calib-k", "3,2,2,3,2,3,3,2,3" }, &c), RAD_E_INVAL);   /* > 8 */
+    CHECK_EQ(parse({ "--draft-calib-k", "3,,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-calib-k", "-1,2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-calib-k" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-profile is a path, read by the engine once the deployment is up. Nothing parses the file
+ * here: the reader owns that, and a missing or malformed file is a start error there. */
+TEST(the_draft_profile_is_a_path_and_optional) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.draft_profile.empty());
+    Config c;
+    CHECK_EQ(parse({ "--draft-profile", "/profiles/r9700-tp2.json" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_profile, std::string("/profiles/r9700-tp2.json"));
+    CHECK_EQ(parse({ "--draft-profile" }, &c), RAD_E_INVAL);
 }
 
 /* An unknown policy name is refused; falling through to the default would make a comparison

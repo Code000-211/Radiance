@@ -99,6 +99,12 @@ typedef struct RadBatch {
      *            the round before and ending in the lm_head; it samples the r-th draft. There is
      *            no pass with r == 1: the history pass carries that round.
      *
+     *    r == 1  a block query, not a draft round: one sequence's anchor plus its mask rows,
+     *            carrying `n_draft` block rows whose last `hidden_n` rows produce the drafts. The
+     *            block drafter (sched/batch.h, block_query) issues it; the serial drafter never
+     *            does, because its round 1 is the history pass above. A plugin must read
+     *            `n_draft`/`hidden_row` to tell the two apart, not the value 1 alone.
+     *
      * Zero is the ordinary step so that a zeroed RadBatch runs the model, the same reason
      * `num_accepted` is one-based (docs/OPS.md).
      *

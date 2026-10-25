@@ -409,7 +409,81 @@ struct Gemma4 {
     int64_t vocab = 320, ctx = 4096;
     float    branch = 0.5f, head = 0.35f;       /* see Gains; head is the tied table's amplitude */
     uint64_t seed = 3;
+    /* A Gemma4 assistant head in a `draft/` companion folder, off by default: every checkpoint
+     * written before this field exists keeps the exact bytes it had. The plugin picks the folder
+     * up as a companion (its own config and weights, under `draft.`) and declares the head only
+     * when max_spec > 0, so a fixture that sets this and a run without speculation still serves
+     * the trunk alone. */
+    bool     assistant = false;
+    int64_t  assistant_width = 128, assistant_layers = 1, assistant_heads = 4, assistant_ffn = 256;
 };
+
+/* The assistant's own checkpoint, written into `<dir>/draft/`. Its geometry must satisfy the checks
+ * in arch/gemma4_bf16's Gemma4Head::declare: the trunk's width and vocabulary, the sliding and
+ * global head dims and kv counts, the window, and the trunk's rotary thetas -- including the
+ * global partial-rotary factor that turns 64 dims into the trunk's 16 rotating ones. */
+inline bool write_gemma4_assistant(const std::string& dir, const Gemma4& s) {
+    Rng r(s.seed ^ 0xA5A5A5A5ull);
+    const int64_t H  = s.hidden;                 /* backbone_hidden_size */
+    const int64_t n  = s.assistant_width;
+    const int64_t qs = s.assistant_heads * s.head_dim;
+    const int64_t qg = s.assistant_heads * s.global_head_dim;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    nlohmann::ordered_json t;
+    t["architectures"] = { "Gemma4AssistantForCausalLM" };
+    t["model_type"] = "gemma4_assistant";
+    t["backbone_hidden_size"] = H;
+    t["hidden_size"] = n;
+    t["num_hidden_layers"] = s.assistant_layers;
+    t["num_attention_heads"] = s.assistant_heads;
+    t["num_key_value_heads"] = s.kv_heads;
+    t["num_global_key_value_heads"] = s.global_kv_heads;
+    t["head_dim"] = s.head_dim;
+    t["global_head_dim"] = s.global_head_dim;
+    t["intermediate_size"] = s.assistant_ffn;
+    t["sliding_window"] = s.window;
+    t["vocab_size"] = s.vocab;
+    t["rms_norm_eps"] = 1e-6;
+    /* The trunk's layer_types order, cut to the head's layer count: layer 0 is sliding, which is
+     * the class whose trunk layer it reads. */
+    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    for (int64_t l = 0; l < s.assistant_layers; ++l)
+        types.push_back((l + 1) % s.interval == 0 ? "full_attention" : "sliding_attention");
+    t["layer_types"] = types;
+    t["rope_parameters"] = {
+        { "sliding_attention", { { "rope_type", "default" }, { "rope_theta", 10000.0 } } },
+        { "full_attention", { { "rope_type", "proportional" }, { "rope_theta", 1000000.0 },
+                              { "partial_rotary_factor", 0.25 } } } };
+    /* The head has no soft-cap of its own on the 31B; leave it out, so no cap op is declared. */
+    t["tie_word_embeddings"] = false;
+    t["max_position_embeddings"] = s.ctx;
+
+    std::vector<Tensor> ts;
+    ts.push_back(linear("model.embed_tokens.weight", s.vocab, n, r));
+    ts.push_back(noise("model.norm.weight", { n }, r, 0.1f, 1.0f));
+    ts.push_back(linear("pre_projection.weight", n, 2 * H, r));
+    ts.push_back(linear("post_projection.weight", H, n, r));
+    for (int64_t l = 0; l < s.assistant_layers; ++l) {
+        const std::string p = "model.layers." + std::to_string(l) + ".";
+        const bool global = (l + 1) % s.interval == 0;
+        const int64_t hd = global ? s.global_head_dim : s.head_dim;
+        const int64_t q  = global ? qg : qs;
+        ts.push_back(noise(p + "input_layernorm.weight", { n }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "self_attn.q_norm.weight", { hd }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "post_attention_layernorm.weight", { n }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "pre_feedforward_layernorm.weight", { n }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "post_feedforward_layernorm.weight", { n }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "layer_scalar", { 1 }, r, 0.1f, 1.0f));
+        ts.push_back(linear(p + "self_attn.q_proj.weight", q, n, r));
+        ts.push_back(linear(p + "self_attn.o_proj.weight", n, q, r, s.branch));
+        ts.push_back(linear(p + "mlp.gate_proj.weight", s.assistant_ffn, n, r));
+        ts.push_back(linear(p + "mlp.up_proj.weight", s.assistant_ffn, n, r));
+        ts.push_back(linear(p + "mlp.down_proj.weight", n, s.assistant_ffn, r, s.branch));
+    }
+    return write_text(dir + "/config.json", t.dump(2)) &&
+           write_safetensors(dir + "/model.safetensors", ts);
+}
 
 inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     Rng r(s.seed);
@@ -448,6 +522,13 @@ inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     c["text_config"] = t;
     c["tie_word_embeddings"] = true;
     c["eos_token_id"] = (int)kEndOfText;
+    /* With the assistant head the checkpoint must also select the plugin that has one. The pair
+     * (arch, quant) is matched exactly and `gemma4` names no quant, so the head's plugin is
+     * `gemma4_bf16`, whose quant is `compressed-tensors`. A `quant_method` with no config group is
+     * not imported (checkpoint.cpp:990), so the bf16 tensors here stay trivial and no weight is
+     * read as quantised. */
+    if (s.assistant)
+        c["quantization_config"] = { { "quant_method", "compressed-tensors" } };
 
     const std::string m = "model.language_model.";
     std::vector<Tensor> ts;
@@ -477,7 +558,8 @@ inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     }
     /* Signed gains around 0, as for LFM2's tied head. */
     ts.push_back(noise(m + "norm.weight", { H }, r, 1.0f));
-    return write_checkpoint(dir, c, ts);
+    return write_checkpoint(dir, c, ts) &&
+           (!s.assistant || write_gemma4_assistant(dir + "/draft", s));
 }
 
 /* ------------------------------------------------------------------ llama: dense attention */

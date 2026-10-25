@@ -33,9 +33,14 @@ struct StepSlot {
     int32_t n_acc;    /* its one-based num_accepted: tokens the last verify step committed */
     int32_t head;     /* the last committed index, which the draft head's first round extends */
     int32_t acc;      /* drafts the last verify step accepted */
+    /* The draft rounds this sequence finished in the cycle the acceptance opened: 0 when it
+     * proposed nothing. ADV_TAKE sets it per row. Once the rounds shrink to the active prefix, the
+     * cycle's deepest round is no longer a row's own count: publishing that many tokens reads
+     * another round's proposal. The host cannot know it in advance (acceptance does). */
+    int32_t gen;
     /* The next verify step's input tokens: the bonus token, then the draft head's proposals. */
     int32_t tok[1 + RAD_SCHED_MAX_SPEC];
-    int32_t pad[3];
+    int32_t pad[2];
 };
 
 enum AdvMode : int32_t {
@@ -43,7 +48,7 @@ enum AdvMode : int32_t {
     ADV_TRUNK  = 2,   /* before a verify step: its tokens, positions and rollback count */
     ADV_HIST   = 3,   /* before the draft head's history pass: the verified positions */
     ADV_ROUND  = 4,   /* before draft round `round` >= 2: the next position, the last proposal */
-    ADV_TAKE   = 5,   /* after the last round: its proposal into the state */
+    ADV_TAKE   = 5,   /* after round `round`'s pass: its proposal into each row's slot */
     /* A block drafter (RAD_DRAFT_BLOCK) on the card: */
     ADV_BLOCK  = 6,   /* before the query pass: the anchor at the committed end, then the masks */
     ADV_BTAKE  = 7,   /* after it: its `round` proposals into the state, behind the bonus token */

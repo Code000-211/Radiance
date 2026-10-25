@@ -18,11 +18,11 @@
  */
 #include "spechub.h"
 
-/* Only for the three globals it declares. Device sources include it for r4d_emit itself; a host
- * build has no HIP headers, and nothing else in this plain C++ file needs one. */
+/* Device build only: r4d_emit.h includes <hip/hip_runtime.h>, and a host-only radiance has neither
+ * libr4d nor a reason for the recorder below -- nothing in this plugin launches through r4d_emit
+ * without the device rows. */
 #ifdef RAD_SPECHUB_WITH_DEVICE
-#include "../../libr4d/r4d_emit.h"
-#endif
+#include "../../libr4d/r4d_emit.h"   /* only for the three globals it declares */
 
 /* THE DISPATCH LOG IS THIS DSO'S OWN. r4d_emit.h routes every launch through this recorder so a test
  * can name the functions it dispatched, but the loader maps plugins RTLD_LOCAL: a plugin cannot
@@ -32,6 +32,7 @@
 const void** r4d_dispatch_log = nullptr;
 int          r4d_dispatch_cap = 0;
 int          r4d_dispatch_n   = 0;
+#endif
 
 namespace {
 const RadPluginInfo kInfo = {

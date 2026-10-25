@@ -1203,6 +1203,8 @@ drafter's confidences would need them before the drafter has run. `--draft-windo
 (serial drafters only) makes the number a ceiling: each sequence's stop follows its measured
 per-position acceptance, and the step's head depth maximises expected tokens per measured step time
 (`core/sched/draft.h`). It is off by default because it loses throughput on a busy server.
+`--draft-window confidence` reads the confidences one window late: the q(x) a coupled head left on
+the window the step in flight verifies set the next window (`--draft-confidence-rule`).
 
 **Default depth.** `--num-speculative-tokens` defaults to `auto`, resolved before declare from
 `rad_arch_probe()`: a serial head's throughput operating point, or the block length a block drafter

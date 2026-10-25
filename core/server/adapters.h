@@ -128,6 +128,27 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     for (size_t d = 0;
          d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
+    /* The observation ledger: three row counts, one cycle count and one cost-observation count,
+     * renamed to keep the unit in the name. */
+    o.draft_obs_rows_attempted   = m.draft_obs_attempted;
+    o.draft_obs_rows_applied     = m.draft_obs_applied;
+    o.draft_obs_rows_skipped     = m.draft_obs_skipped;
+    o.draft_obs_cycles_discarded = m.draft_obs_discarded;
+    o.draft_cost_observations_inactive = m.draft_obs_inactive;
+    o.draft_cost_cycles       = m.draft_cost_cycles;
+    o.draft_cost_priced       = m.draft_cost_priced;
+    o.draft_cost_fallback     = m.draft_cost_fallback;
+    o.draft_cost_no_plan      = m.draft_cost_no_plan;
+    o.draft_cost_empty        = m.draft_cost_empty;
+    o.draft_cost_last_k       = m.draft_cost_last_k;
+    o.draft_cost_last_replay  = m.draft_cost_last_replay;
+    o.draft_cost_last_source  = m.draft_cost_last_source;
+    o.draft_cost_last_fallback = m.draft_cost_last_fallback;
+    o.draft_cost_last_rows    = m.draft_cost_last_rows;
+    o.draft_cost_tiers_priced = m.draft_cost_tiers_priced;
+    o.draft_cost_calibration  = m.draft_calib_forced;
+    o.draft_cost_calibration_cut = m.draft_calib_cut;
+    o.draft_cost_reference_skipped = m.draft_ref_skipped;
     o.preemptions = m.preemptions;
     o.total_requests = m.admitted;
     o.steps = m.steps;

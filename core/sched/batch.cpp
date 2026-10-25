@@ -9,6 +9,16 @@
 #include <cstring>
 #include <cstdlib>
 
+#ifdef RAD_TEST_HOOKS
+/* Test-build-only seam: tests/CMakeLists.txt compiles this file a second time, for the test
+ * binaries alone, with RAD_TEST_HOOKS. tests/sched_fakes.h defines the hook strongly and returns
+ * true once, so the scheduler's "a pass was owed and could not be built" path is reachable from a
+ * test without a runtime fault-injection switch. rad_core is never compiled with RAD_TEST_HOOKS,
+ * so the production library carries neither this definition nor the call below in any
+ * configuration, tests enabled or not. */
+extern "C" __attribute__((weak)) bool rad_test_fail_batch_build() { return false; }
+#endif
+
 namespace rad {
 
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
@@ -798,6 +808,11 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
 /* ------------------------------------------------------------------ build */
 const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, int step) {
     if (plan.e.empty()) return nullptr;
+#ifdef RAD_TEST_HOOKS
+    /* After the empty-plan check: the bench fails a build that has work to do, which is the case
+     * the scheduler must not mistake for "nothing owed". */
+    if (rad_test_fail_batch_build()) return nullptr;
+#endif
     if ((int64_t)plan.e.size() > max_seqs_ || plan.n_tok > max_tok_) {
         RAD_ERR("step plan of %d sequences / %lld tokens exceeds the pools sized at %lld / %lld",
                 (int)plan.e.size(), (long long)plan.n_tok,

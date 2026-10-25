@@ -67,16 +67,114 @@ int DraftController::configure(const Params& p) {
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
                  "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
                  kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst, kHold);
+    conf_ = p.confidence && !p.adapt && p.max_depth > 0;
+    if (conf_) {
+        if (p_.conf_fallback < 0 || p_.conf_fallback > p_.max_depth) {
+            RAD_ERR("--draft-confidence-fallback %d: must be in 0..%d (the ceiling; 0 is the "
+                    "ceiling)", p_.conf_fallback, p_.max_depth);
+            conf_ = false;
+            return RAD_E_INVAL;
+        }
+        if (p_.conf_floor < 1 || p_.conf_floor > p_.max_depth || !(p_.conf_scale >= 0.0) ||
+            !std::isfinite(p_.conf_offset)) {
+            RAD_ERR("--draft-confidence-rule %g,%g,%d: the floor must be in 1..%d (the ceiling) "
+                    "and the scale >= 0", p_.conf_scale, p_.conf_offset, p_.conf_floor,
+                    p_.max_depth);
+            conf_ = false;
+            return RAD_E_INVAL;
+        }
+        RAD_INFO("draft depth: confidence, %d..%d; at one decoding row a sequence's next window is "
+                 "ceil(%g * E %+g), E the expected accepted drafts of its window in flight by the "
+                 "head's q; a cycle with more rows and a publication without q draft %d",
+                 p_.conf_floor, p_.max_depth, p_.conf_scale, p_.conf_offset,
+                 confidence_fallback());
+    }
+
+    /* The cost policy's seam. It stays off unless a mode was asked for, and it is refused --
+     * not silently mapped to legacy -- when either hook it chooses from is missing. */
+    DraftPolicyConfig pc = p.policy;
+    pc.k_ceiling = p.max_depth;
+    pc.max_seqs = p.max_seqs;
+    const bool want_cost = pc.mode == DraftPolicyMode::Cost;
+    if (want_cost && (!p.predictor.predict || !p.costs.estimate)) {
+        RAD_ERR("--draft-policy cost needs a predictor and a cost model: this build has %s%s",
+                p.predictor.predict ? "" : "no predictor", p.costs.estimate ? "" : "no cost model");
+        p_.policy.mode = DraftPolicyMode::Legacy;
+        planner_ = DraftPlanner{};
+        return RAD_E_UNSUPPORTED;
+    }
+    const int rc = planner_.configure(pc, p.costs.records_only);
+    if (rc < 0) return rc;
+    plan_cur_ = -1;
+    cost_failed_ = false;
+    const size_t cap = (size_t)(p.max_seqs > 0 ? p.max_seqs : 0);
+    for (PlanSlot& s : plan_slots_) {
+        s.id.assign(cap, 0);
+        s.slot.assign(cap, -1);
+        s.gen.assign(cap, 0);
+        s.k.assign(cap, 0);
+        s.why.assign(cap, DraftFallback::None);
+        s.rows.assign(RAD_SCHED_MAX_SPEC + 1, 0);
+        s.ctx_class.assign(cap, 0);
+        s.history_tokens.assign(cap, 0);
+        s.fill.assign(cap, DraftDrafter::None);
+        s.plan          = DraftPlan{};
+        s.plan.cap      = (int)cap;
+        s.plan.req_id   = s.id.data();
+        s.plan.slot     = s.slot.data();
+        s.plan.slot_gen = s.gen.data();
+        s.plan.k        = s.k.data();
+        s.plan.why      = s.why.data();
+        s.plan.rows     = s.rows.data();
+        s.plan.ctx_class      = s.ctx_class.data();
+        s.plan.history_tokens = s.history_tokens.data();
+        s.plan.fill           = s.fill.data();
+    }
     return RAD_OK;
 }
 
-void DraftController::observe(int drafted, int accepted) {
+int DraftController::open_cycle(const DraftBatchView& view, DraftPredictions* preds) {
+    plan_cur_ = -1;
+    if (!cost_policy() || !preds) return RAD_OK;
+    /* The next cycle writes the other set, so the plan handed out last cycle keeps its rows. */
+    const int next = plan_cur_prev_ ^ 1;
+    PlanSlot& slot = plan_slots_[next];
+    if (view.n_seq > slot.plan.cap) return RAD_E_INVAL;
+    if (preds->cap < view.n_seq || !preds->seq || !preds->req_id) return RAD_E_INVAL;
+
+    int rc = p_.predictor.predict(p_.predictor.ctx, view, preds);
+    if (rc < 0) return rc;
+    /* A prediction set describes the view it was computed for: a stale version or a row list
+     * that is not this view's would let another cycle's numbers choose this plan. */
+    if (!draft_predictions_current(view, *preds)) return RAD_E_INVAL;
+    rc = planner_.choose(view, *preds, p_.costs, &slot.plan);
+    if (rc < 0) return rc;
+    plan_cur_      = next;
+    plan_cur_prev_ = next;
+    return RAD_OK;
+}
+
+int DraftController::planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const {
+    const DraftPlan* p = plan();
+    if (!p) return -1;
+    for (int32_t i = 0; i < p->n_seq; ++i)
+        if (p->req_id[i] == req_id && p->slot[i] == slot && p->slot_gen[i] == slot_gen)
+            return p->k[i];
+    return -1;
+}
+
+void DraftController::observe(int drafted, int accepted, int raw_match) {
     if (drafted <= 0) return;
     if (drafted > RAD_SCHED_MAX_SPEC) drafted = RAD_SCHED_MAX_SPEC;
     if (accepted < 0) accepted = 0;
     if (accepted > drafted) accepted = drafted;
+    /* The raw tally is the uncensored comparison: a censored stop leaves it above `accepted`, and
+     * it can never sit below what was committed. */
+    if (raw_match < accepted) raw_match = accepted;
+    if (raw_match > drafted) raw_match = drafted;
     tot_drafted_  += drafted;
     tot_accepted_ += accepted;
+    tot_raw_      += raw_match;
 
     /* Position j is evaluated only if every earlier position was accepted: 0..accepted-1 are
      * evaluated and accepted, position `accepted` (if drafted) evaluated and rejected, and nothing
@@ -87,7 +185,23 @@ void DraftController::observe(int drafted, int accepted) {
         if (j < accepted) ++hit_[j];
     }
     if (drafted > seen_) seen_ = drafted;
-    if (adapt_) ++by_depth_[drafted];
+    if (adapt_ || conf_) ++by_depth_[drafted];
+}
+
+int DraftController::confidence_window(const float* q, int n) const {
+    if (!conf_ || !q || n <= 0) return 0;
+    double p = 1.0, e = 0.0;
+    for (int j = 0; j < n; ++j) {
+        const double qj = q[j];
+        p *= qj > 0.0 ? (qj < 1.0 ? qj : 1.0) : 0.0;   /* a probability: NaN and others clamp */
+        e += p;
+    }
+    /* The margin keeps a value that lands on a whole number (2.5 * 0.8) from rounding up past it:
+     * q arrives as float, whose error is near 1e-7 of the value. */
+    const double w = std::ceil(p_.conf_scale * e + p_.conf_offset - 1e-6);
+    if (!(w >= (double)p_.conf_floor)) return p_.conf_floor;
+    if (w >= (double)p_.max_depth) return p_.max_depth;
+    return (int)w;
 }
 
 /* ------------------------------------------------------------------ the step's cost */

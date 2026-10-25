@@ -36,11 +36,24 @@ struct Flag {
 /* Built from kDraftWindowDefault so the default is stated once. Defined before the table that
  * points at it, which fixes their initialisation order. */
 static const std::string g_draft_window_help =
-    std::string("fixed | adaptive: how many drafts each sequence carries. fixed drafts\n"
-                "                                    --num-speculative-tokens every step; adaptive makes that\n"
-                "                                    the ceiling and follows each sequence's acceptance and the\n"
-                "                                    measured step cost (a serial draft head only). Default ") +
+    std::string("fixed | adaptive | confidence: how many drafts each sequence carries.\n"
+                "                                    fixed drafts --num-speculative-tokens every step; adaptive\n"
+                "                                    makes that the ceiling and follows each sequence's acceptance\n"
+                "                                    and the measured step cost (a serial draft head only);\n"
+                "                                    confidence makes it the ceiling and sets each sequence's next\n"
+                "                                    window from the head's q on the window in flight\n"
+                "                                    (--draft-confidence-rule; a serial head under\n"
+                "                                    RADIANCE_MTP_COUPLED). Default ") +
     draft_window_name(kDraftWindowDefault);
+
+static const std::string g_draft_policy_help =
+    std::string("legacy | cost: what decides each cycle's draft window. legacy uses the\n"
+                "                                    fixed depth, or --draft-window adaptive's per-sequence\n"
+                "                                    stop; cost runs the adaptive-MTP policy, which prices the\n"
+                "                                    batch shape and chooses each request's K per cycle. A\n"
+                "                                    deployment without a measured profile falls back to the\n"
+                "                                    configured depth. Default ") +
+    draft_policy_name(kDraftPolicyDefault);
 
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
@@ -155,6 +168,48 @@ static const Flag g_flags[] = {
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
+    { "--draft-confidence-rule", "RULE", "SCALE,OFFSET,FLOOR: --draft-window confidence's next\n"
+    "                                    window, ceil(SCALE * E + OFFSET) clamped to FLOOR..\n"
+    "                                    --num-speculative-tokens, E = sum over j of q1*...*qj on\n"
+    "                                    the window in flight. Default 1.25,0,2" },
+    { "--draft-confidence-fallback", "N", "--draft-window confidence's window where the rule has no\n"
+    "                                    say: a cycle with more than one decoding row, and a\n"
+    "                                    publication without q. 0 is --num-speculative-tokens.\n"
+    "                                    Default 3" },
+    { "--draft-policy",       "MODE",   g_draft_policy_help.c_str() },
+    { "--draft-depth-tiers",  "LIST",   "the K values the cost policy chooses between, ascending\n"
+    "                                    and unique, e.g. 0,2,3,4,6; each must be <= the executable\n"
+    "                                    head depth. Default 0,2,3,4,6 (trimmed to that depth)" },
+    { "--draft-fallback-k",   "K",      "the depth the cost policy drafts when it can price no\n                                    candidate: a cycle whose shape no bucket matches. Default\n                                    the ladder's middle tier; deeper than the executable head\n                                    depth is refused. Refused without --draft-policy cost" },
+    { "--draft-hysteresis",   "MODE",   "which depth moves of the cost policy wait for its hold\n"
+    "                                    (8 cycles) and margin (2%): raise (default; a reduction\n"
+    "                                    is immediate) or both. Needs --draft-policy cost" },
+    { "--draft-calib-k",      "LIST",   "force this fixed sequence of depths, one per non-empty\n"
+    "                                    cycle, e.g. 3,2,2,3; order and duplicates are kept, and\n"
+    "                                    every value must be one of the effective\n"
+    "                                    --draft-depth-tiers. A calibration switch, refused\n"
+    "                                    unless --draft-profile-out and --draft-policy cost are\n"
+    "                                    given; with --draft-reference it measures the no-loan\n"
+    "                                    reference, without it a live diagnostic whose\n"
+    "                                    placement-affected buckets are exported flagged and\n"
+    "                                    never priced. A serving run lets the cost policy decide" },
+    { "--draft-profile",      "PATH",   "a rad-draft-profile/4 file measured on this deployment,\n"
+    "                                    read before the scheduler starts; a fingerprint or\n"
+    "                                    execution mismatch disables it and is named in the log.\n"
+    "                                    Not accepted on a generator or embedding model" },
+    { "--draft-profile-out",  "PATH",   "write the cost profile this run measured to PATH when the\n"
+    "                                    engine exits, with this deployment's fingerprint and\n"
+    "                                    execution; refused if PATH exists or nothing was measured.\n"
+    "                                    Under --draft-policy cost the table is record-only: the run\n"
+    "                                    issues the fallback baseline and prices nothing from what\n"
+    "                                    it records. Needs a serial draft head. Not accepted on a\n"
+    "                                    generator or embedding model" },
+    { "--draft-reference",    "",       "calibrate the no-loan reference: both lenders off for the\n"
+    "                                    whole run (no borrowed KV, no borrowed arena capacity), so\n"
+    "                                    the file is the plan's start placement without loans. Needs\n"
+    "                                    --draft-profile-out; the loaded reference is an optimisation\n"
+    "                                    basis, not a latency bound. Not accepted on a generator or\n"
+    "                                    embedding model" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -632,10 +687,137 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "fixed"))    c->draft_window = DraftWindow::Fixed;
             else if (!std::strcmp(v, "adaptive")) c->draft_window = DraftWindow::Adaptive;
+            else if (!std::strcmp(v, "confidence")) c->draft_window = DraftWindow::Confidence;
             else {
-                RAD_ERR("--draft-window takes fixed or adaptive, not '%s'", v);
+                RAD_ERR("--draft-window takes fixed, adaptive or confidence, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--draft-confidence-rule")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Three fields; the floor against the ceiling is Scheduler::init's check, where auto
+             * has resolved the depth. */
+            const std::string all = v;
+            const size_t c1 = all.find(',');
+            const size_t c2 = c1 == std::string::npos ? c1 : all.find(',', c1 + 1);
+            if (c2 == std::string::npos || all.find(',', c2 + 1) != std::string::npos) {
+                RAD_ERR("--draft-confidence-rule takes SCALE,OFFSET,FLOOR, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            double scale = 0, offset = 0;
+            int64_t floor = 0;
+            if (!parse_num(a.c_str(), all.substr(0, c1).c_str(), &scale) ||
+                !parse_num(a.c_str(), all.substr(c1 + 1, c2 - c1 - 1).c_str(), &offset) ||
+                !parse_int(a.c_str(), all.substr(c2 + 1).c_str(), 1, INT32_MAX, &floor))
+                return RAD_E_INVAL;
+            if (scale < 0) {
+                RAD_ERR("--draft-confidence-rule: SCALE must be >= 0, not %g", scale);
+                return RAD_E_INVAL;
+            }
+            c->draft_conf_scale    = (float)scale;
+            c->draft_conf_offset   = (float)offset;
+            c->draft_conf_floor    = (int)floor;
+            c->draft_conf_rule_set = true;
+        }
+        else if (S("--draft-confidence-fallback")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 0, INT32_MAX, &n)) return RAD_E_INVAL;
+            c->draft_conf_fallback     = (int)n;
+            c->draft_conf_fallback_set = true;
+        }
+        else if (S("--draft-policy")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "legacy")) c->draft_policy = DraftPolicyKind::Legacy;
+            else if (!std::strcmp(v, "cost"))   c->draft_policy = DraftPolicyKind::Cost;
+            else {
+                RAD_ERR("--draft-policy takes legacy or cost, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-hysteresis")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "raise")) c->draft_hold_reductions = false;
+            else if (!std::strcmp(v, "both"))  c->draft_hold_reductions = true;
+            else {
+                RAD_ERR("--draft-hysteresis takes raise or both, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-tiers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Ascending and unique here; the ceiling is not known until auto resolves it, so
+             * "<= ceiling" is DraftPlanner::configure's check, at startup. */
+            const std::string all = v;
+            size_t at = 0;
+            int n = 0;
+            while (at <= all.size()) {
+                const size_t end = std::min(all.find(',', at), all.size());
+                const std::string one = all.substr(at, end - at);
+                int64_t t = 0;
+                if (!parse_int(a.c_str(), one.c_str(), 0, INT32_MAX, &t)) return RAD_E_INVAL;
+                if (n >= kDraftMaxTiers) {
+                    RAD_ERR("--draft-depth-tiers takes at most %d K values", kDraftMaxTiers);
+                    return RAD_E_INVAL;
+                }
+                if (n > 0 && (int)t <= c->draft_tiers[n - 1]) {
+                    RAD_ERR("--draft-depth-tiers must be ascending and unique (%lld after %d)",
+                            (long long)t, c->draft_tiers[n - 1]);
+                    return RAD_E_INVAL;
+                }
+                c->draft_tiers[n++] = (int)t;
+                at = end + 1;
+            }
+            c->draft_n_tiers = n;
+            c->draft_tiers_set = true;
+        }
+        else if (S("--draft-fallback-k")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t t = 0;
+            if (!parse_int(a.c_str(), v, 0, INT32_MAX, &t)) return RAD_E_INVAL;
+            c->draft_fallback_k = (int)t;
+        }
+        else if (S("--draft-calib-k")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* A sequence, not a ladder: order and duplicates are the point (3,2,2,3), so only
+             * the count and the values are checked here. Whether each value is one of the
+             * effective ladder's depths is DraftPlanner::configure's check, at startup, where
+             * the trimmed ladder is known. */
+            const std::string all = v;
+            size_t at = 0;
+            int n = 0;
+            while (at <= all.size()) {
+                const size_t end = std::min(all.find(',', at), all.size());
+                const std::string one = all.substr(at, end - at);
+                int64_t t = 0;
+                if (!parse_int(a.c_str(), one.c_str(), 0, INT32_MAX, &t)) return RAD_E_INVAL;
+                if (n >= kDraftMaxTiers) {
+                    RAD_ERR("--draft-calib-k takes at most %d K values", kDraftMaxTiers);
+                    return RAD_E_INVAL;
+                }
+                c->draft_calib_k[n++] = (int)t;
+                at = end + 1;
+            }
+            if (n < 2) {
+                RAD_ERR("--draft-calib-k takes at least 2 K values: a single depth is not a "
+                        "sequence");
+                return RAD_E_INVAL;
+            }
+            c->draft_calib_n = n;
+        }
+        else if (S("--draft-reference")) {
+            /* A flag, not a mode: it says how this calibration measures, and the writer stamps
+             * the file with that basis. Whether the run may use it (a profile out, a policy that
+             * opens the cycle) is checked where both are known. */
+            c->draft_reference = true;
+        }
+        else if (S("--draft-profile")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->draft_profile = v;
+        }
+        else if (S("--draft-profile-out")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->draft_profile_out = v;
         }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
@@ -1060,6 +1242,32 @@ const ShowRow kShow[] = {
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
+    { "--draft-confidence-rule", [](const Config& c) {
+          return fnum(c.draft_conf_scale) + "," + fnum(c.draft_conf_offset) + "," +
+                 num(c.draft_conf_floor); } },
+    { "--draft-confidence-fallback", [](const Config& c) {
+          return c.draft_conf_fallback > 0 ? num(c.draft_conf_fallback)
+                                           : std::string("0: the ceiling"); } },
+    { "--draft-policy",       [](const Config& c) { return std::string(draft_policy_name(c.draft_policy)); } },
+    { "--draft-depth-tiers",  [](const Config& c) {
+        std::string s;
+        for (int i = 0; i < c.draft_n_tiers; ++i) s += (i ? "," : "") + num(c.draft_tiers[i]);
+        return s;
+    } },
+    { "--draft-hysteresis",   [](const Config& c) {
+          return std::string(c.draft_hold_reductions ? "both" : "raise"); } },
+    { "--draft-fallback-k",   [](const Config& c) {
+          return c.draft_fallback_k < 0 ? std::string("the ladder's middle tier")
+                                        : num(c.draft_fallback_k); } },
+    { "--draft-calib-k",      [](const Config& c) {
+        std::string s;
+        for (int i = 0; i < c.draft_calib_n; ++i) s += (i ? "," : "") + num(c.draft_calib_k[i]);
+        return s.empty() ? std::string("none") : s;
+    } },
+    { "--draft-profile",      [](const Config& c) { return or_none(c.draft_profile, "none"); } },
+    { "--draft-profile-out",  [](const Config& c) { return or_none(c.draft_profile_out, "none"); } },
+    { "--draft-reference",    [](const Config& c) {
+          return std::string(c.draft_reference ? "on: both lenders off" : "off"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

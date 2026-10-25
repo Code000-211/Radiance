@@ -248,7 +248,7 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     ++stats_.dispatches;
 }
 
-void HeatEngine::set_tier(int32_t unit, Tier t) {
+void HeatEngine::set_tier(int32_t unit, Tier t, bool fill, bool initial) {
     if (unit < 0 || (size_t)unit >= tier_.size()) return;
     const int32_t l = layer_of_[(size_t)unit];
     const Tier was = tier_[(size_t)unit];
@@ -262,6 +262,10 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
 
     if (was != Tier::VRAM && t == Tier::VRAM) {
         ++stats_.promotions;
+        if (fill) {
+            ++stats_.fill_promotions;
+            if (initial) ++stats_.initial_fill_promotions;
+        }
         if (ever_[(size_t)unit] & 2u) ++stats_.readmits;
         if (!(ever_[(size_t)unit] & 1u)) { ++stats_.distinct_promoted; ever_[(size_t)unit] |= 1u; }
     } else if (was == Tier::VRAM && t != Tier::VRAM) {

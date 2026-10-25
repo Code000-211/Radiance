@@ -95,6 +95,22 @@ struct HeatRanked { float h; int32_t rc; int32_t unit; };
 struct HeatStats {
     uint64_t dispatches = 0;
     uint64_t proposed = 0, promotions = 0, demotions = 0;
+    /* A subset of `promotions`: the ones Mover::fill issued into lent spare slots. A fill
+     * materialises the plan's start placement -- it evicts nothing and only uses memory the
+     * plan left free -- so the cost profile's drift evidence leaves it out until the start
+     * placement is resolved (Engine::residency_moves). A swap's promotion is not one. */
+    uint64_t fill_promotions = 0;
+    /* Of those, the ones issued before this rank's first observation. Heat is what orders a
+     * fill, and at zero dispatches every heat is zero, so only this fill is the plan's own free
+     * slots by layer -- a function of the plan and the loan. A fill after an observation picks
+     * its units from what the run has seen and is never the start placement. */
+    uint64_t initial_fill_promotions = 0;
+
+    /* The placement moves the drift evidence counts: every promotion and demotion but the
+     * `fill_exempt` promotions that are the start placement materialising. */
+    int64_t moves(int64_t fill_exempt) const {
+        return (int64_t)promotions - fill_exempt + (int64_t)demotions;
+    }
     /* Why a dispatch moved nothing. `refused` is the guard declining, the healthy steady state.
      * `no_candidate` is an empty end of the ranking (everything movable is resident, or nothing
      * is), a budget question rather than a policy one. */
@@ -141,8 +157,10 @@ public:
     /* ---- tier map, written by the mover when a move publishes, not when it is issued ---------
      *
      * Until publish both copies are valid and dispatch reads the old one, so the tier here must
-     * match dispatch's view. `set_busy` is what keeps an in-flight unit from being picked again. */
-    void set_tier(int32_t unit, Tier t);
+     * match dispatch's view. `set_busy` is what keeps an in-flight unit from being picked again.
+     * `fill` marks the promotion as the fill's (HeatStats::fill_promotions), `initial` as one
+     * issued before the first observation (HeatStats::initial_fill_promotions). */
+    void set_tier(int32_t unit, Tier t, bool fill = false, bool initial = false);
     void set_busy(int32_t unit, bool busy);
     Tier tier(int32_t unit) const { return tier_[(size_t)unit]; }
     bool busy(int32_t unit) const { return busy_[(size_t)unit] != 0; }

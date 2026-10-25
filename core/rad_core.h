@@ -128,9 +128,13 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
- *   Fixed     every sequence drafts --num-speculative-tokens.
- *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
- *             acceptance and step cost. Serial drafters only.
+ *   Fixed       every sequence drafts --num-speculative-tokens.
+ *   Adaptive    that is the ceiling; head depth per step and each sequence's stop follow measured
+ *               acceptance and step cost. Serial drafters only.
+ *   Confidence  that is the ceiling; a sequence's next window follows the head's own q(x) on the
+ *               window the step in flight verifies (--draft-confidence-rule), at one decoding
+ *               row. A serial head under RADIANCE_MTP_COUPLED; a batched cycle and a
+ *               publication without q draft --draft-confidence-fallback.
  * The default is kDraftWindowDefault; the help text and startup line read it from there.
  *
  * Fixed is the default because adaptive loses on a busy server. Qwen3.8-Flash-Next, TP2 on two
@@ -143,11 +147,30 @@ const char* table_placement_name(TablePlacement p);
  * At eight sequences depth 5 costs 1.18x the step time (43.0 vs 36.3 ms) for 1.04x the tokens
  * (23.3 vs 22.3). The cost model's prior puts depth 5 at 1.10x depth 3, and a depth not yet timed
  * at a load is priced on the prior. */
-enum class DraftWindow { Fixed = 0, Adaptive = 1 };
+enum class DraftWindow { Fixed = 0, Adaptive = 1, Confidence = 2 };
 constexpr DraftWindow kDraftWindowDefault = DraftWindow::Fixed;
 inline const char* draft_window_name(DraftWindow w) {
-    return w == DraftWindow::Adaptive ? "adaptive" : "fixed";
+    return w == DraftWindow::Adaptive ? "adaptive" : w == DraftWindow::Confidence ? "confidence"
+                                                                                : "fixed";
 }
+
+/* --draft-policy: what decides each cycle's draft window.
+ *   Legacy  the fixed depth above, or --draft-window adaptive's per-sequence stop.
+ *   Cost    the adaptive-MTP cost policy (core/sched/draft_policy.h): B's predictor supplies
+ *           each request's per-position acceptance, A's cost model prices the batch shape, and
+ *           the plan it chooses is what every proposal site reads for the cycle. Without a
+ *           measured profile the model has no anchor, so the policy issues its named fallback at
+ *           the configured depth rather than inventing a price.
+ * The default is kDraftPolicyDefault, read by the help text and the startup line.
+ * `Kind`, not `DraftPolicy`: that name is the seam's choose hook (core/sched/draft_types.h). */
+enum class DraftPolicyKind { Legacy = 0, Cost = 1 };
+constexpr DraftPolicyKind kDraftPolicyDefault = DraftPolicyKind::Legacy;
+inline const char* draft_policy_name(DraftPolicyKind p) {
+    return p == DraftPolicyKind::Cost ? "cost" : "legacy";
+}
+/* The most K values --draft-depth-tiers carries; sizes Config::draft_tiers and the planner's
+ * ladder (RAD_DRAFT_MAX_TIERS, core/sched/draft_policy.h). */
+constexpr int kDraftMaxTiers = 8;
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
@@ -878,6 +901,74 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    /* --draft-confidence-rule SCALE,OFFSET,FLOOR: under --draft-window confidence a sequence's
+     * next window is ceil(SCALE * E + OFFSET) clamped to FLOOR..n_spec, E = sum over j of
+     * q1*...*qj on the window in flight (DraftController::confidence_window). The default is the
+     * rule cross-validated on two legacy K6 BetterBench runs (Qwen3.8-Flash-Next, TP2 wht6). Set
+     * explicitly outside that window it is refused (Scheduler::init). */
+    float   draft_conf_scale  = 1.25f;
+    float   draft_conf_offset = 0.0f;
+    int     draft_conf_floor  = 2;
+    bool    draft_conf_rule_set = false;
+    /* --draft-confidence-fallback N: the window under --draft-window confidence where the rule has
+     * no say -- a cycle with more than one decoding row (the rule was fitted on single-row
+     * windows, and a batched head runs as many rounds as its deepest window) and a publication
+     * without q. 0 is n_spec. Refused outside that window, and above n_spec (Scheduler::init). */
+    int     draft_conf_fallback = 3;
+    bool    draft_conf_fallback_set = false;
+    DraftPolicyKind draft_policy = kDraftPolicyDefault;   /* --draft-policy */
+    /* --draft-depth-tiers: the K values the cost policy chooses between, ascending and unique.
+     * The default is the ladder the policy was tuned with. An explicit tier above the executable
+     * head depth is refused by Scheduler::init, which is where that depth is known (auto resolves
+     * it). A top below it is left as given: a profile that prices that top is a valid reload, so
+     * the list is not refused at init. Only a cycle whose top is unpriced while the named
+     * baseline would run deeper is refused, by the policy that can see the shape; nothing is
+     * learnt into a depth the ladder never offers (docs/ADAPTIVE-MTP.md). The default ladder is
+     * trimmed to the depth instead, so a valid deployment is not refused for its deeper end. */
+    int     draft_tiers[kDraftMaxTiers] = { 0, 2, 3, 4, 6 };
+    int     draft_n_tiers = 5;
+    bool    draft_tiers_set = false;    /* --draft-depth-tiers was given */
+    /* --draft-hysteresis: `raise` (false, the default) holds only a raise for the cost policy's
+     * hold and margin, a reduction is immediate; `both` (true) holds a reduction the same way
+     * (DraftPolicyConfig::hold_reductions). Refused by Scheduler::init without --draft-policy
+     * cost, where it would change nothing. */
+    bool    draft_hold_reductions = false;
+    /* --draft-calib-k: the calibration's fixed depth sequence, in the given order, duplicates
+     * allowed, 2..kDraftMaxTiers values, e.g. 3,2,2,3. Not a ladder: every value must be one of
+     * the effective --draft-depth-tiers, checked at startup against the list the scheduler
+     * really offers. Only a calibration may set it (--draft-profile-out, --draft-policy cost):
+     * with --draft-reference the no-loan reference, without it a live diagnostic whose
+     * placement-affected buckets the export keeps flagged (never priced). A serving run must let
+     * the cost policy decide, and Engine::begin_draft_calibration refuses the flag without them.
+     * Empty: off. */
+    int     draft_calib_k[kDraftMaxTiers] = {};
+    int     draft_calib_n = 0;
+    /* --draft-fallback-k: the depth the cost policy runs when it can price no candidate at all
+     * (`DraftFallback::UnknownShape`). -1 is the policy's own default, the ladder's middle tier: a
+     * profile measured at one row count (the shipped file's 47 buckets are all n_rows = 1) can
+     * never price a wider batch, and the ceiling is then the wrong depth for every cycle of it --
+     * one step off the top is the depth such a batch runs instead of the maximum. Deeper than the
+     * executable head depth is refused at startup, and a recording run
+     * (--draft-profile-out) keeps the executable depth, because the baseline is the depth its
+     * export is priced at. Refused without --draft-policy cost, where it would do nothing. */
+    int     draft_fallback_k = -1;
+    /* --draft-reference: this run calibrates the no-loan reference. Both lenders stay off for the
+     * whole run, so the buckets are the plan's start placement without borrowed copies; the file
+     * is stamped with that basis and a serving run may load it while its own loans stay dynamic.
+     * Not a switch a serving run sets, and not a bound: see docs/ADAPTIVE-MTP.md. */
+    bool    draft_reference = false;
+    /* --draft-profile: a rad-draft-profile/4 file measured on this deployment. Read once before
+     * the scheduler initialises; a fingerprint or execution mismatch leaves the cost table
+     * inactive and names the difference, and Cost is then refused by Scheduler::init. An older
+     * format is refused by name: it cannot be bound to this deployment. */
+    std::string draft_profile;
+    /* --draft-profile-out: where a calibration run writes the cost profile it measured, with the
+     * same fingerprint and execution the reader derives at startup. The observation ring records
+     * under legacy/adaptive; written once at the end of serve(), after the ring is flushed, and
+     * only when the run measured at least one bucket; never over an existing file. Under cost the
+     * table is record-only: the run issues the admitted fallback at its ceiling -- the start cycle
+     * included, which legacy drafting never executes -- and prices nothing from what it records. */
+    std::string draft_profile_out;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

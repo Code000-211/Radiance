@@ -219,6 +219,109 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(g.get("/graph").value("order", json()).size(), (size_t)0);
 }
 
+/* The cost policy's plan ledger. "The policy never priced" and "the ladder priced nothing" are
+ * different facts about a run, and a fallback-only run cannot tell them apart from its plans
+ * alone, so /stats carries both counts beside what the last plan asked for. The replay is named,
+ * never emitted as a number: it is the *candidate* the plan declared (the last bracket's observed
+ * state), so a page must not read it as what ran. No cycle yet means no object at all -- a zeroed
+ * ledger would look like a measurement of nothing. */
+TEST(stats_reports_the_cost_policys_plan_ledger_by_name) {
+    Dash d(false);
+    CHECK(!d.get("/stats").contains("draft_cost"));   /* no cycle, no reference observation */
+
+    /* A cycle that opened and got no plan: counted, named, and nothing claims a plan was issued --
+     * a `last_k` of 0 there would read as a policy that chose K=0. */
+    d.sched.m.draft_cost_cycles  = 1;
+    d.sched.m.draft_cost_no_plan = 1;
+    json dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("no_plan", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("empty", (int64_t)0), (int64_t)0);
+    CHECK(!dc.contains("last_k"));
+    CHECK(!dc.contains("last_replay"));
+    CHECK(!dc.contains("last_source"));
+    CHECK(!dc.contains("last_fallback"));
+
+    /* The last plan: all four dimensions by name, and the ends summing to the cycles. */
+    d.sched.m.draft_cost_cycles      = 4;
+    d.sched.m.draft_cost_no_plan     = 0;
+    d.sched.m.draft_cost_priced      = 3;
+    d.sched.m.draft_cost_fallback    = 1;
+    d.sched.m.draft_cost_last_k      = 2;
+    d.sched.m.draft_cost_last_rows   = 6;
+    d.sched.m.draft_cost_last_source = 1;   /* DraftPlanSource::Cost */
+    d.sched.m.draft_cost_last_fallback = 2; /* DraftFallback::UnknownShape */
+    const char* names[] = { "unknown", "none", "play", "record", "audit" };
+    for (int r = 0; r < (int)(sizeof(names) / sizeof(names[0])); ++r) {
+        d.sched.m.draft_cost_last_replay = r;
+        dc = d.get("/stats")["draft_cost"];
+        CHECK_EQ(dc.value("cycles", (int64_t)0), (int64_t)4);
+        CHECK_EQ(dc.value("priced", (int64_t)0), (int64_t)3);
+        CHECK_EQ(dc.value("fallback", (int64_t)0), (int64_t)1);
+        CHECK_EQ(dc.value("last_k", (int64_t)0), (int64_t)2);
+        CHECK_EQ(dc.value("last_rows", (int64_t)0), (int64_t)6);
+        CHECK_EQ(dc.value("last_replay", std::string()), std::string(names[r]));
+    }
+    CHECK_EQ(dc.value("last_source", std::string()), std::string("cost"));
+    CHECK_EQ(dc.value("last_fallback", std::string()), std::string("unknown_shape"));
+
+    /* An empty planning point is its own end: an idle or prefill step issues the valid K0 plan for
+     * an empty view, and a page that folded it into `fallback` would report a policy that chose
+     * the fallback on a run whose real plans never did. */
+    d.sched.m.draft_cost_cycles = 5;
+    d.sched.m.draft_cost_empty  = 1;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("empty", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("priced", (int64_t)0) + dc.value("fallback", (int64_t)0) +
+                 dc.value("empty", (int64_t)0) + dc.value("no_plan", (int64_t)0),
+             dc.value("cycles", (int64_t)0));
+    /* The `last_*` fields belong to the last plan with rows, so an empty step before that plan
+     * does not publish a K0 decision: no rows, no fields. */
+    d.sched.m.draft_cost_last_rows = 0;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK(!dc.contains("last_k"));
+    CHECK(!dc.contains("last_rows"));
+    d.sched.m.draft_cost_last_rows = 6;
+    d.sched.m.draft_cost_cycles    = 4;
+    d.sched.m.draft_cost_empty     = 0;
+
+    /* The five ends and the two counts that qualify them: a forced calibration plan is neither a
+     * price nor a fallback, and `tiers_priced` says whether the search weighed a shallower depth
+     * instead of never measuring it. */
+    d.sched.m.draft_cost_cycles       = 4;
+    d.sched.m.draft_cost_priced       = 2;
+    d.sched.m.draft_cost_fallback     = 0;
+    d.sched.m.draft_cost_no_plan      = 0;
+    d.sched.m.draft_cost_calibration  = 2;
+    d.sched.m.draft_cost_calibration_cut = 1;
+    d.sched.m.draft_cost_tiers_priced = 1;
+    d.sched.m.draft_cost_last_k       = 2;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("calib_forced", (int64_t)0), (int64_t)2);
+    CHECK_EQ(dc.value("calib_cut", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("tiers_priced", (int64_t)0), (int64_t)1);
+    CHECK_EQ(dc.value("priced", (int64_t)0) + dc.value("fallback", (int64_t)0) +
+                 dc.value("calib_forced", (int64_t)0) + dc.value("empty", (int64_t)0) +
+                 dc.value("no_plan", (int64_t)0),
+             dc.value("cycles", (int64_t)0));
+
+    /* The reference's own count stands alone: a no-loan run absorbs nothing, so this is the only
+     * thing it publishes -- and it must publish it, or "nothing reached the reference" and "the
+     * reference refused nothing" are the same silence. */
+    d.sched.m.draft_cost_cycles            = 0;
+    d.sched.m.draft_cost_priced            = 0;
+    d.sched.m.draft_cost_fallback          = 0;
+    d.sched.m.draft_cost_empty             = 0;
+    d.sched.m.draft_cost_no_plan           = 0;
+    d.sched.m.draft_cost_calibration       = 0;
+    d.sched.m.draft_cost_calibration_cut   = 0;
+    d.sched.m.draft_cost_last_rows         = 0;
+    d.sched.m.draft_cost_reference_skipped = 2;
+    dc = d.get("/stats")["draft_cost"];
+    CHECK_EQ(dc.value("reference_skipped", (int64_t)0), (int64_t)2);
+    CHECK(!dc.contains("last_k"));
+}
+
 /* /sessions lists each stored conversation with where its blocks are, the pool as the card holds
  * it (each block once), the tiers' counters and the snapshot store. */
 TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
@@ -393,6 +496,25 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(p.kv_tokens_total, (int64_t)(200 * 16));
     CHECK_EQ(p.kv_tokens_used, (int64_t)(190 * 16));
     CHECK_EQ(p.kv_tokens_max, (int64_t)(100 * 16));
+}
+
+/* The observation ledger crosses the bridge with its units intact: the scheduler's three row
+ * counters, its cycle counter and its cost-observation counter arrive as such, never converted
+ * into each other. */
+TEST(the_bridge_carries_the_observation_ledger_with_its_units) {
+    rad::SchedMetrics m;
+    m.draft_obs_attempted = 96;
+    m.draft_obs_applied = 51;
+    m.draft_obs_skipped = 45;
+    m.draft_obs_discarded = 3;
+    m.draft_obs_inactive = 7;
+
+    const server::SchedMetrics o = bridge_metrics(m);
+    CHECK_EQ(o.draft_obs_rows_attempted, (int64_t)96);
+    CHECK_EQ(o.draft_obs_rows_applied, (int64_t)51);
+    CHECK_EQ(o.draft_obs_rows_skipped, (int64_t)45);
+    CHECK_EQ(o.draft_obs_cycles_discarded, (int64_t)3);
+    CHECK_EQ(o.draft_cost_observations_inactive, (int64_t)7);
 }
 
 RAD_TEST_MAIN()

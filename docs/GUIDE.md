@@ -731,8 +731,12 @@ architecture plugin declares its activations again at smaller step sizes (the de
 to a power of two, at least 256, then each level 4x the one below, up to the step budget), each packed
 into the bottom of the arena. While recent steps fit a smaller size, the top of the arena holds expert
 weights; the first larger step takes it back before it runs (an address change, not a copy). Startup
-prints what each size lends (`activation arena: lends ...`). A plugin opts in with
-`RadArchProbe::shape_probe_ok`; one that does not keeps its whole arena.
+prints what each size lends (`activation arena: lends ...`), and `/stats` reports the whole set
+(`arena.levels`) with the level chosen for the last prepared batch (`arena.level`, and
+`arena.level_rows` for that level's capacity -- the step size it serves, not the batch's token
+count; 0 until the first batch is prepared, with `arena.level` then a nominal 0 and not a choice).
+A plugin opts in with `RadArchProbe::shape_probe_ok`; one that does not keeps its whole
+arena.
 
 Related flags:
 
@@ -1081,6 +1085,18 @@ speculation off, the window stays fixed and startup says so. Prompt-lookup propo
 head declines count in the acceptance metrics but do not move the window. At temperature 0 the text
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
+
+**Confidence window.** With `--draft-window confidence` a serial head under `RADIANCE_MTP_COUPLED`
+sets each sequence's next window from its own q(x) on the window the step in flight verifies:
+`ceil(SCALE * E + OFFSET)` clamped to `FLOOR..--num-speculative-tokens`, E the sum over j of
+q1*...*qj (`--draft-confidence-rule`, default `1.25,0,2`). The window drafted now cannot see its
+own q -- the next step is issued before the rounds are read back -- so the rule reads the window
+before it, whose acceptance is not known yet. A window grows by at most a quarter per step. The
+rule decides at one decoding row only: with more rows every sequence drafts
+`--draft-confidence-fallback` (default 3), because the head runs as many rounds as the deepest
+window and one deep sequence would make every row pay for them; a request without q (greedy
+sampling, coupling off) drafts it too. Not combined with `--draft-policy cost`; the stop line
+counts the windows verified per depth.
 
 ### 4.7 Multiple cards
 
@@ -1630,7 +1646,9 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only; `confidence` follows the head's q on the window in flight (§4.6) |
+| `--draft-confidence-rule S,O,F` | 1.25,0,2 | `--draft-window confidence`'s next window, `ceil(S * E + O)` clamped to `F..N`; refused without that window (§4.6) |
+| `--draft-confidence-fallback N` | 3 | `--draft-window confidence`'s window at more than one decoding row and without q; 0 is N; refused without that window (§4.6) |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -2880,6 +2898,9 @@ there is none.
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
+| `draft_observation_rows_attempted_total`, `_rows_applied_total`, `_rows_skipped_total` | the cost policy's observation ledger, in **rows**: one per delivered request/sequence row of a cycle, not one per token position — a wider verify window adds labels inside a row, so only more delivered rows raise these. `_applied` applied a learning update (at least one position's learning state moved; it does not promise the estimate changed numerically), `_skipped` taught nothing (no teachable label, or a recycled request/slot identity) |
+| `draft_observation_cycles_discarded_total` | in **whole cycles**: dropped before delivery (incomplete, or refused by the predictor). Not rows, and never a sum with the three row counters |
+| `draft_cost_observations_inactive_total` | in **cost observations**: one per valid observation (a complete cycle with a usable bracket) handed to a cost table with no active profile, so the deployment observes without learning. Not a row and not a cycle; zero while a profile is installed |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
 | `engine_steps_held_total` | decode-only steps `--prefill-interleave` ran between chunks (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
@@ -2892,13 +2913,21 @@ there is none.
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
-Two pitfalls:
+Three pitfalls:
 
 - `draft_acceptance_ratio` is conditional on having drafted, so it can stay high while tokens per
   step collapse. Blocks per step (`draft_tokens_total / depth` over `engine_steps_decode_total`)
   separates the two; `scripts/mcdecl.sh` measures it.
 - Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
+- `draft_observation_rows_attempted_total = 0` means no observation was delivered to the
+  predictor — not that no work ran. Drafting and verification happen under `legacy` too, and a
+  cycle is only delivered when the next one opens (or the engine goes idle); until then
+  `attempted` stays where it was. All observation counters are cumulative source counters
+  over the server's lifetime, like every `radiance:` counter: nothing resets them.
+  `draft_cost_observations_inactive_total` rising while `_rows_applied_total` stays flat means the
+  engine is measuring without a profile, not that the predictor rejected the rows: check the
+  `--draft-policy cost` startup reason before reading it as lost evidence.
 
 `deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
 

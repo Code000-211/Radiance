@@ -28,19 +28,34 @@
  * The policy is for serial drafters only (Scheduler::init): a block drafter proposes its block in
  * one pass and prompt lookup runs none, so neither pays per-round cost.
  *
+ * `--draft-window confidence` uses what the opening paragraph rules out for the window being
+ * drafted, one window late. Under RADIANCE_MTP_COUPLED every round leaves q(x), the head's own
+ * probability of the token it drew (draft_confidence.h), and the engine publishes it with the
+ * drafts. When a cycle opens, the window the step in flight verifies has been published, so its q
+ * are on the host while its acceptance is not: the sequence's next window is
+ * ceil(scale * E + offset) clamped to floor..max_depth, E = sum_j prod_{i<=j} q_i over that
+ * window's drafts (confidence_window). Acceptance history, the adaptive policy's input, arrives a
+ * window later still and carried almost nothing on Qwen3.8-Flash-Next (+0.2% replayed against the
+ * best fixed depth, against +2.1..2.4% for this rule, cross-validated over two legacy K6 runs). The
+ * rule was fitted on single-row windows: a cycle with more than one decoding row drafts the
+ * fallback depth for every row, because a serial head runs as many rounds as the step's deepest
+ * window and one deep sequence of eight made most C8 steps run six rounds (-6.6% against fixed K3
+ * over four BetterBench pairs). A publication without q -- a greedy request, coupling off --
+ * drafts the fallback too. The rule has no hold: its windows are at most max_depth shapes, all
+ * recorded after the first few steps.
+ *
  * It changes only how many drafts a step verifies. Acceptance follows core/sample/accept.h, so
  * every emitted token is the target's own; at temperature 0 the text matches a plain run as far
  * as the logits do, and a verify row's logits are computed at an M that moves with the window
  * (see accept.h).
  */
 #pragma once
-#include "rad_core.h"
+#include "draft_policy.h"
+#include "draft_types.h"
+
+#include <vector>
 
 namespace rad {
-
-/* libr4d's decode kernel serves up to 64 query rows, the verify-step band (spec §10), so 64 is
- * the largest window any batch can carry. */
-enum { RAD_SCHED_MAX_SPEC = 64 };
 
 /* One sequence's half of the adaptive policy: the drafter's record on this sequence's text and the
  * resulting stop. Stored in the scheduler's per-request state; the controller does the arithmetic.
@@ -61,6 +76,21 @@ public:
         /* The adaptive policy: `--draft-window adaptive` with a serial drafter, decided by
          * Scheduler::init. Off, the depth is max_depth. */
         bool adapt = false;
+        /* The confidence window: `--draft-window confidence` with a serial drafter, decided by
+         * Scheduler::init, and its rule (Config::draft_conf_*). Off, nothing here changes. */
+        bool   confidence  = false;
+        double conf_scale  = 1.25;
+        double conf_offset = 0.0;
+        int    conf_floor  = 2;
+        int    conf_fallback = 3;   /* 0 is max_depth */
+        /* The cost policy (--draft-policy cost, Welle 2). Off, nothing here changes. */
+        DraftPolicyConfig policy;
+        /* Requests a plan's caller-provided arrays hold: cfg.max_seqs. */
+        int max_seqs = 0;
+        /* A/B's hooks. The cost policy refuses to run without both (RAD_E_UNSUPPORTED): the
+         * choice is their output, and neither a prediction nor a price is invented here. */
+        DraftPredictor  predictor;
+        DraftCostModel  costs;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -113,6 +143,19 @@ public:
      * policy it is the ceiling, and window_for() is the window. */
     int  next_depth() const { return p_.max_depth; }
 
+    /* ---------------------------------------------------------- the confidence window */
+    bool confidence() const { return conf_; }
+    /* The window a sequence drafts next, from the head's q(x) for the drafts of the publication in
+     * flight, q[0..n) in draft order: ceil(scale * E + offset) clamped to floor..max_depth, with
+     * E = sum_j prod_{i<=j} q_i. 0 when the policy is off or n is 0: no q, so the caller drafts the
+     * ceiling. */
+    int  confidence_window(const float* q, int n) const;
+    /* The window where the rule has no say: a cycle with more than one decoding row, a publication
+     * without q. max_depth when the policy is off. */
+    int  confidence_fallback() const {
+        return conf_ && p_.conf_fallback > 0 ? p_.conf_fallback : p_.max_depth;
+    }
+
     /* ---------------------------------------------------------- the adaptive policy */
     bool adaptive() const { return adapt_; }
     /* The window this sequence may draft into: min(D, its stop), starting its estimate on the
@@ -158,17 +201,41 @@ public:
     /* E(d) for `s`'s current estimate: expected tokens emitted by a verify of d drafts, the
      * verified token included. For tests and logs. */
     double yield(const DraftAdapt& s, int d) const;
-    /* Histogram of verifies by window, counted only under the adaptive policy. */
+    /* Histogram of verifies by window, counted only under the adaptive and confidence policies. */
     int64_t verified_at(int d) const {
         return (d >= 0 && d <= RAD_SCHED_MAX_SPEC) ? by_depth_[d] : 0;
     }
 
-    /* One verify's outcome: `drafted` proposed, a prefix of `accepted` taken. Metrics only. */
-    void observe(int drafted, int accepted);
+    /* ---------------------------------------------------------- the cost policy
+     *
+     * One plan per cycle, written once by open_cycle() and read by every site that caps a
+     * proposal. It is replaced only when the next cycle opens, so a proposal drafted and a step
+     * verified inside a cycle read the same plan. A plan whose identity names another cycle is
+     * not this cycle's; the scheduler falls back to next_depth() instead of acting on it. */
+    bool cost_policy() const { return planner_.config().mode == DraftPolicyMode::Cost; }
+    /* Fill `preds` through the predictor and choose the cycle's plan. Returns RAD_OK, or the
+     * failing hook's error; on any error no plan is in force and the cycle runs legacy. */
+    int  open_cycle(const DraftBatchView& view, DraftPredictions* preds);
+    /* The plan in force, or null. A plan is written once when its cycle opens and is not touched
+     * again until the same storage comes round: the next cycle writes the other of two sets, so a
+     * pointer handed out here keeps its rows across one further open_cycle(). A reader that must
+     * survive two cycles (an issued-ahead pass and its observation) copies it. */
+    const DraftPlan* plan() const { return plan_cur_ >= 0 ? &plan_slots_[plan_cur_].plan : nullptr; }
+    /* This cycle's K for the request, or -1 when the plan does not cover it. Identity, never an
+     * index: a recycled slot with another generation is another request. */
+    int  planned_k(uint64_t req_id, int32_t slot, uint32_t slot_gen) const;
+    DraftPlanner&      planner() { return planner_; }
+    const DraftPlanner& planner() const { return planner_; }
+
+    /* One verify's outcome: `drafted` proposed, a prefix of `accepted` taken, `raw_match` the
+     * uncensored match tally behind it (the end-of-generation cut shortens the commitment, not the
+     * tally). `raw_match` defaults to `accepted` for callers without the raw count. Metrics only. */
+    void observe(int drafted, int accepted, int raw_match = -1);
 
     /* Metrics (spec §14). Cumulative and exact. */
     int64_t drafted()  const { return tot_drafted_; }
     int64_t accepted() const { return tot_accepted_; }
+    int64_t raw_matches() const { return tot_raw_; }   /* uncensored: >= accepted() */
     float   acceptance() const {
         return tot_drafted_ ? (float)((double)tot_accepted_ / (double)tot_drafted_) : 0.0f;
     }
@@ -190,13 +257,14 @@ public:
 
 private:
     Params  p_;
-    int64_t tot_drafted_ = 0, tot_accepted_ = 0;
+    int64_t tot_drafted_ = 0, tot_accepted_ = 0, tot_raw_ = 0;
     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
     int     seen_ = 0;
 
     /* The adaptive policy as configure() resolved it. */
     bool    adapt_ = false;
+    bool    conf_  = false;                       /* the confidence window */
     double  alpha_ = 0.0;                         /* the smoothing step from kHalfLife */
     int64_t by_depth_[RAD_SCHED_MAX_SPEC + 1] = {};
     int32_t step_d_ = 0;                          /* D; 0 until a step chose one */
@@ -208,6 +276,26 @@ private:
     /* T(d, class): the mean step time of each key, and the steps behind it. */
     double  cost_ms_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
     int64_t cost_n_ [RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
+
+    /* The cost policy's plan and its storage (reserved at configure, outside the step path). Two
+     * sets: the caller reads one while the next cycle fills the other. */
+    struct PlanSlot {
+        DraftPlan plan;
+        std::vector<uint64_t>      id;
+        std::vector<int32_t>       slot;
+        std::vector<uint32_t>      gen;
+        std::vector<int32_t>       k;
+        std::vector<DraftFallback> why;
+        std::vector<int32_t>       rows;
+        std::vector<int32_t>       ctx_class;
+        std::vector<int32_t>       history_tokens;
+        std::vector<DraftDrafter>  fill;
+    };
+    DraftPlanner planner_;
+    PlanSlot     plan_slots_[2];
+    int          plan_cur_ = -1;   /* the slot plan() returns; -1 = no plan this cycle */
+    int          plan_cur_prev_ = 0;   /* the slot the last opened cycle wrote */
+    bool cost_failed_ = false;   /* the open_cycle error was logged */
 
     /* Fill a sequence's estimate from the prior and set its first stop. */
     void    start(DraftAdapt& s) const;
