@@ -108,24 +108,42 @@ is launch-to-launch throughput, not a single launch's latency. The arms interlea
 every round, so a drift over the round cancels instead of loading one arm, and the run reports the
 median, the full range and how many paired rounds the candidate won.
 
-Four independent runs, 36 rounds per arm and M, on a card with the GPU queue lock held:
+Two independent runs, 18 paired rounds per arm and M, on one card with the GPU queue lock held
+and no foreign context on the device:
 
 ```text
-weights                     M     frozen      candidate   delta              rounds faster  spread    gain/spread
-256 MiB, rotated            1     5.285 us    4.935 us    -0.343 us  -6.49%  36/36          0.079 us  4.3x
-256 MiB, rotated            2     5.255 us    4.878 us    -0.381 us  -7.25%  36/36          0.066 us  5.1x
-256 MiB, rotated            3     5.239 us    4.920 us    -0.311 us  -5.94%  36/36          0.073 us  4.7x
-one copy, L2-resident       1                             -7.58%             36/36
-one copy, L2-resident       2                            -10.03%             36/36
-one copy, L2-resident       3                             -9.68%             36/36          0.307 us  1.4x
+                 frozen      candidate   delta              rounds faster   frozen range        candidate range
+run A  M=1       4.778 us    4.387 us    -0.391 us  -8.18%  18/18           4.671..5.230 us     4.328..4.444 us
+run A  M=2       4.679 us    4.261 us    -0.418 us  -8.94%  18/18           4.668..5.249 us     4.242..4.358 us
+run A  M=3       4.774 us    4.297 us    -0.477 us  -9.99%  18/18           4.655..5.428 us     4.193..4.311 us
+run B  M=1       4.797 us    4.299 us    -0.499 us -10.39%  18/18           4.774..5.356 us     4.287..4.389 us
+run B  M=2       4.792 us    4.212 us    -0.580 us -12.10%  18/18           4.754..5.194 us     4.198..4.225 us
+run B  M=3       4.881 us    4.165 us    -0.717 us -14.68%  18/18           4.739..5.334 us     4.150..4.265 us
 ```
 
-`spread` is the widest between-run range of the two arms at that M, and `gain/spread` the median
-gain over it: a gain smaller than the spread would not be a win. Two earlier runs were thrown
-away because a second tenant held the cards without taking the queue lock; the six rows above are
-the clean four.
+The frozen row has a slow tail the candidate does not: its worst batch sits 0.4-0.6 us above its own
+median in every case above, while the candidate's whole range stays inside 0.13 us. The medians are
+the number to read; the tail is why `gain_over_spread` is under 1 even where every paired round was
+won. An earlier series, taken while another tenant held the cards without the queue lock, showed the
+same direction at a smaller size (-6.5% / -7.3% / -5.9%, 36/36 rounds).
 
-The gain is real at the kernel and it is small in absolute terms: ~0.3-0.4 us against a 5 us
+`--timing --rank` is the two-rank case: one arm per card, both released together, and the arms
+swapped between the cards on every pair so a card that is slower or busier cancels instead of
+loading one row. Eight pairs, eight samples per arm and M:
+
+```text
+                 frozen        candidate     delta               pairs won
+M=1              4.913 us      4.425 us      -0.489 us  -9.95%   7/8
+M=2              4.905 us      4.338 us      -0.567 us -11.56%   8/8
+M=3              4.918 us      4.316 us      -0.602 us -12.23%   8/8
+```
+
+The gain survives the two ranks sharing the memory system, at the size it has alone. What varies far
+more than the gain is which of the two processes gets a slow window: the same row measured between
+4.06 us and 5.65 us across those pairs, so the paired reading is the only one that carries signal
+and a single unpaired two-rank number would be meaningless.
+
+The gain is real at the kernel and it is small in absolute terms: ~0.4-0.7 us against a 4.8 us
 launch. What it is worth to a served step depends on how often the serving path launches this
 shape and on the step's own length, and **that is not measured**: no MoE container on this host
 runs this row (`n_ff_shared`=640 per rank in the one container that exists, and its shared expert
@@ -216,7 +234,7 @@ reads it.
   subdivision, not a change to the frozen bands' resolution. The edge sits at the band this row
   measured a win on, so a four-token verify step resolves into the band above and is served by
   libr4d's wider row (`gemm_i8a8_nt_m16`), which is faster there: 5.23 µs against 5.35 µs per
-  launch, cold weights, 36/36 rounds (MAIN-42). M=1..3 win by 6-8 % in the same protocol.
+  launch, cold weights, 36/36 rounds (MAIN-42). M=1..3 win by 8-15 % in the same protocol.
 - **No `RAD_R4D_TRACE` or `r4d_record_dispatches` participation.** The source row reached those
   through libr4d's `r4d_emit` sink, which does not exist in this ABI; this DSO packs its launch
   itself. Debugging this row in isolation means adding a trace locally.
