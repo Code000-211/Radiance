@@ -14,35 +14,46 @@
 #
 # NO CARD IS TOUCHED. The DSO links libamdhip64, so every child here runs with HIP_VISIBLE_DEVICES
 # and ROCR_VISIBLE_DEVICES emptied: HIP initialises without a device, a launch that got past the
-# body's refusals would fail instead of running, and no KFD context is claimed. Each child also
-# runs under `timeout`, because a child that hangs keeps whatever context it did claim, and a
-# leaked KFD context on this host is not free: it holds 150+ MB that the scheduler's measured
+# body's refusals would fail instead of running, and no KFD context is claimed.
+#
+# NO CHILD OUTLIVES ITS STEP. Every command below -- the three clang++ steps, the link, nm, and the
+# two test runs -- goes through bounded(), which gives it its own session and a hard limit, and the
+# harness traps INT/TERM/HUP into bounded_kill. A child that hangs keeps whatever context it did
+# claim, and a leaked KFD context is not free on this host: it holds 150+ MB that the measured VRAM
 # budget then misses by (tests/kbench_mutant_test.cpp and tests/oot_plugins.sh hide devices the
-# same way). Neither is optional.
+# same way, for the same reason). test/limit_check.sh proves the limits and the cleanup.
 set -eu
-S=${1:-"$(cd "$(dirname "$0")/../.." && pwd)/.."}
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/bounded.sh"
+S=${1:-"$(cd "$HERE/../../.." && pwd)"}
 ROCM=${ROCM:-/opt/rocm}
 CLANG=$ROCM/llvm/bin/clang++
 ROCMLIB=${ROCM_LIB:-$ROCM/core-10.0}
 ARCH=${ARCH:-gfx1201}
 LIMIT=${LIMIT:-120}
+BUILD_LIMIT=${BUILD_LIMIT:-600}
 D=$(mktemp -d)
+trap 'bounded_kill' INT TERM HUP
 trap 'rm -rf "$D"' EXIT
 
 [ -f "$S/libr4d/r4d_fp8_layout.cpp" ] || { echo "not a radiance source tree: $S" >&2; exit 2; }
 
 echo "building shared_i8a8_down.so from $S"
-"$CLANG" -std=c++17 -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+bounded "$BUILD_LIMIT" \
+    "$CLANG" -std=c++17 -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
          -ffp-contract=off -I"$S/abi" -I"$S/libr4d" -I"$S/candidates/shared-i8a8-down" \
          -c "$S/candidates/shared-i8a8-down/rows.cpp" -o "$D/rows.o"
-"$CLANG" -std=c++17 -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+bounded "$BUILD_LIMIT" \
+    "$CLANG" -std=c++17 -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
          -ffp-contract=off -I"$S/abi" -I"$S/libr4d" -I"$S/candidates/shared-i8a8-down" \
          -c "$S/libr4d/r4d_fp8_layout.cpp" -o "$D/layout.o"
-"$CLANG" -x hip --rocm-path="$ROCMLIB" --rocm-device-lib-path="$ROCMLIB/amdgcn/bitcode" \
+bounded "$BUILD_LIMIT" \
+    "$CLANG" -x hip --rocm-path="$ROCMLIB" --rocm-device-lib-path="$ROCMLIB/amdgcn/bitcode" \
          --offload-arch="$ARCH" -std=c++17 -O3 -fno-fast-math -ffp-contract=off -fPIC \
          -I"$S/abi" -I"$S/libr4d" -I"$S/candidates/shared-i8a8-down" \
          -c "$S/candidates/shared-i8a8-down/shared_i8a8_down.hip" -o "$D/hip.o"
-"$CLANG" -shared -fPIC -o "$D/shared_i8a8_down.so" "$D/rows.o" "$D/hip.o" "$D/layout.o" \
+bounded "$BUILD_LIMIT" \
+    "$CLANG" -shared -fPIC -o "$D/shared_i8a8_down.so" "$D/rows.o" "$D/hip.o" "$D/layout.o" \
          -L"$ROCMLIB/lib" -lamdhip64 -ldl
 
 # The export set is the ABI's, and the DSO carries no undefined symbol from libr4d: the layout
@@ -61,14 +72,13 @@ echo "exports: the ABI's set, nothing from libr4d"
          "$S/candidates/shared-i8a8-down/test/si8_test.cpp" -o "$D/si8_test" -ldl
 
 echo
-# A child that outlives its case is a leaked KFD context, so every one of them is bounded here and
-# sealed off from the card. See the note at the top of this file.
+# Every child is sealed off from the card and bounded; see the note at the top of this file.
 NOCARD="HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=99 RADIANCE_HOST_VRAM_MIB=512"
 echo "--- plugin off (RADIANCE_SHARED_I8A8_DOWN unset)"
-env -u RADIANCE_SHARED_I8A8_DOWN $NOCARD timeout "$LIMIT" \
+bounded "$LIMIT" env -u RADIANCE_SHARED_I8A8_DOWN $NOCARD \
     "$D/si8_test" --off "$D/shared_i8a8_down.so"
 echo "--- plugin on (RADIANCE_SHARED_I8A8_DOWN=1)"
-env $NOCARD RADIANCE_SHARED_I8A8_DOWN=1 timeout "$LIMIT" \
+bounded "$LIMIT" env $NOCARD RADIANCE_SHARED_I8A8_DOWN=1 \
     "$D/si8_test" --on "$D/shared_i8a8_down.so"
 echo
 echo "host tests passed. Not run here: the numerics (compare.hip) and every served-path number,"
