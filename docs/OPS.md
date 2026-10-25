@@ -2396,7 +2396,11 @@ operand lies (ABI 29), because the engine knows what the driver does not -- a ta
 the backend's host pool (`core/device/aql.cpp` keeps those ranges itself and
 `hsa_amd_pointer_info` reports them as unknown) is host memory read over the link, and a fallback to
 `hipPointerGetAttributes` alone would call that a device table and report a miss's 160 bytes as no
-transfer at all. Only when the engine declined to say does the plugin ask the driver. A table the
+transfer at all. Only when the engine declined to say does the plugin ask the driver. The engine
+also declines when it cannot vouch for the placement it named: a mover republishes a demoted
+weight's pointer, not its site (`core/place/mover.cpp`), so an issue whose pointer differs from the
+one the planner placed carries `RAD_SPACE_UNKNOWN` and the bind lands at `table=unknown` -- the
+measured-0 trap again, one indirection further out. A table the
 engine placed in VRAM adds misses and no host bytes, which is the truth of that deployment and not
 a dead counter; the dump and the `fini` line say which case it was (`table=host`, `table=device`,
 `table=unknown`). At `unknown` the misses are counted and the byte figure is *not taken*: the dump

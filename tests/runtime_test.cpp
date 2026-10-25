@@ -489,6 +489,57 @@ TEST(pending_weight_waits_on_the_stream_not_the_host) {
     rad_event_destroy(moving);
 }
 
+/* Where the bytes lie is a claim about the pointer that is actually issued, not about the weight
+ * the planner placed (RadTensor::space, ABI 29). Residency can hand a demoted weight to issue --
+ * the mover publishes only the new pointer (place/mover.cpp) -- and the site would then name a
+ * space the bytes are no longer in: a plugin accounting for a link read would report a measured 0.
+ * So an overwritten pointer says UNKNOWN, while a residency entry naming the planner's own address
+ * leaves the site standing. */
+TEST(a_moved_weight_reports_an_unknown_space) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("gemm_nt", "M", { 8192 }, { k_pre }, { "prefill" }, &g_gemm_schema, { w });
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    rad::WeightSlot& slot = res.slot[(size_t)w];
+    slot.ptr = (void*)g_moved_bytes;
+    CHECK_OK(f.start(&res));
+
+    g_rec.clear();
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+    }));
+    CHECK(g_rec[0].t[1].data == (void*)g_moved_bytes);
+    CHECK_EQ(g_rec[0].t[1].space, RAD_SPACE_UNKNOWN);
+
+    /* Settled at the moved address: a real pointer, still not one the planner placed. */
+    CHECK_OK(f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+    }));
+    CHECK_EQ(g_rec.back().t[1].space, RAD_SPACE_UNKNOWN);
+
+    /* Residency naming the very address the planner placed: the site still describes the bytes. */
+    slot.ptr = (void*)g_weight_bytes;
+    CHECK_OK(f.step(4, 2, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+    }));
+    CHECK_EQ(g_rec.back().t[1].space, RAD_SPACE_DEVICE);
+
+    /* And a table the planner put in host memory to read over the link says host. */
+    f.P.weights[(size_t)w].site = rad::Site::DeviceZeroCopy;
+    CHECK_OK(f.step(4, 3, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+    }));
+    CHECK_EQ(g_rec.back().t[1].space, RAD_SPACE_HOST);
+}
+
 /* With no residency table (all in VRAM: everything on tier 0, the mover never runs) the lookup
  * collapses to WeightInfo::ptr and there is nothing to wait on. The common case must not pay for
  * the dynamic one. */

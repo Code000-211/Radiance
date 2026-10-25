@@ -221,8 +221,9 @@ enum { RAD_MAX_RANK = 6 };
 
 /* Where an operand's bytes lie, as the engine's placement knows it: a buffer's declared domain,
  * the site the planner gave a weight (WeightInfo::site, so a table placed in host memory and read
- * over the link says HOST). UNKNOWN is the engine declining to say -- a raw pointer it did not
- * allocate, a KV pool, a weight a mover owns -- and means a plugin may not assume either: it must
+ * over the link says HOST), a KV operand the block manager's device pool holds (DEVICE). UNKNOWN
+ * is the engine declining to say -- a raw pointer it did not allocate, a weight a mover relocated
+ * (it republishes the pointer, not the site) -- and means a plugin may not assume either: it must
  * either ask what it can itself or report the figure as unmeasured. */
 enum { RAD_SPACE_UNKNOWN = 0, RAD_SPACE_DEVICE = 1, RAD_SPACE_HOST = 2 };
 

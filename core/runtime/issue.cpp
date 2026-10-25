@@ -688,12 +688,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             tt.data = resolve_weight(wh);
             /* Where the bytes lie, for a plugin that has to account for a read: the planner's
              * site, which already knows a table placed in host memory is read over the link
-             * (DeviceZeroCopy) and one in VRAM is not. */
+             * (DeviceZeroCopy) and one in VRAM is not. That holds for the pointer the planner
+             * placed. A mover demotes a weight and republishes only the pointer (place/mover.cpp),
+             * so where residency handed us a different address the site describes bytes that are
+             * no longer at it: say UNKNOWN rather than name a space nothing vouches for, and a
+             * plugin reports the figure as unmeasured instead of a measured 0. */
             {
-                const Site site = program_->weights[wh].site;
-                tt.space = site == Site::Device || site == Site::DeviceStaged
-                               ? RAD_SPACE_DEVICE
-                               : RAD_SPACE_HOST;
+                const Site site  = program_->weights[wh].site;
+                const bool moved = tt.data != w_tmpl_[wh].data;
+                tt.space = moved ? RAD_SPACE_UNKNOWN
+                          : site == Site::Device || site == Site::DeviceStaged ? RAD_SPACE_DEVICE
+                                                                              : RAD_SPACE_HOST;
             }
             w_direct_[wh] = 1;
             if (!tt.data)
