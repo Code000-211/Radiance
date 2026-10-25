@@ -474,6 +474,7 @@ int main(int argc, char** argv) {
             d.idx_cu     = sh[k].idx_cu;
             d.idx_prefix = sh[k].idx_prefix;
             d.idx_history = sh[k].idx_history;
+            d.idx_ordered = sh[k].idx_ordered;
             d.idx_max    = sh[k].idx_max;
             d.idx_const  = sh[k].idx_const;
             d.fill_chunk = sh[k].fill_chunk;

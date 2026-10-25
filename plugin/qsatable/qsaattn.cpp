@@ -103,7 +103,12 @@ int attn_geometry(const RadParam* p, int n, RadQsaAttnCall* c) {
 
 /* Operand 0 is [M, n_head * head_dim]; the cache is [blocks, kv_heads, block_size, 2 * head_dim];
  * the four table operands are the ones `qsa_table` declares; `bt` is the sequence's block table at
- * its declared ceiling; `cu` is the batch's `cu_seqlens`. */
+ * its declared ceiling; `cu` is the batch's `cu_seqlens`.
+ *
+ * The table's four operands carry the shape of what `qsa_table` writes (block order, the union's
+ * length, a mask and a plane offset), and `bt` the shape of the row's block table, so a tool draws a
+ * step a kernel can read rather than a block space it cannot: ids drawn uniform over `blocks` in a
+ * union read as block ids reach past the staged table. */
 int rad_qsa_attn_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
     if (!out || i < 0 || i >= 10) return RAD_E_INVAL;
     RadQsaAttnCall g{};
@@ -122,11 +127,36 @@ int rad_qsa_attn_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
         d.dtype = rad_param_getdt(p, n, "kv_dtype");
         d.rank = 4; d.shape[0] = g.blocks; d.shape[1] = g.kv_heads;
         d.shape[2] = g.block_size; d.shape[3] = 2 * g.head_dim; break;
-    case 2: d.rank = 2; d.shape[0] = g.tiles; d.shape[1] = g.u_max; break;
-    case 3: d.shape[0] = g.tiles; break;
-    case 4: d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.u_max; break;
-    case 7: d.rank = 2; d.shape[0] = rad_param_geti(p, n, "max_seqs", 1); d.shape[1] = g.blocks; break;
-    case 8: d.shape[0] = rad_param_geti(p, n, "max_seqs", 1) + 1; break;   /* cu_seqlens */
+    case 2:
+        /* The tile's union in block order, one block id per entry: the order `qsa_table` wrote it
+         * in, and the reason a row's list is a subsequence of it. */
+        d.rank = 2; d.shape[0] = g.tiles; d.shape[1] = g.u_max;
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_max = g.blocks;
+        d.flags = (uint32_t)RAD_OPD_F_IDX_ORDERED; break;
+    case 3:
+        /* A full selection's union: `topk` entries, inside the plane's declared width. */
+        d.shape[0] = g.tiles;
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.topk; break;
+    case 4:
+        /* Every entry held, so the walk crosses the whole union rather than a prefix of it. */
+        d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.u_max;
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = 1; break;
+    case 5:
+        /* Row m's plane in `tab`: tile 0's, so no row is past the tables given. */
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = 0; break;
+    case 6:
+        /* One step off a block boundary at the end of the last own block: the row's own count is
+         * `topk` and its partial page is appended after the union, the path a boundary-aligned
+         * position never reaches. */
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.ratio * g.topk; break;
+    case 7:
+        /* The sequence's block table: one page id per staged block, `-1` for a dead one. */
+        d.rank = 2; d.shape[0] = rad_param_geti(p, n, "max_seqs", 1); d.shape[1] = g.blocks;
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_max = g.blocks; break;
+    case 8:
+        d.shape[0] = rad_param_geti(p, n, "max_seqs", 1) + 1;
+        d.fill = (uint32_t)RAD_FILL_INDEX;
+        d.flags = (uint32_t)RAD_OPD_F_IDX_CU; break;                        /* cu_seqlens */
     default: break;
     }
     if (d.dtype == RAD_DT_INVALID) return RAD_E_UNSUPPORTED;

@@ -38,6 +38,10 @@ struct OpdShape {
     bool                 idx_prefix = false;
     /* A token history whose rows repeat themselves (RAD_OPD_F_IDX_HISTORY). */
     bool                 idx_history = false;
+    /* A list in block order (RAD_OPD_F_IDX_ORDERED): `[rows, width]`, row r holding `start + j` at
+     * slot j. `qsa_select` emits a selection sorted by block and the ops that read it refuse
+     * anything else, so uniform ids are not a case at all. */
+    bool                 idx_ordered = false;
     /* Value domain of a non-index operand when normals fall outside it. `beta` is a sigmoid
      * output in (0, 1); `g` is an intra-chunk cumulative sum of log-decays, non-increasing and
      * non-positive, so every GDN decay factor e^{g_i - g_j} (j <= i) is <= 1. With normals the

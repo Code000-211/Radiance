@@ -19,7 +19,12 @@ const RadParamSpec kTableParams[] = {
 
 /* `selb`/`nsel`/`pos` are `qsa_select`'s own outputs, one row per query; the four outs describe the
  * table the tile shares. Every one is written on every launch, including the entries a row does not
- * hold (mask 0) and the tail of `tab` past `tlen` (0). */
+ * hold (mask 0) and the tail of `tab` past `tlen` (0).
+ *
+ * The three inputs carry the shape of what `qsa_select` emits, not just their extents: a selection
+ * sorted by block (RAD_OPD_F_IDX_ORDERED), its length, and the row's position. A tool that drew
+ * `selb` as uniform ids would hand `ref_qsa_table` a list that does not ascend, which it refuses --
+ * and right: no correct `qsa_select` emits one. */
 const RadOperandSpec kTableOperands[] = {
     { "selb",    RAD_OPD_IN,  0 },
     { "nsel",    RAD_OPD_IN,  0 },
@@ -95,11 +100,25 @@ int rad_qsa_table_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
     d.rank = 1;
     d.shape[0] = g.M;
     switch (i) {
-    case 0: d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.topk + 1; break;   /* selb */
+    case 0:
+        /* One row's selection, sorted by block (`qsa_select`'s output): slot j holds block j, and
+         * the slot past the row's own complete-block count is the partial page no table holds. */
+        d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.topk + 1;
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_max = g.blocks;
+        d.flags = (uint32_t)RAD_OPD_F_IDX_ORDERED; break;
+    case 1:
+        /* Every row selects `topk` blocks plus the partial page's slot. */
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.topk + 1; break;
+    case 2:
+        /* The row's last position inside its last complete block, so its own block count is exactly
+         * `topk -- the whole selection is inside it -- and `own` is the same for every row of the
+         * tile, which is what a decode step looks like. One below the boundary, so `own` is `topk`
+         * at any ratio. */
+        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.ratio * g.topk - 1; break;
     case 3: d.rank = 2; d.shape[0] = g.tiles; d.shape[1] = g.u_max; break;  /* tab */
     case 4: d.shape[0] = g.tiles; break;                                    /* tlen */
     case 5: d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.u_max; break;      /* mask */
-    default: break;                                                         /* nsel, pos, row_off */
+    default: break;                                                         /* row_off */
     }
     *out = d;
     return RAD_OK;

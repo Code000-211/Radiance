@@ -159,7 +159,8 @@ int Kfixture::save(const std::string& path) const {
             w.u8(o.absent ? 1 : 0);
             w.u32((uint32_t)o.fill);
             w.u8((uint8_t)((o.is_index ? 1 : 0) | (o.idx_unique ? 2 : 0) | (o.idx_cu ? 4 : 0) |
-                           (o.idx_prefix ? 8 : 0) | (o.idx_history ? 16 : 0)));
+                           (o.idx_prefix ? 8 : 0) | (o.idx_history ? 16 : 0) |
+                           (o.idx_ordered ? 32 : 0)));
             w.i64(o.idx_max);
             w.i64(o.idx_const);
             w.i64(o.fill_chunk);
@@ -207,6 +208,7 @@ int Kfixture::load(const std::string& path) {
     const bool v4 = version == 4;
     /* The sampler laws are version 6's; an older file naming one is corrupt. */
     const bool sampler_laws = version >= 6;
+    const bool ordered_law = version >= 7;
     source   = r.str();
     oracle   = r.str();
     recorded = r.str();
@@ -247,9 +249,11 @@ int Kfixture::load(const std::string& path) {
             o.idx_cu      = (flags & 4) != 0;
             o.idx_prefix  = (flags & 8) != 0;
             o.idx_history = (flags & 16) != 0;
+            o.idx_ordered = (flags & 32) != 0;
             /* A flag this reader does not know is a law it would draw as another. */
-            if ((flags & ~0x1Fu) != 0) r.ok = false;
+            if ((flags & ~0x3Fu) != 0) r.ok = false;
             if (!sampler_laws && (o.idx_history || o.fill == KF_FILL_SAMPLE_PARAMS)) r.ok = false;
+            if (!ordered_law && o.idx_ordered) r.ok = false;
             o.idx_max    = r.i64();
             o.idx_const  = r.i64();
             o.fill_chunk = r.i64();
@@ -578,6 +582,19 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
         for (int64_t i = 1; i < n; ++i) {
             acc += cnt[(size_t)(i - 1)];
             tmp[(size_t)i] = (float)acc;
+        }
+    } else if (d.is_index && d.idx_ordered) {
+        /* A list in block order (see OpdShape::idx_ordered): slot j holds `start + j`, so a row
+         * ascends strictly. The start walks up with the row, so a tile's rows disagree about which
+         * blocks they hold and the mask filters what the union carries for the others -- which is
+         * the whole point of the table op. It stops short of idx_max so no entry leaves the block
+         * space. */
+        const int64_t w = d.shape.empty() ? n : d.shape.back();
+        const int64_t rows_n = w > 0 ? n / w : 0;
+        const int64_t span = d.idx_max > 0 ? d.idx_max : w;
+        for (int64_t r = 0; r < rows_n; ++r) {
+            const int64_t start = std::min<int64_t>(r, span > w ? span - w : 0);
+            for (int64_t j = 0; j < w; ++j) tmp[(size_t)(r * w + j)] = (float)(start + j);
         }
     } else if (d.is_index && d.idx_cu) {
         /* Cumulative sequence lengths [0 .. T]. GDN kernels read cu[n] before any null test, so

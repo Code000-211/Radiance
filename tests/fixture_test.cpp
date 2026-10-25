@@ -1931,7 +1931,11 @@ TEST(a_law_newer_than_its_file_or_unknown_to_the_reader_is_refused) {
 
     CHECK_EQ(fx.load(one_input_fixture(5, KF_FILL_SAMPLE_PARAMS, 0)), RAD_E_FORMAT);
     CHECK_EQ(fx.load(one_input_fixture(5, KF_FILL_NORMAL, 1 | 16)), RAD_E_FORMAT);
+    /* The block-order law is version 7's; a version-6 file claiming it held a law it did not. */
     CHECK_EQ(fx.load(one_input_fixture(6, KF_FILL_NORMAL, 1 | 32)), RAD_E_FORMAT);
+    REQUIRE_EQ(fx.load(one_input_fixture(7, KF_FILL_NORMAL, 1 | 32)), RAD_OK);
+    CHECK(fx.cases[0].opd[0].is_index && fx.cases[0].opd[0].idx_ordered);
+    CHECK_EQ(fx.version, (uint32_t)7);
     CHECK_EQ(fx.load(one_input_fixture(6, KF_FILL_SAMPLE_PARAMS + 1, 0)), RAD_E_FORMAT);
     CHECK_EQ(fx.load(one_input_fixture(KF_VERSION + 1, KF_FILL_NORMAL, 0)), RAD_E_FORMAT);
 }

@@ -46,8 +46,9 @@ extern "C" int rad_kernel_reference(int i) {
 #ifdef RAD_QSATABLE_WITH_DEVICE
     return (i == 0 || i == 2) ? 0 : 1;
 #else
-    (void)i;
-    return 1;
+    /* Row i is the i-th reference: `ref_qsa_table` then `ref_qsa_attn`, the same two rows the
+     * device build puts at 1 and 3. */
+    return i == 0 || i == 1;
 #endif
 }
 
@@ -83,7 +84,11 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
 #else
     if (i != 0 && i != 1) return nullptr;
 #endif
+#ifdef RAD_QSATABLE_WITH_DEVICE
     const bool attn = i >= 2;
+#else
+    const bool attn = i == 1;
+#endif
     static const RadKernelInfo ref_tab = [] {
         RadKernelInfo x = rad_qsatable_row(ref_table_launch);
         x.name = "ref_qsa_table";

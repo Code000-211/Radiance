@@ -39,10 +39,10 @@ constexpr int64_t KF_REDUCE_BLOCK = 1 << 18;
  * of sqrt(2/32), about 25%. Fixed because it is baked into every recorded file. */
 constexpr int KF_SKETCH = 32;
 
-/* The format version this tree writes. Versions 4 and 5 still load: version 4 lacks the sketch, the
+/* The format version this tree writes. Versions 4 to 6 still load: version 4 lacks the sketch, the
  * prefix fill law and drawn weight tables (KfOperand::undrawn), version 5 the sampler laws (the
- * request-row fill and the token history). */
-constexpr uint32_t KF_VERSION = 6;
+ * request-row fill and the token history), version 6 the block-order index law. */
+constexpr uint32_t KF_VERSION = 7;
 
 /* The fill laws, mirroring OpdShape::Fill. Separate because these values are on disk and must not
  * be renumbered. */
@@ -75,7 +75,7 @@ struct KfOperand {
      * exact bytes; it cannot be recovered from the shape. */
     int      fill = 0;
     bool     is_index = false, idx_unique = false, idx_cu = false, idx_prefix = false;
-    bool     idx_history = false;
+    bool     idx_history = false, idx_ordered = false;
     int64_t  idx_max = 0, idx_const = -1, fill_chunk = 0;
     /* A weight table (RAD_OPD_WTAB) in a version-4 recording, which drew it as zeros. Its
      * reference was computed on zeros, so the replay draws zeros too; such a case checks nothing
@@ -119,7 +119,8 @@ struct KfCase {
 struct Kfixture {
     /* Version 4 carries each weight operand's encoding and selected planes (KfOperand::enc).
      * Version 5 adds the sketch, the prefix fill law and drawn weight tables, version 6 the
-     * sampler laws. Earlier files are refused and must be re-recorded. */
+     * sampler laws, version 7 the block-order index law. Earlier files are refused and must be
+     * re-recorded. */
     uint32_t    version = KF_VERSION;
     std::string source;        /* the container it was recorded from */
     std::string oracle;        /* the plugin and version that produced the references */

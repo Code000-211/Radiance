@@ -221,6 +221,16 @@ enum {
      * finds a repeat. Additive, as IDX_PREFIX: a tool that does not know the flag draws uniform
      * ids. */
     RAD_OPD_F_IDX_HISTORY = 1u << 4,
+    /* A block-table entry list in block order: `[rows, width]`, row r holding `start + j` at slot j,
+     * so every row ascends strictly and the entries stay below idx_max. `qsa_select` emits its
+     * selection sorted by block (docs/QSA.md, "Table order"), and the ops that consume it refuse
+     * anything else: `ref_qsa_table` returns RAD_E_INVAL for a list that does not ascend, and a
+     * list that does not ascend is not something any correct qsa kernel can produce either, so a
+     * uniform draw over the block space tests nothing. A row's entries past its own complete-block
+     * count are its partial page, which the table holds nowhere -- drawing the slot keeps that
+     * path exercised. Additive, as IDX_PREFIX: a tool that does not know the flag draws uniform
+     * ids, which is why the qsa ops could not be checked before it existed. */
+    RAD_OPD_F_IDX_ORDERED = 1u << 5,
 };
 
 typedef struct RadOpdDesc {

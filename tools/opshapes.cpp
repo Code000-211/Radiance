@@ -32,6 +32,7 @@ int rad_operand_shapes_hook(const RadKernelInfo* k, const Geometry& g, int n_opd
         o.idx_cu     = (d.flags & RAD_OPD_F_IDX_CU)     != 0;
         o.idx_prefix = (d.flags & RAD_OPD_F_IDX_PREFIX) != 0;
         o.idx_history = (d.flags & RAD_OPD_F_IDX_HISTORY) != 0;
+        o.idx_ordered = (d.flags & RAD_OPD_F_IDX_ORDERED) != 0;
         o.is_index   = d.fill == RAD_FILL_INDEX;
         o.idx_max    = d.idx_max;
         o.idx_const  = d.idx_const;
