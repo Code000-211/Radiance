@@ -2721,6 +2721,10 @@ a masked read of it saves.
 - **The mask is a filter, not a re-order**, because the emit is one run in block order: `tab` ascends
   in block index, so a row's own list is its mask's set bits in the order they appear. The test
   recovers every row's table from the kernel's own `selb` this way, byte for byte.
+- **A row's list is `min(topk + 1, blocks)` wide**, its selection capped by the block space: a list
+  cannot carry more entries than there are blocks to select, and the reader takes every entry below
+  the row's own count as a block id. `nsel` is drawn at that same width, so the drawn list stays
+  ascending and inside `[0, blocks)`.
 - **The partial page is not in the table.** Its block index is `(pos + 1) / ratio` by construction, so
   the bound `b < own` already keeps it out of the union; a reader appends it after filtering, which
   is the page it must read last anyway.

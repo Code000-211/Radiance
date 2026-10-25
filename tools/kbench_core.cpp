@@ -85,6 +85,7 @@ const std::vector<TolRow> g_tol = {
      * same pages in the same order, so it takes attention's tolerance. */
     { "qsa_table",    "*",        0.0  },
     { "qsa_attn",     "bf16",     2e-2 },
+    { "qsa_attn",     "f32",      1e-4 },
     { "qsa_attn",     "*",        3e-2 },
     /* Elementwise and norms: one pass, so anything but a rounding difference is a bug. */
     { "rmsnorm",      "bf16",     4e-3 },

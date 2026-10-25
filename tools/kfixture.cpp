@@ -592,9 +592,17 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
         const int64_t w = d.shape.empty() ? n : d.shape.back();
         const int64_t rows_n = w > 0 ? n / w : 0;
         const int64_t span = d.idx_max > 0 ? d.idx_max : w;
+        /* A row wider than the block space holds no `w` distinct ids inside it: the slots past the
+         * span keep the last id the span has, so no entry is negative or past `idx_max` (the shape
+         * hooks cap the width -- `qsa_table`'s selection against `blocks` -- so this only repairs a
+         * hand-written fixture). */
+        const int64_t start_max = span > w ? span - w : 0;
         for (int64_t r = 0; r < rows_n; ++r) {
-            const int64_t start = std::min<int64_t>(r, span > w ? span - w : 0);
-            for (int64_t j = 0; j < w; ++j) tmp[(size_t)(r * w + j)] = (float)(start + j);
+            const int64_t start = std::min<int64_t>(r, start_max);
+            for (int64_t j = 0; j < w; ++j) {
+                const int64_t v = start + j;
+                tmp[(size_t)(r * w + j)] = (float)(v < span ? v : span - 1);
+            }
         }
     } else if (d.is_index && d.idx_cu) {
         /* Cumulative sequence lengths [0 .. T]. GDN kernels read cu[n] before any null test, so

@@ -102,13 +102,16 @@ int rad_qsa_table_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
     switch (i) {
     case 0:
         /* One row's selection, sorted by block (`qsa_select`'s output): slot j holds block j, and
-         * the slot past the row's own complete-block count is the partial page no table holds. */
-        d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.topk + 1;
+         * the slot past the row's own complete-block count is the partial page no table holds. The
+         * width is capped by the block space: a list cannot hold more entries than there are blocks
+         * to select, and an entry past them is not an id the reader could take. */
+        d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.topk + 1 < g.blocks ? g.topk + 1 : g.blocks;
         d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_max = g.blocks;
         d.flags = (uint32_t)RAD_OPD_F_IDX_ORDERED; break;
     case 1:
-        /* Every row selects `topk` blocks plus the partial page's slot. */
-        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.topk + 1; break;
+        /* Every row selects `topk` blocks plus the partial page's slot, against the same cap. */
+        d.fill = (uint32_t)RAD_FILL_INDEX;
+        d.idx_const = g.topk + 1 < g.blocks ? g.topk + 1 : g.blocks; break;
     case 2:
         /* The row's last position inside its last complete block, so its own block count is exactly
          * `topk -- the whole selection is inside it -- and `own` is the same for every row of the

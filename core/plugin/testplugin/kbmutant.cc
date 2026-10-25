@@ -34,6 +34,7 @@
 #define KBM_ARGMAX  7
 #define KBM_INWRITE 8
 #define KBM_ENC     9
+#define KBM_PAIR    10
 
 #ifndef KBM_MUTANT
 #define KBM_MUTANT KBM_OK
@@ -181,6 +182,22 @@ int rmsnorm(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* The pair's device row: the same add, off by a rounding-sized 1e-4 instead of by a defect, which
+ * is inside bf16's tolerance. It exists so that one library holds both a definition and a kernel
+ * (see rad_kernel_reference below): the check of the device row must apply its tolerance, not the
+ * exactness of the library that ships the definition. */
+int pair_add_off(const RadArgs* a, RadStream s) {
+    if (order(s) != RAD_OK) return RAD_E_DEVICE;
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &y = a->t[1], &o = a->t[2];
+    const int64_t n = numel(o);
+    for (int64_t i = 0; i < n; ++i)
+        rad_store_f32(o.data, o.dtype, i,
+                      (rad_load_f32(x.data, x.dtype, i) + rad_load_f32(y.data, y.dtype, i)) *
+                          1.0001f);
+    return RAD_OK;
+}
+
 /* A preferred row that reads no encoding a recording carries: its layout hook refuses, so the
  * engine passes it over, and its launch would fail the comparison if a replay chose it anyway. */
 [[maybe_unused]] int rmsnorm_wrong(const RadArgs* a, RadStream s) {
@@ -218,12 +235,14 @@ extern "C" {
 #endif
 
 static const RadKernelInfo kKernels[] = {
+#if KBM_MUTANT != KBM_PAIR
     { .name = "kbm_add", .op = "add", .family = "elem", .computes = "y = a + b",
       .shape = "any", .dtypes = "bf16", .domain = RAD_DOMAIN_HOST, .priority = 0,
       .launch = add_host, .opd_shape = KBM_ADD_SHAPE },
     { .name = "kbm_add_device", .op = "add", .family = "elem", .computes = "y = a + b",
       .shape = "any", .dtypes = "bf16", .domain = RAD_DOMAIN_DEVICE, .priority = 0,
       .launch = add_device, .opd_shape = KBM_ADD_SHAPE },
+#endif
     /* Reached only at M <= 4, which the recorded cases do not use: --record-rows' target. */
     { .name = "kbm_add_small", .op = "add", .family = "elem", .computes = "y = a + b",
       .shape = "M <= 4", .dtypes = "bf16", .domain = RAD_DOMAIN_HOST, .priority = 5,
@@ -253,6 +272,17 @@ static const RadKernelInfo kKernels[] = {
     { .name = "kbm_rmsnorm", .op = "rmsnorm", .family = "norm", .computes = "rmsnorm",
       .shape = "any", .dtypes = "bf16", .domain = RAD_DOMAIN_HOST, .priority = 0,
       .launch = rmsnorm },
+#if KBM_MUTANT == KBM_PAIR
+    /* The definition of `add` beside a kernel of it, in one library: the reference is a row, not a
+     * library (plugin/qsatable/exports.cpp states the same case). Only the first of these is marked
+     * by rad_kernel_reference below. */
+    { .name = "kbm_pair_add", .op = "add", .family = "elem", .computes = "y = a + b",
+      .shape = "any", .dtypes = "bf16", .domain = RAD_DOMAIN_HOST, .priority = 0,
+      .launch = add_host },
+    { .name = "kbm_pair_add_device", .op = "add", .family = "elem",
+      .computes = "y = (a + b) * (1 + 1e-4)", .shape = "any", .dtypes = "bf16",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 0, .launch = pair_add_off },
+#endif
 };
 
 static const RadPluginInfo kInfo = {
@@ -268,5 +298,12 @@ int                  rad_kernel_count(void) { return NELEM(kKernels); }
 const RadKernelInfo* rad_kernel_at(int i) {
     return (i < 0 || i >= NELEM(kKernels)) ? nullptr : &kKernels[i];
 }
+#if KBM_MUTANT == KBM_PAIR
+/* Per row, never per library: the host add is this library's definition of the op and its device
+ * add is a kernel to be measured against that definition. */
+int rad_kernel_reference(int i) {
+    return i >= 0 && i < NELEM(kKernels) && std::strcmp(kKernels[i].name, "kbm_pair_add") == 0;
+}
+#endif
 
 }  /* extern "C" */

@@ -130,6 +130,14 @@ TEST(the_tolerance_reads_the_attention_and_cache_dtypes) {
     CHECK_EQ(kb::tolerance_for("sample_temp", Geometry{}, "logits").rel_l2, 1e-6);
     /* A per-operand override wins over the op's row. */
     CHECK_EQ(kb::tolerance_for("hc_read", geom({ { "dtype", "bf16" } }), "q").rel_l2, 3e-2);
+    /* The table op is exact (it moves ids); the attention that reads it takes the dtype's bound the
+     * way attn_paged does, so an f32 run is not judged at bf16's 3e-2. */
+    CHECK_EQ(kb::tolerance_for("qsa_table", geom({ { "q_dtype", "f32" } }), "tab").rel_l2, 0.0);
+    CHECK_EQ(kb::tolerance_for("qsa_attn", geom({ { "q_dtype", "bf16" } }), "out").rel_l2, 2e-2);
+    const kb::TolPick qsa_f32 = kb::tolerance_for("qsa_attn",
+                                                 geom({ { "q_dtype", "f32" } }), "out");
+    CHECK_EQ(qsa_f32.rel_l2, 1e-4);
+    CHECK(!qsa_f32.catch_all);
     /* An op nobody wrote a row for lands on the catch-all, and says so. */
     const kb::TolPick none = kb::tolerance_for("zz_new_op", Geometry{}, "y");
     CHECK(none.catch_all);

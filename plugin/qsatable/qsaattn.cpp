@@ -134,9 +134,12 @@ int rad_qsa_attn_shape(const RadParam* p, int n, int i, RadOpdDesc* out) {
         d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_max = g.blocks;
         d.flags = (uint32_t)RAD_OPD_F_IDX_ORDERED; break;
     case 3:
-        /* A full selection's union: `topk` entries, inside the plane's declared width. */
+        /* A full selection's union: `topk` entries, inside the plane's declared width. A table
+         * narrower than `topk` (`u_max` is the caller's, bounded by `tile * topk`) holds fewer ids,
+         * so the count stops at the width rather than claiming entries the plane does not have. */
         d.shape[0] = g.tiles;
-        d.fill = (uint32_t)RAD_FILL_INDEX; d.idx_const = g.topk; break;
+        d.fill = (uint32_t)RAD_FILL_INDEX;
+        d.idx_const = g.topk < g.u_max ? g.topk : g.u_max; break;
     case 4:
         /* Every entry held, so the walk crosses the whole union rather than a prefix of it. */
         d.rank = 2; d.shape[0] = g.M; d.shape[1] = g.u_max;

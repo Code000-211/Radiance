@@ -78,7 +78,7 @@ rad_add_plugin(radtest_quant testquant SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testq
 # Deliberately defective kernel libraries, one per defect, for tests/kbench_mutant_test.cpp: a
 # replay must fail each of them (or, for kbm_ok, pass it). One source, as above; KBM_MUTANT picks
 # the defect. Under testkernels/kbmut, loaded only by name.
-set(RAD_KBM_MUTANTS ok scale nan half overrun refuse shape argmax inwrite enc
+set(RAD_KBM_MUTANTS ok scale nan half overrun refuse shape argmax inwrite enc pair
     CACHE INTERNAL "the kbmutant.cc builds, read by tests/CMakeLists.txt")
 set(i 0)
 foreach(m ${RAD_KBM_MUTANTS})

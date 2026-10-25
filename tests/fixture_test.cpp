@@ -582,6 +582,45 @@ TEST(the_fallback_index_range_is_the_widest_leading_extent) {
     CHECK_EQ(kf_vocab_rows({}), (int64_t)0);
 }
 
+/* A block-order list (`OpdShape::idx_ordered`) is ids inside the block space: a row ascends
+ * strictly and stops short of `idx_max`, the next row starts one later so a tile's rows overlap,
+ * and a row wider than the space cannot ascend at all -- it would have to leave the space. The
+ * shape hooks cap the width (`qsa_table`: `min(topk + 1, blocks)`); this keeps a hand-written
+ * fixture from carrying an id past `idx_max`, which the reader would take as a block id. */
+TEST(an_ordered_list_stays_inside_its_block_space) {
+    auto list = [](int64_t rows, int64_t w, int64_t span) {
+        KfOperand d;
+        d.role = RAD_OPD_IN;
+        d.dtype = RAD_I32;
+        d.is_index = true;
+        d.idx_ordered = true;
+        d.idx_max = span;
+        d.shape = { rows, w };
+        return d;
+    };
+    /* Rows walk up by one, so consecutive rows share all but one entry. */
+    const std::vector<float> overlap = draw_f32({ list(3, 5, 8) }, 0, 3, 0x5151);
+    REQUIRE_EQ((int64_t)overlap.size(), (int64_t)15);
+    for (int64_t r = 0; r < 3; ++r) {
+        CHECK_EQ(overlap[(size_t)(r * 5)], (float)r);
+        for (int64_t j = 1; j < 5; ++j)
+            CHECK(overlap[(size_t)(r * 5 + j)] > overlap[(size_t)(r * 5 + j - 1)]);
+    }
+    /* The last row stops at the top of the space rather than walking out of it. */
+    const std::vector<float> top = draw_f32({ list(2, 7, 8) }, 0, 2, 0x5252);
+    CHECK_EQ(top[7], 1.0f);
+    CHECK_EQ(top[13], 7.0f);
+    /* Wider than the space: every entry stays an id the reader can take. */
+    const std::vector<float> wide = draw_f32({ list(2, 10, 8) }, 0, 2, 0x5353);
+    REQUIRE_EQ((int64_t)wide.size(), (int64_t)20);
+    for (int64_t r = 0; r < 2; ++r) {
+        CHECK_EQ(wide[(size_t)(r * 10)], 0.0f);
+        for (int64_t j = 1; j < 10; ++j)
+            CHECK(wide[(size_t)(r * 10 + j)] >= wide[(size_t)(r * 10 + j - 1)]);
+    }
+    for (float v : wide) CHECK(v >= 0.0f && v < 8.0f);
+}
+
 /* ================================================================== the file */
 
 TEST(a_fixture_survives_a_save_and_a_load) {

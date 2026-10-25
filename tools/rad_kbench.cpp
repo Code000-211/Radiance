@@ -992,7 +992,7 @@ private:
     bool draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why);
     void run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                  const std::vector<Drawn>& in, uint64_t input_hash, const Run& run,
-                 const std::string& oracle);
+                 const std::string& oracle, const KernelRow* oracle_row);
     bool lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
                  const Drawn& d, Bytes* laid, RadTensor* desc);
     std::string oracle_of(const std::string& recorded, const std::string& op, const Geometry& g,
@@ -1208,16 +1208,30 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
      * op beside its own host reference answers it (oracle_of). */
     const std::string rec = oracle_name(fx);
     const std::string oracle = rec.empty() ? ref_name_ : oracle_of(rec, c.op, g, accept);
+    /* The one row the recording's answers came from: the reference's host row for this case, with
+     * the geometry the selector derived it at. */
+    const KernelRow* oracle_row = nullptr;
+    Geometry oracle_g;
+    if (!oracle.empty()) {
+        const std::vector<Run> rr =
+            rows_for_case(*reg_, oracle, c.op, g, RAD_DOMAIN_HOST, accept, false);
+        if (!rr.empty()) { oracle_row = rr[0].row; oracle_g = rr[0].g; }
+    }
     /* That reference must still serve and describe what it recorded; otherwise the case is stale
-     * on every machine, whichever libraries are under test. */
-    if (oracle == rec) {
-        std::vector<Run> rr = rows_for_case(*reg_, oracle, c.op, g, RAD_DOMAIN_HOST, accept, false);
-        if (rr.empty()) {
+     * on every machine, whichever libraries are under test. No substitute reference either -- the
+     * recording's own library dropped the op and no loaded library declares one -- is a stale case,
+     * not a case to compare with a tolerance nobody recorded. */
+    if (!rec.empty() && oracle.empty()) {
+        nm_.stale[c.op + "  (" + rec + " recorded this case and has no row for it now, and no "
+                  "loaded library declares a reference for it)"]++;
+        ++st_.stale;
+    } else if (oracle == rec) {
+        if (!oracle_row) {
             nm_.stale[c.op + "  (" + oracle + " recorded this case and has no row for it "
                       "now)"]++;
             ++st_.stale;
         } else {
-            const std::string why = describes_differently(c, schema, rr[0].row, rr[0].g);
+            const std::string why = describes_differently(c, schema, oracle_row, oracle_g);
             if (!why.empty()) {
                 nm_.stale[c.op + "  (" + oracle + " now describes an output differently from "
                           "its recording -- " + why + ")"]++;
@@ -1315,7 +1329,7 @@ void Replay::replay_case(size_t fi, const KfCase& c) {
             input_hash = kb::hash_combine(input_hash, d.fp);
         }
     }
-    for (const Run& r : runs) run_one(fi, c, schema, in, input_hash, r, oracle);
+    for (const Run& r : runs) run_one(fi, c, schema, in, input_hash, r, oracle, oracle_row);
 }
 
 bool Replay::draw_case(const KfCase& c, std::vector<Drawn>* in, std::string* why) {
@@ -1444,15 +1458,18 @@ bool Replay::lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const
 
 void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                      const std::vector<Drawn>& in, uint64_t input_hash, const Run& run,
-                     const std::string& oracle) {
+                     const std::string& oracle, const KernelRow* oracle_row) {
     const size_t n_opd = c.opd.size();
     const KernelRow* row = run.row;
     const std::string& lib = run.lib;
     const int dom = run.dom;
     const Geometry& g = run.g;
-    /* The library whose answer this case's recording holds is held to it exactly, unless this row
-     * reads a weight's planes where the recording read their decoded tensor (lays_out_weight). */
-    const bool exact = !oracle.empty() && lib == oracle && !lays_out_weight(row, g, c);
+    /* Only the row whose answer the recording holds is held to it exactly: the reference's host row
+     * (oracle_row), never every row of the library that ships it. `plugin/qsatable` carries
+     * `ref_qsa_attn` beside `qsa_attn`, and the device row needs its dtype's tolerance like any
+     * other kernel. A row that reads a weight's planes where the recording read their decoded
+     * tensor is compared with tolerance as well (lays_out_weight). */
+    const bool exact = oracle_row && row == oracle_row && !lays_out_weight(row, g, c);
     auto role_of = [&](size_t k) { return schema->operands[k].role; };
     auto written = [&](size_t k) { return role_of(k) == RAD_OPD_OUT || role_of(k) == RAD_OPD_INOUT; };
     auto name_of = [&](size_t k) {
@@ -2768,10 +2785,13 @@ int main(int argc, char** argv) {
                 if (!o.ranged_key.empty()) g.set_i(o.ranged_key, M);
 
                 /* Checking the reference against itself proves nothing and costs a lot at 151K
-                 * vocab, so a point the reference resolved is visited only to record it. Same for a
-                 * plugin's own host reference, which is the oracle of an op libref does not serve. */
+                 * vocab, so a point the reference's own row resolved is visited only to record it.
+                 * Row identity, not the plugin's name: a library that ships its kernel beside the
+                 * definition (`plugin/qsatable`'s `ref_qsa_table` + `qsa_table`, and a plugin's own
+                 * host reference against its device row) would otherwise have its device row
+                 * skipped as if it were the reference. */
                 const KernelRow* oracle = ref_for(o.op, g);
-                const bool record_only = oracle && r.row->plugin == oracle->plugin;
+                const bool record_only = oracle && r.row == oracle;
                 if (record_only && (!recording || point_recorded)) continue;
                 const bool record_here = recording && !point_recorded;
 

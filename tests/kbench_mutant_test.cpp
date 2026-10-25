@@ -46,7 +46,7 @@ using namespace rad;
 namespace {
 
 const char* const kMutants[] = { "ok", "scale", "nan", "half", "overrun", "refuse", "shape",
-                                 "argmax", "inwrite", "enc" };
+                                 "argmax", "inwrite", "enc", "pair" };
 
 struct Out {
     int code = -1;
@@ -212,10 +212,11 @@ const Env& env() {
 }
 
 /* A fixture made of some of the recorded cases, for a test that needs a particular mix. */
-std::string fixture_of(const std::string& leaf, const std::vector<KfCase>& cases) {
+std::string fixture_of(const std::string& leaf, const std::vector<KfCase>& cases,
+                       const char* oracle = "libref") {
     Kfixture fx;
     fx.source = "kbench_mutant_test";
-    fx.oracle = "libref";
+    fx.oracle = oracle;
     fx.cases = cases;
     const std::string path = env().dir + "/" + leaf;
     return fx.save(path) == RAD_OK ? path : std::string();
@@ -263,6 +264,28 @@ Kfixture recorded() {
 std::string replay(const std::string& lib, const std::string& extra = "") {
     return "--kernels " + lib + ":libref --no-ref --strict --max-bytes 64 --fixture '" + env().fx +
            "' " + extra;
+}
+
+/* A home holding only the libraries a test names. rad-kbench loads every plugin in its home, so "no
+ * loaded library declares a reference for this op" is a property of the home: --kernels picks what
+ * is under test, not what can answer in place of a recording's reference. */
+Env home_with(const std::string& leaf, const std::vector<std::string>& kernels) {
+    Env e = env();
+    e.home = env().dir + "/" + leaf;
+    for (const std::string& d : { "", "/kernels", "/architectures" })
+        if (::mkdir((e.home + d).c_str(), 0755) != 0 && errno != EEXIST) { e.ok = false; return e; }
+    for (const std::string& k : kernels) {
+        /* The mutants live in testkernels/kbmut, as they do in the shared home. */
+        const std::string so = std::string(RAD_PLUGIN_DIR) +
+                               (k.rfind("kbm_", 0) == 0 ? "/testkernels/kbmut/" : "/kernels/") +
+                               k + ".so";
+        if (::symlink(so.c_str(), (e.home + "/kernels/" + k + ".so").c_str()) != 0 &&
+            errno != EEXIST) { e.ok = false; return e; }
+    }
+    const std::string arch = std::string(RAD_PLUGIN_DIR) + "/testarch/kbench/radtest_kbarch.so";
+    if (::symlink(arch.c_str(), (e.home + "/architectures/radtest_kbarch.so").c_str()) != 0 &&
+        errno != EEXIST) e.ok = false;
+    return e;
 }
 
 }  /* namespace */
@@ -695,6 +718,165 @@ double num(const std::string& s) { return s.empty() || s == "-" ? -1.0 : std::at
 
 const char* const kQuickBench = "--bench --bench-flush 1 --bench-iters 2 --bench-reps 3 "
                                 "--bench-warm-ms 0";
+
+/* ================================================================== the row, not the library */
+
+/* One library can ship both: plugin/qsatable marks its host rows as the definitions of its ops and
+ * its device rows as the kernels to be checked (`rad_kernel_reference`, per row). The container pass
+ * asked whether a row's *library* was the reference, so once ref_for held the host row every row of
+ * that library counted as the reference -- including the device row there is to check -- and was
+ * skipped as if it had been checked. Row identity decides: the definition is skipped, the kernel
+ * beside it runs. */
+TEST(a_plugins_device_row_is_checked_against_the_definition_in_the_same_plugin) {
+    const Env pair = home_with("pair", { "libref", "kbm_pair" });
+    REQUIRE(pair.ok);
+    const std::string model = tiny_model();
+    REQUIRE(!model.empty());
+    const std::string report = pair.home + "/pair.md";
+    /* libref is loaded for its `add` schema and its norm and projection rows; `--ref kbm_pair` is
+     * the recording's reference, and the model's add is its device row. */
+    const Out o = run(pair, "-m '" + model + "' --kernels libref:kbm_pair --ref kbm_pair "
+                             "--max-tok 4 --max-bytes 64 --report '" + report + "'");
+    CHECK_RUN(o, o.code == 0);
+    const std::string md = read_text(report);
+    /* A row is only in the report when it was checked (record_only rows are not), so the device
+     * row's presence is the whole claim; the host row beside it stayed the recording's. */
+    CHECK(has(md, "| `add` | `kbm_pair_add_device` |"));
+    CHECK(!has(md, "| `add` | `kbm_pair_add` |"));
+}
+
+/* The same shape in the fixture pass: `exact` was `lib == oracle`, true for the device row of the
+ * library that holds the definition too, so it was held to the reference's bytes instead of its
+ * dtype's bound. Bound to the row the recording came from, a rounding-sized difference passes and a
+ * real divergence on the same row still fails. */
+TEST(a_kernels_device_row_is_held_to_its_tolerance_not_its_librarys_exactness) {
+    REQUIRE(env().ok);
+    /* The add case libref recorded: host row and device row of kbm_pair both serve it. */
+    const std::string base = fixture_of("pair_base.rkb", { recorded().cases[0] });
+    const std::string fx = env().dir + "/pair.rkb";
+    const Out rec = run(env(), "--kernels libref:kbm_pair --ref kbm_pair --max-bytes 64 "
+                               "--rerecord '" + fx + "' --fixture '" + base + "'");
+    CHECK_RUN(rec, rec.code == 0 && has(rec.text, "recorded 1 case(s)"));
+
+    /* Its own device row is 1e-4 off, inside bf16's 6e-3: it passes at that bound and would fail at
+     * the reference's. */
+    const Out ok = run(env(), "--kernels libref:kbm_pair --ref kbm_pair --strict --max-bytes 64 "
+                              "--fixture '" + fx + "'");
+    CHECK_RUN(ok, ok.code == 0);
+    CHECK_RUN(ok, !has(ok.text, "FAIL"));
+    CHECK_RUN(ok, has(ok.text, "3 checked, 3 passed, 0 failed"));
+
+    /* The kernel that is 1.8% off, on the same recording and the same row: the tolerance is a bound,
+     * not a bypass. */
+    const Out bad = run(env(), "--kernels libref:kbm_pair:kbm_scale --ref kbm_pair --strict "
+                               "--max-bytes 64 --fixture '" + fx + "'");
+    CHECK_RUN(bad, bad.code == 1);
+    CHECK_RUN(bad, has(bad.text, "kbm_add_device") && has(bad.text, "FAIL"));
+}
+
+/* A recording that names a library which does not serve its op, while another loaded library
+ * declares a reference for it: not stale, and checked against that library's host row. `--rerecord`
+ * writes the run's reference into the fixture, so a `qsa_table` case that `qsatable`'s host row
+ * answered is written as `libref`'s -- and libref implements no `qsa_table`. The case used to be
+ * reported unserved and lost its exactness; an unresolvable reference is the stale one. */
+TEST(a_recording_whose_library_does_not_serve_it_runs_against_the_one_that_does) {
+    REQUIRE(env().ok);
+    Registry reg;
+    REQUIRE(reg.load_plugin(std::string(RAD_PLUGIN_DIR) + "/kernels/qsatable.so", 0) >= 0);
+    KfCase c;
+    Geometry g;
+    g.set_i("M", 4); g.set_i("blocks", 64); g.set_i("topk", 8); g.set_i("tile", 16);
+    g.set_i("ratio", 4); g.set_i("u_max", 64);
+    REQUIRE(describe_lib(reg, "qsatable", "qsa_table", g, 211, 4, &c));
+    const std::string base = fixture_of("gone_base.rkb", { c });
+    const std::string fx = env().dir + "/gone.rkb";
+    const Out rec = run(env(), "--kernels libref:qsatable --max-bytes 64 --rerecord '" + fx +
+                                 "' --fixture '" + base + "'");
+    CHECK_RUN(rec, rec.code == 0 && has(rec.text, "recorded 1 case(s)"));
+
+    /* The fixture now names libref, which has no row for the op; qsatable's host reference does. */
+    const Out o = run(env(), "--kernels qsatable:libref --strict --max-bytes 64 --fixture '" +
+                             fx + "'");
+    CHECK_RUN(o, o.code == 0);
+    CHECK_RUN(o, !has(o.text, "stale"));
+    CHECK_RUN(o, has(o.text, "1 checked, 1 passed, 0 failed"));
+    CHECK_RUN(o, has(o.text, "worst rel_l2 = 0.000e+00"));
+}
+
+/* The attention reader takes its entry count from `tlen` and reads `tab` and `mask` below it, so a
+ * drawn count wider than the plane's declared `u_max` is a read past the row. The shape hook caps it
+ * at the width, whatever `topk` says. */
+TEST(a_drawn_table_length_never_leaves_the_planes_declared_width) {
+    REQUIRE(env().ok);
+    Registry reg;
+    REQUIRE(reg.load_plugin(std::string(RAD_PLUGIN_DIR) + "/kernels/qsatable.so", 0) >= 0);
+    KfCase c;
+    Geometry g;
+    /* topk 4 into a plane two ids wide: the reader would walk four. */
+    g.set_i("M", 1); g.set_i("n_head", 1); g.set_i("head_dim", 64); g.set_i("gqa", 1);
+    g.set_i("block_size", 4); g.set_i("ratio", 4); g.set_i("tile", 1); g.set_i("topk", 4);
+    g.set_i("blocks", 64); g.set_i("max_seqs", 1); g.set_i("u_max", 2);
+    g.set_s("q_dtype", "f32"); g.set_s("kv_dtype", "f32");
+    REQUIRE(describe_lib(reg, "qsatable", "qsa_attn", g, 212, 1, &c));
+    REQUIRE(c.opd.size() == 10);
+    CHECK_EQ(c.opd[2].shape.back(), (int64_t)2);       /* tab: the union's declared width */
+    CHECK_EQ(c.opd[4].shape.back(), (int64_t)2);       /* mask */
+    CHECK_EQ(c.opd[3].idx_const, (int64_t)2);          /* tlen: inside it */
+
+    /* And the reference reads it without leaving the row. */
+    const std::string base = fixture_of("narrow_base.rkb", { c });
+    const std::string fx = env().dir + "/narrow.rkb";
+    const Out rec = run(env(), "--kernels libref:qsatable --max-bytes 64 --rerecord '" + fx +
+                                 "' --fixture '" + base + "'");
+    CHECK_RUN(rec, rec.code == 0 && has(rec.text, "recorded 1 case(s)"));
+    const Out o = run(env(), "--kernels qsatable:libref --strict --max-bytes 64 --fixture '" + fx +
+                             "'");
+    CHECK_RUN(o, o.code == 0);
+    CHECK_RUN(o, has(o.text, "1 checked, 1 passed, 0 failed"));
+}
+
+/* The gate's negative half: a case of a timed op that was skipped or went stale withdraws every
+ * time of that op and the run ends 1. Keeping the times of the cases that happened to be checked
+ * would publish a measurement of part of an op as the op's. --timing-only compares nothing, so it
+ * keeps what it timed. */
+TEST(a_timed_op_with_a_skipped_or_stale_case_publishes_no_time) {
+    REQUIRE(env().ok);
+    const std::vector<KfCase> all = recorded().cases;
+    REQUIRE(all.size() == 5);          /* add, gather_rows, sample_argmax, rmsnorm, add 32768 */
+    /* One add the replay takes and one it must skip: 3 x 8 x 32768 bf16 operands do not fit a 1 MiB
+     * budget, the 24 KiB case does. */
+    const std::string over = fixture_of("gate_over.rkb", { all[0], all[4] });
+    const std::string report = env().dir + "/gate_over.md";
+    const Out sk = run(env(), "--kernels kbm_ok:libref --no-ref --strict --max-bytes 1 --fixture '" +
+                                 over + "' " + kQuickBench + " --report '" + report + "'");
+    CHECK_RUN(sk, sk.code == 1);
+    CHECK_RUN(sk, has(sk.text, "The measurement gate refused"));
+    /* Both rows of the op are still listed -- the report names what was not timed -- with no
+     * number in either column and the gate's reason beside them. */
+    const std::string md = read_text(report);
+    CHECK(has(md, "**Device timings withheld:**"));
+    const std::vector<std::string> host = speed_row(md, "kbm_add");
+    const std::vector<std::string> dev = speed_row(md, "kbm_add_device");
+    CHECK(host.empty() || num(host[6]) < 0);
+    CHECK(dev.empty() || num(dev[5]) < 0);
+
+    /* The same op registered as stale: a case whose operand list no longer matches its schema. */
+    KfCase stale = all[0];
+    stale.opd.pop_back();
+    stale.seed ^= 1;
+    const std::string sfile = fixture_of("gate_stale.rkb", { all[0], stale });
+    const Out st = run(env(), "--kernels kbm_ok:libref --no-ref --strict --max-bytes 64 "
+                              "--fixture '" + sfile + "' " + kQuickBench);
+    CHECK_RUN(st, st.code == 1);
+    CHECK_RUN(st, has(st.text, "The measurement gate refused"));
+    CHECK_RUN(st, has(st.text, "stale"));
+
+    /* A timing-only run has no comparison to lose: it publishes what it timed and stays 0. */
+    const Out only = run(env(), "--kernels kbm_ok:libref --no-ref --max-bytes 64 --fixture '" +
+                                sfile + "' --timing-only " + kQuickBench);
+    CHECK_RUN(only, only.code == 0);
+    CHECK_RUN(only, has(only.text, "timed. Timing only"));
+}
 
 /* Device rows are timed after the checks, host rows where they are checked, each in its own
  * column with the calibration above the table. A device row that queues its work (the copy-based
