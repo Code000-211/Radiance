@@ -291,10 +291,10 @@ endif()
 
 # arch_test reads libref's vocabulary from $RADIANCE_HOME/kernels to check that each architecture
 # declares on it, and glm5next_test the loaded libraries' op schemas, so libref is built before
-# them. r4d_emu_qsa holds the shared table's masked read to libref's `attn_paged` byte for byte, and
-# a build without it cannot make that claim, so the test fails rather than skipping the comparison --
-# the dependency keeps a plain build from failing it, not an excuse to let it pass.
-foreach(t arch_test glm5next_test r4d_emu_qsa r4d_emu_qsa_sweep)
+# them. (r4d_emu_qsa needs the same edge but is created further down by the emulator's own branch,
+# so its dependency is set there; r4d_emu_qsa_sweep is a CTest entry on the same binary, not a
+# build target.)
+foreach(t arch_test glm5next_test)
   if(TARGET libref AND TARGET ${t})
     add_dependencies(${t} libref)
   endif()
@@ -433,6 +433,11 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
     target_compile_options(r4d_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
     set_target_properties(r4d_emu_${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   endforeach()
+  # test_qsa's `row path:` is libref's `attn_paged`, so the byte claim needs the library built: a
+  # build that never produced it fails the case, and the edge keeps that from being the default.
+  if(TARGET libref)
+    add_dependencies(r4d_emu_qsa libref)
+  endif()
   set(R4D_EMU_BUILT ON)
 else()
   if(RAD_HIP_FOUND AND CMAKE_HIP_COMPILER_ID MATCHES "Clang")
@@ -494,6 +499,10 @@ else()
       list(APPEND exes ${exe})
     endforeach()
     add_custom_target(r4d_emu ALL DEPENDS ${exes})
+    # The same byte claim, through the one combined emulator target this branch builds.
+    if(TARGET libref)
+      add_dependencies(r4d_emu libref)
+    endif()
     set(R4D_EMU_BUILT ON)
   endif()
 endif()
