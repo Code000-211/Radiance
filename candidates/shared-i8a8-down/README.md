@@ -2,7 +2,7 @@
 
 An out-of-tree kernel plugin for radiance, ported from the `mine` model plugin. It serves the
 shared expert's **down projection** — `gemm_nt_q` at dtype `i8a8` — at the speculative-verify
-width.
+widths it measured a win on.
 
 Opt-in: the row exists only when `RADIANCE_SHARED_I8A8_DOWN=1`. With the variable unset the plugin
 declares its schema and no kernel, so selection is exactly the build's existing one.
@@ -13,7 +13,7 @@ declares its schema and no kernel, so selection is exactly the build's existing 
 |---|---|
 | op | `gemm_nt_q` |
 | dtype | `i8a8` |
-| M | 1..4 |
+| M | 1..3 |
 | N | 2560 (`n_embd`) |
 | K | 384 (`n_ff_shared`, per rank) |
 | group | 128 |
@@ -71,16 +71,18 @@ Run on this tree's target build (`libr4d.so` built from the same commit as the c
 $ ./compare /path/to/build/radiance_home/kernels/libr4d.so \
             /path/to/build/radiance_home/kernels/shared_i8a8_down.so
 device 0 AMD Radeon AI PRO R9700 arch=gfx1201 lanes=32
-frozen_row=gemm_i8a8_nt_m16 candidate_row=shared_i8a8_down_m1_m4
+frozen_row=gemm_i8a8_nt_m16 candidate_row=shared_i8a8_down_m1_m3
 mode=random tags frozen=("r4d.i8.w.frag64","r4d.i8.s.t16") candidate=("r4d.i8.w.frag64","r4d.i8.s.t16")
   codes_equal=1 scale_equal=1 bytes=983040/983040
 M=1 bytes=5120  frozen_vs_candidate_diffs=0 first=-1 max_abs=0 frozen_vs_int_reference_bad=0
 M=2 bytes=10240 frozen_vs_candidate_diffs=0 first=-1 max_abs=0 frozen_vs_int_reference_bad=0
 M=3 bytes=15360 frozen_vs_candidate_diffs=0 first=-1 max_abs=0 frozen_vs_int_reference_bad=0
-M=4 bytes=20480 frozen_vs_candidate_diffs=0 first=-1 max_abs=0 frozen_vs_int_reference_bad=0
 ... the same for mode=signed-extremes and mode=zeros ...
 negative_control changed_input_differs=1
-gate/up geometry (N=768,K=2560) candidate launch status=-1 refused=1
+gate/up geometry (N=768,K=2560,M=1) candidate launch status=-1 refused=1
+gate/up geometry (N=768,K=2560,M=1) candidate opd_shape status=-2 refused=1
+fourth row (N=2560,K=384,M=4)       candidate launch status=-1 refused=1
+fourth row (N=2560,K=384,M=4)       candidate opd_shape status=-2 refused=1
 RESULT: BYTE-IDENTICAL AND REFERENCE-CONSISTENT
 ```
 
@@ -175,8 +177,11 @@ reads it.
 - **Layout bytes come from a source tree, not from the installed SDK.** If the engine's `libr4d`
   and `RAD_LIBR4D_DIR` come from different revisions, the tag would match while the bytes did not.
   The comparison above holds only because both were built from the same commit.
-- **The bucket table gains an edge at M=4.** Any M-bounded row does this; it is a declare-time
-  subdivision, not a change to the frozen bands' resolution.
+- **The bucket table gains an edge at M=3.** Any M-bounded row does this; it is a declare-time
+  subdivision, not a change to the frozen bands' resolution. The edge sits at the band this row
+  measured a win on, so a four-token verify step resolves into the band above and is served by
+  libr4d's wider row (`gemm_i8a8_nt_m16`), which is faster there: 5.23 µs against 5.35 µs per
+  launch, cold weights, 36/36 rounds (MAIN-42). M=1..3 win by 6-8 % in the same protocol.
 - **No `RAD_R4D_TRACE` or `r4d_record_dispatches` participation.** The source row reached those
   through libr4d's `r4d_emit` sink, which does not exist in this ABI; this DSO packs its launch
   itself. Debugging this row in isolation means adding a trace locally.

@@ -147,7 +147,8 @@ void check_row(const RadKernelInfo* k) {
     CHECK(k->launch && k->opd_shape && k->layout && k->relayout && k->unrelayout);
     CHECK(k->scratch == nullptr);          /* one launch, nothing staged */
     /* The geometry is an equality on N and K, not a band: the body is written for one pair. */
-    CHECK(constraint_holds(k, "M", 1) && constraint_holds(k, "M", 4) && !constraint_holds(k, "M", 0) &&
+    CHECK(constraint_holds(k, "M", 1) && constraint_holds(k, "M", 3) &&
+          !constraint_holds(k, "M", 0) && !constraint_holds(k, "M", 4) &&
           !constraint_holds(k, "M", 5));
     CHECK(constraint_holds(k, "N", 2560) && !constraint_holds(k, "N", 768));
     CHECK(constraint_holds(k, "K", 384) && !constraint_holds(k, "K", 256));

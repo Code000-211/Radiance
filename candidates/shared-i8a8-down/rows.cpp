@@ -55,21 +55,23 @@ const RadOpSchema kSchemas[] = {
 /* ================================================================== the row's bounds
  *
  * N and K are equalities, not bands: the arithmetic the row performs is written for one pair.
- * The M bound is the verify width, and it is an upper bound, not a promise about one step's row
- * count -- the issue path narrows the operands and the launch reads the rows off them.
+ * The M bound is the measured band (the .hip states the numbers), and it is an upper bound, not a
+ * promise about one step's row count -- the issue path narrows the operands and the launch reads
+ * the rows off them. It also cuts the bucket boundary: a four-token verify step lands in the band
+ * above and goes to libr4d's wider row.
  */
 const RadConstraint kBounds[] = {
-    RAD_CGE("M", 1), RAD_CLE("M", 4), RAD_CEQ("N", 2560), RAD_CEQ("K", 384),
+    RAD_CGE("M", 1), RAD_CLE("M", 3), RAD_CEQ("N", 2560), RAD_CEQ("K", 384),
     RAD_CEQ("group", 128), RAD_CIN("dtype", "i8a8"),
 };
 
 const RadKernelInfo kRow = [] {
     RadKernelInfo r{};
-    r.name    = "shared_i8a8_down_m1_m4";
+    r.name    = "shared_i8a8_down_m1_m3";
     r.op      = "gemm_nt_q";
     r.family  = "gemm";
     r.computes = "signed i8 packed dot, int32 per 128 K, FP32 scale and fold, BF16 output";
-    r.shape    = "M=1..4, N=2560, K=384, group=128; tight rows, frag64 weights";
+    r.shape    = "M=1..3, N=2560, K=384, group=128; tight rows, frag64 weights";
     r.dtypes   = "i8 A and blocked W; f32 A scales; bf16 W scales and Y";
     r.domain   = RAD_DOMAIN_DEVICE;
     r.priority = 100;

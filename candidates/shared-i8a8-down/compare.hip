@@ -5,7 +5,8 @@
  *   - the weight planes are canonical affine i8/bf16 [N][K] and [N][K/128];
  *   - the packed bytes come from each row's own layout/relayout hook, and the two are compared,
  *     so the claim "same layout bytes" is a measurement rather than a reading of the source;
- *   - the outputs of both rows are compared byte for byte at M=1..4.
+ *   - the outputs of both rows are compared byte for byte at M=1..3 (the row's band; M=4
+ *     belongs to the frozen row and must be refused here).
  */
 #include <hip/hip_runtime.h>
 
@@ -242,7 +243,7 @@ int main(int argc, char** argv) {
           "gfx1201 wave32 required");
 
     Plugin frozen(frozen_path, "gemm_i8a8_nt_m16");
-    Plugin cand(cand_path, "shared_i8a8_down_m1_m4");
+    Plugin cand(cand_path, "shared_i8a8_down_m1_m3");
     std::printf("frozen_row=%s candidate_row=%s\n", frozen.row->name, cand.row->name);
 
     hipStream_t stream = nullptr;
@@ -286,7 +287,7 @@ int main(int argc, char** argv) {
         Buffer d_a(a.size()), d_asc(asc.size() * 4), d_w(fw.size()), d_ws(fs.size());
         d_a.put(a.data()); d_asc.put(asc.data()); d_w.put(fw.data()); d_ws.put(fs.data());
 
-        for (int m = 1; m <= 4; ++m) {
+        for (int m = 1; m <= 3; ++m) {
             p.set_m(m);
             Buffer yf((size_t)m * N * 2), yc((size_t)m * N * 2);
             HIP(hipMemset(yf.p, 0xa5, yf.size));
@@ -345,18 +346,30 @@ int main(int argc, char** argv) {
         if (base == changed) ++fails;
     }
 
-    /* The one refusal that must survive: the gate/up geometry would be wrong here. */
+    /* The refusals that must survive: the gate/up geometry, and the fourth row, which the measured
+     * band hands to the frozen row. */
     {
-        Params p;
-        p.v[1] = integer("N", 768);
-        p.v[2] = integer("K", 2560);
-        Buffer b1(1), b2(1), b3(1), b4(1), b5(1);
-        Call c(1, b1, b2, b3, b4, b5);
-        c.a.p = p.v.data(); c.a.n_p = (int)p.v.size();
-        const int rc = cand.row->launch(&c.a, (RadStream)stream);
-        std::printf("gate/up geometry (N=768,K=2560) candidate launch status=%d refused=%d\n",
-                    rc, (int)(rc != RAD_OK));
-        if (rc == RAD_OK) ++fails;
+        struct Refusal { const char* what; int64_t n, k, m; };
+        const Refusal rs[] = { { "gate/up geometry (N=768,K=2560,M=1)", 768, 2560, 1 },
+                               { "fourth row (N=2560,K=384,M=4)",       2560, 384, 4 } };
+        for (const Refusal& r : rs) {
+            Params p;
+            p.v[1] = integer("N", r.n);
+            p.v[2] = integer("K", r.k);
+            p.set_m((int)r.m);
+            Buffer b1(1), b2(1), b3(1), b4(1), b5(1);
+            Call c((int)r.m, b1, b2, b3, b4, b5);
+            c.a.p = p.v.data(); c.a.n_p = (int)p.v.size();
+            const int rc = cand.row->launch(&c.a, (RadStream)stream);
+            std::printf("%-36s candidate launch status=%d refused=%d\n", r.what, rc, (int)(rc != RAD_OK));
+            if (rc == RAD_OK) ++fails;
+            /* The description has to agree, or a tool sizes buffers for a launch that refuses. */
+            RadOpdDesc d{};
+            const int rs2 = cand.row->opd_shape(p.v.data(), (int)p.v.size(), 0, &d);
+            std::printf("%-36s candidate opd_shape status=%d refused=%d\n", r.what, rs2,
+                        (int)(rs2 != RAD_OK));
+            if (rs2 == RAD_OK) ++fails;
+        }
     }
 
     HIP(hipStreamDestroy(stream));

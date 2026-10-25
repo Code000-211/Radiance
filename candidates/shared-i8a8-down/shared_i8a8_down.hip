@@ -7,11 +7,15 @@
  *
  * WHY THIS ROW EXISTS. The shared expert's down projection is `gemm_nt_q` at dtype i8a8
  * (arch/common/rad_fp8.h, LinearFP8::declare's `i8` branch): i8 codes [N][K], a bf16 scale per row
- * per 128 of K, an i8 activation with an f32 scale per (row, 128). At M <= 4 the frozen row is
+ * per 128 of K, an i8 activation with an f32 scale per (row, 128). At M <= 3 the frozen row is
  * libr4d's `gemm_i8a8_nt_m16`, a 16-row WMMA tile; this row gives one 32-lane wave a 32-column
  * strip and reuses each packed weight word for every live token.
  *
- * SCOPE. Exactly one geometry: N=2560 (n_embd), K=384 (n_ff_shared per rank), group 128, M=1..4.
+ * SCOPE. Exactly one geometry: N=2560 (n_embd), K=384 (n_ff_shared per rank), group 128, M=1..3.
+ * M=4 IS EXCLUDED ON A MEASUREMENT: at four live rows this row's Rows=4 path is slower than the
+ * frozen tile, 5.35 us against 5.23 us per launch (36/36 rounds, cold 256 MiB weights, MAIN-42),
+ * while M=1..3 win by 6-8 % in the same protocol. The band boundary therefore sits at 3 and a
+ * four-token verify step goes to libr4d's wider row, which is where it is faster.
  * The gate/up geometry (N=768, K=2560) was measured and LOSES; its constraints and its body both
  * refuse it, so no wider row can pick it up. This row covers K=384 only: the rank-1 K=256 shape of
  * a different model is a different instantiation and is not served here.
@@ -57,7 +61,7 @@ namespace {
 constexpr int Group  = 128;
 constexpr int N      = 2560;   /* n_embd: this rank's down output width              */
 constexpr int K      = 384;    /* n_ff_shared: this rank's down input width           */
-constexpr int RowCap = 4;      /* speculative-verify width; M >= 5 is another row's job */
+constexpr int RowCap = 3;      /* measured band; M >= 4 is libr4d's wider row's job */
 
 /* One launch path, typed: the kernel arrives as `void (*)(P...)`, so every argument is converted
  * to the parameter the kernel declares before it is packed. `hipLaunchKernel` copies raw bytes and
@@ -203,8 +207,7 @@ int body(const RadArgs* args, RadStream stream) {
     switch (rows) {
         case 1: return launch<1>(stream, wp, wsp, ap, asp, yp, nn, kk);
         case 2: return launch<2>(stream, wp, wsp, ap, asp, yp, nn, kk);
-        case 3: return launch<3>(stream, wp, wsp, ap, asp, yp, nn, kk);
-        default: return launch<4>(stream, wp, wsp, ap, asp, yp, nn, kk);
+        default: return launch<3>(stream, wp, wsp, ap, asp, yp, nn, kk);
     }
 }
 
