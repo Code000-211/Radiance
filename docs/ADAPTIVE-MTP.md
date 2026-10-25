@@ -19,13 +19,38 @@ profile has been generated or measured yet and no M1/M2 or GPU result is claimed
 Four things a deployment operator has to know, and one thing nobody measured. None of them is a
 performance claim.
 
-**`cost` is explicit, and it refuses rather than degrades.** Under `--draft-policy cost`, a cycle whose
-shape no bucket matches takes the named fallback; when the profile can supply neither a usable bucket
-nor an admitted baseline, the policy fails closed and `Engine::fail_loop` ends the run with its reason
-in the log instead of quietly drafting at a depth it cannot justify. A start whose profile does not
-bind to this runtime -- another placement, another host budget, a fingerprint or execution mismatch --
-is refused at startup, by name, before any request is served. That is the point of naming the policy
-on the start line: the mode cannot change behind the operator's back.
+**`cost` is explicit, and its error paths are four different things.** Naming the policy on the start
+line is what keeps the mode from changing behind the operator's back; it does not mean that every
+failure looks the same. Read them apart:
+
+- **Start refusal, before anything is served.** `--draft-policy cost` without a serial draft head, a
+  positive ceiling or a depth to plan over is refused in `Scheduler::init`; so is a profile that does
+  not bind to this deployment -- another placement, another host budget, a strategy/host/file/dynamic/
+  residency-digest or execution mismatch -- or a file that does not read. The run exits with the
+  refusal's name and serves nothing. The same startup checks refuse the flags only this policy can
+  honour (`--draft-fallback-k`, `--draft-hysteresis both`) when another policy is selected.
+- **The everyday fallback is not an error.** A cycle whose batch shape no bucket matches takes the
+  named baseline `--draft-fallback-k` (the ladder's middle tier, K3 by default), capped by each row's
+  ceiling -- `draft_policy.cpp`, `DraftPlanSource::Fallback` / `DraftFallback::UnknownShape`. Serving
+  continues; the cycle is counted apart and traced as unpriced. A deployment that prices few shapes
+  runs almost entirely on this path, by design: the C2 profile prices 0.5-2.5 % of cycles. Missing
+  prices are therefore **not** a start prohibition as long as that baseline is admissible.
+- **The ladder gap ends the run.** Narrower than "unpriced": the deepest offered tier is unpriced,
+  the named baseline would run deeper than that tier, and at least one row is correspondingly
+  untrimmed, so no later cycle of this deployment could price the offered top and the run would draft
+  at a depth the ladder never offers. The controller refuses that cycle (`RAD_E_UNSUPPORTED`),
+  `Scheduler::draft_cost_cycle` latches it so the step path stops drafting, and the engine ends the
+  run through `Engine::fail_loop`; the log names the fix (end the ladder at K, or raise the ceiling).
+- **A residency drift ends the run as well.** For a profile that is not the no-loan reference, any
+  observed move since the profile was bound means every later bracket describes a placement the file
+  never measured: the table is deactivated stickily, no fallback is admitted in its place, and the
+  engine ends the run on its error path. A record-only calibration keeps recording instead and marks
+  those cycles `placement`.
+- **Not every planner failure is an abort.** A cycle left without a plan for another reason is
+  counted as `draft_cost_no_plan`, logged once with its error, and that cycle runs at the executable
+  head depth: refused is not the same as ended. `Engine::fail_loop` is also the shared exit of the
+  ordinary runtime error paths, so "the cost policy fails closed" is not a statement about the
+  engine as a whole.
 
 **The deployment start line.** `cost` becomes a deployment's standard by being written on its own
 start line, together with the profile it is meant to use:
@@ -36,10 +61,18 @@ radiance --model <checkpoint> --tp 2 ... \
 ```
 
 The way back is the same line with `--draft-policy legacy` (the fixed depth, or `--draft-window
-adaptive`'s per-sequence stop); no other flag changes. Two things this repository does not carry: the
-line itself and the profile file. There is no service unit, no preset and no config file here -- the
-only environment inputs are `RADIANCE_HOME` and `RADIANCE_KERNELS` -- so the start line belongs to the
-deployment and to whoever starts it, and the profile path is the operator's. `kDraftPolicyDefault`
+adaptive`'s per-sequence stop). For the minimal line above that is a pure policy switch, because the
+line carries no flag the other policy refuses -- on a real start line it usually does:
+`--draft-fallback-k` and `--draft-hysteresis both` are refused under `legacy` in `Scheduler::init`,
+and `--draft-calib-k` / `--draft-reference` are refused by the startup checks; remove those together
+with the policy, or the rollback refuses the start instead of running `legacy`. `--draft-profile` is
+not refused by name, but nothing prices from it under `legacy`, so drop it as well rather than leave a
+line naming a policy that is not running.
+
+Two things this repository does not carry: the line itself and the profile file. There is no service
+unit, no deployment or serving preset (`CMakePresets.json` is a build preset) and no config file here
+-- the only environment inputs are `RADIANCE_HOME` and `RADIANCE_KERNELS` -- so the start line belongs
+to the deployment and to whoever starts it, and the profile path is the operator's. `kDraftPolicyDefault`
 stays `legacy`: a bare `radiance`, every test and every existing start line are unchanged, and no
 library default is flipped for one deployment. Until someone edits that line, nothing is active.
 
