@@ -138,8 +138,9 @@ static const RadParamSpec pAttnPagedTree[] = {
     P_INTO("max_ctx"),
     P_INTO("n_head"),
     P_INTO("max_seqs"),
-    /* The position of the tree's root (the last committed token): a row's position is this plus
-     * its depth, which its mask carries. */
+    /* The cache row of the tree's root (the last committed token): node i lives at cache row
+     * root_pos + i. A row's RoPE position is its depth past the root and comes from the rope
+     * stage, not from this offset. */
     P_INT("root_pos"),
 };
 static const RadOperandSpec oAttnPagedTree[] = {
@@ -151,8 +152,8 @@ static const RadOperandSpec oAttnPagedTree[] = {
     { "v_descale",   RAD_OPD_IN,  1 },
     { "cu_seqlens",  RAD_OPD_IN,  1 },
     { "out",         RAD_OPD_OUT, 0 },
-    /* One ancestor set per query row, u16: bit b is the node at position root_pos + b, the row's
-     * own path with itself included. Required: without it the op is attn_paged. */
+    /* One ancestor set per query row, u16 or u32: bit b is the node at cache row root_pos + b, the
+     * row's own path with itself included. Required: without it the op is attn_paged. */
     { "ancestors",   RAD_OPD_IN,  0 },
 };
 
@@ -2961,11 +2962,14 @@ static const RadOpSchema kSchemas[] = {
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
            "where it lies rather than lifted into a dense block first."),
     SCHEMA("attn_paged_tree", pAttnPagedTree, oAttnPagedTree,
-           "attn_paged over one verify step's candidate tree: every query row is a node, at "
-           "root_pos + its depth, and attends to the committed prefix plus exactly the nodes its "
-           "u16 `ancestors` mask names (its own path, itself included). `causal` 1 and `window` 0 "
-           "only: the mask, not the position, decides what is visible. Same-SHA exactness: a row's "
-           "scores are the serial path's for the tokens on that path."),
+           "attn_paged over one verify step's candidate tree: every query row is a node and lives at "
+           "cache row root_pos + its index, so two children of one parent -- same depth, different "
+           "token -- hold distinct rows. A row attends to the committed prefix plus exactly the "
+           "node rows its `ancestors` mask names (its own path, itself included); bit b of a u16 or "
+           "u32 mask names cache row root_pos + b, and the block table must address and map every "
+           "row those paths use. `causal` 1 and `window` 0 only: the mask, not the position, "
+           "decides what is visible. Same-SHA exactness: a row's scores are the serial path's for "
+           "the tokens on that path."),
     SCHEMA("attn_paged_gate_quant", pAttnPagedGq, oAttnPagedGq,
            "attn_paged followed by gate_quant_fp8 over its output, in the split-KV merge: each "
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "

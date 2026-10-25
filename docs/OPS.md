@@ -846,11 +846,12 @@ over the same paged cache: every query row is a node, the tree's nodes are cache
 different token — hold distinct slots), and row `i` attends to the committed prefix (every row
 below `root_pos`) plus exactly the nodes its `ancestors[i]` mask names, itself included. Bit `b`
 of a mask names the node at row `root_pos + b`; the mask's agreement with the tree's parent links
-is the caller's check (`masks_consistent`). `causal` must be 1 and `window` 0: the mask decides
-what is visible, not the position, and a window over node rows would mask by position. `seqused`
-is the total key count including every node row. A mask that drops the root, drops the row's own
-node, or names a node past this step's rows is refused rather than run against the nearest causal
-mask. The row's RoPE position — its depth past the root — comes from the rope stage, not from
+is the caller's check (`masks_consistent`). A mask is one u16 or u32 a row. `causal` must be 1 and
+`window` 0: the mask decides what is visible, not the position, and a window over node rows would
+mask by position. `seqused` is the total key count including every node row, and the block table
+must both address the last node row and map every block the paths use. A mask that drops the root,
+drops the row's own node, or names a node past this step's rows is refused rather than run against
+the nearest causal mask, as is a block table that would leave a needed row out. The row's RoPE position — its depth past the root — comes from the rope stage, not from
 this op. libr4d has no ancestor-masked kernel yet, so a card-side resolve refuses it
 (`sched/tree_dispatch.h`); the reference op is the contract and the oracle such a kernel must
 match.

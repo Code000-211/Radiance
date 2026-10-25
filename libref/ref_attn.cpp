@@ -117,12 +117,18 @@ static int ref_attn_paged_impl(const RadArgs* a, const RadTensor* anc, int64_t r
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
 
+    const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
+    const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
+    const int64_t bt_cs = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
+
     /* A tree step's masks, checked before a row is computed. The sequence's nodes are cache rows
      * root_pos .. root_pos + qlen - 1, one row a node, so siblings sit on distinct rows even
      * though they share a depth; `seqused` must reach the last of them or the mask would name a row
      * the step cannot read. A mask with a bit past its sequence's nodes, without the root, or
      * without the row's own node conditions a row on text that is not on its path. All refused,
-     * none clamped. */
+     * none clamped. A tree step also needs every row of its path mapped: the block table has to
+     * address the sequence's last needed row and hold a block for each one, or required rows would
+     * silently drop out of the softmax and a shortened attention would answer RAD_OK. */
     if (anc) {
         if (anc->dtype != RAD_U16 && anc->dtype != RAD_U32) return RAD_E_INVAL;
         if (numel(anc) < rows) return RAD_E_SHAPE;
@@ -139,12 +145,15 @@ static int ref_attn_paged_impl(const RadArgs* a, const RadTensor* anc, int64_t r
                 if ((m & 1) == 0) return RAD_E_INVAL;             /* the root is on every path */
                 if (((m >> i) & 1) == 0) return RAD_E_INVAL;      /* a row attends to itself */
             }
+            /* Every row the paths use is a block the table must name: the prefix rows 0 ..
+             * root_pos - 1 and the node rows root_pos .. root_pos + qlen - 1. */
+            const int64_t need = (root_pos + qlen - 1) / block_size + 1;
+            if (need > max_blocks) return RAD_E_SHAPE;
+            for (int64_t b = 0; b < need; ++b)
+                if (ld_int(bt->dtype, bt->data, s * bt_rs + b * bt_cs) < 0) return RAD_E_INVAL;
         }
     }
 
-    const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
-    const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
-    const int64_t bt_cs = bt->rank >= 2 ? bt->stride[bt->rank - 1] : 1;
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
 
     /* Row strides of q and out read as [rows, q_heads, head_dim], at whatever rank they arrived. */
@@ -207,8 +216,12 @@ static int ref_attn_paged_impl(const RadArgs* a, const RadTensor* anc, int64_t r
                 auto key_at = [&](int64_t j) -> int64_t {
                     if (anc) {
                         /* The prefix below the root is on every path; past it, exactly the node
-                         * rows the mask names. A clear bit is a sibling, not a later position. */
+                         * rows the mask names. A clear bit is a sibling, not a later position.
+                         * Rows past the step's nodes are hidden before the mask is shifted: a
+                         * mask is one u16/u32 a row, so bit `qlen` and above is no bit of it, and
+                         * shifting by it (`seqused` may run well past the nodes) is undefined. */
                         const int64_t rel = j - root_pos;
+                        if (rel >= qlen) return -1;
                         if (rel >= 0 && ((mask >> rel) & 1) == 0) return -1;
                     } else if (causal && j > pos) return -1;
                     if (window > 0) {
@@ -303,7 +316,9 @@ int ref_attn_paged(const RadArgs* a, RadStream) { return ref_attn_paged_impl(a, 
  * Admitted and refused, never approximated: `causal` 1 and `window` 0 (a verify is an unwindowed
  * causal step, and a window over tree rows would mask by position, not by path); at most 32 nodes
  * per sequence (one mask each); every mask with the root and the row's own node set and no bit past
- * the sequence's nodes; root_pos >= 0; a `seqused` reaching the last node's row.
+ * the sequence's nodes; root_pos >= 0; a `seqused` reaching the last node's row; and a block table
+ * that both addresses that row and maps every block the paths use, so no needed row can drop out of
+ * the softmax.
  * The mask's agreement with the tree's topology is the caller's check (masks_consistent), because
  * the operand carries the sets and not the parents. */
 int ref_attn_paged_tree(const RadArgs* a, RadStream) {

@@ -3117,6 +3117,65 @@ TEST(op_attn_paged_tree_refuses_a_mask_it_cannot_honour) {
     }
 }
 
+TEST(op_attn_paged_tree_hides_rows_past_its_nodes) {
+    /* The same four-node fixture with a `seqused` far past the tree: 70 keys, of which only rows
+     * 0..5 are the prefix plus the tree's nodes. Rows past the nodes are no bit of a one-word
+     * mask, so a shift by their offset would be undefined -- on a machine that masks the shift
+     * count they would read as a bit of the mask and become visible (row 66 would shift by 0).
+     * Every path still returns the prefix plus exactly its named nodes. */
+    T q(RAD_F32, {4, 1, 1}); q.f({0, 0, 0, 0});
+    T kv(RAD_F32, {2, 1, 3, 2});
+    kv.f({ 0, 1,  0, 2,  0, 4,  0, 8,  0, 16, 0, 32 });
+    /* The table declares room for 24 blocks (jcap 72) and maps block 1 in every column past the
+     * fixture's, so a shifted-out-of-range read would land on mapped rows rather than be hidden by
+     * an unmapped block and prove nothing. */
+    std::vector<int64_t> tab(24, 1);
+    tab[0] = 0;
+    T bt(RAD_I32, {1, 24}); bt.n(tab);
+    T su(RAD_I32, {1});     su.n({70});
+    T anc(RAD_U16, {4});    anc.n({1, 3, 7, 9});
+    T out(RAD_F32, {4, 1, 1});
+    A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).t(anc)
+          .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+          .i("causal", 1).i("window", 0).i("root_pos", 2)
+          .s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_OK(run("attn_paged_tree", a));
+
+    CHECK_NEAR(out.at(0), 7.0f / 3, 1e-6);
+    CHECK_NEAR(out.at(1), 15.0f / 4, 1e-6);
+    CHECK_NEAR(out.at(2), 31.0f / 5, 1e-6);
+    CHECK_NEAR(out.at(3), 39.0f / 4, 1e-6);
+}
+
+/* A tree step needs its path rows mapped: a block table too narrow to address the last node row,
+ * or one that leaves a needed block unmapped, would let required rows drop out of the softmax and
+ * still answer RAD_OK. Refused rather than answered with a shortened attention. */
+TEST(op_attn_paged_tree_refuses_an_unmapped_path) {
+    T q(RAD_F32, {4, 1, 1}); q.f({0, 0, 0, 0});
+    T kv(RAD_F32, {2, 1, 3, 2});
+    kv.f({ 0, 1,  0, 2,  0, 4,  0, 8,  0, 16, 0, 32 });
+    T su(RAD_I32, {1});    su.n({6});
+    T anc(RAD_U16, {4});   anc.n({1, 3, 7, 9});
+    T out(RAD_F32, {4, 1, 1});
+    auto run_tree = [&](T& bt) -> int {
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out).t(anc)
+              .i("q_len", 4).i("head_dim", 1).i("gqa", 1).i("block_size", 3)
+              .i("causal", 1).i("window", 0).i("root_pos", 2)
+              .s("q_dtype", "f32").s("kv_dtype", "f32");
+        return run("attn_paged_tree", a);
+    };
+
+    /* jcap is 3 here, so the rows below node 1 would silently vanish: node 3 would answer
+     * (1 + 2 + 4) / 3 instead of 39 / 4. */
+    { T bt(RAD_I32, {1, 1}); bt.n({0});      CHECK_EQ(run_tree(bt), RAD_E_SHAPE); }
+    /* The row's block is not mapped: node 3 would lose its own row. */
+    { T bt(RAD_I32, {1, 2}); bt.n({0, -1});  CHECK_EQ(run_tree(bt), RAD_E_INVAL); }
+    /* And a prefix block that is unmapped is refused the same way. */
+    { T bt(RAD_I32, {1, 2}); bt.n({-1, 1});  CHECK_EQ(run_tree(bt), RAD_E_INVAL); }
+    /* The fixture's own table is still admitted. */
+    { T bt(RAD_I32, {1, 2}); bt.n({0, 1});   CHECK_OK(run_tree(bt)); CHECK_NEAR(out.at(3), 39.0f / 4, 1e-6); }
+}
+
 TEST(op_attn_dense) {
     const float sc = 1.0f / 1.41421356f;
     T q(RAD_F32, {2, 1, 2}); q.f({1, 0, 0, 1});
