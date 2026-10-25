@@ -1,0 +1,26 @@
+{
+  "name": "radiance-pi-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Long-term memory for the Pi coding agent on a Radiance server: compaction forks the cached conversation and archives it, and the agent can search and question what was compacted away.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p .",
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/node": "22.15.3",
+    "typescript": "5.8.3"
+  }
+}
