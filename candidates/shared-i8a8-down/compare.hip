@@ -19,6 +19,11 @@
 #include <dlfcn.h>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <memory>
+#include <unistd.h>
 
 namespace {
 
@@ -226,10 +231,214 @@ int self_check() {
     return fails ? 1 : 0;
 }
 
+/* ============================================================== the timing run
+ *
+ *   compare.hip --timing <out.csv>                          one card, arms interleaved ABBA
+ *   compare.hip --timing --rank frozen|cand <out.csv> <gofile>
+ *                                                           one arm on this card, both cards
+ *                                                           started together through <gofile>
+ *
+ * Both shapes time the same work and the same weights the correctness run above uses: `Rounds`
+ * rounds of `Batches` batches of `PerBatch` launches at N=2560, K=384, group 128, the codes
+ * rotating over `Planes` 983 040-byte planes, so a plane has left cache when it comes round
+ * again. One event pair per batch, so the unit is launch-to-launch throughput; a single launch's
+ * latency is the other question and this file does not answer it.
+ *
+ * The interleave is ABBA inside every round, so a drift over the round cancels instead of loading
+ * one arm. The `--rank` shape exists because a --tp 2 step runs two ranks at once and the gain has
+ * to survive their sharing the memory system; the two processes contend for it exactly as two
+ * ranks do, and each writes its own medians. `*_FROZEN`/`*_CAND` come from the environment
+ * (SI8_FROZEN, SI8_CAND) when the paths differ from the defaults.
+ */
+constexpr int Batches = 9, PerBatch = 256, Rounds = 9, Planes = 64;
+
+double median(std::vector<double> v) {
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+/* One arm's planes, activations and outputs, packed by that arm's own layout hook. */
+struct Arm {
+    std::string name;
+    const RadKernelInfo* row = nullptr;
+    std::vector<std::unique_ptr<Buffer>> wb, wsb;
+    std::unique_ptr<Buffer> a, as;
+    std::vector<std::unique_ptr<Buffer>> y;
+    std::vector<RadParam> params[3];
+    RadArgs args[3]{};
+};
+
+int timing(const char* frozen_path, const char* cand_path, bool abba, const char* out_path,
+           const char* arm_name, const char* gofile) {
+    int dev = 0;
+    HIP(hipGetDevice(&dev));
+    hipDeviceProp_t props{};
+    HIP(hipGetDeviceProperties(&props, dev));
+    std::fprintf(stderr, "pid=%d device=%d %s arch=%s\n", (int)getpid(), dev, props.name,
+                 props.gcnArchName);
+    check(!std::strncmp(props.gcnArchName, "gfx1201", 7), "gfx1201 required");
+
+    Plugin frozen(frozen_path, "gemm_i8a8_nt_m16");
+    Plugin cand(cand_path, "shared_i8a8_down_m1_m3");
+    hipStream_t stream = nullptr;
+    HIP(hipStreamCreate(&stream));
+
+    const RadEncoding enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, G);
+    const int sel_codes = 0, sel_scale = 1;
+
+    /* Fixed seed, so every run of this file measures the same bytes. */
+    uint64_t rng = 0x243f6a8885a308d3ull;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    std::vector<int8_t> codes((size_t)N * K), act((size_t)3 * K);
+    std::vector<uint16_t> scales((size_t)N * (K / G));
+    std::vector<float> asc((size_t)3 * (K / G));
+    for (auto& v : codes)  v = (int8_t)((int)(next() % 255) - 127);
+    for (auto& v : act)    v = (int8_t)((int)(next() % 255) - 127);
+    for (auto& v : scales) v = to_bf((float)((int)(next() % 2001) - 1000) / 3103.0f);
+    for (auto& v : asc)    v = (float)((int)(next() % 2001) - 1000) / 837.0f;
+
+    auto make_arm = [&](const char* name, const RadKernelInfo* row) {
+        Arm arm;
+        arm.name = name;
+        arm.row = row;
+        Params p;
+        const std::vector<uint8_t> fw = stored(row, p.v, 2, enc, &sel_codes, codes.data(), RAD_I8,
+                                               N, K, nullptr);
+        const std::vector<uint8_t> fs = stored(row, p.v, 3, enc, &sel_scale, scales.data(),
+                                               RAD_BF16, N, K / G, nullptr);
+        for (int i = 0; i < Planes; ++i) {
+            arm.wb.push_back(std::make_unique<Buffer>(fw.size()));
+            arm.wb.back()->put(fw.data());
+            arm.wsb.push_back(std::make_unique<Buffer>(fs.size()));
+            arm.wsb.back()->put(fs.data());
+        }
+        arm.a = std::make_unique<Buffer>(act.size());
+        arm.a->put(act.data());
+        arm.as = std::make_unique<Buffer>(asc.size() * 4);
+        arm.as->put(asc.data());
+        for (int m = 1; m <= 3; ++m) {
+            arm.y.push_back(std::make_unique<Buffer>((size_t)m * N * 2));
+            Params pm;
+            pm.set_m(m);
+            arm.params[m - 1] = pm.v;
+            arm.args[m - 1].p = arm.params[m - 1].data();
+            arm.args[m - 1].n_p = (int)arm.params[m - 1].size();
+        }
+        return arm;
+    };
+
+    std::vector<Arm> arms;
+    if (abba) {
+        arms.push_back(make_arm("frozen", frozen.row));
+        arms.push_back(make_arm("cand", cand.row));
+    } else {
+        const bool use_cand = !std::strcmp(arm_name, "cand");
+        arms.push_back(make_arm(use_cand ? "cand" : "frozen", use_cand ? cand.row : frozen.row));
+    }
+
+    /* One round: `Batches` batches, one event pair each, median µs per launch over the batches. */
+    auto round_us = [&](Arm& arm, int m) {
+        const int mi = m - 1;
+        const int64_t need = arm.row->scratch ? arm.row->scratch(&arm.args[mi]) : 0;
+        Buffer scratch((size_t)std::max<int64_t>(need, 1));
+        std::vector<double> per;
+        hipEvent_t e0, e1;
+        HIP(hipEventCreate(&e0));
+        HIP(hipEventCreate(&e1));
+        for (int b = 0; b < Batches; ++b) {
+            HIP(hipEventRecord(e0, stream));
+            for (int i = 0; i < PerBatch; ++i) {
+                const int plane = (b * PerBatch + i) % Planes;
+                Call c(m, *arm.a, *arm.as, *arm.wb[plane], *arm.wsb[plane], *arm.y[mi]);
+                c.a.p = arm.args[mi].p;
+                c.a.n_p = arm.args[mi].n_p;
+                c.a.scratch = scratch.p;
+                c.a.scratch_bytes = need;
+                check(arm.row->launch(&c.a, (RadStream)stream) == RAD_OK,
+                      arm.name + ": launch refused");
+            }
+            HIP(hipEventRecord(e1, stream));
+            HIP(hipEventSynchronize(e1));
+            float ms = 0;
+            HIP(hipEventElapsedTime(&ms, e0, e1));
+            per.push_back((double)ms * 1000.0 / PerBatch);
+        }
+        HIP(hipEventDestroy(e0));
+        HIP(hipEventDestroy(e1));
+        HIP(hipGetLastError());
+        return median(per);
+    };
+
+    FILE* out = std::fopen(out_path, "w");
+    check(out != nullptr, std::string("cannot write ") + out_path);
+    int fails = 0;
+
+    if (abba) {
+        for (Arm& arm : arms)
+            for (int m = 1; m <= 3; ++m) round_us(arm, m);      /* warm */
+        for (int m = 1; m <= 3; ++m) {
+            std::vector<double> af, bf;
+            for (int r = 0; r < Rounds; ++r) {
+                const double a1 = round_us(arms[0], m);
+                const double b1 = round_us(arms[1], m);
+                const double b2 = round_us(arms[1], m);
+                const double a2 = round_us(arms[0], m);
+                af.push_back(a1);
+                af.push_back(a2);
+                bf.push_back(b1);
+                bf.push_back(b2);
+            }
+            const auto [flo, fhi] = std::minmax_element(af.begin(), af.end());
+            const auto [clo, chi] = std::minmax_element(bf.begin(), bf.end());
+            const double fm = median(af), cm = median(bf);
+            int faster = 0;
+            for (size_t i = 0; i < af.size(); ++i) faster += bf[i] < af[i];
+            const double spread = std::max(*fhi - *flo, *chi - *clo);
+            std::printf("M=%d frozen_us=%.4f [%.4f..%.4f] cand_us=%.4f [%.4f..%.4f] "
+                        "delta_us=%+.4f delta_pct=%+.2f cand_faster=%d/%zu spread_us=%.4f "
+                        "gain_over_spread=%.2f\n",
+                        m, fm, *flo, *fhi, cm, *clo, *chi, cm - fm, 100.0 * (cm - fm) / fm, faster,
+                        af.size(), spread, spread > 0 ? std::fabs(cm - fm) / spread : 0.0);
+            std::fprintf(out, "%d,%.4f,%.4f\n", m, fm, cm);
+        }
+    } else {
+        Arm& arm = arms[0];
+        for (int m = 1; m <= 3; ++m) round_us(arm, m);             /* warm */
+        std::fprintf(stderr, "rank %s ready\n", arm.name.c_str());
+        /* Both ranks start their timed rounds together: the parent touches <gofile> once both have
+         * warmed, so the window they contend in is the window that is reported. */
+        while (!std::ifstream(gofile).good()) {
+            struct timespec ts { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, nullptr);
+        }
+        for (int m = 1; m <= 3; ++m) {
+            std::vector<double> v;
+            for (int r = 0; r < Rounds; ++r) v.push_back(round_us(arm, m));
+            const auto [lo, hi] = std::minmax_element(v.begin(), v.end());
+            std::printf("rank=%s M=%d median_us=%.4f [%.4f..%.4f]\n", arm.name.c_str(), m,
+                        median(v), *lo, *hi);
+            std::fprintf(out, "%s,%d,%.4f\n", arm.name.c_str(), m, median(v));
+        }
+    }
+
+    std::fclose(out);
+    HIP(hipStreamDestroy(stream));
+    return fails;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--self-check")) return self_check();
+    if (argc > 1 && !std::strcmp(argv[1], "--timing")) {
+        const char* frozen_path = std::getenv("SI8_FROZEN") ? std::getenv("SI8_FROZEN") : "libr4d.so";
+        const char* cand_path   = std::getenv("SI8_CAND") ? std::getenv("SI8_CAND") : "shared_i8a8_down.so";
+        if (argc > 3 && !std::strcmp(argv[2], "--rank"))
+            return timing(frozen_path, cand_path, false, argv[4], argv[3], argv[5]);
+        check(argc > 2, "usage: --timing <out.csv> | --timing --rank frozen|cand <out.csv> <gofile>");
+        return timing(frozen_path, cand_path, true, argv[2], nullptr, nullptr);
+    }
 
     const char* frozen_path = argc > 1 ? argv[1] : "libr4d.so";
     const char* cand_path   = argc > 2 ? argv[2] : "shared_i8a8_down.so";
