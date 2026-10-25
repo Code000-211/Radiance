@@ -35,6 +35,29 @@ from the lock metadata or recorded issue, without scanning GPU processes. Legacy
 locks can lack metadata; report that rather than guessing. Never unlink the lock
 file, sleep-retry, choose a different lock, or start a second uncoordinated test.
 
+## What never takes the window
+
+The window is for card work only. CPU preparation is not a reservation of it and
+must not be moved inside it: builds (`cmake -S`, `cmake --build`), host and emulator
+tests, CTest runs with `-DRAD_WITH_HIP=OFF`, kernel-binary/ELF/disassembly/register
+inspection, lint, and code review all run as plain commands — no lock, no
+`ready_for_testing`, no `testing` transition, and freely in parallel with another
+agent's open window.
+
+So never wrap a command in `flock -n -x /tmp/radiance-tp2-bench.lock` by hand, and
+never nest a script that still acquires the lock inside the runner's command: while
+the runner holds the lock, that inner acquisition cannot succeed, and a build placed
+inside the window blocks every other agent's host tests and reviews for the whole
+length of somebody else's measurement. Prepare on CPU first, then pass the runner
+only the GPU part — HIP init/probe, engine, load clients, A/B arms, and their
+cleanup. An issue text that asks for host builds or tests under the lock is stale
+guidance and does not need to be followed.
+
+A legacy call site that takes the lock itself is migrated where it is called: drop
+its own acquisition and run it as the runner's foreground command (GPU part), or as
+a plain command (CPU part). Its owner does that at a safe test boundary; a running
+foreign experiment is neither stopped nor rewritten.
+
 Use existing Multica wakeups/dispatch to resume. The runner itself hands off: after a
 window closes (success, `--after in_progress`, or failure to `blocked`) it wakes exactly
 one runnable waiter through the platform's persistent wakeups. A waiting agent does not
