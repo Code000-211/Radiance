@@ -1,5 +1,6 @@
 #include "runtime/tierexec.h"
 
+#include "device/device.h"
 #include "rad_internal.h"
 
 #include <algorithm>
@@ -53,6 +54,14 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
         q.set_i("M", max_batch);
         gi.gather  = reg->resolve("gather_rows",  q, RAD_DOMAIN_DEVICE);
         gi.scatter = reg->resolve("scatter_rows", q, RAD_DOMAIN_DEVICE);
+        /* On the host backend the pool, the staging and the arena are all host memory, and the
+         * kernel libraries (libavx, libref) register host rows only: run those, as ops with no
+         * device kernel do there (Ctx's domain choice). */
+        if ((!gi.gather || !gi.scatter) && device_is_host()) {
+            gi.gather  = reg->resolve("gather_rows",  q, RAD_DOMAIN_HOST);
+            gi.scatter = reg->resolve("scatter_rows", q, RAD_DOMAIN_HOST);
+            gi.host = true;
+        }
         if (!gi.gather || !gi.scatter) {
             RAD_WARN("kv tiers: no device gather/scatter for group %d at a %lld-byte fragment, "
                      "so a finished conversation cannot leave VRAM. The tiers are off.",
@@ -207,6 +216,10 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
     a.t = t3; a.n_t = 3;
     a.p = r.geom.params(); a.n_p = r.geom.n_params();
     a.instance = r.instance;
+    /* A host row runs now: what the stream still has queued (the index upload, the copy into the
+     * staging, the wait on the step) must land first. What is enqueued after it is ordered behind
+     * it, since it has finished by then. */
+    if (gi.host) RAD_TRY(rad_stream_sync(stream_));
     return r.row->info->launch(&a, stream_);
 }
 

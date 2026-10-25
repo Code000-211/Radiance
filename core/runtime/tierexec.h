@@ -111,6 +111,9 @@ private:
         /* rad_kv_group_zero: no shard on this rank. Kept in place because a job's block ids are
          * one per cached group in the same order on every rank; it moves no bytes. */
         bool     zero = false;
+        /* The host backend's host-domain rows (Ctx's choice there): they run on the calling
+         * thread, not in stream order, so the stream is drained before each launch. */
+        bool     host = false;
         Resolved gather, scatter;
     };
 
