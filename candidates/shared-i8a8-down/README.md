@@ -96,8 +96,43 @@ What the harness establishes, and what it does not:
 - changing the activation changes the output (the comparison has teeth);
 - the gate/up geometry is refused, so the losing shape cannot be picked up.
 
-**Not measured:** speed. No `rad-kbench --bench`, no BetterBench, no served-path number. Whether
-this row should be selected at all is a timing question this harness does not answer.
+**Not measured here:** speed. The correctness run above is one launch per case; the timed run
+below is the speed question.
+
+## Timed
+
+`compare.hip --timing <out.csv>` is the speed half of the same harness and the same two rows. It
+times `Rounds`=9 rounds of `Batches`=9 batches of `PerBatch`=256 launches, the codes rotating over
+`Planes`=64 planes of 983,040 B (63 MiB, past this card's L2), one event pair per batch: the number
+is launch-to-launch throughput, not a single launch's latency. The arms interleave **ABBA** inside
+every round, so a drift over the round cancels instead of loading one arm, and the run reports the
+median, the full range and how many paired rounds the candidate won.
+
+Four independent runs, 36 rounds per arm and M, on a card with the GPU queue lock held:
+
+```text
+weights                     M     frozen      candidate   delta              rounds faster  spread    gain/spread
+256 MiB, rotated            1     5.285 us    4.935 us    -0.343 us  -6.49%  36/36          0.079 us  4.3x
+256 MiB, rotated            2     5.255 us    4.878 us    -0.381 us  -7.25%  36/36          0.066 us  5.1x
+256 MiB, rotated            3     5.239 us    4.920 us    -0.311 us  -5.94%  36/36          0.073 us  4.7x
+one copy, L2-resident       1                             -7.58%             36/36
+one copy, L2-resident       2                            -10.03%             36/36
+one copy, L2-resident       3                             -9.68%             36/36          0.307 us  1.4x
+```
+
+`spread` is the widest between-run range of the two arms at that M, and `gain/spread` the median
+gain over it: a gain smaller than the spread would not be a win. Two earlier runs were thrown
+away because a second tenant held the cards without taking the queue lock; the six rows above are
+the clean four.
+
+The gain is real at the kernel and it is small in absolute terms: ~0.3-0.4 us against a 5 us
+launch. What it is worth to a served step depends on how often the serving path launches this
+shape and on the step's own length, and **that is not measured**: no MoE container on this host
+runs this row (`n_ff_shared`=640 per rank in the one container that exists, and its shared expert
+is served block-fp8, not i8a8), so a serving A/B has no model to run on. `--timing --rank
+frozen|cand <out.csv> <gofile>` is the harness for that case once there is one: two processes, one
+per card, released together through `<gofile>`, so the gain has to survive the two ranks sharing
+the memory system the way a `--tp 2` step does.
 
 ## How it hooks the weight
 
