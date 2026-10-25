@@ -38,7 +38,7 @@
  * `r4d.i8.s.t16` tile-major scale plane. The hooks are libr4d's own (libr4d/r4d_fp8_layout.cpp),
  * compiled into THIS DSO with hidden visibility (CMakeLists.txt) rather than left as unresolved
  * references into a library loaded RTLD_LOCAL. The tag and the bytes therefore match what
- * libr4d's wider row reads for the same weight in the bands above M=4.
+ * libr4d's wider row reads for the same weight in the bands above M=3.
  */
 #ifdef __FAST_MATH__
 #error "the reordered FP32 fold requires precise floating-point compilation"

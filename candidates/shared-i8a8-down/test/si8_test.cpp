@@ -8,7 +8,7 @@
  * accidentally launching.
  *
  * What is NOT here: the numerics. compare.hip beside this directory is the harness for those
- * (M = 1..4, random / signed extrema / zeros, against the frozen gemm_i8a8_nt_m16 and an
+ * (M = 1..3, random / signed extrema / zeros, against the frozen gemm_i8a8_nt_m16 and an
  * independent signed-integer reference), and it needs a card.
  *
  * Usage:
@@ -269,12 +269,47 @@ void negatives(const RadKernelInfo* k) {
                       c.want);
         check(rc == c.want, buf);
     }
+    /* THE BAND'S OWN EDGE: four complete operand rows, every plane sized for four, exactly as a
+     * four-token verify step would issue them. The M=5 case above changes only the output shape,
+     * which the operand-completeness checks refuse as well, so it cannot stand in for this one:
+     * only a complete four-row call tells the row cap apart from a truncated plane. With the cap
+     * widened to four this call reaches the device (RAD_E_DEVICE under the test's hidden devices)
+     * and the check fails. */
+    {
+        Operands o(4);
+        const int rc = call(k, &o.a);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "M = 4, four full operand rows -> %d (%s), want %d", rc,
+                      rad_strerror(rc), RAD_E_SHAPE);
+        check(rc == RAD_E_SHAPE, buf);
+    }
     /* A null RadArgs, and one carrying fewer operands than the body reads. */
     CHECK(call(k, nullptr) == RAD_E_INVAL);
     {
         Operands o(1);
         o.a.t = nullptr;
         CHECK(call(k, &o.a) == RAD_E_INVAL);
+    }
+}
+
+/* The operand description is bounded on the same band as the body, so a tool that asks about four
+ * rows is told this row will not run it instead of being sized buffers for a refusal. The
+ * parameter list comes from Operands, so M, N, K and the group are the ones the body reads. */
+void shape_refusals(const RadKernelInfo* k) {
+    {
+        Operands o(4);
+        RadOpdDesc d{};
+        const int rc = k->opd_shape(o.a.p, o.a.n_p, 4, &d);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "opd_shape M = 4 -> %d (%s), want %d", rc,
+                      rad_strerror(rc), RAD_E_UNSUPPORTED);
+        check(rc == RAD_E_UNSUPPORTED, buf);
+    }
+    /* The band's top row is still described, so the refusal above is the cap and not a stub. */
+    {
+        Operands o(3);
+        RadOpdDesc d{};
+        CHECK(k->opd_shape(o.a.p, o.a.n_p, 4, &d) == RAD_OK && d.shape[0] == 3);
     }
 }
 
@@ -323,6 +358,7 @@ int main(int argc, char** argv) {
         CHECK(p.concurrent && p.concurrent(0) == 1);
         if (k) {
             negatives(k);
+            shape_refusals(k);
         }
         std::printf("on:  1 schema, 1 row\n");
     }

@@ -46,7 +46,7 @@ row's own `layout`/`relayout` hooks, and compares the two output buffers. See
 What could differ is the order of the FP32 fold across the three 128-K groups. At `K = 384` the
 frozen narrow row does not split K at all — its split rule's first test is `K < 512` — so it folds
 the groups ascending, which is this row's order. `compare.hip` confirms it on the card: zero
-differing BF16 words at M = 1..4 under random, signed-extrema and all-zero inputs.
+differing BF16 words at M = 1..3 under random, signed-extrema and all-zero inputs.
 
 The declaration stays `reordered`, not `bitexact`: the measured equality is one weight and one
 activation set per mode on one gfx1201 card, and it is an equality of this row against the row it
@@ -105,7 +105,7 @@ The stored planes are libr4d's `r4d.i8.w.frag64` codes and `r4d.i8.s.t16` tile-m
 The row publishes libr4d's own `layout` / `relayout` / `unrelayout` hooks — the same ones
 `gemm_i8a8_nt_m16` publishes — and those come from `libr4d/r4d_fp8_layout.cpp` **compiled into this
 DSO**, not linked from `libr4d.so`. Re-implementing the permutation here would drift from the bytes
-libr4d's wider row reads for the same weight in the bands above M=4, so the implementation is
+libr4d's wider row reads for the same weight in the bands above M=3, so the implementation is
 borrowed rather than restated.
 
 Why compiled in and not resolved at load: the loader opens every plugin `RTLD_LOCAL`
@@ -162,7 +162,7 @@ reads it.
 - Reads **M from the operands** (`y->shape[0]`), not from the band's `M` parameter. Bands resolve
   at their upper bound, so the parameter reads 4 while a decode step issues one row; dispatching on
   it would run a 4-row template over a 1-row pass and write past the output.
-- Refuses (negative status, never a no-op success): wrong dtypes, wrong rank, `M` outside 1..4, any
+- Refuses (negative status, never a no-op success): wrong dtypes, wrong rank, `M` outside 1..3, any
   `(N, K, group)` other than the pair above, a non-`i8a8` dtype string, a `pb1`/`pb2` partition, a
   non-tight row pitch, or a misaligned operand. It also refuses a call that passes `a_sum` or
   `b_ref`, which belong to other formats.
