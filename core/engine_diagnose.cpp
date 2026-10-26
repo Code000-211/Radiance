@@ -385,9 +385,6 @@ int Engine::diagnose_point(const diagnose::Point& spec, int index, int64_t salt,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     out->max_live = peak_live;
 
-    /* Everything the sinks and the scheduler still hold about these requests, read before they are
-     * reaped and their Request objects go away. */
-    const SchedMetrics m1 = sched_.metrics();
     /* The point is over when its last sink is full, but the step that filled it is recorded a
      * moment later, by the loop thread's step_finished(). Wait for the scheduler to go quiet: a
      * point's last step belongs to its own distribution, and not to the next point's. */
@@ -400,6 +397,12 @@ int Engine::diagnose_point(const diagnose::Point& spec, int index, int64_t salt,
         out->absent.push_back(
             "step time: the scheduler had not finished its last step when this point's records "
             "were read, so the distributions cover the steps before it");
+    /* The counters are read here, at the boundary the records are drained at, and not at the
+     * sink's fill: the step that filled it, and the one the drafter issued behind it, are charged
+     * to this point in both families or in neither, so a reader comparing a count with a
+     * distribution is comparing the same set of steps. Read at the fill, the counters race the
+     * loop thread's next step_finished() and flap run to run. */
+    const SchedMetrics m1 = sched_.metrics();
     uint64_t dropped = sched_.drain_step_log(&recs);
     out->steps = m1.steps - m0.steps;
     out->requests = n;

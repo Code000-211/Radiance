@@ -192,6 +192,21 @@ TEST(diagnose_writes_both_files_and_measures_every_point_it_can_hold) {
         int64_t sum = 0;
         for (const json& q : p.value("requests", json::array())) sum += (int64_t)q.value("tokens", json::array()).size();
         CHECK_EQ(sum, p["tokens"].value("out", (int64_t)-1));
+        /* The counters and the records are two readings of the same steps, charged at the same
+         * quiet boundary: the phase families sum to the point's step count, and so do the shapes
+         * the distributions are made of. A count read at the sink's fill, one step ahead of the
+         * drain below it, flaps run to run instead. */
+        if (p.value("step_records_dropped", (int64_t)0) == 0) {
+            CHECK_EQ(p["steps_by_phase"].value("prefill", (int64_t)0) +
+                         p["steps_by_phase"].value("mixed", (int64_t)0) +
+                         p["steps_by_phase"].value("decode", (int64_t)0),
+                     p.value("steps", (int64_t)-1));
+            CHECK_EQ(p["steps_by_shape"].value("prefill_chunk", (int64_t)0) +
+                         p["steps_by_shape"].value("mixed", (int64_t)0) +
+                         p["steps_by_shape"].value("decode", (int64_t)0) +
+                         p["steps_by_shape"].value("draft_pass", (int64_t)0),
+                     p.value("steps", (int64_t)-1));
+        }
 
         /* The distributions it exists to produce. */
         CHECK(p["steps_by_shape"].value("decode", (int64_t)0) >= 0);
