@@ -17,10 +17,13 @@ FAIL (exit 1; nothing is written):
   a half-integer K (trellis last dimension 16K+8, exllamav3 1.5.2+): no decoder here reads it
   a K outside 2..8, a trellis not I16 of rank 3, a linear without .suh/.svh, a codebook marker of a wrong value
   a <X>.weight beside an <X>.trellis (two weights of one name)
-  a layer whose experts differ in K, codebook or shape at one slot: the container addresses a layer's experts
-  by a fixed stride and refuses that (core/format/radfile.h)
+  a layer whose experts have more than 8 weights each (a movement group's slots)
   a tensor dtype the safetensors reader does not take (core/format/safetensors.cpp)
   an EXL3 linear whose rows or columns are not a multiple of 128 (the importer refuses it)
+MIXED (exit 0): a layer whose experts differ in K, codebook or shape, or lack a weight. The container
+  addresses a layer's expert group by a fixed stride (core/format/radfile.cpp), so the layer's most common
+  expert form is its group and every other expert is written as tensors of the layer, as radiance writes
+  protected bf16 experts. The line says how much that keeps out of expert placement and offload.
 WARN (exit 0, or 1 with --strict): tensors of a linear the importer does not read (.su / .sv / unknown parts),
   a bias on an EXL3 linear (written as its own plain weight).
 
@@ -198,32 +201,48 @@ def main():
                        "bytes": t["data_offsets"][1] - t["data_offsets"][0]}
 
     # A layer's experts: one K, codebook and shape at each slot, and every expert with every slot.
-    slots = defaultdict(dict)   # (prefix, layer) -> key -> {expert: form}
+    slots = defaultdict(dict)   # (prefix, layer) -> key -> {expert: (form, bytes)}
     for x, r in lin.items():
         prefix, layer, expert, key = layer_expert(x + ".weight")
         if expert is not None and layer is not None:
-            slots[(prefix, layer)].setdefault(key, {})[expert] = ("exl3", r["bits"], r["codebook"], r["rows"],
-                                                                  r["cols"])
+            form = ("exl3", r["bits"], r["codebook"], r["rows"], r["cols"])
+            slots[(prefix, layer)].setdefault(key, {})[expert] = (form, r["bytes"])
     for name, r in plain.items():
         prefix, layer, expert, key = layer_expert(name)
         if expert is not None and layer is not None:
-            slots[(prefix, layer)].setdefault(key, {})[expert] = ("plain", r["dtype"], tuple(r["shape"]))
+            slots[(prefix, layer)].setdefault(key, {})[expert] = (("plain", r["dtype"], tuple(r["shape"])),
+                                                                  r["bytes"])
     experts_by_layer = {}
+    outside_n = outside_bytes = 0
+    outside_layers = []
     for (prefix, layer), keys in sorted(slots.items()):
-        ids = set()
-        for key, forms in keys.items():
-            ids |= set(forms)
-            kinds = Counter(forms.values())
-            if len(kinds) > 1:
-                fails.append(f"{prefix}layers.{layer}: {key} differs between experts ({dict(kinds)}); the "
-                             f"container needs one form a slot in a layer")
-        for key, forms in keys.items():
-            if set(forms) != ids:
-                fails.append(f"{prefix}layers.{layer}: {key} is missing for experts "
-                             f"{sorted(ids - set(forms))[:8]}")
+        where = f"{prefix}layers.{layer}"
+        ids = sorted(set().union(*(set(f) for f in keys.values())))
         if len(keys) > 8:
-            fails.append(f"{prefix}layers.{layer}: {len(keys)} weights an expert; a movement group holds 8")
-        experts_by_layer[f"{prefix}layers.{layer}"] = {"experts": len(ids), "slots": sorted(keys)}
+            fails.append(f"{where}: {len(keys)} weights an expert; a movement group holds 8")
+        # The expert group: the most common whole form (as plugin/arch/exl3_import.cpp chooses it), ties to the
+        # form of the lowest-numbered expert. Every other expert is written as tensors of the layer.
+        by_form, order = {}, []
+        for e in ids:
+            whole = tuple((k, keys[k][e][0] if e in keys[k] else None) for k in sorted(keys))
+            if whole not in by_form:
+                order.append(whole)
+            by_form.setdefault(whole, []).append(e)
+        best = order[0]
+        for f in order:
+            if len(by_form[f]) > len(by_form[best]):
+                best = f
+        group = by_form[best]
+        out = [e for e in ids if e not in set(group)]
+        out_bytes = sum(keys[k][e][1] for e in out for k in keys if e in keys[k])
+        rec = {"experts": len(ids), "slots": sorted(keys), "group": len(group), "outside": out,
+               "outside_bytes": out_bytes,
+               "forms": {repr(dict(f)): len(by_form[f]) for f in order}}
+        experts_by_layer[where] = rec
+        if out:
+            outside_n += len(out)
+            outside_bytes += out_bytes
+            outside_layers.append((where, len(group), len(ids), out_bytes))
 
     by_k = Counter((r["bits"], r["codebook"]) for r in lin.values())
     lin_bytes = sum(r["bytes"] for r in lin.values())
@@ -242,6 +261,18 @@ def main():
     if n_exp:
         e = next(iter(experts_by_layer.values()))
         print(f"experts     {n_exp} layers with experts, e.g. {e['experts']} experts x {len(e['slots'])} weights")
+        if outside_n:
+            all_exp = sum(r["bytes"] for k, r in lin.items() if layer_expert(k + ".weight")[2] is not None)
+            all_exp += sum(r["bytes"] for k, r in plain.items() if layer_expert(k)[2] is not None)
+            print(f"mixed       {outside_n} experts in {len(outside_layers)} layers differ from their layer's group "
+                  f"and are written as tensors of the layer: {outside_bytes / 2**30:.2f} GiB of "
+                  f"{all_exp / 2**30:.2f} GiB of experts ({100 * outside_bytes / max(all_exp, 1):.1f} %), which "
+                  f"expert placement and offload do not move")
+            for where, g, n, ob in outside_layers[:8]:
+                print(f"            {where}: group {g} of {n} experts, {n - g} outside ({ob / 2**20:.1f} MiB)")
+            if len(outside_layers) > 8:
+                print(f"            ... and {len(outside_layers) - 8} more layers" +
+                      (" (all in --json)" if a.json else " (--json lists all)"))
     print(f"container   about {(lin_bytes + plain_bytes) / 2**30:.2f} GiB")
     for tag, items in (("WARN", warns), ("FAIL", fails)):
         for x in items[:20]:
@@ -251,7 +282,8 @@ def main():
 
     report = {"source": str(a.src), "arch": arch, "quant": quant, "num_hidden_layers": n_layers,
               "exl3": {k: v for k, v in lin.items()}, "plain": plain, "experts": experts_by_layer,
-              "bytes": {"exl3": lin_bytes, "plain": plain_bytes}, "warn": warns, "fail": fails}
+              "bytes": {"exl3": lin_bytes, "plain": plain_bytes, "experts_outside_groups": outside_bytes},
+              "warn": warns, "fail": fails}
     if a.json:
         Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True))
     if fails or (a.strict and warns):

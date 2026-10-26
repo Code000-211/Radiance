@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """make_fixture.py -- a tiny exllamav3 (EXL3) checkpoint shaped like a DeepSeek MoE, for the convert test.
 
-    make_fixture.py OUT [--half-k] [--mixed-experts]
+    make_fixture.py OUT [--half-k] [--mixed-experts] [--odd-dims]
 
 Not a model anyone runs: random trellis symbols (every symbol sequence is a valid EXL3 encoding) and random
 scales. What it covers is what an import must get right: EXL3 linears at K 2, 3, 4 and 6 in all three codebooks
@@ -10,7 +10,10 @@ experts with three weights each, shared experts, a router, an MTP layer under it
 behind an index.
 
 --half-k     one linear at half-integer K (trellis last dimension 16K+8): the inventory must refuse it
---mixed-experts  one expert of layer 0 at another K: the inventory must refuse the layer
+--mixed-experts  experts that differ inside their layer, as a SAGE-style mixed-width pack has them: layer 0's
+             expert 2 has gate_proj at K=3 (the group renumbers the experts after it), layer 1's expert 0 has
+             down_proj at K=3 (the expert that would set the group's layout), and the MTP layer's expert 3 has
+             no up_proj. Each is written as tensors of its layer.
 --odd-dims   one linear of 192 output rows (not a multiple of 128): the inventory must refuse it
 """
 import argparse
@@ -65,10 +68,9 @@ def build(half_k, mixed, odd=False):
         t[p + "mlp.gate.e_score_correction_bias"] = np.zeros(E, np.float32)
         for e in range(E):
             q = f"{p}mlp.experts.{e}."
-            kb = 3 if (mixed and l == 0 and e == 2) else 2
-            linear(t, rng, q + "gate_proj", FF, H, kb, "mul1")
+            linear(t, rng, q + "gate_proj", FF, H, 3 if (mixed and l == 0 and e == 2) else 2, "mul1")
             linear(t, rng, q + "up_proj", FF, H, 2, "mul1")
-            linear(t, rng, q + "down_proj", H, FF, 2, "mul1")
+            linear(t, rng, q + "down_proj", H, FF, 3 if (mixed and l == 1 and e == 0) else 2, "mul1")
         for proj, n, k in (("gate_proj", SFF, H), ("up_proj", SFF, H), ("down_proj", H, SFF)):
             linear(t, rng, f"{p}mlp.shared_experts.{proj}", n, k, 3, "mul1")
     m = "mtp.layers.0."
@@ -77,7 +79,8 @@ def build(half_k, mixed, odd=False):
     t[m + "eh_proj.weight"] = rng.standard_normal((H, 2 * H)).astype(np.float16).view(np.uint16)  # stored bf16-ish
     for e in range(E):
         for proj, n, k in (("gate_proj", FF, H), ("up_proj", FF, H), ("down_proj", H, FF)):
-            linear(t, rng, f"{m}mlp.experts.{e}.{proj}", n, k, 2, "mul1")
+            if not (mixed and e == 3 and proj == "up_proj"):
+                linear(t, rng, f"{m}mlp.experts.{e}.{proj}", n, k, 2, "mul1")
     if odd:
         linear(t, rng, "model.layers.0.self_attn.wkv_a", 192, H, 4, "mul1")
     t["model.rope.inv_freq_table"] = rng.standard_normal((2, 4, 8)).astype(np.float32)

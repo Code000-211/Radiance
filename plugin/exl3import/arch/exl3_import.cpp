@@ -24,8 +24,17 @@
  * GROUPS (spec §4.2). A tensor under `<P>layers.<N>.` is in layer N when <P> is the trunk's prefix (the one
  * whose layer count is num_hidden_layers, else the first), and in layer num_hidden_layers + ... for every
  * other prefix (an MTP head, a vision tower), numbered after the trunk in name order. One under
- * `.experts.<E>.` is expert E of its layer, and its slot is the rank of its name with the expert number taken
- * out among that layer's expert names (gate_proj, up_proj, down_proj -> down 0, gate 1, up 2).
+ * `.experts.<E>.` is routed expert E of its layer, and its slot is the rank of its name with the expert number
+ * taken out among that layer's expert names (gate_proj, up_proj, down_proj -> down 0, gate 1, up 2).
+ *
+ * MIXED EXPERTS. The container addresses a layer's expert group by a fixed stride, so every expert in it has one
+ * layout: the same encoding and shape at every slot (core/format/radfile.cpp, index_experts). A checkpoint whose
+ * experts differ inside a layer (SAGE-style mixed bit widths, an expert missing a weight) is written the way
+ * radiance's own containers write protected bf16 experts (arch/common/rad_block_moe_fp8.h): the layer's most
+ * common expert form is its expert group, numbered densely in expert order, and every other expert's weights
+ * are tensors of the layer (expert -1). Each keeps its checkpoint name, which carries its real expert number;
+ * a group member's number in the directory is its place among the group's members. Ties go to the form of the
+ * lowest-numbered expert.
  *
  * Its step is never run: a container is served by the model's own plugin. Declared with no logits, a serve
  * of this plugin is refused at startup.
@@ -107,7 +116,15 @@ bool expert_of(const std::string& name, int* e, std::string* key) {
 struct Logical {
     std::string name;    /* the declared weight and the checkpoint tensor it is made from */
     bool exl3 = false;   /* an EXL3 linear (<name> is <X>.weight) */
-    int layer = -1, expert = -1, slot = 0;
+    int layer = -1;
+    int real = -1;       /* the expert number its name carries, -1 for none */
+    int expert = -1;     /* its place in the layer's expert group, -1 outside one */
+    int slot = 0;
+    std::string key;     /* an expert weight's name with the number taken out */
+    RadEncoding enc{};
+    int64_t shape[RAD_MAX_RANK] = {0};
+    uint32_t rank = 0;
+    std::string form;    /* encoding and shape, as a comparable string */
 };
 
 int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -168,34 +185,8 @@ int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     for (const auto& kv : count)
         if (kv.first != trunk) { base[kv.first] = next; next += kv.second; }
 
-    /* Experts and their slots. */
-    std::map<int, std::set<std::string>> keys;   /* layer -> its expert names, expert number taken out */
-    std::vector<std::string> key_of(logical.size());
-    for (size_t i = 0; i < logical.size(); ++i) {
-        Logical& L = logical[i];
-        std::string p;
-        int n = 0;
-        if (layer_of(L.name, &p, &n)) L.layer = base[p] + n;
-        int e = 0;
-        if (L.layer >= 0 && expert_of(L.name, &e, &key_of[i])) {
-            L.expert = e;
-            keys[L.layer].insert(key_of[i]);
-        }
-    }
-    for (size_t i = 0; i < logical.size(); ++i) {
-        Logical& L = logical[i];
-        if (L.expert < 0) continue;
-        const auto& k = keys[L.layer];
-        if (k.size() > 8)
-            return refuse(RAD_E_UNSUPPORTED, "layer %d's experts have %zu weights each; a movement group holds at "
-                                             "most 8 slots", L.layer, k.size());
-        L.slot = (int)std::distance(k.begin(), k.find(key_of[i]));
-    }
-
-    /* Declare each one plane by plane: a declaration that takes several planes as one operand needs a kernel to
-     * join them, and this plugin declares no op (core/build/rad_builder.cpp, finish_layouts). */
-    int64_t n_exl3 = 0, n_plain = 0;
-    for (const Logical& L : logical) {
+    /* Every weight's name map entry and encoding (the recipe's, for an EXL3 linear). */
+    for (Logical& L : logical) {
         /* The name map is how the checkpoint is searched for a weight, even under its own name. */
         RadNameMap map;
         std::memset(&map, 0, sizeof map);
@@ -206,46 +197,110 @@ int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
         map.src_index[0] = -1;
         if (rad_decl_name_map(b, &map) != RAD_OK)
             return refuse(RAD_E_INVAL, "'%s': the name map refused it", L.name.c_str());
-        RadEncoding enc;
-        int64_t shape[RAD_MAX_RANK] = {0};
-        uint32_t rank = 0;
-        const int st = rad_weight_encoding(b, L.name.c_str(), &enc, shape, &rank);
+        const int st = rad_weight_encoding(b, L.name.c_str(), &L.enc, L.shape, &L.rank);
         if (st != RAD_OK)
             return refuse(st, "'%s' has no encoding (%d)%s", L.name.c_str(), st,
                           L.exl3 ? ": is the hole file (tools/exl3_inventory.py --holes) passed with --add?" : "");
-        if (L.exl3 && exl3_encoding_read(&enc, nullptr, nullptr, nullptr) != RAD_OK) {
-            char e[256];
-            rad_enc_format(&enc, e, sizeof e);
+        char e[256];
+        rad_enc_format(&L.enc, e, sizeof e);
+        if (L.exl3 && exl3_encoding_read(&L.enc, nullptr, nullptr, nullptr) != RAD_OK)
             return refuse(RAD_E_DTYPE, "'%s' is an EXL3 linear and its encoding is %s: the recipe must import it "
                                        "with the exl3 quantiser (`*.weight exl3 src=$EXL3_SRC bits=0 codebook=auto`)",
                           L.name.c_str(), e);
+        L.form = e;
+        for (uint32_t r = 0; r < L.rank && r < RAD_MAX_RANK; ++r) L.form += " " + std::to_string(L.shape[r]);
+    }
+
+    /* Layers and experts. */
+    for (Logical& L : logical) {
+        std::string p;
+        int n = 0;
+        if (layer_of(L.name, &p, &n)) L.layer = base[p] + n;
+        int e = 0;
+        if (L.layer >= 0 && expert_of(L.name, &e, &L.key)) L.real = e;
+    }
+
+    /* Each layer's expert group: the most common expert form, an expert's form being its weights' forms by
+     * slot key (a missing weight is a form of its own). */
+    std::map<int, std::set<std::string>> keys;                       /* layer -> its expert weight keys */
+    std::map<int, std::map<int, std::map<std::string, std::string>>> unit;   /* layer -> expert -> key -> form */
+    for (const Logical& L : logical)
+        if (L.real >= 0) {
+            keys[L.layer].insert(L.key);
+            unit[L.layer][L.real][L.key] = L.form;
         }
+    std::map<int, std::map<int, int>> place;   /* layer -> real expert -> its place in the group */
+    int64_t n_outside = 0, n_outside_layers = 0;
+    for (auto& [layer, experts] : unit) {
+        std::map<std::string, std::vector<int>> by_form;   /* an expert's whole form -> its experts, in order */
+        std::vector<std::string> order;                    /* forms by their lowest expert */
+        for (const auto& [real, forms] : experts) {
+            std::string whole;
+            for (const std::string& k : keys[layer]) {
+                const auto f = forms.find(k);
+                whole += k + "=" + (f == forms.end() ? std::string("(absent)") : f->second) + ";";
+            }
+            if (!by_form.count(whole)) order.push_back(whole);
+            by_form[whole].push_back(real);
+        }
+        const std::string* best = &order.front();
+        for (const std::string& f : order)
+            if (by_form[f].size() > by_form[*best].size()) best = &f;
+        const std::vector<int>& members = by_form[*best];
+        for (size_t i = 0; i < members.size(); ++i) place[layer][members[i]] = (int)i;
+        if (keys[layer].size() > 8)
+            return refuse(RAD_E_UNSUPPORTED, "layer %d's experts have %zu weights each; a movement group holds at "
+                                             "most 8 slots", layer, keys[layer].size());
+        const int64_t out = (int64_t)(experts.size() - members.size());
+        if (out > 0) {
+            n_outside += out;
+            ++n_outside_layers;
+            rad_note(b, "%s: layer %d: %zu of %zu experts are its expert group; %lld differ and are tensors of the "
+                        "layer", kPlugin, layer, members.size(), experts.size(), (long long)out);
+        }
+    }
+    for (Logical& L : logical) {
+        if (L.real < 0) continue;
+        const auto& k = keys[L.layer];
+        const auto it = place[L.layer].find(L.real);
+        if (it == place[L.layer].end()) continue;   /* outside the group: a tensor of the layer */
+        L.expert = it->second;
+        L.slot = (int)std::distance(k.begin(), k.find(L.key));
+    }
+
+    /* Declare each one plane by plane: a declaration that takes several planes as one operand needs a kernel to
+     * join them, and this plugin declares no op (core/build/rad_builder.cpp, finish_layouts). */
+    int64_t n_exl3 = 0, n_plain = 0;
+    for (const Logical& L : logical) {
         int64_t rows = 0, cols = 0;
-        rad_enc_view(rank, shape, &rows, &cols);
-        for (int k = 0; k < enc.n_planes; ++k) {
-            const RadEncPlane& p = enc.plane[k];
+        rad_enc_view(L.rank, L.shape, &rows, &cols);
+        for (int k = 0; k < L.enc.n_planes; ++k) {
+            const RadEncPlane& p = L.enc.plane[k];
             RadWeightDecl d;
             std::memset(&d, 0, sizeof d);
             d.dtype = p.dtype;
-            if (enc.n_planes == 1 && p.kind == RAD_PLANE_TILED && p.block[0] == 1 && p.block[1] == 1) {
-                d.rank = rank;   /* a plain tensor keeps its shape */
-                for (uint32_t r = 0; r < rank && r < RAD_MAX_RANK; ++r) d.shape[r] = shape[r];
+            if (L.enc.n_planes == 1 && p.kind == RAD_PLANE_TILED && p.block[0] == 1 && p.block[1] == 1) {
+                d.rank = L.rank;   /* a plain tensor keeps its shape */
+                for (uint32_t r = 0; r < L.rank && r < RAD_MAX_RANK; ++r) d.shape[r] = L.shape[r];
             } else {
                 d.rank = 2;
                 rad_enc_plane_dims(&p, rows, cols, &d.shape[0], &d.shape[1]);
             }
-            d.access = L.expert >= 0 ? RAD_ACCESS_CONDITIONAL : RAD_ACCESS_PER_TOKEN;
+            d.access = L.real >= 0 ? RAD_ACCESS_CONDITIONAL : RAD_ACCESS_PER_TOKEN;
             d.shard = RAD_SHARD_NONE;
             d.group.layer = L.layer;
             d.group.expert = L.expert;
             d.group.slot = L.expert >= 0 ? L.slot : 0;
             d.source = L.name.c_str();
             d.planes = p.role;
-            const std::string handle = enc.n_planes == 1 ? L.name : L.name + "@" + p.role;
+            const std::string handle = L.enc.n_planes == 1 ? L.name : L.name + "@" + p.role;
             if (rad_decl_weight(b, handle.c_str(), &d) == RAD_NULL_HANDLE) return RAD_E_INVAL;
         }
         ++(L.exl3 ? n_exl3 : n_plain);
     }
+    if (n_outside)
+        rad_note(b, "%s: %lld experts in %lld layers differ from their layer's group and are tensors of the layer",
+                 kPlugin, (long long)n_outside, (long long)n_outside_layers);
     rad_note(b, "%s: %lld EXL3 linears and %lld other tensors of %s, declared under their checkpoint names; a "
                 "convert-only plugin (no ops)", kPlugin, (long long)n_exl3, (long long)n_plain, src);
     return RAD_OK;

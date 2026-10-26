@@ -87,8 +87,10 @@ def load_src(src):
     return out, json.loads((src / "config.json").read_text())
 
 
-def groups(names, n_layers):
-    """(layer, expert, slot) for every name, as the README's contract states it."""
+def groups(forms, n_layers):
+    """(layer, expert, slot) for every name, as the README's contract states it. `forms` maps each name to its
+    form (encoding and shape); a layer's expert group is its most common whole expert form, ties to the
+    lowest-numbered expert's, numbered densely; every other expert's weights are tensors of the layer."""
     def lay(n):
         parts, got = n.split("."), None
         for i in range(len(parts) - 2):
@@ -96,6 +98,7 @@ def groups(names, n_layers):
                 got = (".".join(parts[:i]), int(parts[i + 1]))
         return got
 
+    names = sorted(forms)
     count = {}
     for n in names:
         g = lay(n)
@@ -106,20 +109,40 @@ def groups(names, n_layers):
     for p in sorted(count):
         if p != trunk:
             base[p], nxt = nxt, nxt + count[p]
-    out, keys = {}, {}
+    info, units = {}, {}
     for n in names:
         g = lay(n)
         layer = base[g[0]] + g[1] if g else -1
         parts = n.split(".")
-        expert, key = -1, None
+        real, key = -1, None
         for i in range(1, len(parts) - 2):
             if parts[i] == "experts" and parts[i + 1].isdigit():
-                expert, key = int(parts[i + 1]), ".".join(parts[: i + 1] + ["*"] + parts[i + 2:])
+                real, key = int(parts[i + 1]), ".".join(parts[: i + 1] + ["*"] + parts[i + 2:])
                 break
-        out[n] = [layer, expert, key]
-        if layer >= 0 and expert >= 0:
-            keys.setdefault(layer, set()).add(key)
-    return {n: (l, e, sorted(keys[l]).index(k) if e >= 0 and l >= 0 else 0) for n, (l, e, k) in out.items()}
+        info[n] = (layer, real, key)
+        if layer >= 0 and real >= 0:
+            units.setdefault(layer, {}).setdefault(real, {})[key] = forms[n]
+    place, keys = {}, {}
+    for layer, experts in units.items():
+        keys[layer] = sorted(set().union(*(set(u) for u in experts.values())))
+        by_form, order = {}, []
+        for real in sorted(experts):
+            whole = tuple(experts[real].get(k) for k in keys[layer])
+            if whole not in by_form:
+                order.append(whole)
+            by_form.setdefault(whole, []).append(real)
+        best = order[0]
+        for f in order:
+            if len(by_form[f]) > len(by_form[best]):
+                best = f
+        place[layer] = {real: i for i, real in enumerate(by_form[best])}
+    out = {}
+    for n, (layer, real, key) in info.items():
+        if real >= 0 and layer >= 0 and real in place[layer]:
+            out[n] = (layer, place[layer][real], keys[layer].index(key))
+        else:
+            out[n] = (layer, -1, 0)
+    return out
 
 
 def main():
@@ -144,7 +167,14 @@ def main():
         bad.append(f"{n}: not in the container")
     for n in sorted(set(have) - want):
         bad.append(f"{n}: in the container, not in the checkpoint")
-    grp = groups(sorted(want), cfg["num_hidden_layers"])
+    forms = {}
+    for x in linears:
+        sh = src[x + ".trellis"][1]
+        cb = next((m for m in MARKERS if x + "." + m in src), "3inst")
+        forms[x + ".weight"] = ("exl3", sh[2] // 16, cb, sh[1] * 16, sh[0] * 16)
+    for n in want - {x + ".weight" for x in linears}:
+        forms[n] = ("plain", src[n][0], tuple(src[n][1]))
+    grp = groups(forms, cfg["num_hidden_layers"])
 
     n_exl3 = n_plain = 0
     for x in linears:
