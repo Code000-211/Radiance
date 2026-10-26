@@ -281,7 +281,7 @@ if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 # diagnose_e2e_test runs the engine's self-measurement over its whole fixed workload, once per case:
-# five runs of the workload, most of them seconds apart in wall time because the workload is the
+# ten runs of the workload, most of them seconds apart in wall time because the workload is the
 # cost. Labelled `e2e` with engine_e2e_test and kept out of the fast tier.
 if(TARGET diagnose_e2e_test)
   set_tests_properties(diagnose_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)

@@ -13,7 +13,8 @@
  *     a suggestion.
  *   A baseline is taken seriously: one's own report passes, a report written with another salt is
  *     refused with the salt named, and `--diagnose-baseline` without `--diagnose` is refused before
- *     anything is loaded.
+ *     anything is loaded. The threshold `--diagnose-acceptance-drop` names is the threshold the
+ *     comparison used, read back from the note that names it.
  *   Absent is not zero. A point this deployment cannot hold is reported with the reason, and a run
  *     with no drafter reports its acceptance as absent rather than as 0 -- and with
  *     `--num-speculative-tokens`, the positions are there and the counts add up.
@@ -281,6 +282,29 @@ TEST(diagnose_baseline_refuses_another_salt_by_naming_it) {
     CHECK(r.status != 0);
     CHECK(has(r.log, "salted its prompts with 11"));
     CHECK(has(r.log, "12"));
+}
+
+TEST(diagnose_the_acceptance_drop_flag_reaches_the_comparison) {
+    if (!world().ok || !RAD_E2E_SERVER[0]) SKIP("no checkpoint or no radiance binary");
+    const std::string a = world().out + "/drop-a", b = world().out + "/drop-b";
+    /* Two runs of the spec model against each other: identical acceptance, so nothing fell, and
+     * the note the comparison writes names the threshold it compared against. That note is the
+     * only place the flag's value is observable end to end -- compare_acceptance's arithmetic is
+     * held to hand-computed numbers in diagnose_test -- so a run that ignored the flag and kept
+     * the default would be caught here saying 10% where 50% was asked for. */
+    REQUIRE_EQ(diagnose(world().qwen35_spec, a,
+                        { "--diagnose-salt", "3", "--num-speculative-tokens", "3" }).status,
+               0);
+    const Ran r = diagnose(world().qwen35_spec, b,
+                           { "--diagnose-salt", "3", "--num-speculative-tokens", "3",
+                             "--diagnose-baseline", a + "/diagnose.json",
+                             "--diagnose-acceptance-drop", "0.50" });
+    if (r.status != 0) fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+    REQUIRE_EQ(r.status, 0);
+    CHECK(has(r.log, "no point's pooled acceptance fell by 50% or more"));
+    /* The startup report says the flag was heard; the note above says it was obeyed. */
+    CHECK(has(r.log, "0.50"));
+    CHECK(!has(r.log, "fell by 10% or more"));
 }
 
 TEST(diagnose_a_baseline_without_a_run_is_refused_before_the_model_is_loaded) {

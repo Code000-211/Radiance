@@ -586,7 +586,10 @@ int Engine::run_diagnose() {
             return RAD_E_FORMAT;
         }
         diagnose::compare_tokens(body, text, &rep.findings);
-        diagnose::compare_acceptance(body, text, 0.10, &rep.findings);
+        /* The threshold the flag named, not the default it ships with: the startup report echoes
+         * --diagnose-acceptance-drop, and a comparison that ignored it would report a fall the
+         * operator had asked not to hear about (or stay quiet about one they had). */
+        diagnose::compare_acceptance(body, text, cfg_.diagnose_acceptance_drop, &rep.findings);
     }
 
     for (const diagnose::Finding& f : rep.findings)
