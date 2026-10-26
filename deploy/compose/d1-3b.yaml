@@ -1,0 +1,18 @@
+# LiquidAI d1-3B in bf16, converted as a decision model (rad-convert ... --set decision.type=d1):
+# named yes/no, choice and score questions over a state, answered as probabilities on
+# /v1/systemone with nothing generated (docs/GUIDE.md §5.13). The model is 3B and serves one rank
+# only, on one card, RADIANCE_GPU in .env (default 0); about 6 GiB of weights, so a 16 GB RDNA4
+# card such as the RX 9060 XT (gfx1200) holds it with room for the KV cache. The image's kernels
+# are built for gfx1201: for a gfx1200 card build it with docker/build.sh -t gfx1200.
+# Text states only as written; add --mm-max-patches N to take pictures as well.
+name: radiance-d1-3b
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-d1-3b
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/d1-3b-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 32 --max-model-len 16384
