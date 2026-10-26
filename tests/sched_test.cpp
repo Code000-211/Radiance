@@ -2038,6 +2038,51 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     CHECK(chunk);
 }
 
+/* step_quiet() is what the self-measurement waits on before it drains a point's records
+ * (engine_diagnose.cpp): it has to name every step that is still outstanding -- open, issued
+ * ahead, committed but not yet recorded -- because a step left unrecorded at the drain belongs
+ * to the next point's distribution. The arms are driven here by hand, in the engine's own order
+ * (step_loop: step_next at one iteration's tail, promote_next at the next one's head), where the
+ * interleaving is made by the test and not won or lost by a race on a fast machine. */
+TEST(step_quiet_names_the_step_that_is_still_outstanding) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 2;
+    CHECK_OK(f.start());
+    CHECK(f.sch.step_quiet());                     /* nothing has run */
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    CHECK(!f.sch.step_quiet());                    /* a step is open */
+    f.commit_plain(11);
+    CHECK(!f.sch.step_quiet());                    /* committed, its record not yet written */
+    f.sch.step_finished();
+    CHECK(f.sch.step_quiet());                     /* recorded: quiet again */
+
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);                /* the chunk, beside the decoder */
+    CHECK(f.sch.step_next() == nullptr);           /* a prompt continues: nothing issued ahead */
+    f.commit_plain(12);
+    CHECK(!f.sch.step_quiet());
+    f.sch.step_finished();
+    CHECK(f.sch.step_quiet());
+
+    CHECK(f.sch.step() != nullptr);                /* the decoder alone: the chunk is held */
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK(f.sch.step_next() != nullptr);           /* the hold's second step, issued ahead */
+    CHECK(!f.sch.step_quiet());                    /* open, and one issued ahead beside it */
+    f.commit_plain(12);
+    CHECK(!f.sch.step_quiet());                    /* committed; the ahead step is outstanding too */
+    f.sch.step_finished();
+    CHECK(!f.sch.step_quiet());                    /* recorded, but the ahead step is still planned */
+    f.sch.promote_next();
+    CHECK(!f.sch.step_quiet());                    /* the promoted step is open */
+    f.commit_plain(12);
+    CHECK(!f.sch.step_quiet());                    /* committed, its record not yet written */
+    f.sch.step_finished();
+    CHECK(f.sch.step_quiet());                     /* everything recorded: quiet */
+}
+
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
  * at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates take the rest). */
 TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
