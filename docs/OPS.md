@@ -2474,6 +2474,22 @@ kernels while the oracle is what the reference gate knows about — on a machine
 the oracle is left, and the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
 if it is set, it must name `spechub` or the coupled ops are not loaded at all.
 
+A tree-layout verify (`RadBatch::spec_parent`, `spec_is_tree`) is not served by this build. The
+host half exists in `core/sched/tree_dispatch.h`: it admits a tree only behind
+`RADIANCE_MTP_COUPLED=1` and only at temperature 0 (a sampled row's pick is not the token a tree
+walk matches, and there is no approximate tree sampling -- such a call is refused with
+`RAD_E_UNSUPPORTED` and the serial path keeps running), refuses a tree whose ancestor set has no
+exact `tree_mask16` form when the consumer is 16-bit, refuses a budget that would cut the fixed
+MTP8 profile short, and produces the parents, positions and masks a batch stages plus the commit
+(winner path, accepted count, discarded branches, end-of-generation cut). The card side of the same
+walk exists as `ADV_TREE_ACCEPT`, and `tree_dispatch_confirm` is the comparison the engine will run
+before a step is emitted. Both are prepared, not wired: nothing produces a tree step, `spec_is_tree`
+has no producer, `d_parent` is never filled, and no architecture is marked tree-capable. What is
+missing is the attention operand: no kernel in this tree takes an ancestor mask, `attn_paged` is
+causal over positions, so a tree row would attend to its siblings; and no GDN/QSA/PLE update can
+discard a losing branch, since the linear state absorbs every verified row in row order. `core/sched/batch.cpp` therefore still refuses `spec_is_tree`,
+with that reason, and enabling a tree needs those two kernels (and their op schemas) first.
+
 `mtp_couple_propose` runs on a draft round's
 final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
 scores at temperature 1; it writes `x` into column 0 of `idx` and one state row per round. A row

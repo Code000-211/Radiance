@@ -805,10 +805,14 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         return nullptr;
     }
     if (plan.spec_is_tree) {
-        /* spec_parent is in the ABI and allocated, but no drafter emits a tree, so tree parents
-         * and positions are not written. Filling in the linear-chain answer would verify a tree
-         * against the wrong causal mask. */
-        RAD_ERR("tree-layout speculation was requested but is not implemented in this build");
+        /* The host half of a tree verify exists (sched/tree_dispatch.h: the switch, the
+         * temperature contract, the staged parents/positions/masks and the commit), and the card
+         * walk over those parents is ADV_TREE_ACCEPT. What is missing is the attention operand: no
+         * kernel in this tree takes an ancestor mask, so a tree row would attend to its siblings
+         * and the picks would be computed against text that is not on its path. The masks are
+         * refused here rather than staged and silently ignored. */
+        RAD_ERR("tree-layout speculation needs an ancestor-mask attention operand; no kernel in "
+                "this build takes one, so the tree is refused instead of run against a causal mask");
         return nullptr;
     }
 
@@ -1173,6 +1177,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.row_off  = off(s.d_rows);
     a.row_pitch = (int32_t)max_seqs_;
     a.grp_off  = off(s.d_grp);
+    a.parent_off = off(s.d_parent);
     if (mm_on_) {
         a.rope_off   = off(s.d_rope);
         a.rope_pitch = (int32_t)last_n_tok_;

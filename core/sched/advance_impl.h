@@ -70,7 +70,7 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     const int32_t aux  = rows[3 * a.row_pitch + i];
     /* Acceptance runs over every row that sampled, whoever staged it; every other mode over the
      * rows the card owns. */
-    if (a.mode == ADV_ACCEPT ? rout < 0 : !rows[i]) return;
+    if ((a.mode == ADV_ACCEPT || a.mode == ADV_TREE_ACCEPT) ? rout < 0 : !rows[i]) return;
 
     int32_t* tok = adv_i32(a, a.tok_off);
     int32_t* pos = adv_i32(a, a.pos_off);
@@ -97,6 +97,57 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         S.ctx = head + 1;
         S.n_acc = acc + 1;
         S.tok[0] = y[acc];
+        return;
+    }
+    case ADV_TREE_ACCEPT: {
+        /* verify_tree_greedy's walk over the row's nodes, then collect_step's end-of-generation
+         * cut (accept_cut_at_eog's rule). Node 0 is the root at the row's first position; a node is accepted when a lower-id
+         * child of the current node carries the target's pick at the current node, lowest id
+         * first, and the first node without such a child contributes the step's own token. The
+         * row's tokens are the nodes' tokens in id order, its parents at parent_off.
+         *
+         * Prepared, not wired: nothing in this build issues ADV_TREE_ACCEPT, because the batch
+         * cannot stage a tree without an ancestor-mask attention operand (sched/tree_dispatch.h).
+         * A node without a pick, a tree with no node or one past the row's capacity is not a tree
+         * the host admitted: acc = -1 is what the host's cross-check (tree_dispatch_confirm) will
+         * refuse the step on, and the other fields keep the position the slot was staged at. */
+        if (n <= 0 || n > kAdvTreeMaxNodes) {
+            S.acc = -1;
+            S.n_acc = 0;
+            S.head = ctx[i];
+            S.ctx = ctx[i];
+            S.tok[0] = 0;
+            return;
+        }
+        const int32_t* par = adv_i32(a, a.parent_off) + k;
+        const int32_t* pick = a.src + rout;
+        int32_t emitted[kAdvTreeMaxNodes + 1];
+        int32_t node = 0, acc = 0;
+        for (;;) {
+            const int32_t g = pick[node];
+            if (g < 0) {
+                S.acc = -1;
+                S.n_acc = 0;
+                S.head = ctx[i];
+                S.ctx = ctx[i];
+                S.tok[0] = 0;
+                return;
+            }
+            int32_t match = -1;
+            for (int32_t j = node + 1; j < n; ++j)
+                if (par[j] == node && tok[k + j] == g) { match = j; break; }
+            emitted[acc] = g;
+            if (match < 0) break;
+            ++acc;
+            node = match;
+        }
+        for (int32_t j = 0; j <= acc; ++j)
+            if (adv_is_eog(a, emitted[j])) { acc = j; break; }
+        S.acc = acc;
+        S.head = ctx[i] + acc;
+        S.ctx = S.head + 1;
+        S.n_acc = acc + 1;
+        S.tok[0] = emitted[acc];
         return;
     }
     case ADV_TRUNK: {

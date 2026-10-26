@@ -18,12 +18,10 @@
  */
 #include "spechub.h"
 
-/* The header is included only where a device row is built: it pulls the HIP runtime, and a radiance
- * built without a device backend has no HIP headers installed (the same host-only build the engine
- * supports). The globals below are the only thing taken from it, and spechub.hip -- the one file
- * that launches through r4d_emit -- is compiled in that build only. */
-#if defined(RAD_SPECHUB_WITH_DEVICE)
-#include "../../libr4d/r4d_emit.h"   /* only for the three globals it declares */
+/* Only for the three globals it declares. Device sources include it for r4d_emit itself; a host
+ * build has no HIP headers, and nothing else in this plain C++ file needs one. */
+#ifdef RAD_SPECHUB_WITH_DEVICE
+#include "../../libr4d/r4d_emit.h"
 #endif
 
 /* THE DISPATCH LOG IS THIS DSO'S OWN. r4d_emit.h routes every launch through this recorder so a test
