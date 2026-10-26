@@ -20,14 +20,21 @@
 namespace exl3 {
 
 /* ------------------------------------------------------------------ JSON (just what these files need) */
+struct JsonMember;
 struct Json {
     enum Kind { Null, Bool, Num, Str, Arr, Obj } kind = Null;
     bool b = false;
     double num = 0;
     std::string str;
     std::vector<Json> arr;
-    std::vector<std::pair<std::string, Json>> obj;
+    /* Not std::pair<std::string, Json>: a pair of an incomplete type is not a vector element libstdc++
+     * accepts, where a declared struct completed below is (C++17 vector of an incomplete type). */
+    std::vector<JsonMember> obj;
     const Json* get(const char* key) const;   /* an object's member, or null */
+};
+struct JsonMember {
+    std::string first;
+    Json second;
 };
 /* Parse [p, end). False with `why` on malformed text or nesting deeper than 64. */
 bool parse_json(const char* p, const char* end, Json* out, std::string* why);

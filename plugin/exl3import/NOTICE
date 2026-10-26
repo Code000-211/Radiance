@@ -1,0 +1,14 @@
+radiance-exl3-import
+Copyright 2026 Code000-211
+
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This product includes code from radiance-exl3 (https://github.com/Dyluhn/radiance-exl3, v1.3.0, c88ba2b),
+Copyright 2026 Dylan Johnston, under the Apache License, Version 2.0: include/exl3_encoding.h,
+common/exl3_decode.{c,h}, common/exl3_layout.{c,h}, quant/exl3_src.{h,cpp}, tests/exl3_ref.py, and
+quant/exl3_quant.cpp, which is modified here (the generic import). Its NOTICE is reproduced in
+NOTICE.radiance-exl3, including the MIT notice of exllamav3 (https://github.com/turboderp-org/exllamav3),
+whose EXL3 decode common/exl3_decode.c transcribes.
+
+It is built against radiance (https://codeberg.org/StillDeadcode/radiance), Copyright 2026 Deadcode and the
+radiance contributors, under the Apache License, Version 2.0; nothing of radiance is copied here.

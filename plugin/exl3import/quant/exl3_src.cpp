@@ -106,7 +106,7 @@ struct Parser {
             ws();
             if (p < end && *p == '}') { ++p; return true; }
             for (;;) {
-                std::pair<std::string, Json> kv;
+                JsonMember kv;
                 ws();
                 if (!string(&kv.first)) return false;
                 ws();

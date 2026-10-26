@@ -1,6 +1,6 @@
-# exl3import: an EXL3 checkpoint into a `.rad` container
+# radiance-exl3-import: an EXL3 checkpoint into a `.rad` container
 
-This directory writes an exllamav3 (EXL3) checkpoint, as it is downloaded, into a `.rad` container. Every weight
+This project writes an exllamav3 (EXL3) checkpoint, as it is downloaded, into a `.rad` container. Every weight
 keeps its checkpoint name, nothing is quantised and nothing is lost. It exists so that a model's container can be
 written **before** an architecture plugin that serves the model exists. The first use is DeepSeek-V4.1-Flash from
 an EXL3 conversion (for example `vcruz305/DSV4.1-Flash-1017-DERISKED-EXL3-2.50bpw`).
@@ -21,16 +21,29 @@ form: any `<X>.weight` whose `<X>.trellis` the checkpoint holds, with K and code
 
 ## Building
 
-Build it with the rest of the tree. It is part of the top-level build:
+The plugins are host code only, and a convert needs no GPU. They are written against radiance **1.10.0, plugin
+ABI 26**: the [Code000-211/Radiance](https://github.com/Code000-211/Radiance) fork at the commit `RADIANCE_VERSION`
+names. A build against another ABI is refused at configure time, and a plugin of another ABI is refused at load.
+
+**Standalone, against an installed radiance** (its headers, CMake package and `rad-convert`):
 
 ```sh
-cmake -S . -B build -DRAD_WITH_HIP=OFF -DCMAKE_BUILD_TYPE=Release   # a convert needs no GPU
-cmake --build build --target rad-convert libref libquant exl3_quant exl3_import
+# a radiance install prefix, host-only: in the radiance checkout
+cmake -S . -B build -G Ninja -DRAD_WITH_HIP=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build && cmake --install build --prefix $HOME/radiance-1.10.0
+
+# this project
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$HOME/radiance-1.10.0 -DCMAKE_BUILD_TYPE=Release
+cmake --build build && cmake --install build   # -> build/home/{architectures,quantizers}
+ctest --test-dir build -L host --output-on-failure
 ```
 
-`build/radiance_home` is then a plugin home that holds everything a convert loads. To build against an installed
-radiance instead, use `cmake -S plugin/exl3import -B build-exl3 -DCMAKE_PREFIX_PATH=<prefix>` and put
-`build-exl3/home` ahead of the engine's home on `RADIANCE_HOME`.
+`build/home` is this project's plugin home. Put it ahead of the engine's own on `RADIANCE_HOME`:
+`RADIANCE_HOME=$PWD/build/home:$HOME/radiance-1.10.0/share/radiance`.
+
+**In radiance's tree:** the same directory is `plugin/exl3import` on the fork's `claude/jolly-hamilton-n405gx`
+branch, and is built with the rest of the tree. There `build/radiance_home` holds every plugin a convert loads.
 
 Installed beside the serving plugins, `exl3_import` is inert. It claims the architecture `exl3import`, which no
 checkpoint has, unless `EXL3_IMPORT_ARCH` names another id.
@@ -38,9 +51,10 @@ checkpoint has, unless `EXL3_IMPORT_ARCH` names another id.
 ## Converting
 
 ```sh
-export RAD_CONVERT=$PWD/build/bin/rad-convert RADIANCE_HOME=$PWD/build/radiance_home
-PLAN_ONLY=1 plugin/exl3import/tools/exl3_convert.sh /models/DSV4.1-Flash-EXL3 /models/dsv4.1-flash-exl3.rad
-plugin/exl3import/tools/exl3_convert.sh /models/DSV4.1-Flash-EXL3 /models/dsv4.1-flash-exl3.rad
+export RAD_CONVERT=$HOME/radiance-1.10.0/bin/rad-convert
+export RADIANCE_HOME=$PWD/build/home:$HOME/radiance-1.10.0/share/radiance
+PLAN_ONLY=1 tools/exl3_convert.sh /models/DSV4.1-Flash-EXL3 /models/dsv4.1-flash-exl3.rad
+tools/exl3_convert.sh /models/DSV4.1-Flash-EXL3 /models/dsv4.1-flash-exl3.rad
 ```
 
 Run `PLAN_ONLY=1` first. It reads only headers (seconds), prints the inventory, writes the hole file and runs
