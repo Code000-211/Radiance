@@ -114,3 +114,41 @@ this whole mode exists to avoid.
 - A baseline compares tokens exactly and timings not at all. That is deliberate — timings on a busy
   box move by more than most changes — but it means the report answers "did this change the words, and
   what did it do to the shapes" and leaves "is it faster" to the distributions beside them.
+
+## Addendum: what review found after this log was written
+
+This log records the day the mode was built. Reviewing the merged change later, against the real
+model and in sealed pairs, found two more defects; both are fixed on this branch and each carries
+the test that would have caught it. They belong in this log because the log's third story above
+claims the last-step question was settled, and it was only half settled.
+
+**4. The acceptance-drop flag never reached the comparison.** `--diagnose-acceptance-drop` was
+parsed into the config and echoed by the startup report, but `run_diagnose()` passed a hardcoded
+`0.10` to `compare_acceptance()`, so the threshold the operator named was compared against nothing.
+The flag's value is observable end to end in exactly one place: the note the comparison writes when
+nothing fell ("no point's pooled acceptance fell by N% or more"). The e2e case added with the fix
+runs the spec model against its own report with the flag at 0.50 and reads the note back; with the
+hardcoded default restored, the note says 10% and the case fails.
+
+**5. The counters were charged at the sink's fill, one step ahead of the drain.** Two sealed runs
+of the same build, same salt, quiet box: `decode-floor` reported `steps: 96` in one and `steps: 97`
+in the other, `steps_by_phase.decode` 95 and 96, while the record-based counts — the ones the
+distributions are made of — said 97 both times. A count is not a timing; two identical runs
+disagreeing on one was the sealed-pair protocol doing its job. The point's metrics were read before
+the quiet wait, but the point is not over at the sink's fill: the step that filled it owes its
+`step_finished()`, and behind it the drafter's issued-ahead step runs a full pass that emits
+nothing, because its request is done. Those increments raced the read; the records, drained after
+quiet, did not. The counters are now read at the same boundary the records are drained at, and the
+e2e asserts the contract the header states — the phase families sum to the point's step count, and
+so do the shapes. After the fix, the sealed pair agrees: 97 and 97, both families, both runs.
+
+An honest word about the mutation control on that one: with the counters moved back to the fill,
+the e2e's tiny model finishes its tail step faster than the diagnose thread wakes, the race
+resolves the same way every time, and the suite cannot kill the mutant. The kill evidence is the
+sealed pair itself — 96/97 before, 97/97 after. The invariant checks pin the boundary and catch the
+flap wherever the timing allows it; the protocol catches it everywhere.
+
+And one hole the mutation control found in the suite rather than in the mode: with
+`Scheduler::step_quiet()` made to return true unconditionally, every e2e case still passed on this
+host — the drain's wait resolves benignly when it is lied to. `sched_test` now drives the quiet
+arms by hand, in the engine's own order, and the disabled mutant dies on four arms at once.
