@@ -310,6 +310,10 @@ add_subdirectory(arch)
 # the experimental line owns. Built by default so the flag's kernels exist in the same tree that
 # enables it; a deployment that never sets the flag loads a library whose rows it never resolves.
 add_subdirectory(plugin/spechub)
+# exl3import: rad-convert of an exllamav3 (EXL3) checkpoint into a container, by a convert-only
+# architecture that declares every tensor under its checkpoint name (plugin/exl3import/README.md).
+# It claims no architecture unless EXL3_IMPORT_ARCH names one, so it is inert beside the serving plugins.
+add_subdirectory(plugin/exl3import)
 # candidates/: ports of out-of-tree candidates, opted in one directory at a time. Each is built as
 # its own project shape (see candidates/gdn-query-reload/CMakeLists.txt) and never installed, so a
 # default build is unchanged.
