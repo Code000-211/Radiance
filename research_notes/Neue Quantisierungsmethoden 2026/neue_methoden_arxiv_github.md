@@ -65,3 +65,29 @@ hinter einem Trellis. Sie sind Alternativen für Hardware mit festen Formaten, n
 - Am ehesten relevant sind XOR-Trellis (Rotationsfreiheit für TP) und BCJR-QAT (Gradienten durch Trellis-Codes).
   Beide wären eigene Projekte; keines liegt als lauffähiger Code für EXL3 vor.
 - Die Aussage „Trellis-Codes sind nicht gradientenfähig" aus den Notizen zum Feintuning ist durch BCJR-QAT überholt.
+
+## Nachtrag 2026-11-01: Gibt es ein besseres Format als einen Trellis bei 4 bis 4.5 bpw?
+
+Quellen: arXiv-API und Volltexte (arxiv.org/html).
+
+- **HyperQuant** (arXiv 2606.23406, 2026-06-22): Hadamard, Gitter E8/D4/A2/Z, verlustfreies Bit-Stripping und
+  Rice-Codierung variabler Länge. Llama-3.1-8B-Instruct, WikiText-2, bei 4.0 bit pro Skalar: HIGGS 7.618 PPL,
+  HyperQuant (2D-Gitter) 7.500. Kein Vergleich mit QTIP. Variable Länge braucht eigenen GPU-Decoder.
+- **LLVQ, Leech-Gitter** (arXiv 2603.11021, Qualcomm): schlägt QuIP#, QTIP und PVQ, Ergebnisse bei 2 bit
+  (Llama-2-7B). Nachfolger **Tetra** (2609.35465) bei 2.7 bpw über das ganze Modell.
+- **CoS-VQ** (arXiv 2610.37336, 2026-10-27): gemeinsame Optimierung von Indizes und geteilter Skala; schlägt QTIP
+  und LLVQ, auch auf Qwen3.8-27B. Hauptsetting 2 bit pro Gewicht plus FP16-Skala je 128 Spalten. Qwen3-8B,
+  mittlere PPL: BF16 8.93, QTIP 11.10, LLVQ 10.86, CoS-VQ 10.56. Ablation: gemeinsame Index- und Skalensuche
+  bringt mehr als reines Skalen-Feintuning.
+- **NestQuant** (arXiv 2502.09720): verschachtelte Gosset-Gitter für W4A4KV4-Matrixprodukte; Ziel sind
+  Aktivierungen, nicht reine Gewichtsquantisierung.
+- **EntroLLM** (2505.02380), **ZipServ** (2603.17435): Entropie- bzw. verlustfreie Codierung. Hilft skalaren
+  Codes, deren Entropie unter der Bitbreite liegt; Trellis-Pfadbits sind praktisch inkompressibel.
+- **MCWC** (2605.24754): Vorhersage über Schichten plus gelerntes Entropiemodell; Gewichte müssen vor der
+  Rechnung rekonstruiert werden, nicht im GEMM fusionierbar.
+
+Einordnung (eigene Abschätzung, nicht gemessen): Ein Trellis mit 2^16 Zuständen liegt grob 0.4 bis 0.5 dB über
+der Gauß-Schranke (QTIP-Werte bei 2 bit). E8 mit Entropiecodierung liegt etwa 0.65 dB darüber, Leech etwa 0.5 dB.
+Den ganzen Abstand zu schließen wären rund 0.075 bit, bei 3.3 bis 3.7-facher KL pro Bit höchstens etwa 10 % KL.
+Ergebnis: kein besseres Format bei 4 bis 4.5 bpw belegt. Übertragbar ist die gemeinsame Index- und Skalensuche
+von CoS-VQ auf die Zeilenskala von IQR-V3, die heute vor GPTQ fest gewählt wird.
