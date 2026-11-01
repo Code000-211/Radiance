@@ -12,12 +12,40 @@ repository — `git log --all` over every branch finds no `--draft-cycle-stop`, 
 `52252c3` is the deployment tree's — so this plan binds the *reading* of the deployment's
 measurement, and the deployment owner applies it.
 
-Two trees are named, and every `file:line` below was re-validated against the tree it names:
+Two trees of this repository are named, and every `file:line` below was re-validated against the
+tree it names. The deployment's own tree is not reachable from this host: it appears below only as
+*the deployment*, never as a tree with a SHA, and its artifacts are tabulated in §0.
 
 | tree | SHA | what it is |
 |------|-----|------------|
 | `main` | `39f957d` | `origin/main` at the time of writing |
-| deployment | (not reachable) | the owner's serving tree: carries E4-B, the five-run basis runs, the paired harness |
+| `strand` | `738dd49` | `origin/feat/draft-calib-boundary`, the deployment line the #61 plan audits; used below only for what is absent from `/stats` |
+
+## 0. The artifacts this decision runs on
+
+The E4-B code is in no tree of this repository, so every row below is an artifact of the
+deployment, cited and not re-run. A stage that names a flag without naming the binary that will
+run it cannot be closed from a checkout of `main` — which is why this table exists, and why its
+empty cells are **Asks** (§0.1) rather than silence.
+
+| artifact | branch | commit | binary | record |
+|---|---|---|---|---|
+| the fixed-K3 basis (five Quicks) | not named | not named | `aa00289` | GH-60 five-run series, 48/48 per class |
+| the one E4-B pair (§2.2) | not named | not named | the **sync-carrying** build | GH-60 comment 2026-10-26 13:52 |
+| E4-B row-renumbering fix | not named | `52252c3` | not named | foreign record, 18/18 green |
+| **the deciding binary for the three pairs** | not named — Ask A1 | not named — Ask A1 | the **drain-free** build: one pinned `uint8` per row, copied on a dedicated copy stream between an event on rank 0's stream and a completion event, read at the next cycle's open and **not waited for**; an absent byte falls back to the confidence rule | deployment owner's review of PR #72, item 2, 2026-10-29 |
+
+The last row is the decision's, and it is not interchangeable with the second: the pair of §2.2
+was produced by a build that paid a full `rad_stream_sync` of rank 0 inside every flag-on cycle
+(§3.4). Three pairs against that build would measure the drain, not the flag.
+
+### 0.1 Asks
+
+- **A1 — branch, commit and binary hash of the drain-free build.** Without them the three pairs
+  have no identity gate to bind to (G1 names a binary, not a description), and no sealed line
+  can be written before the first run.
+- **A2 — the threshold theta the stop rule ships with.** §3's envelope is a function of it, and
+  the two candidate values differ by ~15 % relative in the derived stop rate.
 
 ## 1. Where issue #62 stands
 
@@ -28,10 +56,12 @@ The issue's four acceptance criteria, and what satisfies each today:
    paid for every row even where the row's accepted prefix will not survive the round), the
    hypothesis (stopping a row at its accepted-prefix boundary removes built and issued work —
    "the first change in this program that removes work instead of rearranging it"), and the
-   expected effect (a throughput lead). This plan completes the expected-effect record with the
-   quantitative envelope of §3 — written before any deciding pair exists, so the pre-registration
-   keeps its substance: the envelope is derivable without the deciding data.
-   **Met by the record as it stands; the envelope is completed here.**
+   expected effect (a throughput lead). That record satisfies the *before* requirement at its own
+   timestamp — 2026-10-26 13:52, ahead of the first serving pair — and this plan adds derived
+   material after the fact: the quantitative envelope of §3, derivable without the deciding data,
+   so the pre-registration of the *deciding* rules keeps its substance.
+   **Met by the deployment record, at that record's timestamp; nothing is claimed here for the
+   before-property, which this document cannot carry.**
 2. **Existing policy/predictor/scheduler interfaces used, correctness cases checked.** E4-B runs
    through the existing coupled seam, all of which is on `main`: the coupled-mode gate that
    requires the linear serial chain (`core/engine_draft.cpp:62-77`), the per-round advance modes
@@ -112,6 +142,12 @@ table is the measured closure of the depth lever, and that closure is what made 
 candidate, so the record should be restated once, under the medians, before the #62 decision
 cites it. One statistic per named quantity; the campaign's own rule.
 
+**Restatement accepted (2026-10-29, deployment owner's review of PR #72, item 1) and reproduced
+independently.** The citable form from here on is the restated column — K2/K3 0.888 (C6) and
+0.889 (C8), K4/K3 0.986 and 0.965 — and the owner's record will cite it rather than the original
+table. Stated once, here, so no later document has to rediscover which K3 column it was
+reading.
+
 ### 2.4 The per-position acceptance (**foreign**)
 
 `/stats` per-position conditional acceptance (`runs/gh-60/20261026T120942Z-native-stats-acceptance-r01`;
@@ -134,11 +170,23 @@ continues to round 3 only when position 1 and position 2 were both accepted. Per
 - P(continue) = p₁·p₂ — C1: 0.750 × 0.700 = 0.525; C8: 0.775 × 0.712 = 0.552
 - P(stop) — C1: 0.475; C8: 0.448
 
+**These two rates are a model, not a measurement, and they carry a parameter.** The rule that
+actually fires is a product-of-confidence gate against a threshold theta, not a comparison of
+the accepted prefix against 2; the numbers above are what that gate returns only when it is set
+so that the two criteria coincide. The deployment owner measured the gate directly over 2 885
+recorded windows (mixed C1+C8, **foreign**): it fires in **41.4 %** of windows at theta 0.20 and
+**52.2 %** at theta 0.35, so a 47 % rate corresponds to **theta ≈ 0.27** — not to the documented
+default. Read every rate below as *derived-from-q through `1 − p₁p₂`*, an expectation about the
+mechanism, never as a gate setting or an achieved stop rate; the counters of D4 are the only
+accepted measurement of what actually stopped.
+
 Round 3 disappears entirely (is never built or issued) only when **every** row of the cycle has
 stopped. Per cycle:
 
-- C1 (one row): P ≈ 0.475 — round 3 is skipped in roughly every second cycle.
-- C8 (eight rows): P ≈ 0.448⁸ ≈ 0.0016 — round 3 is skipped in roughly one cycle in six hundred.
+- C1 (one row): P ≈ 0.475 under the model; ≈ 0.414 if the gate is at its shipped default 0.20.
+  Round 3 is skipped in roughly every second cycle either way.
+- C8 (eight rows): P ≈ 0.448⁸ ≈ 0.0016 under the model, ≈ 0.414⁸ ≈ 0.0009 at theta 0.20 — round 3
+  is skipped in roughly one cycle in six hundred, or one in a thousand.
 
 Rows that stop while others continue leave round 3 issued with fewer rows — the row-shrinking
 channel, a smaller pass rather than a missing one.
@@ -150,7 +198,10 @@ so ≈ 2.70 ms of host issue per step. The step rate implied by the basis and th
 (**derived**): committed tokens per verify ≈ 1 + p₁ + p₁p₂ + p₁p₂p₃ ≈ 2.70 at C1, so the 193.92
 tok/s basis implies ≈ 71.8 steps/s, ≈ 13.9 ms/step, of which host issue is ≈ 19 %. Skipping
 round-3 issue in 47.5 % of cycles saves ≈ 0.475 × 674 µs ≈ 320 µs ≈ **2.3 % of the C1 step**,
-before charging the added readback (§3.4).
+before charging the added readback (§3.4). At the owner's measured 41.4 % (theta 0.20) the same
+arithmetic gives ≈ 279 µs ≈ **2.0 % of the step**. The two bracket the envelope; both sit inside
+C1's 4.21 % floor, so the conclusion below does not depend on which theta the pairs ran with —
+but the figure quoted in a keep record must name its theta.
 
 The one-pair C1 lead is +2.4 % within-binary — the same order as the envelope. Two consequences:
 the C1 lead is the documented mechanism at its documented size, and **a confirmed C1 lead of this
@@ -158,8 +209,9 @@ size still does not clear C1's 4.21 % floor** — under D3 it is not keepable on
 
 ### 3.3 The C8 discrepancy
 
-The full-round channel at C8 is bounded at ≈ 0.16 % of cycles ≈ 1 µs per step — three orders of
-magnitude below the one-pair C8 lead of +14.0 %. If the pairs reproduce a C8 lead, it cannot be
+The full-round channel at C8 is bounded at ≈ 0.16 % of cycles ≈ 1 µs per step (model), or
+≈ 0.09 % ≈ 0.6 µs at theta 0.20 — three orders of magnitude below the one-pair C8 lead of
++14.0 % whichever rate is used. If the pairs reproduce a C8 lead, it cannot be
 the documented stop channel that produced it. The candidate channels:
 
 1. **Row shrinking** — round 3 issued with fewer rows; the saving then rides on device work per
@@ -181,6 +233,20 @@ per cycle, at round K. That is within #67's bound — "keine Host-Abfrage oder z
 Synchronisation je Draft-Token"; once per cycle is not per draft token — but the bound permits
 the mechanism, it does not pay for it: the readback's stall is part of the net the pairs measure,
 and the ledger reports it rather than amortising it away.
+
+The cost is not hypothetical, and its size is a property of the build, not of the idea. The E4-B
+that produced §2.2 paid `rad_memcpy_2d_async` **plus a full `rad_stream_sync` of rank 0 inside
+every cycle whose flag was on** — a host round trip for one integer per row (deployment owner's
+review of PR #72, item 2). That is why the saving could not be separated from the control's
+spread: the feature bought work with one hand and paid a drain with the other. The current build
+removes the drain (the shape is the deciding-binary row of §0). Two consequences bind this
+protocol: the pairs run on the drain-free build and on nothing else (§5), and a lead measured on
+the sync build is a measurement of the drain's absence when it disappears, not of the stop.
+
+A general rule the campaign should carry past this issue: **a mechanism's cost is the shape of
+its data path** — bytes, stream, waited-for-or-not, per what unit — and not its stated intent.
+For a change that moves a value across a boundary, name those four before naming an expected
+percentage.
 
 ## 4. The gates, pre-registered
 
@@ -206,7 +272,10 @@ needs the suites on the measured binary.
 ## 5. The deciding measurement, pre-registered
 
 Three alternating pairs of the same binary, only the flag differing, on the exclusive GPU window,
-one owned server per run (the five-run basis's lifetime policy). The first arm of the first pair
+one owned server per run (the five-run basis's lifetime policy). **The binary is the drain-free
+build of §0** — branch, commit and binary hash still to be named by the owner (Ask A1), and the
+first sealed line of the first pair records them; a pair run against the sync-carrying build of
+§2.2 measures the drain and is not admissible to this decision. The first arm of the first pair
 is fixed by the binary hash's parity — even hash: flag-off first — and alternates thereafter
 (AB/BA/AB or BA/AB/BA); no coin toss, no discretion. Classes: C1 and C8 at minimum — the
 Ergänzung's regular set; all five is welcome and is already the one pair's practice. Whichever
@@ -237,7 +306,8 @@ pair and is never quietly promoted.
   supports no keep.
 - **D4 — the mechanism shows its work.** The keep record carries the counters: rounds built and
   issued per cycle, flag 0 beside flag 2, per measured class, under the patch's own named
-  counters (none exist in `/stats` on `main` or the strand; the patch names its own, and the
+  counters (none exist in `/stats` on `main` `39f957d` or the `strand` `738dd49`; the patch names
+  its own, and the
   one-name-per-quantity rule holds). #67's contracts apply although E4-B ran early under #62:
   discarding already-computed tokens is not work saving — the counters must show rounds never
   built or issued, not tokens dropped at commit — and the once-per-cycle readback's cost is in
@@ -273,6 +343,9 @@ precedent E4-B extends within the cycle (`core/sched/draft.h`) — and re-derive
 envelope of §2–3 from the quoted record. The three pairs, the counters, the gates and the
 decision itself are the deployment's. This plan binds only their reading, and it was written
 before the data.
+
+What it still needs from the deployment is in §0.1: the identity of the deciding binary, and the
+threshold the stop rule ships with. Both change numbers in §3; neither changes a decision rule.
 
 ## 8. The rules that hold
 
