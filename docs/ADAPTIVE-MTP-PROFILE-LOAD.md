@@ -183,6 +183,13 @@ The machinery the remaining bullets exercise, each fact re-read at `738dd49`:
   (`core/engine_bringup.cpp:1016-1019`), or set it to that depth explicitly. The recorded k6
   buckets say this deployment's head depth is at least 6; the sealed line records the resolved
   ceiling with the rest of the line.
+
+  **The counter-example, so the clamp is not read as a curse.** The clamp is harmless whenever the
+  ceiling reaches the ladder's top. The deployment's own cost run passed `--num-speculative-tokens 6`,
+  so `exec_depth` was 6, no tier was clamped, and the engine logged
+  `tiers 0..6 (5), baseline K3` — the named baseline where the plan expects it. The trap bites only
+  when a comparator's depth-carrying flag is carried over onto the cost line; the recipe's rule is
+  to leave the ceiling `auto` and read the resolved value off the log line.
 - P4. The serving traffic includes **short prompts** (context class 0, the only class the profile
   measured) beside the 64K prefill target tier — because of D3 below, a pure-64K load run cannot
   prove "prices from it" at all. The exact request mix is recorded on the sealed line.
@@ -213,6 +220,13 @@ window (the trace self-limits to 64 plan lines; the ledger line covers every req
   honest expected result, not a failure of the load** — it is the coverage table read through
   serving, and §5 turns it into the per-class report. A run that instead *crashed*, hung or
   refused requests is a failure of the run and voids the cell.
+
+  **No longer a prediction.** The deployment's screening (GH-62 comment of 2026-10-26, **foreign**)
+  priced **82 of 1 344** exact `(draft_k × verify_tokens × n_rows)` cells — **6.1 %** — and **49 of
+  97 requests had no priced cycle at all**; the named K3 fallback is what served. The reason is
+  structural and matches this rule exactly: every measured bucket carries `prefill_tokens = 0`, and
+  `verify_tokens` is acceptance-dependent, so it changes cycle by cycle. D2 is therefore kept as the
+  reading rule it was, and §5's table is the per-class version of the owner's single mixed run.
 - **D3 — the priced half.** The load run proves "prices from it" only if some cycle prices: at
   least one trace line with `price=ok:…` and a `/stats` `priced ≥ 1` in the same window, on
   class-0 traffic, after the start placement has settled (prices are held until the fill
@@ -274,6 +288,11 @@ reported per class:
 The counters are read from the `/stats` `draft_cost` block by their engine names — no synonyms
 (the campaign plan's "one name per quantity"); the shares divide by `cycles` per class, and every
 figure's sealed line names the run it came from.
+
+**One non-per-class figure already exists (the owner's screening, GH-62 comment of 2026-10-26,
+foreign):** 82 of 1 344 exact cells priced (6.1 %), 49 of 97 requests with no priced cycle. It is
+a single mixed load, so it does not fill any row of the table above and is not promoted to a
+per-class share; it is the order of magnitude the table is expected to confirm.
 
 **Reading rules, pre-registered.**
 

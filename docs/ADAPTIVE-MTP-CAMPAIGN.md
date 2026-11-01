@@ -191,6 +191,14 @@ is a candidate, not a result: only Stage 6 decides. A change whose effect is wit
 not kept for ticket fulfilment — that rule is #62's own acceptance criterion, restated here as
 the pre-registered rule it already is.
 
+**A stage measures a binary, not a flag.** Several of this campaign's stages measure code that is
+not in this repository — `--draft-cycle-stop` and its successors live in the deployment's worktrees
+alone. Any stage that names such a flag names, beside it, the **branch, commit and engine binary
+hash** it will run (the `#62` plan's artifact table, `docs/ADAPTIVE-MTP-E4B-DECISION.md` §0); a
+pair run against a build other than the one named measures that build. Without the row, the
+stage's acceptance cannot be closed from a checkout of `main`, and the honest status is *not
+closable from this repository* rather than *pending*.
+
 ### Stage 4 — the first kernel bottleneck, end to end (#63)
 
 Relevance in the live path first (the per-op profile and the step records name the kernels the
